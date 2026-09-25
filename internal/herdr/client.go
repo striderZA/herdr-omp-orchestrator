@@ -89,6 +89,12 @@ const (
 	CodeAgentPromptStalled = "agent_prompt_stalled"
 	// CodeTimeout is returned when the caller's own timeout expired.
 	CodeTimeout = "timeout"
+	// CodeNotLinkedWorktree is returned by `worktree remove` when the workspace is
+	// not the checkout's Herdr-managed worktree workspace: a response to a move
+	// that closed the worktree's own workspace, not to a refusal of the removal
+	// itself, and the one refusal a caller recovers from by opening the recorded
+	// checkout.
+	CodeNotLinkedWorktree = "not_linked_worktree"
 )
 
 // Sentinel errors, so callers can classify without string matching.
@@ -726,6 +732,21 @@ type WorktreeList struct {
 	Worktrees []WorktreeInfo
 }
 
+// WorktreeOpened is the result of `worktree open`: the workspace that now holds
+// the checkout, and whether it was already open. Herdr reports it as already open
+// for a checkout it still lists, which is exactly the moved state that needs the
+// recovery.
+type WorktreeOpened struct {
+	WorkspaceID      string
+	TabID            string
+	RootPaneID       string
+	WorktreePath     string
+	RepoRoot         string
+	Branch           string
+	IsLinkedWorktree bool
+	AlreadyOpen      bool
+}
+
 // WorktreeRemoved is the result of `worktree remove`.
 type WorktreeRemoved struct {
 	WorkspaceID string
@@ -971,6 +992,112 @@ func (c *Client) WorktreeList(ctx context.Context, cwd string) (*WorktreeList, e
 		}
 	}
 	return &WorktreeList{Source: res.Source, Worktrees: res.Worktrees}, nil
+}
+
+// WorktreeOpen re-opens an existing Git worktree checkout, so Herdr registers the
+// workspace that holds that linked checkout again.
+//
+// It is the recovery for a checkout whose worktree workspace a move closed: Herdr
+// then refuses `worktree remove --workspace <the moved-to workspace>` with
+// `not_linked_worktree` even though `worktree list` still names the exact
+// checkout. The checkout is named by its path together with the repository it
+// belongs to, never by a label, and the response is validated as strictly as
+// `worktree create`'s: the workspace, tab, root pane and worktree must all
+// describe one linked checkout, and a response that does not is refused.
+//
+// Note for callers: the same checkout can be spelled with either separator and in
+// either namespace (`workspace.worktree.checkout_path` and `worktree.path` differ
+// that way in a real response), so compare paths with the platform's own rules.
+func (c *Client) WorktreeOpen(ctx context.Context, root, path string) (opened *WorktreeOpened, err error) {
+	const op = "worktree open"
+	for _, arg := range []struct{ name, value string }{
+		{"cwd", root}, {"path", path},
+	} {
+		if strings.TrimSpace(arg.value) == "" {
+			return nil, fmt.Errorf("%w: %s: %s is empty", ErrInvalidArgument, op, arg.name)
+		}
+	}
+	args := []string{"worktree", "open", "--cwd", root, "--path", path, "--no-focus"}
+
+	// The open may have taken effect: every failure from here on, including a
+	// response this client cannot interpret, is classified by the semantics.
+	defer func() { err = c.classify(op, timeoutAfterMutation, err) }()
+
+	raw, err := c.call(ctx, op, args, timeoutAfterMutation)
+	if err != nil {
+		return nil, err
+	}
+	var res struct {
+		Type        string        `json:"type"`
+		AlreadyOpen *bool         `json:"already_open"`
+		Workspace   WorkspaceInfo `json:"workspace"`
+		Tab         TabInfo       `json:"tab"`
+		RootPane    PaneInfo      `json:"root_pane"`
+		Worktree    WorktreeInfo  `json:"worktree"`
+	}
+	if err := decodeResult(op, raw, &res); err != nil {
+		return nil, err
+	}
+	if err := checkType(op, "worktree_opened", res.Type); err != nil {
+		return nil, err
+	}
+	if res.AlreadyOpen == nil {
+		// The schema requires it, and a caller deciding whether the checkout's
+		// registration was just restored cannot be told "maybe".
+		return nil, &IdentityError{Op: op, Field: "already_open", Detail: "response does not say whether the checkout was already open"}
+	}
+	if err := validateWorkspace(op, res.Workspace); err != nil {
+		return nil, err
+	}
+	if err := validateTab(op, res.Tab); err != nil {
+		return nil, err
+	}
+	if err := validatePane(op, res.RootPane); err != nil {
+		return nil, err
+	}
+	if res.RootPane.WorkspaceID != res.Workspace.WorkspaceID {
+		return nil, &IdentityError{
+			Op:     op,
+			Field:  "root_pane.workspace_id",
+			Detail: fmt.Sprintf("root pane belongs to workspace %q but the opened workspace is %q", res.RootPane.WorkspaceID, res.Workspace.WorkspaceID),
+		}
+	}
+	if res.Workspace.Worktree == nil {
+		return nil, &IdentityError{Op: op, Field: "workspace.worktree", Detail: "opened workspace carries no worktree provenance"}
+	}
+	if strings.TrimSpace(res.Workspace.Worktree.CheckoutPath) == "" || strings.TrimSpace(res.Workspace.Worktree.RepoRoot) == "" {
+		return nil, &IdentityError{Op: op, Field: "workspace.worktree.checkout_path", Detail: "opened workspace has no checkout path or repo root"}
+	}
+	if strings.TrimSpace(res.Worktree.Path) == "" {
+		return nil, &IdentityError{Op: op, Field: "worktree.path", Detail: "response carries no worktree path"}
+	}
+	if !res.Worktree.IsLinkedWorktree {
+		// `worktree open` opens an existing linked checkout; a response saying
+		// otherwise describes the primary repository, which the orchestrator must
+		// never remove as a worker's checkout.
+		return nil, &IdentityError{Op: op, Field: "worktree.is_linked_worktree", Detail: "response does not describe a linked worktree checkout"}
+	}
+	if res.Worktree.OpenWorkspaceID != nil && *res.Worktree.OpenWorkspaceID != res.Workspace.WorkspaceID {
+		return nil, &IdentityError{
+			Op:     op,
+			Field:  "worktree.open_workspace_id",
+			Detail: fmt.Sprintf("worktree is open in workspace %q but the opened workspace is %q", *res.Worktree.OpenWorkspaceID, res.Workspace.WorkspaceID),
+		}
+	}
+	branchName := ""
+	if res.Worktree.Branch != nil {
+		branchName = *res.Worktree.Branch
+	}
+	return &WorktreeOpened{
+		WorkspaceID:      res.Workspace.WorkspaceID,
+		TabID:            res.Tab.TabID,
+		RootPaneID:       res.RootPane.PaneID,
+		WorktreePath:     res.Worktree.Path,
+		RepoRoot:         res.Workspace.Worktree.RepoRoot,
+		Branch:           branchName,
+		IsLinkedWorktree: res.Worktree.IsLinkedWorktree,
+		AlreadyOpen:      *res.AlreadyOpen,
+	}, nil
 }
 
 // WorktreeRemove deletes the checkout of the worktree workspace. It never

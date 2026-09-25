@@ -1611,12 +1611,22 @@ type stubScript struct {
 	// RemoveNotFound names workspaces Herdr no longer has, the state a move into
 	// another workspace leaves behind.
 	RemoveNotFound []string `json:"removeNotFound"`
+	// NotLinked names workspaces Herdr refuses to remove with
+	// `not_linked_worktree`: after a move, the workspace holding the pane is not
+	// the checkout's Herdr-managed worktree workspace.
+	NotLinked []string `json:"notLinked"`
+	// OpenWorkspace is the workspace the stand-in reports when it re-opens a
+	// checkout no workspace holds, standing in for the workspace Herdr creates
+	// for that checkout.
+	OpenWorkspace string `json:"openWorkspace"`
 	// RemoveError makes `worktree remove` refuse; a dirty checkout is one way.
 	RemoveError string `json:"removeError"`
 
 	Prompts  []stubPrompt   `json:"prompts"`
 	SentKeys []stubSendKeys `json:"sentKeys"`
 	Removed  []string       `json:"removed"`
+	// Opened records the workspaces `worktree open` answered with.
+	Opened []string `json:"opened"`
 }
 
 type stubPrompt struct {
@@ -1761,11 +1771,18 @@ func runHerdrScript(path string) int {
 			},
 			"worktrees": worktrees,
 		})
+	case "worktree open":
+		return stubWorktreeOpen(&script, path, argv)
 	case "worktree remove":
 		workspace := stubFlag(argv, "--workspace")
 		for _, gone := range script.RemoveNotFound {
 			if gone == workspace {
 				return stubError("workspace_not_found", "workspace "+workspace+" no longer exists")
+			}
+		}
+		for _, blocked := range script.NotLinked {
+			if blocked == workspace {
+				return stubError("not_linked_worktree", "workspace is not a Herdr-managed worktree checkout")
 			}
 		}
 		if script.RemoveError != "" {
@@ -1798,6 +1815,101 @@ func runHerdrScript(path string) int {
 		fmt.Fprintf(os.Stderr, "stub: unsupported command: argv %q\n", argv)
 		return 40
 	}
+}
+
+// stubWorktreeOpen answers `worktree open` the way Herdr does for a checkout it
+// still lists: the checkout is reported as already open, and the workspace's own
+// worktree registration is restored — which is exactly what `worktree remove` was
+// missing after a move closed the source workspace.
+func stubWorktreeOpen(script *stubScript, scriptPath string, argv []string) int {
+	checkout := stubFlag(argv, "--path")
+	index := -1
+	for i, wt := range script.Worktree {
+		if stubSamePath(wt.Path, checkout) {
+			index = i
+			break
+		}
+	}
+	if index < 0 {
+		return stubError("not_git_worktree", "Herdr worktree actions require a path inside a Git work tree")
+	}
+	workspace := script.Worktree[index].OpenWorkspaceID
+	if workspace == "" {
+		workspace = stubText(script.OpenWorkspace, "w-open")
+		script.Worktree[index].OpenWorkspaceID = workspace
+	}
+	// The open restores the workspace's worktree registration, so the refusal it
+	// caused is gone.
+	script.NotLinked = slices.DeleteFunc(script.NotLinked, func(id string) bool { return id == workspace })
+	script.Opened = append(script.Opened, workspace)
+	if err := writeStubScript(scriptPath, *script); err != nil {
+		return 45
+	}
+	branch := script.Worktree[index].Branch
+	// A real response spells the same checkout two ways: the request carried the
+	// recorded path, and Herdr answers with forward slashes. Callers must compare
+	// paths with the platform's own rules, and this stand-in keeps that difference
+	// real so a regression cannot hide behind it.
+	reported := filepath.ToSlash(checkout)
+	return stubResult(map[string]any{
+		"type":         "worktree_opened",
+		"already_open": true,
+		"workspace":    stubWorkspaceBody(script.RepoRoot, workspace, reported),
+		"tab": map[string]any{
+			"tab_id": workspace + ":t1", "workspace_id": workspace, "label": "1",
+			"number": 1, "pane_count": 1,
+		},
+		"root_pane": stubPaneBody(stubPane{
+			PaneID: workspace + ":p1", TerminalID: "term-" + workspace,
+			WorkspaceID: workspace, Cwd: checkout,
+		}),
+		"worktree": stubWorktreeBody(workspace, reported, branch),
+	})
+}
+
+// stubWorkspaceBody is one workspace projection, including the checkout
+// provenance Herdr attaches to a worktree workspace.
+func stubWorkspaceBody(repoRoot, workspaceID, checkout string) map[string]any {
+	return map[string]any{
+		"workspace_id":  workspaceID,
+		"label":         filepath.Base(checkout),
+		"active_tab_id": workspaceID + ":t1",
+		"agent_status":  "unknown",
+		"number":        1,
+		"pane_count":    1,
+		"tab_count":     1,
+		"worktree": map[string]any{
+			"checkout_path":      checkout,
+			"repo_key":           strings.ToLower(filepath.ToSlash(repoRoot)) + "/.git",
+			"repo_name":          filepath.Base(repoRoot),
+			"repo_root":          repoRoot,
+			"is_linked_worktree": true,
+		},
+	}
+}
+
+// stubWorktreeBody is one worktree entry as `worktree open` and `worktree list`
+// report it.
+func stubWorktreeBody(workspaceID, checkout, branch string) map[string]any {
+	return map[string]any{
+		"path":               checkout,
+		"label":              filepath.Base(checkout),
+		"branch":             branch,
+		"open_workspace_id":  workspaceID,
+		"is_bare":            false,
+		"is_detached":        false,
+		"is_prunable":        false,
+		"is_linked_worktree": true,
+	}
+}
+
+// stubSamePath compares two paths the way a Windows Herdr does: separators are
+// interchangeable and case does not distinguish.
+func stubSamePath(a, b string) bool {
+	normalize := func(path string) string {
+		return strings.ToLower(filepath.Clean(strings.ReplaceAll(path, "/", `\`)))
+	}
+	return normalize(a) == normalize(b)
 }
 
 // agent finds one live agent by pane id or by its live name.
@@ -2001,12 +2113,32 @@ func (s *herdrStub) calls() [][]string {
 // called reports whether one exact argv was made.
 func (s *herdrStub) called(argv ...string) bool {
 	s.t.Helper()
-	for _, call := range s.calls() {
+	return s.callIndex(argv...) >= 0
+}
+
+// callIndex reports where one exact argv sits in the recorded calls, or -1, so a
+// test can assert the order of two operations as well as their presence.
+func (s *herdrStub) callIndex(argv ...string) int {
+	s.t.Helper()
+	for i, call := range s.calls() {
 		if slices.Equal(call, argv) {
-			return true
+			return i
 		}
 	}
-	return false
+	return -1
+}
+
+// lastCallIndex reports where one exact argv was made for the last time, which is
+// what an operation that may be retried has to be asserted on.
+func (s *herdrStub) lastCallIndex(argv ...string) int {
+	s.t.Helper()
+	last := -1
+	for i, call := range s.calls() {
+		if slices.Equal(call, argv) {
+			last = i
+		}
+	}
+	return last
 }
 
 // forced reports whether any removal asked Herdr to force it, which this plugin
@@ -2544,6 +2676,7 @@ func TestCleanupRequiresReviewedDoneAndACleanProvenanceCheckout(t *testing.T) {
 		if got := stub.script().Removed; len(got) != 0 {
 			t.Fatalf("cleanup removed a checkout under a live worker: %v", got)
 		}
+		assertCheckoutNotOpened(t, stub, f.repoRoot, checkout)
 	})
 
 	// The worker exits; its checkout is still not clean.
@@ -2560,6 +2693,7 @@ func TestCleanupRequiresReviewedDoneAndACleanProvenanceCheckout(t *testing.T) {
 		if got := stub.script().Removed; len(got) != 0 {
 			t.Fatalf("cleanup removed a dirty checkout: %v", got)
 		}
+		assertCheckoutNotOpened(t, stub, f.repoRoot, checkout)
 	})
 
 	if err := os.Remove(filepath.Join(checkout, "notes.txt")); err != nil {
@@ -2628,6 +2762,142 @@ func TestCleanupRequiresReviewedDoneAndACleanProvenanceCheckout(t *testing.T) {
 		})
 		wantError(t, f.callWith("cleanup", primarySession, `{"taskId":"t1"}`, ops), "provenance_unconfirmed")
 	})
+}
+
+// assertCheckoutNotOpened pins the ordering the cleanup gate requires: the
+// live-worker and dirty-checkout refusals happen before anything is opened, so a
+// refused cleanup has no side effect to undo.
+func assertCheckoutNotOpened(t *testing.T, stub *herdrStub, root, checkout string) {
+	t.Helper()
+	if stub.called("worktree", "open", "--cwd", root, "--path", checkout, "--no-focus") {
+		t.Errorf("a refused cleanup still opened the checkout: %v", stub.calls())
+	}
+}
+
+// approve records the worker's final report and the primary's disposition for it,
+// which is the state cleanup requires before it may touch a checkout.
+func (f *bridgeFixture) approve(t *testing.T, ops Ops) {
+	t.Helper()
+	f.asWorker()
+	if resp := f.callWith("report", workerSession, f.reportPayload(t, "t1", "result"), ops); !resp.OK {
+		t.Fatalf("report failed: %+v", resp.Error)
+	}
+	f.asPrimary()
+	if resp := f.callWith("review", primarySession, `{"taskId":"t1","disposition":"accepted"}`, ops); !resp.OK {
+		t.Fatalf("review failed: %+v", resp.Error)
+	}
+}
+
+// movedWorkspace is the ordinary workspace a pane move puts a worker in, which is
+// not the checkout's Herdr-managed worktree workspace.
+const movedWorkspace = "wS"
+
+// TestCleanupRecoversAMovedWorkerCheckout reproduces the production failure: the
+// worker's pane was moved into an ordinary workspace, that move closed the
+// worktree's own workspace, Herdr still lists the exact checkout but refuses to
+// remove the workspace the pane now lives in (`not_linked_worktree`).
+//
+// Cleanup must recover by opening the *recorded* checkout — its project root and
+// its exact path, never a label — and then remove the workspace Herdr reports for
+// it, without forcing anything and without touching the branch.
+func TestCleanupRecoversAMovedWorkerCheckout(t *testing.T) {
+	f := newBridgeFixture(t)
+	f.seedPrimary()
+	worker := f.seedWorker("t1", workerPane, workerPane, workerSession)
+	f.asPrimary()
+
+	root, checkout := bridgeRepoWithWorktree(t, worker.Branch)
+	// The record a move leaves behind: the pane lives in the workspace Herdr moved
+	// it to, while the worktree workspace it was created in is closed.
+	if _, err := f.store.UpdateTask(context.Background(), worker.ID, worker.Revision, func(next *task.Task) error {
+		next.WorktreePath = checkout
+		next.CurrentWorkspaceID = movedWorkspace
+		return nil
+	}); err != nil {
+		t.Fatalf("record the move: %v", err)
+	}
+	stub := f.useHerdrStub(stubScript{
+		RepoRoot:  root,
+		Worktree:  []stubWorktree{{Path: checkout, Branch: worker.Branch, OpenWorkspaceID: movedWorkspace}},
+		NotLinked: []string{movedWorkspace},
+	})
+	ops := CoordinatorOps(f.coordinator(t))
+	f.approve(t, ops)
+
+	var result coord.CleanupResult
+	f.callWith("cleanup", primarySession, `{"taskId":"t1"}`, ops).decodeResult(t, &result)
+	if !result.Removed || result.Path != checkout {
+		t.Fatalf("cleanup = %+v, want the recorded checkout %s removed", result, checkout)
+	}
+
+	// The open names the *recorded* checkout, not the listing's spelling of it.
+	open := []string{"worktree", "open", "--cwd", f.repoRoot, "--path", checkout, "--no-focus"}
+	if !stub.called(open...) {
+		t.Fatalf("cleanup did not open the recorded checkout: %v", stub.calls())
+	}
+	// The refused attempt came first, then the open, then the removal that
+	// succeeded: the retry is what the recovery is for.
+	remove := []string{"worktree", "remove", "--workspace", movedWorkspace}
+	openAt := stub.callIndex(open...)
+	if stub.callIndex(remove...) > openAt {
+		t.Errorf("the refusal was never attempted before the open: %v", stub.calls())
+	}
+	if stub.lastCallIndex(remove...) < openAt {
+		t.Errorf("the removal was not retried after the checkout was re-opened: %v", stub.calls())
+	}
+	if stub.forced() {
+		t.Error("cleanup asked Herdr to force the removal")
+	}
+	if branches := bridgeGit(t, root, "branch", "--list", worker.Branch); !strings.Contains(branches, worker.Branch) {
+		t.Errorf("cleanup deleted the branch: %q", branches)
+	}
+}
+
+// TestCleanupOpensACheckoutNoWorkspaceHolds covers the other half of the same
+// state: Herdr lists the recorded checkout but names no workspace holding it, so
+// the removal has to begin by opening that exact checkout.
+func TestCleanupOpensACheckoutNoWorkspaceHolds(t *testing.T) {
+	f := newBridgeFixture(t)
+	f.seedPrimary()
+	worker := f.seedWorker("t1", workerPane, workerPane, workerSession)
+	f.asPrimary()
+
+	root, checkout := bridgeRepoWithWorktree(t, worker.Branch)
+	if _, err := f.store.UpdateTask(context.Background(), worker.ID, worker.Revision, func(next *task.Task) error {
+		next.WorktreePath = checkout
+		return nil
+	}); err != nil {
+		t.Fatalf("record the checkout: %v", err)
+	}
+	stub := f.useHerdrStub(stubScript{
+		RepoRoot: root,
+		// No open_workspace_id: the workspace that held this checkout is gone.
+		Worktree:      []stubWorktree{{Path: checkout, Branch: worker.Branch}},
+		OpenWorkspace: "wT",
+	})
+	ops := CoordinatorOps(f.coordinator(t))
+	f.approve(t, ops)
+
+	var result coord.CleanupResult
+	f.callWith("cleanup", primarySession, `{"taskId":"t1"}`, ops).decodeResult(t, &result)
+	if !result.Removed || result.Path != checkout || result.WorkspaceID != "wT" {
+		t.Fatalf("cleanup = %+v, want the recorded checkout removed from the re-opened workspace", result)
+	}
+
+	open := []string{"worktree", "open", "--cwd", f.repoRoot, "--path", checkout, "--no-focus"}
+	if !stub.called(open...) {
+		t.Fatalf("cleanup did not open the recorded checkout: %v", stub.calls())
+	}
+	remove := []string{"worktree", "remove", "--workspace", "wT"}
+	if stub.callIndex(remove...) < stub.callIndex(open...) {
+		t.Errorf("the removal was attempted before the checkout was re-opened: %v", stub.calls())
+	}
+	if stub.forced() {
+		t.Error("cleanup asked Herdr to force the removal")
+	}
+	if branches := bridgeGit(t, root, "branch", "--list", worker.Branch); !strings.Contains(branches, worker.Branch) {
+		t.Errorf("cleanup deleted the branch: %q", branches)
+	}
 }
 
 // bridgeRepoWithWorktree creates a real repository with a real linked checkout,

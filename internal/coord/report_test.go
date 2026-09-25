@@ -823,12 +823,12 @@ func TestCleanupProvenanceFollowsTheRecordedCheckout(t *testing.T) {
 			{Path: filepath.Dir(checkout), Branch: new("main")},
 			{Path: checkout, Branch: new(branch), OpenWorkspaceID: new("w9")},
 		}}
-		workspace, err := provenanceWorkspace(worker, listed)
+		target, err := provenanceWorkspace(worker, listed)
 		if err != nil {
 			t.Fatalf("provenanceWorkspace: %v", err)
 		}
-		if workspace != "w9" {
-			t.Errorf("workspace = %q, want the recorded destination w9", workspace)
+		if target.WorkspaceID != "w9" || !target.Held {
+			t.Errorf("target = %+v, want the recorded destination w9 still holding the checkout", target)
 		}
 	})
 
@@ -861,16 +861,31 @@ func TestCleanupProvenanceFollowsTheRecordedCheckout(t *testing.T) {
 		}
 	})
 
-	t.Run("a checkout no workspace holds falls back to the recorded one", func(t *testing.T) {
+	t.Run("a checkout no workspace holds is reported as unheld", func(t *testing.T) {
+		// Herdr names no workspace for the checkout: the workspace that held it is
+		// gone, so the removal has to open the recorded checkout first.
 		listed := &herdr.WorktreeList{Worktrees: []herdr.WorktreeInfo{
 			{Path: checkout, Branch: new(branch)},
 		}}
-		workspace, err := provenanceWorkspace(worker, listed)
+		target, err := provenanceWorkspace(worker, listed)
 		if err != nil {
 			t.Fatalf("provenanceWorkspace: %v", err)
 		}
-		if workspace != "w7" {
-			t.Errorf("workspace = %q, want the recorded worktree workspace w7", workspace)
+		if target.WorkspaceID != "w7" || target.Held {
+			t.Errorf("target = %+v, want the recorded worktree workspace w7 and not held", target)
+		}
+	})
+
+	t.Run("an unheld checkout with no recorded workspace is refused", func(t *testing.T) {
+		listed := &herdr.WorktreeList{Worktrees: []herdr.WorktreeInfo{
+			{Path: checkout, Branch: new(branch)},
+		}}
+		unrecorded := worker
+		unrecorded.WorktreeWorkspaceID = ""
+		unrecorded.CurrentWorkspaceID = ""
+		// Nothing identifies a workspace to remove, so a human decides.
+		if _, err := provenanceWorkspace(unrecorded, listed); !errors.Is(err, ErrProvenance) {
+			t.Fatalf("provenanceWorkspace err = %v, want ErrProvenance", err)
 		}
 	})
 
@@ -880,4 +895,32 @@ func TestCleanupProvenanceFollowsTheRecordedCheckout(t *testing.T) {
 			t.Fatalf("provenanceWorkspace err = %v, want ErrProvenance", err)
 		}
 	})
+}
+
+// TestCleanupRecoversOnlyFromRefusalsThatProveTheCheckoutMoved pins the set of
+// Herdr refusals cleanup recovers from by opening the recorded checkout: a
+// workspace the move closed, and a workspace that is not the checkout's
+// Herdr-managed worktree workspace. Anything else is reported as it is, because
+// nothing about it proves the checkout's registration is merely stale.
+func TestCleanupRecoversOnlyFromRefusalsThatProveTheCheckoutMoved(t *testing.T) {
+	// The two real refusals the production probe produced.
+	closed := &herdr.CLIError{Op: "worktree remove", Code: "workspace_not_found", Message: "workspace wR no longer exists"}
+	notLinked := &herdr.CLIError{Op: "worktree remove", Code: herdr.CodeNotLinkedWorktree, Message: "workspace is not a Herdr-managed worktree checkout"}
+	if !isMissingTarget(closed) {
+		t.Error("a closed workspace is not classified as a missing target")
+	}
+	if !isNotLinkedWorktree(notLinked) {
+		t.Errorf("code %q is not classified as not_linked_worktree", herdr.CodeNotLinkedWorktree)
+	}
+
+	// A refusal that proves nothing about the registration is not recoverable.
+	for _, err := range []error{
+		&herdr.CLIError{Op: "worktree remove", Code: "worktree_dirty", Message: "the checkout has uncommitted changes"},
+		&herdr.CLIError{Op: "worktree remove", Code: "permission_denied", Message: "the checkout could not be deleted"},
+		errors.New("herdr worktree remove: ambiguous outcome"),
+	} {
+		if isNotLinkedWorktree(err) || isMissingTarget(err) {
+			t.Errorf("%v is treated as a stale registration", err)
+		}
+	}
 }

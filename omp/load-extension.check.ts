@@ -425,6 +425,21 @@ async function checkGates(): Promise<void> {
   check(!cleanupConfirmRequest({ ...checkout, reviewed: false }).ok, "the removal accepted an unreviewed task");
   check(!cleanupConfirmRequest({ ...checkout, liveWorker: true }).ok, "the removal accepted a live worker");
   check(!cleanupConfirmRequest({ ...checkout, clean: false, detail: "?? notes.txt" }).ok, "the removal accepted a dirty checkout");
+  check(!cleanupConfirmRequest({ ...checkout, path: "" }).ok, "the removal accepted a task with no recorded checkout");
+
+  // A checkout Herdr no longer holds in a workspace is still removable: the
+  // bridge opens it by its recorded path first, which is the state a move leaves
+  // behind. The confirmation must say so instead of naming a workspace.
+  const unheld = cleanupConfirmRequest({ ...checkout, workspaceId: "", detail: "opens it by its recorded path first" });
+  if (!unheld.ok) {
+    failures.push(`the removal refused a checkout no workspace holds: ${unheld.reason}`);
+  } else {
+    check(
+      unheld.request.message.includes(checkout.path) &&
+        unheld.request.message.includes("opened by its recorded path first"),
+      `the unheld-checkout confirmation does not explain the re-open: ${JSON.stringify(unheld.request.message)}`,
+    );
+  }
 
   // No UI: the action must not run at all.
   let acted = 0;

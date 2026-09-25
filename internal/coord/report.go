@@ -245,9 +245,14 @@ type CleanupPreview struct {
 	Clean       bool   `json:"clean"`
 	LiveWorker  bool   `json:"liveWorker"`
 	Removable   bool   `json:"removable"`
-	// Detail explains the first reason this checkout may not be removed, in the
-	// words the primary shows the user.
+	// Detail explains the first reason this checkout may not be removed, or what
+	// exactly the removal will do when it may, in the words the primary shows the
+	// user.
 	Detail string `json:"detail"`
+	// reopens records that Herdr no longer holds the checkout in any workspace, so
+	// the removal has to open it by its recorded path first. It is unexported
+	// because it only shapes Detail: the bridge recomputes it when it acts.
+	reopens bool
 }
 
 // CleanupResult is the answer to one removed checkout. Branch is reported
@@ -674,11 +679,12 @@ func (c *Coordinator) CleanupPreview(ctx context.Context, primaryLaunchPaneID, t
 		}
 	}
 
-	workspace, err := c.checkoutWorkspace(ctx, st)
+	target, err := c.checkoutWorkspace(ctx, st)
 	if err != nil {
 		blockers = append(blockers, err.Error())
 	} else {
-		preview.WorkspaceID = workspace
+		preview.WorkspaceID = target.WorkspaceID
+		preview.reopens = !target.Held
 	}
 
 	live, err := c.workerLive(ctx, st)
@@ -690,10 +696,17 @@ func (c *Coordinator) CleanupPreview(ctx context.Context, primaryLaunchPaneID, t
 		blockers = append(blockers, "the worker agent is still running in its pane; close it before removing its checkout")
 	}
 
-	preview.Removable = preview.Reviewed && preview.Clean && !preview.LiveWorker && preview.WorkspaceID != ""
+	preview.Removable = preview.Reviewed && preview.Clean && !preview.LiveWorker && preview.Path != ""
 	preview.Detail = strings.Join(blockers, "; ")
 	if preview.Removable {
-		preview.Detail = fmt.Sprintf("removes %s (branch %s, workspace %s); the branch is kept and the removal is never forced", preview.Path, preview.Branch, preview.WorkspaceID)
+		// A checkout Herdr no longer holds in a workspace is still removable: the
+		// removal opens it by its recorded path first. The user is told, because
+		// the confirmation names what will happen.
+		held := fmt.Sprintf("workspace %s", preview.WorkspaceID)
+		if preview.reopens {
+			held = "no workspace holds it, so it is opened by its recorded path first"
+		}
+		preview.Detail = fmt.Sprintf("removes %s (branch %s, %s); the branch is kept and the removal is never forced", preview.Path, preview.Branch, held)
 	}
 	return preview, nil
 }
@@ -735,11 +748,11 @@ func (c *Coordinator) Cleanup(ctx context.Context, primaryLaunchPaneID, taskID s
 		return CleanupResult{}, fmt.Errorf("%w: the worker agent recorded for task %s is still running; close it before removing its checkout", ErrWorkerLive, st.ID)
 	}
 
-	workspace, err := c.checkoutWorkspace(ctx, st)
+	target, err := c.checkoutWorkspace(ctx, st)
 	if err != nil {
 		return CleanupResult{}, err
 	}
-	removed, err := c.removeCheckout(ctx, workspace, st)
+	removed, err := c.removeCheckout(ctx, target, st)
 	if err != nil {
 		return CleanupResult{}, err
 	}
@@ -773,15 +786,23 @@ func (c *Coordinator) Cleanup(ctx context.Context, primaryLaunchPaneID, taskID s
 }
 
 // checkoutWorkspace confirms the recorded checkout against the repository's own
-// worktree listing and returns the workspace whose removal Herdr would honor.
-func (c *Coordinator) checkoutWorkspace(ctx context.Context, st task.Task) (string, error) {
+// worktree listing and reports where Herdr holds it.
+func (c *Coordinator) checkoutWorkspace(ctx context.Context, st task.Task) (checkoutTarget, error) {
 	callCtx, cancel := c.callContext(ctx)
 	defer cancel()
 	listed, err := c.herdr.WorktreeList(callCtx, st.ProjectKey)
 	if err != nil {
-		return "", fmt.Errorf("%w: the worktrees of %s could not be read: %w", ErrProvenance, st.ProjectKey, err)
+		return checkoutTarget{}, fmt.Errorf("%w: the worktrees of %s could not be read: %w", ErrProvenance, st.ProjectKey, err)
 	}
 	return provenanceWorkspace(st, listed)
+}
+
+// checkoutTarget is where a task's recorded checkout lives: the workspace Herdr
+// holds it in, and whether Herdr still holds it at all. A checkout no workspace
+// holds has to be re-opened by its recorded path before it can be removed.
+type checkoutTarget struct {
+	WorkspaceID string
+	Held        bool
 }
 
 // provenanceWorkspace picks the workspace that holds the checkout this task
@@ -791,38 +812,39 @@ func (c *Coordinator) checkoutWorkspace(ctx context.Context, st task.Task) (stri
 // pointer to it. A pane that was moved into another workspace can close the
 // source workspace, so the workspace Herdr lists as the holder is accepted when
 // it is one this task recorded, and the recorded worktree workspace is the
-// fallback when Herdr reports none. A checkout held by a workspace this task
-// never recorded is somebody else's, and is refused.
-func provenanceWorkspace(st task.Task, listed *herdr.WorktreeList) (string, error) {
+// fallback when Herdr reports none (Held false: the checkout's registration has
+// to be restored before it can be removed). A checkout held by a workspace this
+// task never recorded is somebody else's, and is refused.
+func provenanceWorkspace(st task.Task, listed *herdr.WorktreeList) (checkoutTarget, error) {
 	checkout := strings.TrimSpace(st.WorktreePath)
 	if checkout == "" || strings.TrimSpace(st.Branch) == "" {
-		return "", fmt.Errorf("%w: task %s records no checkout to remove", ErrProvenance, st.ID)
+		return checkoutTarget{}, fmt.Errorf("%w: task %s records no checkout to remove", ErrProvenance, st.ID)
 	}
 	if listed == nil {
-		return "", fmt.Errorf("%w: Herdr listed no worktrees for the repository", ErrProvenance)
+		return checkoutTarget{}, fmt.Errorf("%w: Herdr listed no worktrees for the repository", ErrProvenance)
 	}
-	accepted := nonEmpty(st.WorktreeWorkspaceID, st.CurrentWorkspaceID)
+	recorded := nonEmpty(st.WorktreeWorkspaceID, st.CurrentWorkspaceID)
 	for _, entry := range listed.Worktrees {
 		if !samePath(entry.Path, checkout) {
 			continue
 		}
 		if entry.Branch != nil && !sameBranch(*entry.Branch, st.Branch) {
-			return "", fmt.Errorf("%w: the checkout at %s tracks branch %q, not the recorded %q", ErrProvenance, checkout, *entry.Branch, st.Branch)
+			return checkoutTarget{}, fmt.Errorf("%w: the checkout at %s tracks branch %q, not the recorded %q", ErrProvenance, checkout, *entry.Branch, st.Branch)
 		}
 		if entry.OpenWorkspaceID != nil && strings.TrimSpace(*entry.OpenWorkspaceID) != "" {
 			open := strings.TrimSpace(*entry.OpenWorkspaceID)
-			if !containsString(accepted, open) {
-				return "", fmt.Errorf("%w: Herdr holds the checkout at %s in workspace %q, which task %s never recorded (%s)",
-					ErrProvenance, checkout, open, st.ID, quotedIDs(accepted))
+			if !containsString(recorded, open) {
+				return checkoutTarget{}, fmt.Errorf("%w: Herdr holds the checkout at %s in workspace %q, which task %s never recorded (%s)",
+					ErrProvenance, checkout, open, st.ID, quotedIDs(recorded))
 			}
-			return open, nil
+			return checkoutTarget{WorkspaceID: open, Held: true}, nil
 		}
-		if len(accepted) == 0 {
-			return "", fmt.Errorf("%w: no workspace is recorded for the checkout at %s, so it cannot be removed safely", ErrProvenance, checkout)
+		if len(recorded) == 0 {
+			return checkoutTarget{}, fmt.Errorf("%w: no workspace is recorded for the checkout at %s, so it cannot be removed safely", ErrProvenance, checkout)
 		}
-		return accepted[0], nil
+		return checkoutTarget{WorkspaceID: recorded[0]}, nil
 	}
-	return "", fmt.Errorf("%w: the worktree listing has no checkout at %s, so task %s cannot be removed from it", ErrProvenance, checkout, st.ID)
+	return checkoutTarget{}, fmt.Errorf("%w: the worktree listing has no checkout at %s, so task %s cannot be removed from it", ErrProvenance, checkout, st.ID)
 }
 
 // checkoutStatus reads the checkout's porcelain status, which is empty exactly
@@ -843,31 +865,84 @@ func (c *Coordinator) checkoutStatus(ctx context.Context, path string) (string, 
 	return status, nil
 }
 
-// removeCheckout removes the checkout of the verified workspace. It never forces
-// and never touches the branch, and it refuses to act on a workspace whose
-// checkout is not the recorded one.
+// removeCheckout removes the verified checkout, and never forces anything.
 //
-// A workspace a move closed is expected state, not a reason to refuse: the
-// candidates are the listing's workspace followed by the ones this task
-// recorded, and only a definite "that workspace is gone" moves on to the next.
-func (c *Coordinator) removeCheckout(ctx context.Context, workspace string, st task.Task) (*herdr.WorktreeRemoved, error) {
-	var firstErr error
-	for _, candidate := range nonEmpty(workspace, st.WorktreeWorkspaceID, st.CurrentWorkspaceID) {
-		callCtx, cancel := c.callContext(ctx)
-		removed, err := c.herdr.WorktreeRemove(callCtx, candidate, false)
-		cancel()
+// The workspace Herdr names is tried first. When Herdr refuses for a reason that
+// proves the checkout is no longer registered to that workspace — the workspace a
+// move closed is gone (`workspace_not_found`), or the workspace the pane now lives
+// in is not the checkout's Herdr-managed worktree workspace
+// (`not_linked_worktree`) — the *recorded* checkout is opened and the removal is
+// retried against the workspace Herdr reports for it. That state is expected after
+// a move and is not a reason to refuse cleanup; it is also the only recovery this
+// performs, and it happens after every refusal check, so a live worker or a dirty
+// checkout is refused before anything is opened.
+func (c *Coordinator) removeCheckout(ctx context.Context, target checkoutTarget, st task.Task) (*herdr.WorktreeRemoved, error) {
+	if target.Held {
+		removed, err := c.tryRemove(ctx, target.WorkspaceID, st)
 		switch {
 		case err == nil:
-			return verifyRemoval(removed, st)
-		case isMissingTarget(err):
-			if firstErr == nil {
-				firstErr = err
-			}
-		default:
-			return nil, fmt.Errorf("remove the checkout of task %s from workspace %q: %w", st.ID, candidate, err)
+			return removed, nil
+		case !isMissingTarget(err) && !isNotLinkedWorktree(err):
+			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("%w: no recorded workspace still holds the checkout of task %s (%v)", ErrProvenance, st.ID, firstErr)
+	opened, err := c.openCheckout(ctx, st)
+	if err != nil {
+		return nil, err
+	}
+	return c.tryRemove(ctx, opened.WorkspaceID, st)
+}
+
+// tryRemove asks Herdr to remove one workspace's checkout, without force, and
+// verifies the removal it acknowledged.
+func (c *Coordinator) tryRemove(ctx context.Context, workspaceID string, st task.Task) (*herdr.WorktreeRemoved, error) {
+	callCtx, cancel := c.callContext(ctx)
+	defer cancel()
+	removed, err := c.herdr.WorktreeRemove(callCtx, workspaceID, false)
+	if err != nil {
+		return nil, fmt.Errorf("remove the checkout of task %s from workspace %q: %w", st.ID, workspaceID, err)
+	}
+	return verifyRemoval(removed, st)
+}
+
+// openCheckout re-opens the task's recorded checkout so Herdr registers the
+// workspace that holds it again, and verifies what Herdr reports for it before
+// anything is removed.
+//
+// The checkout is named by its recorded path and the project's canonical root —
+// never by a label — and Herdr's answer must describe that exact checkout as a
+// linked worktree in a named workspace. Moving a pane out of a worktree's
+// workspace closes that workspace, which is why Herdr then refuses to remove the
+// checkout it still lists; opening it is the documented way back.
+func (c *Coordinator) openCheckout(ctx context.Context, st task.Task) (*herdr.WorktreeOpened, error) {
+	checkout := strings.TrimSpace(st.WorktreePath)
+	callCtx, cancel := c.callContext(ctx)
+	defer cancel()
+	opened, err := c.herdr.WorktreeOpen(callCtx, st.ProjectKey, checkout)
+	if err != nil {
+		return nil, fmt.Errorf("%w: the checkout at %s could not be opened for removal: %w", ErrProvenance, checkout, err)
+	}
+	if !samePath(opened.WorktreePath, checkout) {
+		return nil, fmt.Errorf("%w: Herdr opened the checkout at %s, not the recorded %s", ErrProvenance, opened.WorktreePath, checkout)
+	}
+	if branch := strings.TrimSpace(opened.Branch); branch != "" && !sameBranch(branch, st.Branch) {
+		return nil, fmt.Errorf("%w: the opened checkout at %s tracks branch %q, not the recorded %q", ErrProvenance, checkout, branch, st.Branch)
+	}
+	if !opened.IsLinkedWorktree {
+		return nil, fmt.Errorf("%w: Herdr did not report %s as a linked worktree checkout", ErrProvenance, checkout)
+	}
+	if strings.TrimSpace(opened.WorkspaceID) == "" {
+		return nil, fmt.Errorf("%w: Herdr opened %s without naming a workspace to remove it from", ErrProvenance, checkout)
+	}
+	return opened, nil
+}
+
+// isNotLinkedWorktree reports Herdr's refusal to remove a workspace that is not
+// the checkout's Herdr-managed worktree workspace: a definite refusal that wrote
+// nothing, and the state a move leaves behind.
+func isNotLinkedWorktree(err error) bool {
+	var cliErr *herdr.CLIError
+	return errors.As(err, &cliErr) && cliErr.IsCode(herdr.CodeNotLinkedWorktree)
 }
 
 // verifyRemoval checks the removal Herdr acknowledged: the checkout it removed

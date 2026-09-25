@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -391,6 +392,101 @@ func TestDecodeWorktreeCreateResponse(t *testing.T) {
 	}
 	if raw := f.argv(); len(raw) != 9 || raw[0] != "worktree" || raw[1] != "create" {
 		t.Errorf("argv = %q, want worktree create ...", raw)
+	}
+	f.assertDirectChild()
+}
+
+// TestDecodeWorktreeOpenResponse uses the response captured from a real Herdr
+// 0.9.1-preview probe of the production failure: a worker's pane was moved into a
+// new workspace (closing the worktree's own workspace), and `worktree open` is
+// what restored the checkout's registration. Field names and shapes are exactly
+// as Herdr sent them; only the probe's own paths were replaced.
+func TestDecodeWorktreeOpenResponse(t *testing.T) {
+	f := newFixture(t).captured("worktree-open.json")
+	opened, err := f.client.WorktreeOpen(shortCtx(t, 5*time.Second), `C:/work/orch-probe-repo`,
+		`C:\work\herdr\worktrees\orch-probe-repo\probe-moved`)
+	if err != nil {
+		t.Fatalf("WorktreeOpen: %v", err)
+	}
+	if opened.WorkspaceID != "wY" {
+		t.Errorf("WorkspaceID = %q, want wY (from .result.workspace.workspace_id)", opened.WorkspaceID)
+	}
+	if opened.TabID != "wY:t1" || opened.RootPaneID != "wY:p1" {
+		t.Errorf("tab/pane = %q/%q, want wY:t1/wY:p1", opened.TabID, opened.RootPaneID)
+	}
+	if opened.WorktreePath != "C:/work/herdr/worktrees/orch-probe-repo/probe-moved" {
+		t.Errorf("WorktreePath = %q, want the checkout the response names", opened.WorktreePath)
+	}
+	if opened.RepoRoot != "C:/work/orch-probe-repo" {
+		t.Errorf("RepoRoot = %q, want the repository from workspace.worktree.repo_root", opened.RepoRoot)
+	}
+	if opened.Branch != "probe/moved" {
+		t.Errorf("Branch = %q, want probe/moved", opened.Branch)
+	}
+	if !opened.IsLinkedWorktree {
+		t.Error("IsLinkedWorktree = false, want true for an opened linked checkout")
+	}
+	if !opened.AlreadyOpen {
+		t.Error("AlreadyOpen = false, want true: the moved checkout is still listed, which is why it had to be re-opened")
+	}
+	if raw := f.argv(); len(raw) != 7 || !slices.Equal(raw, []string{
+		"worktree", "open", "--cwd", `C:/work/orch-probe-repo`, "--path", `C:\work\herdr\worktrees\orch-probe-repo\probe-moved`, "--no-focus",
+	}) {
+		t.Errorf("argv = %q, want worktree open --cwd ... --path ... --no-focus", raw)
+	}
+	f.assertDirectChild()
+}
+
+// TestWorktreeOpenRefusesResponsesThatDoNotDescribeTheCheckout pins the client's
+// fail-closed reading of a `worktree open` answer: the caller is about to delete
+// the checkout, so a response that does not name that linked checkout, or that
+// does not say whether it was already open, is refused rather than interpreted.
+func TestWorktreeOpenRefusesResponsesThatDoNotDescribeTheCheckout(t *testing.T) {
+	captured := readFixture(t, "worktree-open.json")
+	cases := []struct {
+		name    string
+		payload string
+		want    error
+	}{
+		{"wrong result type", strings.Replace(captured, `"type":"worktree_opened"`, `"type":"worktree_created"`, 1), ErrMalformedResponse},
+		{"missing already_open", strings.Replace(captured, `"already_open":true,`, "", 1), ErrIdentity},
+		{"not a linked worktree", strings.ReplaceAll(captured, `"is_linked_worktree":true`, `"is_linked_worktree":false`), ErrIdentity},
+		{"no workspace", strings.Replace(captured, `"workspace_id":"wY"`, `"workspace_id":""`, 1), ErrIdentity},
+		{"no worktree provenance", strings.Replace(captured, `"worktree":{`, `"worktree":null,"unused":{`, 1), ErrIdentity},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t).stdout(tc.payload)
+			_, err := f.client.WorktreeOpen(shortCtx(t, 5*time.Second), `C:/work/orch-probe-repo`, `C:/work/herdr/worktrees/orch-probe-repo/probe-moved`)
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("WorktreeOpen err = %v, want %v", err, tc.want)
+			}
+			f.assertDirectChild()
+		})
+	}
+
+	// An `already_open:false` answer is the other documented state and decodes.
+	f := newFixture(t).stdout(strings.Replace(captured, `"already_open":true`, `"already_open":false`, 1))
+	opened, err := f.client.WorktreeOpen(shortCtx(t, 5*time.Second), `C:/work/orch-probe-repo`, `C:/work/herdr/worktrees/orch-probe-repo/probe-moved`)
+	if err != nil {
+		t.Fatalf("WorktreeOpen(already open false): %v", err)
+	}
+	if opened.AlreadyOpen {
+		t.Error("AlreadyOpen = true, want false for the reopened state")
+	}
+}
+
+// TestWorktreeRemoveClassifiesTheNotLinkedRefusal pins the code cleanup recovers
+// from: the real envelope Herdr answered for the workspace a move created.
+func TestWorktreeRemoveClassifiesTheNotLinkedRefusal(t *testing.T) {
+	f := newFixture(t).capturedError("cli-error-not-linked-worktree.json")
+	_, err := f.client.WorktreeRemove(shortCtx(t, 5*time.Second), "wY", false)
+	var cliErr *CLIError
+	if !errors.As(err, &cliErr) {
+		t.Fatalf("WorktreeRemove err = %v, want *CLIError", err)
+	}
+	if !cliErr.IsCode(CodeNotLinkedWorktree) {
+		t.Errorf("code = %q, want %q", cliErr.Code, CodeNotLinkedWorktree)
 	}
 	f.assertDirectChild()
 }
@@ -1327,6 +1423,15 @@ func TestArgvWindowsPathsWithSpacesStayDiscrete(t *testing.T) {
 				return err
 			},
 			want: []string{"worktree", "list", "--cwd", root},
+		},
+		{
+			name:    "worktree open",
+			payload: readFixture(t, "worktree-open.json"),
+			call: func(ctx context.Context, c *Client) error {
+				_, err := c.WorktreeOpen(ctx, root, root+`\\linked checkout`)
+				return err
+			},
+			want: []string{"worktree", "open", "--cwd", root, "--path", root + `\\linked checkout`, "--no-focus"},
 		},
 		{
 			name:    "worktree remove",

@@ -254,16 +254,23 @@ export function cleanupConfirmRequest(preview: CleanupPreview): ConfirmPlan {
   if (!preview.clean) {
     return { ok: false, reason: `the checkout ${preview.path} is not clean: ${preview.detail}` };
   }
-  if (preview.path.length === 0 || preview.workspaceId.length === 0) {
+  if (preview.path.length === 0) {
     return { ok: false, reason: `task ${preview.taskId} records no checkout that can be removed` };
   }
+  // A checkout Herdr no longer holds in a workspace is still removable: the bridge
+  // opens it by its recorded path first, which it does for the moved state a pane
+  // move leaves behind. The user is told which of the two is about to happen.
+  const where =
+    preview.workspaceId.length > 0
+      ? `workspace ${preview.workspaceId}`
+      : "no workspace currently holds it, so it is opened by its recorded path first";
   return {
     ok: true,
     request: {
       title: "Remove worker checkout",
       message:
-        `Task ${preview.taskId}: remove ${preview.path} on branch ${preview.branch} ` +
-        `(workspace ${preview.workspaceId}). The branch is kept and the removal is never forced.`,
+        `Task ${preview.taskId}: remove ${preview.path} on branch ${preview.branch} (${where}). ` +
+        `The branch is kept and the removal is never forced.`,
     },
   };
 }

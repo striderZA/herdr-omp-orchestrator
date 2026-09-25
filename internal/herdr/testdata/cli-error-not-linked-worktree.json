@@ -1,0 +1,1 @@
+{"error":{"code":"not_linked_worktree","message":"workspace is not a Herdr-managed worktree checkout"},"id":"cli:worktree:remove"}
