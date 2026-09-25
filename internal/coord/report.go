@@ -1288,6 +1288,9 @@ func (c *Coordinator) recordWithNote(
 		}
 		updated, inserted, err := c.store.UpdateTaskWithNote(ctx, st.ID, current.Revision, mutate, note)
 		if err == nil {
+			// The fact and its note are durable together; deliver if the primary
+			// can take it now, and keep it pending otherwise.
+			c.flushAfterNote(ctx, updated.ProjectKey)
 			return updated, inserted, nil
 		}
 		if !errors.Is(err, state.ErrConflict) {
@@ -1328,6 +1331,10 @@ func (c *Coordinator) note(ctx context.Context, st task.Task, kind, summary, del
 	if err != nil {
 		return false, fmt.Errorf("record the %s note for task %s: %w", kind, st.ID, err)
 	}
+	// The note is durable; the primary is told now if it can be, and otherwise on
+	// its next safe turn. A duplicate note is re-attempted too: it may be waiting
+	// for exactly this.
+	c.flushAfterNote(ctx, st.ProjectKey)
 	return inserted, nil
 }
 

@@ -489,8 +489,12 @@ func fixtureBound(storeDir, pane string, announced task.Announcement) bool {
 }
 
 // adoptFixtureSession stands in for the bridge adopting an announced session for
-// the task already keyed to this pane: the extension resolves before the
-// coordinator could have recorded the session it reads from `agent get`.
+// the task or project already keyed to this pane: the extension resolves before
+// the coordinator could have recorded the session it reads from `agent get`.
+//
+// Both roles are adopted the way the real bridge does it: a primary's announced
+// native id is recorded even though `agent get` will report the session file, so
+// a fixture that reports kind "path" exercises the cross-form handshake.
 func adoptFixtureSession(pane, session string) {
 	storeDir := stateDirOf()
 	if storeDir == "" || session == "" {
@@ -503,16 +507,31 @@ func adoptFixtureSession(pane, session string) {
 	defer func() { _ = store.Close() }()
 	ctx := context.Background()
 	taskOnPane, err := store.ByLaunchPane(ctx, pane)
-	if err != nil || strings.TrimSpace(taskOnPane.OMPSessionID) != "" {
+	if err == nil {
+		if strings.TrimSpace(taskOnPane.OMPSessionID) != "" {
+			return
+		}
+		// The bridge adopts the announced id when the runtime exposes one, which is
+		// what OMP always does.
+		if _, err := store.UpdateTask(ctx, taskOnPane.ID, taskOnPane.Revision, func(next *task.Task) error {
+			next.OMPSessionID = session
+			return nil
+		}); err != nil {
+			fmt.Fprintf(os.Stderr, "fixture: adopt: %v\n", err)
+		}
 		return
 	}
-	// The bridge adopts the announced id when the runtime exposes one, which is
-	// what OMP always does.
-	if _, err := store.UpdateTask(ctx, taskOnPane.ID, taskOnPane.Revision, func(next *task.Task) error {
-		next.OMPSessionID = session
+	primary, err := store.ProjectByLaunchPane(ctx, pane)
+	if err != nil || strings.TrimSpace(primary.OMPSessionID) != "" {
+		return
+	}
+	if err := store.UpdateProject(ctx, primary.Key, func(next *task.Project) error {
+		if strings.TrimSpace(next.OMPSessionID) == "" {
+			next.OMPSessionID = session
+		}
 		return nil
 	}); err != nil {
-		fmt.Fprintf(os.Stderr, "fixture: adopt: %v\n", err)
+		fmt.Fprintf(os.Stderr, "fixture: adopt primary: %v\n", err)
 	}
 }
 

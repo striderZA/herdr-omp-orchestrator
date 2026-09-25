@@ -375,6 +375,21 @@ func (f *coordFixture) requeue(t *testing.T, st task.Task, kind, summary, delive
 	return f.coord.noteFor(st, kind, summary, delivery).ID
 }
 
+// queueNote writes the durable note a worker's write leaves behind, without the
+// delivery attempt that write also makes.
+//
+// A test that needs a note waiting in the inbox asks for exactly that: the row a
+// worker's report creates is delivered by the same call now, so a pending note is
+// written the way the store sees it - one durable row, untouched by delivery.
+func (f *coordFixture) queueNote(t *testing.T, st task.Task, kind, summary, delivery string) task.Inbox {
+	t.Helper()
+	note := f.coord.noteFor(st, kind, summary, delivery)
+	if _, err := f.store.AddInbox(context.Background(), note); err != nil {
+		t.Fatalf("AddInbox(%s): %v", note.ID, err)
+	}
+	return note
+}
+
 // ---------------------------------------------------------------------------
 // the event adapter
 // ---------------------------------------------------------------------------
@@ -721,10 +736,7 @@ func TestEventPrimaryStatusIsNotAWorkerNoticeAndIdleFlushesOnce(t *testing.T) {
 
 	// One durable worker note is queued, exactly as a worker's own report would
 	// leave it.
-	if _, err := f.coord.Progress(context.Background(), worker.LaunchPaneID, "halfway"); err != nil {
-		t.Fatalf("Progress: %v", err)
-	}
-	noteID := f.requeue(t, worker, "progress", "halfway", "worker progress")
+	noteID := f.queueNote(t, worker, "progress", "halfway", "worker progress").ID
 	if state := f.noteState(t, noteID); state != task.DeliveryPending {
 		t.Fatalf("queued note state = %q, want %q", state, task.DeliveryPending)
 	}
@@ -1104,10 +1116,7 @@ func TestReconcileKeepsInboxPendingUntilThePrimaryIsIdleAndVerified(t *testing.T
 	f := newCoordFixture(t, fixturePlan{})
 	worker := f.boundWorker(t)
 	primary := f.boundProject(t).PublicPaneID
-	if _, err := f.coord.Progress(context.Background(), worker.LaunchPaneID, "halfway"); err != nil {
-		t.Fatalf("Progress: %v", err)
-	}
-	noteID := f.requeue(t, worker, "progress", "halfway", "worker progress")
+	noteID := f.queueNote(t, worker, "progress", "halfway", "worker progress").ID
 
 	// A blocked primary cannot take the note, and the pass says so by doing
 	// nothing: the note stays pending and no prompt is submitted.
@@ -1153,10 +1162,7 @@ func TestPrimaryLossKeepsWorkersAndInboxWithoutRespawning(t *testing.T) {
 	worker := f.boundWorker(t)
 	before := f.boundProject(t)
 	startsBefore := f.countCalls("agent start")
-	if _, err := f.coord.Progress(context.Background(), worker.LaunchPaneID, "halfway"); err != nil {
-		t.Fatalf("Progress: %v", err)
-	}
-	noteID := f.requeue(t, worker, "progress", "halfway", "worker progress")
+	noteID := f.queueNote(t, worker, "progress", "halfway", "worker progress").ID
 
 	// The primary's OMP process is gone; its workspace (and pane) remain.
 	f.rewriteState(func(current *fixtureState) {
@@ -1195,10 +1201,7 @@ func TestInboxDeliveryIsClaimedOnceAndNeverBlindlyResent(t *testing.T) {
 	t.Run("a claim has exactly one owner", func(t *testing.T) {
 		f := newCoordFixture(t, fixturePlan{})
 		worker := f.boundWorker(t)
-		if _, err := f.coord.Progress(context.Background(), worker.LaunchPaneID, "halfway"); err != nil {
-			t.Fatalf("Progress: %v", err)
-		}
-		noteID := f.requeue(t, worker, "progress", "halfway", "worker progress")
+		noteID := f.queueNote(t, worker, "progress", "halfway", "worker progress").ID
 
 		claimed, err := f.store.ClaimInbox(context.Background(), []string{noteID})
 		if err != nil {
@@ -1229,10 +1232,7 @@ func TestInboxDeliveryIsClaimedOnceAndNeverBlindlyResent(t *testing.T) {
 		// The knob describes the notification prompt, not the dispatcher's brief,
 		// so it is set only once the worker is dispatched.
 		f.updatePlan(func(plan *fixturePlan) { plan.PromptAmbiguous = true })
-		if _, err := f.coord.Progress(context.Background(), worker.LaunchPaneID, "halfway"); err != nil {
-			t.Fatalf("Progress: %v", err)
-		}
-		noteID := f.requeue(t, worker, "progress", "halfway", "worker progress")
+		noteID := f.queueNote(t, worker, "progress", "halfway", "worker progress").ID
 
 		err := f.coord.FlushInbox(context.Background(), f.projectKey())
 		if !errors.Is(err, ErrAmbiguousStep) {
@@ -1265,10 +1265,7 @@ func TestInboxDeliveryIsClaimedOnceAndNeverBlindlyResent(t *testing.T) {
 		worker := f.boundWorker(t)
 		// The refusal applies to the notification prompt only.
 		f.updatePlan(func(plan *fixturePlan) { plan.PromptError = "agent_blocked" })
-		if _, err := f.coord.Progress(context.Background(), worker.LaunchPaneID, "halfway"); err != nil {
-			t.Fatalf("Progress: %v", err)
-		}
-		noteID := f.requeue(t, worker, "progress", "halfway", "worker progress")
+		noteID := f.queueNote(t, worker, "progress", "halfway", "worker progress").ID
 
 		if err := f.coord.FlushInbox(context.Background(), f.projectKey()); err == nil {
 			t.Fatalf("FlushInbox succeeded, want the refusal")
@@ -1301,10 +1298,7 @@ func TestInboxDeliveryIsClaimedOnceAndNeverBlindlyResent(t *testing.T) {
 	t.Run("a claim interrupted by a stop becomes uncertain at startup", func(t *testing.T) {
 		f := newCoordFixture(t, fixturePlan{})
 		worker := f.boundWorker(t)
-		if _, err := f.coord.Progress(context.Background(), worker.LaunchPaneID, "halfway"); err != nil {
-			t.Fatalf("Progress: %v", err)
-		}
-		noteID := f.requeue(t, worker, "progress", "halfway", "worker progress")
+		noteID := f.queueNote(t, worker, "progress", "halfway", "worker progress").ID
 
 		// The plugin claimed the note and stopped before the prompt's outcome was
 		// recorded.
@@ -1364,10 +1358,7 @@ func TestStoreRecoveryLeavesSettledNotesAlone(t *testing.T) {
 func TestFlushInboxRequiresAProbeablePrimary(t *testing.T) {
 	f := newCoordFixture(t, fixturePlan{})
 	worker := f.boundWorker(t)
-	if _, err := f.coord.Progress(context.Background(), worker.LaunchPaneID, "halfway"); err != nil {
-		t.Fatalf("Progress: %v", err)
-	}
-	noteID := f.requeue(t, worker, "progress", "halfway", "worker progress")
+	noteID := f.queueNote(t, worker, "progress", "halfway", "worker progress").ID
 
 	if err := f.coord.FlushInbox(context.Background(), ""); !errors.Is(err, ErrInvalidRequest) {
 		t.Fatalf("FlushInbox(\"\") err = %v, want ErrInvalidRequest", err)
@@ -1444,9 +1435,7 @@ func TestFlushInboxDeliversEveryClaimedNoteAndLeavesTheRestPending(t *testing.T)
 	primary := f.boundProject(t).PublicPaneID
 	const notes = 25
 	for i := 1; i <= notes; i++ {
-		if _, err := f.coord.Progress(ctx, worker.LaunchPaneID, fmt.Sprintf("step %02d", i)); err != nil {
-			t.Fatalf("Progress %d: %v", i, err)
-		}
+		f.queueNote(t, worker, "progress", fmt.Sprintf("step %02d", i), "worker progress")
 	}
 	pending, err := f.store.PendingInbox(ctx, f.projectKey())
 	if err != nil {
@@ -1514,9 +1503,7 @@ func TestFlushInboxBatchesBySizeAndLeavesTheRestPending(t *testing.T) {
 	const notes = 12
 	summary := strings.Repeat("x", 400)
 	for i := range notes {
-		if _, err := f.coord.Progress(ctx, worker.LaunchPaneID, fmt.Sprintf("%02d %s", i, summary)); err != nil {
-			t.Fatalf("Progress %d: %v", i, err)
-		}
+		f.queueNote(t, worker, "progress", fmt.Sprintf("%02d %s", i, summary), "worker progress")
 	}
 	if err := f.coord.FlushInbox(ctx, f.projectKey()); err != nil {
 		t.Fatalf("FlushInbox: %v", err)
@@ -2013,6 +2000,212 @@ func TestSessionsAreProvenOnlyThroughAConfirmedHandshake(t *testing.T) {
 	}
 	if unknown.Proven || unknown.proves(task.SessionRef{Kind: task.SessionKindID, Value: worker.OMPSessionID}) {
 		t.Fatalf("a pane that never announced a session proved one")
+	}
+}
+
+// TestRefreshedAnnouncementCannotBridgeAStaleIDToACurrentPane pins the
+// announcement/readiness window: reading the announcement and the confirmation as
+// two queries let a concurrent re-announcement refresh the row in between, so a
+// pair of an earlier id and a later confirmation could be assembled and could
+// accept the pane Herdr reports now. The verified handshake is read in one store
+// read, so the identity a caller holds is always the row that is actually
+// confirmed.
+//
+// The interleaving itself is not drivable from a test (it happens between two
+// store calls inside one function); it was demonstrated with a probe whose output
+// is recorded in the report. This test pins the consequence an interleaving would
+// have produced.
+func TestRefreshedAnnouncementCannotBridgeAStaleIDToACurrentPane(t *testing.T) {
+	ctx := context.Background()
+	f := newCoordFixture(t, fixturePlan{})
+	worker := f.boundWorker(t)
+	agent := f.state().Agents[worker.PublicPaneID]
+	file := sessionFileFor(agent.Session)
+
+	// The pane re-announces the same session file under a new id, and Herdr
+	// confirms that refreshed pair by path (the confirmed path still matches).
+	if err := f.store.RecordReady(ctx, worker.LaunchPaneID,
+		task.Announcement{ID: "omp-session-refreshed", File: file}, 1); err != nil {
+		t.Fatalf("RecordReady: %v", err)
+	}
+	if err := f.store.ConfirmReady(ctx, worker.LaunchPaneID,
+		task.SessionRef{Kind: task.SessionKindPath, Value: file}); err != nil {
+		t.Fatalf("ConfirmReady: %v", err)
+	}
+
+	// The refreshed pane Herdr reports now.
+	current := task.SessionRef{Kind: task.SessionKindPath, Value: file}
+
+	// A binding that recorded the id the row no longer carries must not be able to
+	// claim that pane: the stale id and the shared file are not one session.
+	stale, err := f.coord.identityOf(ctx, worker.LaunchPaneID, worker.OMPSessionID)
+	if err != nil {
+		t.Fatalf("identityOf: %v", err)
+	}
+	if stale.proves(current) {
+		t.Fatalf("the stale id %q was bridged to the refreshed pane via the shared file", worker.OMPSessionID)
+	}
+	if !stale.Proven {
+		// Either answer is safe; failing to prove keeps the binding on attention.
+		t.Logf("the refreshed row no longer confirms the stale id %q (unproven, as intended)", worker.OMPSessionID)
+	}
+
+	// The row's own identities still prove the pane it confirms.
+	fresh, err := f.coord.identityOf(ctx, worker.LaunchPaneID, "omp-session-refreshed")
+	if err != nil {
+		t.Fatalf("identityOf(refreshed): %v", err)
+	}
+	if !fresh.Proven || !fresh.proves(task.SessionRef{Kind: task.SessionKindID, Value: "omp-session-refreshed"}) {
+		t.Fatalf("the refreshed row did not prove its own id: proven=%v", fresh.Proven)
+	}
+
+	// And the identity a caller holds is exactly the row that is confirmed: one
+	// read, so no earlier announcement can be paired with a later confirmation.
+	confirmed, verified, err := f.store.VerifiedAnnouncement(ctx, worker.LaunchPaneID)
+	if err != nil {
+		t.Fatalf("VerifiedAnnouncement: %v", err)
+	}
+	if !verified {
+		t.Fatalf("the refreshed row is not verified")
+	}
+	if fresh.Announced != confirmed {
+		t.Fatalf("identityOf used %+v, but the confirmed row is %+v", fresh.Announced, confirmed)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// note creation triggers delivery (found by the acceptance run)
+// ---------------------------------------------------------------------------
+
+// TestAWorkerNoteReachesAnAlreadyIdlePrimary pins the delivery trigger a worker's
+// own write makes: a question recorded while the primary is already idle must
+// reach it, because waiting for the primary's *next* status transition waits for
+// an event that never comes.
+func TestAWorkerNoteReachesAnAlreadyIdlePrimary(t *testing.T) {
+	ctx := context.Background()
+	f := newCoordFixture(t, fixturePlan{})
+	worker := f.boundWorker(t)
+	primary := f.boundProject(t).PublicPaneID
+	if prompts := f.promptsTo(t, primary); len(prompts) != 0 {
+		t.Fatalf("the primary was prompted %d times before the question", len(prompts))
+	}
+
+	if _, err := f.coord.Question(ctx, worker.LaunchPaneID, "which error contract should this use?"); err != nil {
+		t.Fatalf("Question: %v", err)
+	}
+	prompts := f.promptsTo(t, primary)
+	if len(prompts) != 1 {
+		t.Fatalf("prompts = %d, want the queued question delivered to the already-idle primary", len(prompts))
+	}
+	if !strings.Contains(prompts[0].Text, worker.ID) || !strings.Contains(prompts[0].Text, "which error contract") {
+		t.Fatalf("prompt text = %q, want the task id and the question", prompts[0].Text)
+	}
+	note := f.requeue(t, worker, "question", "which error contract should this use?", "worker question")
+	if state := f.noteState(t, note); state != task.DeliveryDelivered {
+		t.Fatalf("note state = %q, want %q", state, task.DeliveryDelivered)
+	}
+}
+
+// TestAWorkerNoteStaysPendingWhileThePrimaryIsNotIdle is the other half: the
+// trigger never sends to a primary that is not verified idle, and the note is
+// delivered on the next safe turn.
+func TestAWorkerNoteStaysPendingWhileThePrimaryIsNotIdle(t *testing.T) {
+	ctx := context.Background()
+	f := newCoordFixture(t, fixturePlan{})
+	worker := f.boundWorker(t)
+	primary := f.boundProject(t).PublicPaneID
+	f.setAgentStatus(t, primary, "blocked")
+
+	if _, err := f.coord.Question(ctx, worker.LaunchPaneID, "which error contract should this use?"); err != nil {
+		t.Fatalf("Question: %v", err)
+	}
+	if prompts := f.promptsTo(t, primary); len(prompts) != 0 {
+		t.Fatalf("a blocked primary was prompted %d times, want 0", len(prompts))
+	}
+	note := f.requeue(t, worker, "question", "which error contract should this use?", "worker question")
+	if state := f.noteState(t, note); state != task.DeliveryPending {
+		t.Fatalf("note state = %q, want %q", state, task.DeliveryPending)
+	}
+
+	// The next safe turn delivers it.
+	f.setAgentStatus(t, primary, "idle")
+	f.mustHandle(t, EventAgentStatus, statusEventPayload(t, primary, "idle"))
+	if prompts := f.promptsTo(t, primary); len(prompts) != 1 {
+		t.Fatalf("prompts after the primary went idle = %d, want 1", len(prompts))
+	}
+	if state := f.noteState(t, note); state != task.DeliveryDelivered {
+		t.Fatalf("note state = %q, want %q", state, task.DeliveryDelivered)
+	}
+}
+
+// TestADuplicateWorkerNoteIsNeverDeliveredTwice pins the trigger's interaction
+// with the note deduplication FinalReport's semantics depend on: re-attempting a
+// note that is already durable may deliver it once, never twice.
+func TestADuplicateWorkerNoteIsNeverDeliveredTwice(t *testing.T) {
+	ctx := context.Background()
+	f := newCoordFixture(t, fixturePlan{})
+	worker := f.boundWorker(t)
+	primary := f.boundProject(t).PublicPaneID
+
+	for i := 1; i <= 2; i++ {
+		if _, err := f.coord.Question(ctx, worker.LaunchPaneID, "same question"); err != nil {
+			t.Fatalf("Question %d: %v", i, err)
+		}
+		notes := f.notesOfKind(t, "question")
+		if len(notes) != 1 {
+			t.Fatalf("question notes = %d, want the one durable note", len(notes))
+		}
+		if state := f.noteState(t, notes[0].ID); state != task.DeliveryDelivered {
+			t.Fatalf("note state after attempt %d = %q, want %q", i, state, task.DeliveryDelivered)
+		}
+		if prompts := f.promptsTo(t, primary); len(prompts) != 1 {
+			t.Fatalf("prompts after attempt %d = %d, want exactly 1", i, len(prompts))
+		}
+	}
+}
+
+// TestAWorkerNoteReachesAnIdlePrimaryAcrossSessionForms is the acceptance
+// sequence run 2 traced: the note is recorded while the primary is *already*
+// idle, so no status transition will ever trigger a flush, and the primary's
+// recorded session is its native id while Herdr reports the session file. The
+// note's own write must deliver it through the verified cross-form handshake:
+// observe the primary, prompt it, and settle the delivery.
+func TestAWorkerNoteReachesAnIdlePrimaryAcrossSessionForms(t *testing.T) {
+	ctx := context.Background()
+	f := crossFormFixture(t)
+	worker := f.boundWorker(t)
+	primary := f.boundProject(t).PublicPaneID
+	assertCrossFormRecorded(t, f, worker)
+	if recorded := f.boundProject(t).OMPSessionID; strings.ContainsAny(recorded, `/\`) {
+		t.Fatalf("the primary recorded %q, want the native id Herdr announced", recorded)
+	}
+
+	// The primary has been idle since before the note existed: nothing changes its
+	// status afterwards, so the note's own write is the only opportunity.
+	if prompts := f.promptsTo(t, primary); len(prompts) != 0 {
+		t.Fatalf("the primary was prompted %d times with nothing queued", len(prompts))
+	}
+	if _, err := f.coord.Question(ctx, worker.LaunchPaneID, "which error contract should this use?"); err != nil {
+		t.Fatalf("Question: %v", err)
+	}
+
+	prompts := f.promptsTo(t, primary)
+	if len(prompts) != 1 {
+		t.Fatalf("prompts = %d, want the queued question delivered through the verified cross-form handshake", len(prompts))
+	}
+	if !strings.Contains(prompts[0].Text, worker.ID) || !strings.Contains(prompts[0].Text, "which error contract") {
+		t.Fatalf("prompt text = %q, want the task id and the question", prompts[0].Text)
+	}
+	note := f.requeue(t, worker, "question", "which error contract should this use?", "worker question")
+	if state := f.noteState(t, note); state != task.DeliveryDelivered {
+		t.Fatalf("note state = %q, want %q", state, task.DeliveryDelivered)
+	}
+
+	// The delivery is settled, so the next idle observation submits nothing again.
+	f.setAgentStatus(t, primary, "idle")
+	f.mustHandle(t, EventAgentStatus, statusEventPayload(t, primary, "idle"))
+	if prompts := f.promptsTo(t, primary); len(prompts) != 1 {
+		t.Fatalf("prompts after the next idle observation = %d, want 1", len(prompts))
 	}
 }
 

@@ -685,29 +685,25 @@ func (id recordedIdentity) proves(ref task.SessionRef) bool {
 // identityOf joins the session a binding recorded to the confirmed handshake of
 // its launch pane.
 //
-// It requires both Store.AnnouncedSession (what the extension announced) and
-// Store.Ready (that the reference Herdr reported was the announced one), because
-// only a confirmed announcement can say that an id and a session file name the
-// same running session. A pane that never announced, or whose confirmation no
-// longer describes the announcement, yields an unproven identity: nothing may be
+// It reads that handshake in **one** store read (Store.VerifiedAnnouncement),
+// which returns the row's announcement only when the same row's confirmation
+// describes it. Reading the announcement and the confirmation separately would
+// let a concurrent re-announcement refresh the row in between: the pair a caller
+// held would then combine an earlier announcement with a later confirmation, and
+// an id the store no longer knows could be accepted for the pane Herdr reports
+// now. A pane with no row, an unverified row, or a row whose confirmation does
+// not describe its own announcement yields an unproven identity: nothing may be
 // proven from it, and a caller that needs a proof refuses instead of guessing.
 func (c *Coordinator) identityOf(ctx context.Context, launchPaneID, session string) (recordedIdentity, error) {
 	identity := recordedIdentity{Session: strings.TrimSpace(session), LaunchPaneID: strings.TrimSpace(launchPaneID)}
 	if identity.Session == "" || identity.LaunchPaneID == "" {
 		return identity, nil
 	}
-	announced, found, err := c.store.AnnouncedSession(ctx, launchPaneID)
-	switch {
-	case err != nil:
+	announced, verified, err := c.store.VerifiedAnnouncement(ctx, identity.LaunchPaneID)
+	if err != nil {
 		return recordedIdentity{}, err
-	case !found:
-		return identity, nil
 	}
-	ready, err := c.store.Ready(ctx, launchPaneID, announced)
-	switch {
-	case err != nil:
-		return recordedIdentity{}, err
-	case !ready:
+	if !verified {
 		return identity, nil
 	}
 	identity.Announced, identity.Proven = announced, true
@@ -760,6 +756,33 @@ func (c *Coordinator) projectAttention(ctx context.Context, project task.Project
 // contradiction.
 func refusal(sentinel error, id, reason string) error {
 	return fmt.Errorf("%w: %s: %s", sentinel, id, reason)
+}
+
+// flushAfterNote is the best-effort delivery attempt a write makes once its note
+// is durable.
+//
+// A note recorded while the primary is already idle would otherwise wait for the
+// primary's next status transition - an event that may never come, because a
+// primary waiting for the user does not change status. So whoever records a
+// worker-sourced note also asks FlushInbox to carry it. The attempt is strictly
+// about delivery, never about the caller's own fact:
+//
+//   - it runs after the note is committed, so a failed attempt cannot lose it;
+//   - FlushInbox claims the note transactionally and settles it, so a repeated
+//     attempt cannot duplicate a delivery and a note that was already there is
+//     still safe to re-attempt;
+//   - it prompts only a primary verified as idle, so a working or blocked primary
+//     keeps the note pending for its next safe turn and no prompt echoes back as a
+//     notice about itself;
+//   - the outcome is not part of the caller's result: the caller's fact is
+//     already durable, and a delivery whose outcome could not be determined is
+//     left `uncertain` for a human to inspect, exactly as a hook-driven flush
+//     leaves it.
+func (c *Coordinator) flushAfterNote(ctx context.Context, projectKey string) {
+	if strings.TrimSpace(projectKey) == "" {
+		return
+	}
+	_ = c.FlushInbox(ctx, projectKey)
 }
 
 // ---------------------------------------------------------------------------
