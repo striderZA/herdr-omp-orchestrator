@@ -84,10 +84,21 @@ const HERDR_BINARY = "@@OMP_ORCH_HERDR_BINARY@@";
 const PROTOCOL = 1;
 `
 
-const integrationReportInstalled = "omp: installed (C:\\Users\\Jaco\\.omp\\agent\\extensions\\herdr-omp-agent-state.ts)\n"
+// `herdr integration status` lines. The "current (v10)" line is what the
+// installed Herdr 0.9.1-preview on this machine really prints once the OMP
+// integration exists; "installed" is the wording the documentation uses; and
+// "not installed" is what the same machine printed before the install.
+const (
+	integrationLineCurrent   = "omp: current (v10) (C:\\Users\\Jaco\\.omp\\agent\\extensions\\herdr-omp-agent-state.ts)"
+	integrationLineInstalled = "omp: installed (C:\\Users\\Jaco\\.omp\\agent\\extensions\\herdr-omp-agent-state.ts)"
+	integrationLineOutdated  = "omp: outdated (v9) (C:\\Users\\Jaco\\.omp\\agent\\extensions\\herdr-omp-agent-state.ts)"
+	integrationLineMissing   = "omp: not installed (C:\\Users\\Jaco\\.omp\\agent\\extensions\\herdr-omp-agent-state.ts)"
+)
+
+const integrationReportCurrent = integrationLineCurrent + "\n"
 
 const integrationReportMissing = "pi: not installed (C:\\Users\\Jaco\\.pi\\agent\\extensions\\herdr-agent-state.ts)\n" +
-	"omp: not installed (C:\\Users\\Jaco\\.omp\\agent\\extensions\\herdr-omp-agent-state.ts)\n" +
+	integrationLineMissing + "\n" +
 	"claude: not installed (C:\\Users\\Jaco\\.claude\\hooks\\herdr-agent-state.ps1)\n"
 
 type fixture struct {
@@ -120,7 +131,7 @@ func newFixture(t *testing.T) *fixture {
 		"HERDR_PLUGIN_ROOT":      f.root,
 		"HERDR_PLUGIN_STATE_DIR": f.stateDir,
 		"HERDR_BIN_PATH":         executablePath(t),
-		fixtureStatusFile:        f.statusReport(integrationReportInstalled),
+		fixtureStatusFile:        f.statusReport(integrationReportCurrent),
 		fixtureArgvFile:          filepath.Join(f.home, "status-argv.txt"),
 	}
 	return f
@@ -496,6 +507,53 @@ func TestInstallStatusIsCheckedWithTheEffectiveProfile(t *testing.T) {
 	}
 	if got := strings.TrimSpace(string(argv)); got != "integration status" {
 		t.Errorf("herdr was called with %q, want %q", got, "integration status")
+	}
+}
+
+// TestStatusReportsInstalledMatchesHerdrReportedVocabulary pins the words Herdr
+// actually prints. The first release of this check required the line to contain
+// "installed", which a correctly installed integration never says on this
+// machine: it prints "current (v10)". Only "not installed" proves absence, and
+// an installed-but-outdated integration is still installed.
+func TestStatusReportsInstalledMatchesHerdrReportedVocabulary(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		report string
+		want   bool
+	}{
+		{"real installed line", integrationLineCurrent, true},
+		{"real line inside a full report", integrationReportCurrent, true},
+		{"documented installed wording", integrationLineInstalled, true},
+		{"outdated is still installed", integrationLineOutdated, true},
+		{"real not-installed line", integrationLineMissing, false},
+		{"not-installed line inside a full report", integrationReportMissing, false},
+		{"report without an omp line", "pi: current (v3) (C:\\Users\\Jaco\\.pi\\agent\\extensions\\herdr-agent-state.ts)\n", false},
+		{"another integration's not-installed line is not ours", "pi: not installed (C:\\Users\\Jaco\\.pi\\agent\\extensions\\herdr-agent-state.ts)\n", false},
+		{"empty report", "", false},
+		{"indented line", "  " + integrationLineCurrent + "  ", true},
+		{"uppercase absence wording", "omp: NOT INSTALLED (C:\\Users\\Jaco\\.omp\\agent\\extensions\\herdr-omp-agent-state.ts)", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := statusReportsInstalled(tc.report); got != tc.want {
+				t.Errorf("statusReportsInstalled(%q) = %v, want %v", tc.report, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestInstallAcceptsAnUpToDateIntegration proves the whole install path, not
+// just the parser: with the exact status report a real machine prints after
+// `herdr integration install omp`, setup writes its extension.
+func TestInstallAcceptsAnUpToDateIntegration(t *testing.T) {
+	f := newFixture(t)
+	f.installIntegration(t, "")
+	f.setStatus(integrationReportCurrent)
+
+	if err := f.install(); err != nil {
+		t.Fatalf("Install with Herdr's installed status = %v, want success", err)
+	}
+	if _, err := os.Stat(f.extensionPath("")); err != nil {
+		t.Fatalf("setup did not write the extension for an installed integration: %v", err)
 	}
 }
 

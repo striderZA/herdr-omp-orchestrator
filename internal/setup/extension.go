@@ -272,15 +272,21 @@ func checkIntegration(env map[string]string, dir, herdrBinary string) error {
 }
 
 // statusReportsInstalled reads the text report of `herdr integration status`.
-// A line starting with "omp:" reports that integration; anything else on the
-// line is Herdr's business.
+//
+// Herdr's vocabulary for one integration line is what it prints, not a fixed
+// word: observed on Herdr 0.9.1-preview this machine prints
+// `omp: not installed (<path>)` before the integration exists and
+// `omp: current (v10) (<path>)` once it is installed and up to date. An
+// installed-but-outdated integration is still installed, so the only wording
+// that proves absence is "not installed": every other status on an `omp:` line
+// is accepted, and a report with no `omp:` line at all proves nothing.
 func statusReportsInstalled(report string) bool {
 	for _, line := range strings.Split(report, "\n") {
 		trimmed := strings.TrimSpace(line)
 		if !strings.HasPrefix(trimmed, "omp:") {
 			continue
 		}
-		return !strings.Contains(trimmed, "not installed") && strings.Contains(trimmed, "installed")
+		return !strings.Contains(strings.ToLower(trimmed), "not installed")
 	}
 	return false
 }
