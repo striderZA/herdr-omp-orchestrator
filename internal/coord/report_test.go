@@ -935,6 +935,9 @@ func TestInputAttemptMarkerNamesTheChannelAndNeverTheText(t *testing.T) {
 		inputAttemptPrefix + "answer deadbeef",
 		inputAttemptPrefix + "bogus deadbeef - 1700000000123",
 		inputAttemptPrefix + "answer deadbeef - not-a-time",
+		// A marker of the right shape but the wrong alphabet was not written here.
+		inputAttemptPrefix + "answer deadbeef - zzzzzzzzzzzzzzzz 1700000000123",
+		inputAttemptPrefix + "answer deadbeef - 0123456789abcde 1700000000123",
 	} {
 		if _, ok := parseInputAttempt(notAnAttempt); ok {
 			t.Errorf("%q is read as a pending input attempt", notAnAttempt)

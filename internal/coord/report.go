@@ -210,7 +210,11 @@ func parseInputAttempt(marker string) (inputAttempt, bool) {
 		keys = ""
 	}
 	nonce := strings.TrimSpace(fields[3])
-	if len(nonce) != attemptNonceBytes*2 {
+	// The nonce has to be exactly what this coordinator writes: sixteen hexadecimal
+	// characters. A marker of the right shape but a different alphabet was not written
+	// here, so it is refused rather than carried as a pending attempt.
+	raw, err := hex.DecodeString(nonce)
+	if err != nil || len(raw) != attemptNonceBytes {
 		return inputAttempt{}, false
 	}
 	at, err := strconv.ParseInt(fields[4], 10, 64)
