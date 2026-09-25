@@ -447,12 +447,21 @@ func (s *Store) ByOMPSession(ctx context.Context, ompSessionID string) (Binding,
 	if ompSessionID == "" {
 		return Binding{}, fmt.Errorf("%w: OMP session id is required", ErrInvalid)
 	}
-	workers, err := queryFacts[task.Task](ctx, s.db,
+	// Both lookups run in one read-only transaction so they see a single
+	// database snapshot: concurrent writers must not make a session that had
+	// exactly one owner at every instant look missing or ambiguous.
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return Binding{}, fmt.Errorf("begin read for OMP session %q: %w", ompSessionID, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	workers, err := queryFacts[task.Task](ctx, tx,
 		`SELECT data FROM tasks WHERE json_extract(data, '$.OMPSessionID') = ?`, ompSessionID)
 	if err != nil {
 		return Binding{}, fmt.Errorf("read tasks for OMP session %q: %w", ompSessionID, err)
 	}
-	primaries, err := queryFacts[task.Project](ctx, s.db,
+	primaries, err := queryFacts[task.Project](ctx, tx,
 		`SELECT data FROM projects WHERE json_extract(data, '$.OMPSessionID') = ?`, ompSessionID)
 	if err != nil {
 		return Binding{}, fmt.Errorf("read projects for OMP session %q: %w", ompSessionID, err)
@@ -485,8 +494,13 @@ func scanTask(row interface{ Scan(...any) error }, what string) (task.Task, erro
 	return t, nil
 }
 
-func queryFacts[T any](ctx context.Context, db *sql.DB, query string, args ...any) ([]T, error) {
-	rows, err := db.QueryContext(ctx, query, args...)
+// querier is the read surface shared by *sql.DB and a read-only *sql.Tx.
+type querier interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+func queryFacts[T any](ctx context.Context, q querier, query string, args ...any) ([]T, error) {
+	rows, err := q.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}

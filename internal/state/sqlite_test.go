@@ -2,6 +2,7 @@ package state_test
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"os"
@@ -9,6 +10,8 @@ import (
 	"reflect"
 	"sync"
 	"testing"
+
+	_ "modernc.org/sqlite"
 
 	"herdr-omp-orchestrator/internal/state"
 	"herdr-omp-orchestrator/internal/task"
@@ -60,8 +63,29 @@ func TestStoreUsesStateDirDatabase(t *testing.T) {
 	dir := t.TempDir()
 	open(t, dir)
 
-	if _, err := os.Stat(filepath.Join(dir, "orchestrator.sqlite")); err != nil {
+	path := filepath.Join(dir, "orchestrator.sqlite")
+	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("state database not created under state dir: %v", err)
+	}
+
+	// The database the store opens must stay in WAL mode: a bare handle on the
+	// same file reports the journal mode actually persisted by the store's DSN.
+	raw, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path))
+	if err != nil {
+		t.Fatalf("sql.Open(%q): %v", path, err)
+	}
+	t.Cleanup(func() {
+		if err := raw.Close(); err != nil {
+			t.Errorf("close raw handle: %v", err)
+		}
+	})
+
+	var journalMode string
+	if err := raw.QueryRow(`PRAGMA journal_mode`).Scan(&journalMode); err != nil {
+		t.Fatalf("PRAGMA journal_mode: %v", err)
+	}
+	if journalMode != "wal" {
+		t.Errorf("journal_mode = %q, want %q: the store DSN must keep _pragma=journal_mode(WAL)", journalMode, "wal")
 	}
 }
 
