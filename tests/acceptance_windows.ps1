@@ -893,6 +893,41 @@ function Test-HandshakeMaterialized {
     return $null
 }
 
+function Test-SessionIdentity {
+    <#
+        Links the native forms of one OMP session. Herdr publishes a TYPED
+        reference (kind id or path), the bind answer carries Herdr reference
+        value, and the store/announcement carries whichever native identity the
+        runtime exposed - so a raw string compare between two of them is wrong.
+        Two values name the same session when they are equal in one form, or when
+        both appear among the announced identities of the same handshake row.
+    #>
+    param([string]$Left, [string]$Right, $Ready)
+    if ([string]::IsNullOrWhiteSpace($Left) -or [string]::IsNullOrWhiteSpace($Right)) { return $false }
+    if ($Left -ieq $Right) { return $true }
+    if (Test-SamePath -A $Left -B $Right) { return $true }
+    $announced = @()
+    foreach ($field in @('omp_session_id', 'omp_session_file', 'verified_value')) {
+        $value = [string](Get-Field $Ready $field)
+        if (-not [string]::IsNullOrWhiteSpace($value)) { $announced += $value }
+    }
+    if ($announced.Count -eq 0) { return $false }
+    $leftSeen = $false
+    $rightSeen = $false
+    foreach ($candidate in $announced) {
+        foreach ($value in @($Left, $Right)) {
+            $same = ($candidate -ieq $value)
+            if (-not $same -and ($candidate -match '[\\/]' -or $value -match '[\\/]')) {
+                $same = Test-SamePath -A $candidate -B $value
+            }
+            if ($same) {
+                if ($value -ceq $Left) { $leftSeen = $true } else { $rightSeen = $true }
+            }
+        }
+    }
+    return ($leftSeen -and $rightSeen)
+}
+
 function Test-OmpSessionMaterialized {
     # A path-shaped session reference is materialized only when the file exists;
     # an id-shaped reference cannot be proven from here (the store records the
@@ -922,24 +957,28 @@ function Invoke-PluginAction {
     param(
         [Parameter(Mandatory)][string]$ActionId,
         [hashtable]$PaneContext = @{},
-        [double]$TimeoutSeconds = 180
+        [double]$TimeoutSeconds = 180,
+        [switch]$NoSessionScope
     )
-    $result = Invoke-Herdr -Arguments @('plugin', 'action', 'invoke', $ActionId, '--plugin', $script:PluginId) `
-        -ExtraEnvironment $PaneContext -TimeoutSeconds $TimeoutSeconds
-    if ($result.ExitCode -ne 0) {
-        Report-CommandFailure -AssertId "action/$ActionId" -Arguments @('plugin', 'action', 'invoke', $ActionId) -Result $result
+    $argv = @('plugin', 'action', 'invoke', $ActionId, '--plugin', $script:PluginId)
+    $invocation = Invoke-Herdr -Arguments $argv -ExtraEnvironment $PaneContext `
+        -TimeoutSeconds $TimeoutSeconds -NoSessionScope:$NoSessionScope
+    if ($invocation.ExitCode -ne 0) {
+        Report-CommandFailure -AssertId "action/$ActionId" -Arguments $argv -Result $invocation
         return $null
     }
-    try { return ($result.Stdout | ConvertFrom-Json).result } catch {
-        Report-CommandFailure -AssertId "action/$ActionId" -Arguments @('plugin', 'action', 'invoke', $ActionId) -Result $result
+    $answer = $null
+    try { $answer = ($invocation.Stdout | ConvertFrom-Json).result } catch {
+        Report-CommandFailure -AssertId "action/$ActionId" -Arguments $argv -Result $invocation
         return $null
     }
+    return [pscustomobject]@{ Result = $answer; Invocation = $invocation }
 }
 
 function Get-PluginLogEntry {
-    param([Parameter(Mandatory)][string]$LogId, [double]$TimeoutSeconds = 60)
+    param([Parameter(Mandatory)][string]$LogId, [double]$TimeoutSeconds = 60, [switch]$NoSessionScope)
     $wait = Wait-Until -TimeoutSeconds $TimeoutSeconds -IntervalSeconds 1 -What "plugin log $LogId" -Probe {
-        $json = Get-HerdrJson -Arguments @('plugin', 'log', 'list', '--plugin', $script:PluginId, '--limit', '40')
+        $json = Get-HerdrJson -Arguments @('plugin', 'log', 'list', '--plugin', $script:PluginId, '--limit', '40') -NoSessionScope:$NoSessionScope
         $entry = @($json.Result.logs | Where-Object { $_.log_id -eq $LogId })
         if ($entry.Count -eq 0) { return $null }
         if ($entry[0].status -eq 'running') { return $null }
@@ -954,8 +993,8 @@ function Get-ActionOutput {
         stdout). This is the plugin's own answer - the same object a human reads
         in the plugin log.
     #>
-    param([Parameter(Mandatory)][string]$LogId, [double]$TimeoutSeconds = 60)
-    $entry = Get-PluginLogEntry -LogId $LogId -TimeoutSeconds $TimeoutSeconds
+    param([Parameter(Mandatory)][string]$LogId, [double]$TimeoutSeconds = 60, [switch]$NoSessionScope)
+    $entry = Get-PluginLogEntry -LogId $LogId -TimeoutSeconds $TimeoutSeconds -NoSessionScope:$NoSessionScope
     if (-not $entry) { return $null }
     $payload = $null
     if ($entry.stdout) {
@@ -1507,13 +1546,25 @@ function Get-ExtensionConstants {
 
 function Invoke-SetupAction {
     Write-Step 'Phase 6: setup action (effective profile install)'
-    $invoke = Invoke-PluginAction -ActionId 'setup'
+    # setup installs into OMP global, effective-profile extension directory, so it
+    # must run against the DEFAULT Herdr server: the one the user extension is
+    # installed for. The invoking server supplies HERDR_BIN_PATH, and a different
+    # server (this isolated 0.9.1 session, for example) would re-embed a different
+    # Herdr binary into that shared user file. Every other action stays scoped to
+    # the isolated session, and both scopes are asserted at their call sites.
+    $invoke = Invoke-PluginAction -ActionId 'setup' -NoSessionScope
     Assert-True -Id 'U1.1' -What 'plugin action invoke setup returns an invocation envelope' -Condition ($null -ne $invoke) -Evidence (Protect-Text (Get-Json $invoke) 500)
     if (-not $invoke) { throw 'the setup action could not be invoked' }
-    $logId = [string](Get-Field (Get-Field $invoke 'log') 'log_id')
+    Assert-True -Id 'U1.0' -What 'the setup invocation does not name the isolated session (setup is profile-global)' `
+        -Condition ($invoke.Invocation.CommandLine -notmatch '(?i)--session') `
+        -Command $invoke.Invocation.CommandLine -Evidence $invoke.Invocation.CommandLine
+    Assert-Match -Id 'U1.0b' -What 'the setup invocation names the setup action of this plugin' `
+        -Pattern 'plugin action invoke setup --plugin user\.omp-orchestrator' -Actual $invoke.Invocation.CommandLine
+    $action = Get-Field $invoke 'Result'
+    $logId = [string](Get-Field (Get-Field $action 'log') 'log_id')
     Assert-NonEmpty -Id 'U1.2' -What 'the setup invocation is recorded in the plugin log' -Value $logId
 
-    $output = Get-ActionOutput -LogId $logId -TimeoutSeconds 90
+    $output = Get-ActionOutput -LogId $logId -TimeoutSeconds 90 -NoSessionScope
     Assert-True -Id 'U1.3' -What 'the setup command finished' -Condition ($null -ne $output) -Evidence (Protect-Text (Get-Json $output) 400)
     if (-not $output) { throw 'the setup action never finished' }
     Assert-Equal -Id 'U1.4' -What 'the setup command exited 0' -Expected 0 -Actual (Get-Field $output.Entry 'exit_code')
@@ -1552,8 +1603,8 @@ function Invoke-SetupAction {
 # ---------------------------------------------------------------------------
 
 function Get-BindPayload {
-    param([Parameter(Mandatory)]$Invoke, [double]$TimeoutSeconds = 120)
-    $logId = [string](Get-Field (Get-Field $Invoke 'log') 'log_id')
+    param([Parameter(Mandatory)]$Result, [double]$TimeoutSeconds = 120)
+    $logId = [string](Get-Field (Get-Field $Result 'log') 'log_id')
     return (Get-ActionOutput -LogId $logId -TimeoutSeconds $TimeoutSeconds)
 }
 
@@ -1571,12 +1622,16 @@ function Invoke-Bind {
     $invoke = Invoke-PluginAction -ActionId 'bind' -PaneContext $context -TimeoutSeconds 240
     Assert-True -Id 'N1.1' -What 'plugin action invoke bind returns an invocation envelope' -Condition ($null -ne $invoke) -Evidence (Protect-Text (Get-Json $invoke) 500)
     if (-not $invoke) { throw 'the bind action could not be invoked' }
-    $resolved = Get-Field $invoke 'context'
+    Assert-True -Id 'N1.0' -What 'the bind invocation names the isolated session' `
+        -Condition ($invoke.Invocation.CommandLine -match [regex]::Escape("--session $($script:SessionName)")) `
+        -Command $invoke.Invocation.CommandLine -Evidence $invoke.Invocation.CommandLine
+    $action = Get-Field $invoke 'Result'
+    $resolved = Get-Field $action 'context'
     Assert-SamePath -Id 'N1.2' -What 'the invocation context names the temp repository' -Expected $script:RepoPath -Actual ([string](Get-Field $resolved 'focused_pane_cwd'))
     Assert-Equal -Id 'N1.3' -What 'the invocation context names the temp workspace' -Expected $script:PrimaryWorkspace -Actual ([string](Get-Field $resolved 'workspace_id'))
     Assert-Equal -Id 'N1.4' -What 'the invocation context names the temp pane' -Expected $script:PrimaryPane -Actual ([string](Get-Field $resolved 'focused_pane_id'))
 
-    $output = Get-BindPayload -Invoke $invoke
+    $output = Get-BindPayload -Result $action
     Assert-True -Id 'N2.1' -What 'the bind command finished' -Condition ($null -ne $output) -Evidence (Protect-Text (Get-Json $output) 400)
     if (-not $output) { throw 'the bind action never finished' }
     Assert-Equal -Id 'N2.2' -What 'the bind command exited 0' -Expected 0 -Actual (Get-Field $output.Entry 'exit_code')
@@ -1599,11 +1654,18 @@ function Invoke-Bind {
         $dump = Get-StateDump
         $row = @($dump.tables.projects | Where-Object { (Get-Field $_ 'key') -eq (Get-Field $project 'Key') })
         Assert-Equal -Id 'N4.1' -What 'the store holds exactly one project row for this repository' -Expected 1 -Actual $row.Count
+        $answerSession = [string](Get-Field $project 'OMPSessionID')
+        $handshake = Get-ReadySession -LaunchPaneId $script:PrimaryPane
         if ($row.Count -gt 0) {
-            Assert-Equal -Id 'N4.2' -What 'the stored session identity matches the action answer' -Expected ([string](Get-Field $project 'OMPSessionID')) -Actual ([string](Get-Field (Get-Field $row[0] 'fact') 'OMPSessionID'))
+            $storedSession = [string](Get-Field (Get-Field $row[0] 'fact') 'OMPSessionID')
+            # The bind answer carries Herdr reference value; the store carries the
+            # native identity the OMP runtime announced. They are the same session
+            # in two forms, linked by the handshake row - never by raw equality.
+            Assert-True -Id 'N4.2' -What 'the action answer and the stored row name the same session, each in the form it records' `
+                -Condition (Test-SessionIdentity -Left $answerSession -Right $storedSession -Ready $handshake) `
+                -Evidence ("answer=[$answerSession] stored=[$storedSession] handshake=" + (Protect-Text (Get-Json $handshake) 400))
             Assert-Equal -Id 'N4.3' -What 'the stored agent name matches the action answer' -Expected ([string](Get-Field $project 'AgentName')) -Actual ([string](Get-Field (Get-Field $row[0] 'fact') 'AgentName'))
         }
-        $handshake = Get-ReadySession -LaunchPaneId $script:PrimaryPane
         Assert-True -Id 'N4.4' -What 'the primary announced a readiness handshake' -Condition ($null -ne $handshake) -Evidence (Protect-Text (Get-Json $handshake) 400)
         if ($handshake) {
             Assert-Equal -Id 'N4.5' -What 'the handshake was confirmed against `agent get` (the real extension announced it)' -Expected 1 -Actual ([int](Get-Field $handshake 'verified'))
@@ -1694,9 +1756,12 @@ function Invoke-PrimaryTurn {
         'HERDR_TAB_ID'       = $script:PrimaryTab
     }
     $invoke = Invoke-PluginAction -ActionId 'bind' -PaneContext $context -TimeoutSeconds 240
-    $output = Get-BindPayload -Invoke $invoke
-    Assert-Equal -Id 'N8.1' -What 're-binding an existing project exits 0 (reopen path)' -Expected 0 -Actual (Get-Field $output.Entry 'exit_code')
-    $payload = $output.Payload
+    Assert-True -Id 'N8.0' -What 'the re-bind invocation names the isolated session' `
+        -Condition ($null -ne $invoke -and $invoke.Invocation.CommandLine -match [regex]::Escape("--session $($script:SessionName)")) `
+        -Evidence $(if ($invoke) { $invoke.Invocation.CommandLine } else { 'no invocation' })
+    $output = if ($invoke) { Get-BindPayload -Result (Get-Field $invoke 'Result') } else { $null }
+    Assert-Equal -Id 'N8.1' -What 're-binding an existing project exits 0 (reopen path)' -Expected 0 -Actual $(if ($output) { Get-Field $output.Entry 'exit_code' } else { 'no invocation' })
+    $payload = if ($output) { $output.Payload } else { $null }
     Assert-True -Id 'N8.2' -What 're-bind answered ok=true' -Condition (Get-Flag $payload 'ok') -Evidence (Protect-Text (Get-Json $payload) 500)
     $project2 = Get-Field $payload 'project'
     Assert-Equal -Id 'N8.3' -What 're-bind keeps the recorded OMP session (identity retained)' -Expected ([string](Get-Field $script:Project 'OMPSessionID')) -Actual ([string](Get-Field $project2 'OMPSessionID'))
@@ -1728,15 +1793,15 @@ function New-TaskBriefs {
 $($script:MarkerPrefix)TASK-A. You are in your own Git worktree of a disposable test repository. Do exactly this and nothing else:
 1. Edit a.js so it also exports ``function subtract(a, b) { return a - b; }``, keeping the existing content.
 2. Commit it: run ``git add -A`` then ``git commit -m "ACCEPT-A change"``.
-3. Call the orch_question tool once with text "ACCEPT-Q-A: should a.js keep the existing export style?" and then stop and wait: the answer arrives later as a user message. Wait for it before doing anything else.
-4. After the answer arrives, call the orch_report tool with kind "result", summary "ACCEPT-A: a.js now also exports subtract", branch = the branch printed by ``git branch --show-current``, evidence = ["commit <the full sha from git rev-parse HEAD>"], checks = ["git log -1 --format=%H"], risk "ACCEPT-RISK-A: none".
+3. Then STOP and WAIT. Do not call any tool and do not finish: a user message arrives later, and only after it may you continue.
+4. After that user message arrives, call the orch_report tool with kind "result", summary "ACCEPT-A: a.js now also exports subtract", branch = the branch printed by ``git branch --show-current``, evidence = ["commit <the full sha from git rev-parse HEAD>"], checks = ["git log -1 --format=%H"], risk "ACCEPT-RISK-A: none".
 Never merge, never remove the branch and never remove the checkout.
 "@
     $script:BriefB = @"
 $($script:MarkerPrefix)TASK-B. You are in your own Git worktree of a disposable test repository. Do exactly this and nothing else:
 1. Edit b.js so it also exports ``function multiply(a, b) { return a * b; }``, keeping the existing content. Do NOT commit it: leave the change uncommitted in your worktree.
-2. Call the ask tool exactly once with a single question: "ACCEPT-Q-DIALOG: which contract should b.js use?" and exactly two options: "keep the current contract" and "change the contract". Then stop and wait for that dialog to be answered.
-3. After the dialog is answered, call the orch_report tool with kind "result", summary "ACCEPT-B: b.js now also exports multiply and the change is left uncommitted", branch = the branch printed by ``git branch --show-current``, evidence = ["uncommitted change to b.js", "git status --porcelain lists it"], checks = ["git status --porcelain"], risk "ACCEPT-RISK-B: the change is uncommitted".
+2. Then STOP and WAIT. Do not call any tool and do not finish: a user message arrives later, and only after it may you continue.
+3. After that user message arrives, call the orch_report tool with kind "result", summary "ACCEPT-B: b.js now also exports multiply and the change is left uncommitted", branch = the branch printed by ``git branch --show-current``, evidence = ["uncommitted change to b.js", "git status --porcelain lists it"], checks = ["git status --porcelain"], risk "ACCEPT-RISK-B: the change is uncommitted".
 Never commit, never merge, never remove the branch and never remove the checkout.
 "@
 }
@@ -1819,13 +1884,17 @@ function Invoke-Dispatch {
         $id = [string](Get-Field $fact 'ID')
         $pane = [string](Get-Field $fact 'PublicPaneID')
         $live = Get-LiveAgent -Target $pane
+        $handshake = Get-ReadySession -LaunchPaneId ([string](Get-Field $fact 'LaunchPaneID'))
         Assert-True -Id "D4.live/$id" -What "Herdr reports the worker agent of $id on its recorded pane" -Condition $live.Found -Evidence (Protect-Text (Get-Json $live.Agent) 400)
         if ($live.Found) {
             $ref = Get-Field $live.Agent 'agent_session'
-            Assert-Equal -Id "D4.session/$id" -What "Herdr publishes $id's recorded OMP session" -Expected ([string](Get-Field $fact 'OMPSessionID')) -Actual ([string](Get-Field $ref 'value')) -CaseInsensitive
+            # The task records the native OMP identity; Herdr publishes a typed
+            # reference. The handshake row links the two forms.
+            Assert-True -Id "D4.session/$id" -What "the task and Herdr name the same session for $id, each in the form it records" `
+                -Condition (Test-SessionIdentity -Left ([string](Get-Field $fact 'OMPSessionID')) -Right ([string](Get-Field $ref 'value')) -Ready $handshake) `
+                -Evidence ("task=[$(Get-Field $fact 'OMPSessionID')] ref_kind=[$(Get-Field $ref 'kind')] ref=[$(Get-Field $ref 'value')] handshake=" + (Protect-Text (Get-Json $handshake) 400))
             Assert-SamePath -Id "D4.cwd/$id" -What "the worker agent of $id works in its own checkout" -Expected ([string](Get-Field $fact 'WorktreePath')) -Actual ([string](Get-Field $live.Agent 'cwd'))
         }
-        $handshake = Get-ReadySession -LaunchPaneId ([string](Get-Field $fact 'LaunchPaneID'))
         Assert-True -Id "D4.handshake/$id" -What "the worker's OMP extension announced and was confirmed" -Condition ($null -ne $handshake -and [int](Get-Field $handshake 'verified') -eq 1) -Evidence (Protect-Text (Get-Json $handshake) 400)
         if ($script:Python -and $handshake) {
             $materialized = Test-HandshakeMaterialized -Handshake $handshake
@@ -1966,6 +2035,14 @@ function Invoke-QuestionRelay {
     $script:TaskA = Get-Field $taskA 'fact'
     $idA = [string](Get-Field $script:TaskA 'ID')
 
+    # The worker briefs say "edit, then wait", so the partial-report gate above
+    # ran while both workers were still Running. The question is requested here,
+    # through the real agent surface, so this phase lines up with the store.
+    $askPrompt = 'ACCEPT-QUESTION. Call the orch_question tool once with text "ACCEPT-Q-A: should a.js keep the existing export style?" and then stop and wait for the answer. Reply with the word asked.'
+    $askResult = Invoke-AgentPrompt -PaneId ([string](Get-Field $script:TaskA 'PublicPaneID')) -Text $askPrompt -TimeoutSeconds 240
+    Assert-True -Id 'Q1.3' -What 'worker A accepts the instruction to raise its question' -Condition ($askResult.ExitCode -eq 0) -TaskId $idA `
+        -Command $askResult.CommandLine -Evidence (Protect-Text $askResult.Stderr 300)
+
     $wait = Wait-Until -TimeoutSeconds 420 -IntervalSeconds 10 -What 'worker question' -Probe {
         $row = Get-TaskById -Id $idA
         if (-not $row) { return $null }
@@ -2081,6 +2158,13 @@ function Invoke-BlockedDialog {
     $script:TaskB = Get-Field $taskB 'fact'
     $idB = [string](Get-Field $script:TaskB 'ID')
     $paneB = [string](Get-Field $script:TaskB 'PublicPaneID')
+
+    # Same as the question above: the dialog is requested explicitly, so the
+    # partial-report gate earlier had a Running task to work with.
+    $dialogPrompt = 'ACCEPT-ASK. Call the ask tool exactly once with a single question "ACCEPT-Q-DIALOG: which contract should b.js use?" and exactly two options "keep the current contract" and "change the contract". Then stop and wait for that dialog to be answered.'
+    $dialogResult = Invoke-AgentPrompt -PaneId $paneB -Text $dialogPrompt -TimeoutSeconds 240
+    Assert-True -Id 'K1.3' -What 'worker B accepts the instruction to open its dialog' -Condition ($dialogResult.ExitCode -eq 0) -TaskId $idB `
+        -Command $dialogResult.CommandLine -Evidence (Protect-Text $dialogResult.Stderr 300)
 
     $blocked = Wait-Until -TimeoutSeconds 420 -IntervalSeconds 8 -What 'worker B blocked' -Probe {
         $live = Get-LiveAgent -Target $paneB
@@ -2729,7 +2813,10 @@ function Invoke-Restart {
         $agent = Get-LiveAgent -Target $restoredPane
         if ($agent.Found) {
             $ref = Get-Field $agent.Agent 'agent_session'
-            Assert-Equal -Id 'T7.2' -What 'the restored agent still carries the recorded OMP session' -Expected ([string](Get-Field $script:Project 'OMPSessionID')) -Actual ([string](Get-Field $ref 'value')) -CaseInsensitive
+            $restoredReady = Get-ReadySession -LaunchPaneId ([string](Get-Field $script:Project 'LaunchPaneID'))
+            Assert-True -Id 'T7.2' -What 'the restored agent still carries the recorded OMP session (compared by reference kind)' `
+                -Condition (Test-SessionIdentity -Left ([string](Get-Field $script:Project 'OMPSessionID')) -Right ([string](Get-Field $ref 'value')) -Ready $restoredReady) `
+                -Evidence ("recorded=[$(Get-Field $script:Project 'OMPSessionID')] ref=[$(Get-Field $ref 'value')] handshake=" + (Protect-Text (Get-Json $restoredReady) 300))
         } else {
             Block-Item -Id 'T7.2' -What 'the restored agent still carries the recorded OMP session' -Evidence (Protect-Text (Get-Json $agent.Raw) 300)
         }
@@ -2760,9 +2847,12 @@ function Invoke-Restart {
         'HERDR_WORKSPACE_ID' = [string](Get-Field $before.Project 'RepoWorkspaceID')
     }
     $invoke = Invoke-PluginAction -ActionId 'bind' -PaneContext $context -TimeoutSeconds 240
-    $output = Get-BindPayload -Invoke $invoke
-    Assert-Equal -Id 'T9.1' -What 're-binding after the restart exits 0' -Expected 0 -Actual (Get-Field $output.Entry 'exit_code')
-    if ($output.Payload) {
+    Assert-True -Id 'T8.9' -What 'the re-bind after the restart names the isolated session' `
+        -Condition ($null -ne $invoke -and $invoke.Invocation.CommandLine -match [regex]::Escape("--session $($script:SessionName)")) `
+        -Evidence $(if ($invoke) { $invoke.Invocation.CommandLine } else { 'no invocation' })
+    $output = if ($invoke) { Get-BindPayload -Result (Get-Field $invoke 'Result') } else { $null }
+    Assert-Equal -Id 'T9.1' -What 're-binding after the restart exits 0' -Expected 0 -Actual $(if ($output) { Get-Field $output.Entry 'exit_code' } else { 'no invocation' })
+    if ($output -and $output.Payload) {
         $p = Get-Field $output.Payload 'project'
         Assert-SamePath -Id 'T9.2' -What 'the project key survives the restart' -Expected ([string](Get-Field $before.Project 'Key')) -Actual ([string](Get-Field $p 'Key'))
         Assert-Equal -Id 'T9.3' -What 'the primary agent name survives the restart' -Expected ([string](Get-Field $before.Project 'AgentName')) -Actual ([string](Get-Field $p 'AgentName'))
