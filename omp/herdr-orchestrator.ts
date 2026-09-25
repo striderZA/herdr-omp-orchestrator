@@ -300,6 +300,64 @@ export async function confirmThen<T>(
   return { ok: true, value: await act() };
 }
 
+// ---------------------------------------------------------------------------
+// the post-turn session refresh
+// ---------------------------------------------------------------------------
+//
+// OMP materializes a session lazily: the JSONL appears with the first assistant
+// message, so the identity a freshly started process announces legitimately
+// reports onDisk false — and a resume hint built from an unmaterialized session
+// can never work. `agent_end` is the first point at which the runtime has
+// persisted the turn, so the extension re-announces there.
+
+// REFRESH_TIMEOUT_MS bounds one refresh. The turn is already complete when it
+// runs, and OMP awaits a turn's post-prompt handlers, so a wedged bridge must not
+// hold the runtime for the full bridge timeout.
+const REFRESH_TIMEOUT_MS = 5_000;
+
+// MATERIALIZE_TRIES and MATERIALIZE_WAIT_MS bound the wait for a session the
+// runtime says is not on disk yet. Persistence is queued in emission order, so the
+// write for this very turn may still be in flight when the hook runs: waiting a
+// few milliseconds once is what makes the refresh see the materialized session,
+// and it costs nothing on every later turn.
+const MATERIALIZE_TRIES = 5;
+const MATERIALIZE_WAIT_MS = 40;
+
+// refreshIdentity is what one post-turn refresh announces, or null while the
+// runtime reports the identity the load-time handshake already recorded. Every
+// field counts, including materialization: a session that only just reached the
+// disk is exactly the fact worth announcing.
+export function refreshIdentity(identity: SessionIdentity, announced: SessionIdentity | null): SessionIdentity | null {
+  if (announced === null) return null;
+  if (identity.id === announced.id && identity.file === announced.file && identity.onDisk === announced.onDisk) {
+    return null;
+  }
+  return identity;
+}
+
+// refreshReady re-announces the current session identity, once.
+//
+// It never fails a completed turn: a bridge failure warns and reports that
+// nothing was announced, leaving the coordinator's recorded handshake — and with
+// it the no-resume state — untouched. It is exported because it is the one place
+// the refresh happens, which is what the load check drives with a recording send.
+export async function refreshReady(
+  identity: SessionIdentity,
+  announced: SessionIdentity | null,
+  send: (identity: SessionIdentity) => Promise<void>,
+  warn: (message: string) => void,
+): Promise<SessionIdentity | null> {
+  const refresh = refreshIdentity(identity, announced);
+  if (refresh === null) return null;
+  try {
+    await send(refresh);
+    return refresh;
+  } catch (error) {
+    warn(`Orchestrator session refresh failed: ${String(error)}`);
+    return null;
+  }
+}
+
 // toolResult and toolRefusal are the two shapes these tools answer with: the
 // bridge's value, or the reason an action was not taken.
 function toolResult(value: unknown) {
@@ -502,7 +560,7 @@ export default function (pi: ExtensionAPI) {
     ];
     if (desired.join("\0") !== current.join("\0")) await pi.setActiveTools(desired);
     role = nextRole;
-    if (role) await callBridge("ready", {}, identity);
+    if (role) await announce(identity);
     return role;
   }
 
@@ -519,6 +577,51 @@ export default function (pi: ExtensionAPI) {
   // plugin's own startup reconciliation can run after that process already
   // loaded this extension. Re-resolving before every user turn lets a verified
   // rebind restore the right tools instead of silently disabling them forever.
+  // The handshake the coordinator holds, as this process last announced it.
+  let announced: SessionIdentity | null = null;
+  let refreshWarned = false;
+
+  // announce records the identity surface for the bound role and remembers what
+  // was announced, so the post-turn refresh can tell whether anything changed.
+  async function announce(identity: SessionIdentity): Promise<void> {
+    await callBridge("ready", {}, identity);
+    announced = identity;
+  }
+
+  // A completed turn is where a lazily materialized session reaches the disk.
+  // Re-announce then, so the coordinator can offer a resume hint for a session
+  // that really exists — and never let this fail the turn: a bridge failure warns
+  // once and leaves the recorded handshake, and with it the no-resume state, alone.
+  pi.on("agent_end", async (_event, ctx) => {
+    if (role === null) return;
+    try {
+      let identity = sessionIdentity(ctx.sessionManager);
+      for (let attempt = 0; !identity.onDisk && attempt < MATERIALIZE_TRIES; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, MATERIALIZE_WAIT_MS));
+        identity = sessionIdentity(ctx.sessionManager);
+      }
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), REFRESH_TIMEOUT_MS);
+      try {
+        const refreshed = await refreshReady(identity, announced, (next) => callBridge("ready", {}, next, controller.signal), (message) => {
+          if (refreshWarned) return;
+          refreshWarned = true;
+          ctx.ui.notify(message, "warning");
+        });
+        if (refreshed !== null) announced = refreshed;
+      } finally {
+        clearTimeout(timer);
+      }
+    } catch (error) {
+      // The hook is the last thing between a completed turn and the user: only an
+      // unexpected failure reaches here, and it must not escape.
+      if (!refreshWarned) {
+        refreshWarned = true;
+        ctx.ui.notify(`Orchestrator session refresh failed: ${String(error)}`, "warning");
+      }
+    }
+  });
+
   pi.on("before_agent_start", async (event, ctx) => {
     const currentRole = await activate(sessionIdentity(ctx.sessionManager));
     if (!currentRole) return;

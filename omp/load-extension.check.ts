@@ -22,6 +22,8 @@ import extension, {
   cleanupConfirmRequest,
   confirmThen,
   dialogConfirmRequest,
+  refreshIdentity,
+  refreshReady,
   uiGate,
 } from "./herdr-orchestrator.ts";
 
@@ -51,6 +53,10 @@ interface StubAPI {
   registerTool(tool: RegisteredTool): void;
   on(event: string, handler: (...args: unknown[]) => unknown): void;
 }
+
+// ExtensionHandler is one registered event handler, kept so the check can invoke
+// the hooks that run outside a turn (or at its end) by hand.
+type ExtensionHandler = (...args: unknown[]) => unknown;
 
 const failures: string[] = [];
 function check(condition: boolean, message: string): void {
@@ -96,6 +102,7 @@ process.env.HERDR_PANE_ID = "w1:p2";
 
 const tools: RegisteredTool[] = [];
 const events: string[] = [];
+const handlers = new Map<string, ExtensionHandler>();
 const active = new Set(["read", "write"]);
 const setActiveCalls: string[][] = [];
 
@@ -110,8 +117,9 @@ const stub: StubAPI = {
   registerTool: (tool: RegisteredTool) => {
     tools.push(tool);
   },
-  on: (event: string) => {
+  on: (event: string, handler: ExtensionHandler) => {
     events.push(event);
+    handlers.set(event, handler);
   },
 };
 
@@ -148,6 +156,11 @@ check(
 );
 check(events.includes("session_start"), "the extension does not listen to session_start");
 check(events.includes("before_agent_start"), "the extension does not listen to before_agent_start");
+// OMP materializes a session lazily: the file appears with the first assistant
+// message, so the identity announced at load time can still report onDisk false.
+// The extension has to re-announce after a turn, or no resume hint can ever be
+// offered for a session that is really on disk.
+check(events.includes("agent_end"), "the extension does not listen to agent_end");
 
 for (const tool of tools) {
   check(tool.defaultInactive === true, `${tool.name} must be registered inactive`);
@@ -504,6 +517,98 @@ async function checkGates(): Promise<void> {
 }
 
 await checkGates();
+
+// --- the post-turn session refresh -----------------------------------------
+
+// The ready refresh is asserted through the function the agent_end hook uses, with
+// the bridge send replaced by a recorder: spawning cannot be intercepted under
+// bun (mock.module does not reach an already-imported module's bindings, and no
+// stub executable can be handed to a .ts import), so the payload is pinned where
+// it is produced and the hook's safety is asserted separately.
+async function checkSessionRefresh(): Promise<void> {
+  const loaded: SessionIdentity = { id: "sess-1", file: "C:\s.jsonl", onDisk: false };
+  const materialized: SessionIdentity = { id: "sess-1", file: "C:\s.jsonl", onDisk: true };
+
+  check(
+    refreshIdentity(materialized, loaded) !== null,
+    "the refresh saw nothing to announce although the runtime reported the session on disk",
+  );
+  const announced = refreshIdentity(materialized, loaded);
+  check(
+    announced?.onDisk === true && announced?.id === "sess-1" && announced?.file === "C:\s.jsonl",
+    `the refreshed identity is ${JSON.stringify(announced)}, want the session the runtime reports now`,
+  );
+  check(
+    refreshIdentity(loaded, loaded) === null,
+    "an unchanged identity was refreshed, which would re-announce every turn",
+  );
+
+  // Nothing is announced before the load-time handshake has been recorded.
+  let sentIdle = 0;
+  const idle = await refreshReady(materialized, null, async () => {
+    sentIdle++;
+  }, () => {});
+  check(idle === null && sentIdle === 0, "a refresh was sent before any handshake was recorded");
+
+  // The ready case: exactly one send, carrying the refreshed identity.
+  const sent: SessionIdentity[] = [];
+  let warned: string[] = [];
+  const refreshed = await refreshReady(materialized, loaded, async (identity) => {
+    sent.push(identity);
+  }, (message) => warned.push(message));
+  check(sent.length === 1, `the refresh sent ${sent.length} ready calls, want exactly 1`);
+  check(
+    sent[0]?.onDisk === true && sent[0]?.id === "sess-1" && sent[0]?.file === "C:\s.jsonl",
+    `the second ready carried ${JSON.stringify(sent[0])}, want the refreshed identity with onDisk true`,
+  );
+  check(refreshed?.onDisk === true, "the refresh did not report the identity it announced");
+
+  // A failing bridge warns once and fails nothing: the coordinator keeps its
+  // no-resume state, and the completed turn is untouched.
+  const failed = await refreshReady(materialized, loaded, async () => {
+    throw new Error("the bridge is unavailable");
+  }, (message) => warned.push(message));
+  check(failed === null, "a failed refresh reported the identity as announced");
+  check(warned.length === 1, `a failed refresh warned ${warned.length} times, want once`);
+  check(
+    warned[0]?.includes("refresh failed"),
+    `the warning does not say what failed: ${JSON.stringify(warned[0])}`,
+  );
+
+  // The hook itself, invoked as OMP invokes it, must be safe: this process is not
+  // bound in the check (the bridge cannot run), so it does nothing at all rather
+  // than throwing into a completed turn.
+  const hook = handlers.get("agent_end");
+  if (!hook) {
+    failures.push("the agent_end hook was not registered");
+  } else {
+    let prompts = 0;
+    const notices: string[] = [];
+    const ctx = {
+      hasUI: true,
+      ui: {
+        confirm: async () => {
+          prompts++;
+          return false;
+        },
+        notify: (message: string) => notices.push(message),
+      },
+      sessionManager: {
+        getSessionId: () => "sess-1",
+        getSessionFile: () => "C:\s.jsonl",
+        isSessionOnDisk: () => true,
+      },
+    };
+    try {
+      await hook({ type: "agent_end", messages: [] }, ctx);
+    } catch (error) {
+      failures.push(`the agent_end hook threw into a completed turn: ${String(error)}`);
+    }
+    check(prompts === 0, "the agent_end hook asked the user something at the end of a turn");
+  }
+}
+
+await checkSessionRefresh();
 
 if (failures.length > 0) {
   for (const failure of failures) console.error(`load check FAILED: ${failure}`);
