@@ -11,3 +11,9 @@ command = ["go", "build", "-o", "herdr-omp-orchestrator.exe", "./cmd/herdr-omp-o
 id = "setup"
 title = "Setup OMP orchestrator extension"
 command = ["./herdr-omp-orchestrator.exe", "setup"]
+
+[[actions]]
+id = "bind"
+title = "Bind this repository as an orchestrated project"
+contexts = ["pane", "workspace"]
+command = ["./herdr-omp-orchestrator.exe", "bind"]
