@@ -1,7 +1,16 @@
 id = "user.omp-orchestrator"
 name = "OMP Orchestrator"
 version = "0.1.0"
-min_herdr_version = "0.9.1"
+# Semver orders any 0.9.1-preview BELOW 0.9.1, so declaring 0.9.1 cannot be
+# satisfied by a 0.9.1 preview build (observed: plugin_requires_newer_herdr on
+# herdr 0.9.1-preview.2026-09-21, which reports 0.9.0 for version comparison).
+# Every method and hook event this plugin uses is present in that build's own
+# `herdr api schema --json`: pane.move, worktree.create/remove/list,
+# workspace.create, plugin.pane.open, events.subscribe/wait, session.snapshot,
+# agent.start/prompt/get/read, pane.get, pane.report_agent/release_agent,
+# pane.agent_status_changed and pane.moved. So the last released floor that
+# matches the required feature set is the correct declaration.
+min_herdr_version = "0.9.0"
 platforms = ["windows"]
 
 [[build]]
