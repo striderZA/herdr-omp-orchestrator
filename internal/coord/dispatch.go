@@ -1189,7 +1189,7 @@ func (c *Coordinator) adjudicate(
 
 	// Apply on the inspected revision, re-checking the state inside the compare and
 	// swap so a task that changed under the decision is refused rather than adjusted.
-	decided, err := c.store.UpdateTask(ctx, st.ID, expectedRevision, func(next *task.Task) error {
+	decided, err := c.store.UpdateTaskAndClearStepClaim(ctx, st.ID, expectedRevision, func(next *task.Task) error {
 		if !IsAmbiguousBriefTask(*next) {
 			return fmt.Errorf("%w: task %s changed while it was being adjudicated", ErrNotAdjudicable, next.ID)
 		}
@@ -1211,12 +1211,10 @@ func (c *Coordinator) adjudicate(
 	if decision == BriefDelivered {
 		return decided, nil
 	}
-	// Not delivered: resume the recorded phase exactly once. The user's inspection
-	// is the proof that the uncertain step is not running, so its claim may go; the
-	// phase owns the task's provisioning slot, so nothing has to be claimed again.
-	if err := c.store.ClearStepClaim(ctx, decided.ID); err != nil {
-		return decided, err
-	}
+	// Not delivered: resume the recorded phase exactly once. The decision above
+	// already retired the step's claim in the same transaction that cleared the
+	// blocker, so no concurrent caller can take the step in between; the phase owns
+	// the task's provisioning slot, so nothing has to be claimed again.
 	provisioned, err := c.provision(ctx, decided)
 	if err != nil {
 		return provisioned, err

@@ -357,6 +357,11 @@ const toolCalls: { name: string; params: Record<string, unknown>; bad: Record<st
     params: { taskId: "orch_abc", decision: "not_delivered" },
     bad: { taskId: "", decision: "not_delivered" },
   },
+  {
+    name: "orch_adjudicate_dispatch",
+    params: { taskId: "orch_abc", decision: "delivered" },
+    bad: { taskId: "orch_abc", decision: "maybe" },
+  },
   { name: "orch_cleanup", params: { taskId: "orch_abc" }, bad: {} },
 ];
 

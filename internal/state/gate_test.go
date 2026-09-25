@@ -265,3 +265,66 @@ func TestStoreClaimStepIsExclusivePerPhase(t *testing.T) {
 		t.Errorf("ReleaseStep(own claim) err = %v", err)
 	}
 }
+
+// TestStoreDecisionLeavesTheClaimIntactWhenItRefuses pins the both-or-neither half
+// of a decision: a mutation that fails or a stale revision must not retire the step
+// claim of a step that may still be running. The single-transaction half is not
+// observable from outside the store (there is no window to inspect), so it is
+// structural: UpdateTaskAndClearStepClaim is the only path a decision takes.
+func TestStoreDecisionLeavesTheClaimIntactWhenItRefuses(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	s := open(t, dir)
+	other := open(t, dir)
+
+	st := gateTask(t, "t1", "repo-a", nil)
+	if err := s.CreateTask(ctx, st); err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	current, err := s.Task(ctx, "t1")
+	if err != nil {
+		t.Fatalf("Task: %v", err)
+	}
+	if took, err := s.ClaimStep(ctx, "t1", task.Intent, "owner-a", time.Minute); err != nil || !took {
+		t.Fatalf("ClaimStep = (%v, %v), want the claim", took, err)
+	}
+
+	// A failed mutation leaves the task AND the claim alone: a decision that cannot
+	// be stored must not retire the claim of a step that may still be running.
+	if _, err := s.UpdateTaskAndClearStepClaim(ctx, "t1", current.Revision, func(*task.Task) error {
+		return errors.New("refused")
+	}); err == nil {
+		t.Fatal("UpdateTaskAndClearStepClaim with a failing mutation = nil, want an error")
+	}
+	if took, err := other.ClaimStep(ctx, "t1", task.Intent, "owner-b", time.Minute); err != nil || took {
+		t.Fatalf("ClaimStep after a failed decision = (%v, %v), want the claim still held", took, err)
+	}
+
+	// A stale revision is refused the same way.
+	if _, err := s.UpdateTaskAndClearStepClaim(ctx, "t1", current.Revision+9, func(next *task.Task) error {
+		next.Blocker = ""
+		return nil
+	}); !errors.Is(err, state.ErrConflict) {
+		t.Fatalf("stale revision err = %v, want ErrConflict", err)
+	}
+	if took, err := other.ClaimStep(ctx, "t1", task.Intent, "owner-b", time.Minute); err != nil || took {
+		t.Fatalf("ClaimStep after a stale decision = (%v, %v), want the claim still held", took, err)
+	}
+
+	// Both changes land together: the mutation is stored and the claim is gone, so
+	// the next caller can take the step the decision resolved.
+	decided, err := s.UpdateTaskAndClearStepClaim(ctx, "t1", current.Revision, func(next *task.Task) error {
+		next.Blocker = ""
+		next.Phase = task.PromptSubmitted
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("UpdateTaskAndClearStepClaim: %v", err)
+	}
+	if decided.Phase != task.PromptSubmitted || decided.Blocker != "" || decided.Revision != current.Revision+1 {
+		t.Fatalf("decided task = %+v, want the mutation stored once", decided)
+	}
+	if took, err := other.ClaimStep(ctx, "t1", task.PromptSubmitted, "owner-b", time.Minute); err != nil || !took {
+		t.Fatalf("ClaimStep for the next step = (%v, %v), want it free", took, err)
+	}
+}

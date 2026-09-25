@@ -1217,25 +1217,47 @@ func (s *Store) ClaimStep(ctx context.Context, taskID string, phase task.Phase, 
 	return true, nil
 }
 
-// ClearStepClaim drops any owner's step claim for one task.
+// UpdateTaskAndClearStepClaim applies a compare-and-swap update to one task and
+// retires its step claim in the same transaction.
 //
-// It exists for exactly one caller: a user who has inspected a task and decided
-// what happened to a step whose outcome was undecided. That inspection is the
-// proof that no live caller is running the step, so the claim may go — and no
-// automatic caller may do this, or a live step could be raced.
-func (s *Store) ClearStepClaim(ctx context.Context, taskID string) error {
-	if strings.TrimSpace(taskID) == "" {
-		return fmt.Errorf("%w: task id is required", ErrInvalid)
+// The single transaction is the point. A step claim is what stops two callers from
+// running the same step, so a decision that resolves the step (a user who inspected
+// it and said what happened) must retire the claim at the same instant it makes the
+// task eligible again: clearing the claim first would leave a decision with no
+// effect, and clearing it after would let a concurrent resume take the step in
+// between and then have its live claim removed underneath it, submitting the brief
+// twice. Either both changes are stored or neither is.
+func (s *Store) UpdateTaskAndClearStepClaim(
+	ctx context.Context,
+	id string,
+	expectedRevision int64,
+	mutate func(*task.Task) error,
+) (task.Task, error) {
+	if mutate == nil {
+		return task.Task{}, fmt.Errorf("%w: nil mutation for task %q", ErrInvalid, id)
 	}
-	res, err := s.db.ExecContext(ctx,
-		`UPDATE tasks SET step_claim_owner = '', step_claim_phase = '', step_claim_until = 0 WHERE id = ?`, taskID)
+	tx, err := s.begin(ctx, "decide task "+id)
 	if err != nil {
-		return fmt.Errorf("clear the step claim of %s: %w", taskID, err)
+		return task.Task{}, err
 	}
-	if err := requireOneRow(res, ErrNotFound, "clear the step claim of "+taskID); err != nil {
-		return err
+	defer tx.rollback()
+
+	next, err := updateTask(ctx, tx, id, expectedRevision, mutate)
+	if err != nil {
+		return task.Task{}, err
 	}
-	return nil
+	res, err := tx.ExecContext(ctx,
+		`UPDATE tasks SET step_claim_owner = '', step_claim_phase = '', step_claim_until = 0 WHERE id = ?`, id)
+	if err != nil {
+		return task.Task{}, fmt.Errorf("clear the step claim of %s: %w", id, err)
+	}
+	if err := requireOneRow(res, ErrNotFound, "clear the step claim of "+id); err != nil {
+		return task.Task{}, err
+	}
+	if err := tx.commit("decide task " + id); err != nil {
+		return task.Task{}, err
+	}
+	return next, nil
 }
 
 // ReleaseStep gives up this owner's step claim, for a step that failed without

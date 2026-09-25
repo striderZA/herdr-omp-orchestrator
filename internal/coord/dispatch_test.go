@@ -3130,7 +3130,7 @@ func TestAdjudicateBriefRefusesChangedOrForeignEvidence(t *testing.T) {
 	f := newCoordFixture(t, fixturePlan{})
 	st := f.ambiguousBrief("one")
 	ctx := context.Background()
-	evidence, _, err := f.coord.BriefInspection(ctx, st.ID)
+	evidence, inspected, err := f.coord.BriefInspection(ctx, st.ID)
 	if err != nil {
 		t.Fatalf("BriefInspection: %v", err)
 	}
@@ -3162,6 +3162,23 @@ func TestAdjudicateBriefRefusesChangedOrForeignEvidence(t *testing.T) {
 		t.Errorf("unknown decision err = %v, want ErrInvalidRequest", err)
 	}
 
+	// The pane now holds a different session: the terminal text is restored to what
+	// was inspected, so the digest matches and only the worker's identity can tell
+	// that the inspected worker is gone. The decision must be refused.
+	f.updatePlan(func(p *fixturePlan) { p.AgentReadText = inspected })
+	f.updatePlan(func(p *fixturePlan) { p.SessionRefValue = "omp-session-replaced" })
+	if _, err := f.coord.AdjudicateBrief(ctx, st.ID, current.Revision, BriefDelivered, evidence); !errors.Is(err, ErrEvidenceChanged) {
+		t.Errorf("replaced session err = %v, want ErrEvidenceChanged", err)
+	}
+	f.updatePlan(func(p *fixturePlan) { p.SessionRefValue = "" })
+
+	// The pane holds a different worker by name: the session still matches, but the
+	// recorded worker is not the one on the pane, so the decision is refused.
+	wrongWorker := f.block(current, func(next *task.Task) { next.AgentName = "orch_someone_else" })
+	if _, err := f.coord.AdjudicateBrief(ctx, st.ID, wrongWorker.Revision, BriefDelivered, evidence); !errors.Is(err, ErrEvidenceChanged) {
+		t.Errorf("wrong worker err = %v, want ErrEvidenceChanged", err)
+	}
+
 	// Nothing was applied by any of those refusals.
 	after, err := f.store.Task(ctx, st.ID)
 	if err != nil {
@@ -3169,6 +3186,47 @@ func TestAdjudicateBriefRefusesChangedOrForeignEvidence(t *testing.T) {
 	}
 	if after.Phase != task.AgentStarted || after.Blocker != st.Blocker {
 		t.Errorf("a refused adjudication changed the task: %+v", after)
+	}
+}
+
+func TestAdjudicationRetiresTheStepClaimItDecidedAbout(t *testing.T) {
+	// The claim can outlive its lease while the user thinks, so a concurrent resume
+	// may hold the step again by the time the decision lands. The decision retires
+	// the claim in the same transaction that clears the blocker, so the brief goes
+	// out once and no claim survives to be raced.
+	f := newCoordFixture(t, fixturePlan{})
+	ctx := context.Background()
+	st := f.ambiguousBrief("one")
+	before := f.countCalls("agent prompt")
+
+	// Another caller holds the step by the time the decision lands (the lease can
+	// outlive the caller that wrote the blocker while the user thinks).
+	f.coord.releaseStep(ctx, st)
+	if took, err := f.store.ClaimStep(ctx, st.ID, task.AgentStarted, "another-caller", time.Minute); err != nil || !took {
+		t.Fatalf("ClaimStep as another caller = (%v, %v), want the claim", took, err)
+	}
+	current, err := f.store.Task(ctx, st.ID)
+	if err != nil {
+		t.Fatalf("Task: %v", err)
+	}
+	evidence, _, err := f.coord.BriefInspection(ctx, st.ID)
+	if err != nil {
+		t.Fatalf("BriefInspection: %v", err)
+	}
+	decided, err := f.coord.AdjudicateBrief(ctx, st.ID, current.Revision, BriefNotDelivered, evidence)
+	if err != nil {
+		t.Fatalf("AdjudicateBrief(not_delivered): %v", err)
+	}
+	if decided.Phase != task.PromptSubmitted {
+		t.Fatalf("phase = %q, want %q", decided.Phase, task.PromptSubmitted)
+	}
+	if got := f.countCalls("agent prompt"); got != before+1 {
+		t.Errorf("agent prompt calls = %d, want %d: the decision's own resume submitted the brief once", got, before+1)
+	}
+	// The decided step's claim is gone, and the phase has moved on, so nothing can
+	// re-run it: the next step is the one that is now claimable.
+	if took, err := f.store.ClaimStep(ctx, st.ID, task.AgentStarted, "probe", time.Minute); err != nil || took {
+		t.Errorf("ClaimStep for the decided step = (%v, %v), want the phase to refuse it", took, err)
 	}
 }
 
