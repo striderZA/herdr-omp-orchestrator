@@ -384,12 +384,17 @@ func Run(ctx context.Context, store *state.Store, client Herdr, projectKey strin
 // still hosts the recorded worker, and focuses that pane. It returns the pane it
 // focused.
 //
-// Everything that can make the recorded pane the wrong pane is a refusal, never
-// a guess: a public ID that resolves to a different pane (the record is stale),
-// a different terminal, a different workspace, a different checkout, a
-// different OMP session, or a session reference this build cannot read. A
-// refusal focuses nothing, so a stale card can never move the user's focus onto
-// somebody else's terminal.
+// A verified worker is one whose recorded checkout, terminal, workspace and OMP
+// session are all present and all still match the live pane: a public ID that
+// resolves to a different pane (the record is stale), a different terminal,
+// workspace or checkout, a pane that reports no working directory, a missing
+// session reference, a different OMP session, or a session reference this build
+// cannot read are all refusals. A task that records none of those facts never
+// reached a worker pane, so it is refused before Herdr is called at all.
+//
+// Nothing is compared approximately and nothing is skipped when it is absent: a
+// refusal focuses nothing, so a stale or under-recorded card can never move the
+// user's focus onto somebody else's terminal.
 func FocusVerified(ctx context.Context, store *state.Store, client Herdr, taskID string) (string, error) {
 	if store == nil || client == nil {
 		return "", fmt.Errorf("the board has no store or Herdr boundary")
@@ -399,8 +404,20 @@ func FocusVerified(ctx context.Context, store *state.Store, client Herdr, taskID
 		return "", fmt.Errorf("the task facts could not be read: %w", err)
 	}
 	paneID := strings.TrimSpace(fact.PublicPaneID)
-	if paneID == "" {
-		return "", fmt.Errorf("the task records no worker pane")
+	checkout := strings.TrimSpace(fact.WorktreePath)
+	terminal := strings.TrimSpace(fact.TerminalID)
+	workspace := recordedWorkspace(fact)
+	session := strings.TrimSpace(fact.OMPSessionID)
+	for _, recorded := range []struct{ field, value string }{
+		{"worker pane", paneID},
+		{"checkout", checkout},
+		{"terminal", terminal},
+		{"workspace", workspace},
+		{"OMP session", session},
+	} {
+		if recorded.value == "" {
+			return "", fmt.Errorf("the task records no %s, so it is not a verified worker", recorded.field)
+		}
 	}
 
 	pane, err := client.PaneGet(ctx, paneID)
@@ -410,16 +427,18 @@ func FocusVerified(ctx context.Context, store *state.Store, client Herdr, taskID
 	if reported := strings.TrimSpace(pane.PaneID); reported != paneID {
 		return "", fmt.Errorf("pane %s now reports itself as pane %s, so the recorded pane is stale", paneID, reported)
 	}
-
-	if recorded := strings.TrimSpace(fact.TerminalID); recorded != "" && strings.TrimSpace(pane.TerminalID) != recorded {
-		return "", fmt.Errorf("pane %s is on terminal %s, not the recorded terminal %s", paneID, pane.TerminalID, recorded)
+	if got := strings.TrimSpace(pane.TerminalID); got != terminal {
+		return "", fmt.Errorf("pane %s is on terminal %s, not the recorded terminal %s", paneID, got, terminal)
 	}
-	if recorded := recordedWorkspace(fact); recorded != "" && strings.TrimSpace(pane.WorkspaceID) != recorded {
-		return "", fmt.Errorf("pane %s is in workspace %s, not the recorded workspace %s", paneID, pane.WorkspaceID, recorded)
+	if got := strings.TrimSpace(pane.WorkspaceID); got != workspace {
+		return "", fmt.Errorf("pane %s is in workspace %s, not the recorded workspace %s", paneID, got, workspace)
 	}
-	if checkout := strings.TrimSpace(fact.WorktreePath); checkout != "" && strings.TrimSpace(pane.Cwd) != "" &&
-		!task.SameSessionReference(task.SessionKindPath, pane.Cwd, checkout) {
-		return "", fmt.Errorf("pane %s works in %s, not the recorded checkout %s", paneID, pane.Cwd, checkout)
+	cwd := strings.TrimSpace(pane.Cwd)
+	if cwd == "" {
+		return "", fmt.Errorf("pane %s reports no working directory, so the recorded checkout %s cannot be proved", paneID, checkout)
+	}
+	if !task.SameSessionReference(task.SessionKindPath, cwd, checkout) {
+		return "", fmt.Errorf("pane %s works in %s, not the recorded checkout %s", paneID, cwd, checkout)
 	}
 
 	agent, err := client.AgentGet(ctx, paneID)
@@ -430,16 +449,17 @@ func FocusVerified(ctx context.Context, store *state.Store, client Herdr, taskID
 		return "", fmt.Errorf("pane %s hosts the agent Herdr reports on pane %s", paneID, reported)
 	}
 
-	if recorded := strings.TrimSpace(fact.OMPSessionID); recorded != "" {
-		kind, value, ok, err := client.AgentSession(ctx, paneID)
-		if err != nil {
-			return "", fmt.Errorf("the OMP session on pane %s could not be read: %w", paneID, err)
-		}
-		// The integration may not have published a reference yet; an absent
-		// reference is not a different session.
-		if ok && !task.SameSessionReference(kind, recorded, value) {
-			return "", fmt.Errorf("pane %s runs %s session %s, not the recorded %s", paneID, kind, value, recorded)
-		}
+	kind, value, ok, err := client.AgentSession(ctx, paneID)
+	if err != nil {
+		return "", fmt.Errorf("the OMP session on pane %s could not be read: %w", paneID, err)
+	}
+	if !ok {
+		// The board never assumes a pane is the recorded worker: an unpublished
+		// session reference is an identity it cannot prove.
+		return "", fmt.Errorf("pane %s reports no OMP session reference, so it cannot be proved to be the recorded worker session %s", paneID, session)
+	}
+	if !task.SameSessionReference(kind, session, value) {
+		return "", fmt.Errorf("pane %s runs %s session %s, not the recorded %s", paneID, kind, value, session)
 	}
 
 	focused, err := client.AgentFocus(ctx, paneID)

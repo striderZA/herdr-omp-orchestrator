@@ -573,20 +573,54 @@ func TestFocusVerifiedPaneIsTheOnlyHerdrWrite(t *testing.T) {
 		}
 	}
 	cases := []struct {
-		name    string
-		broken  func(p *fixturePlan)
-		want    string // substring the refusal must name
-		focused bool
+		name string
+		// broken mutates the live state the stand-in Herdr reports.
+		broken func(p *fixturePlan)
+		// brokenTask mutates the recorded facts before they are stored.
+		brokenTask func(*task.Task)
+		want       string // substring the refusal must name
+		focused    bool
 		// attempted marks a case where Herdr was asked to focus and answered
 		// something the board refused to accept: exactly one focus on the
 		// recorded pane, which is still a refusal to claim success.
 		attempted bool
+		// noHerdr marks a recorded-identity gap: the board must refuse before it
+		// calls Herdr at all.
+		noHerdr bool
 	}{
 		{name: "verified", focused: true},
 		{
 			name:    "verified, with a Herdr that only acknowledges the focus",
 			broken:  breakPane(func(p *fixturePane) { p.FocusResultType = "ok" }),
 			focused: true,
+		},
+		{
+			name:   "a pane that reports no working directory",
+			broken: breakPane(func(p *fixturePane) { p.Cwd = "" }),
+			want:   "working directory",
+		},
+		{
+			name:   "a pane whose Herdr withholds the session reference",
+			broken: breakPane(func(p *fixturePane) { p.NoSession = true }),
+			want:   "session reference",
+		},
+		{
+			name:       "a task that records no checkout",
+			brokenTask: func(x *task.Task) { x.WorktreePath = "" },
+			want:       "checkout",
+			noHerdr:    true,
+		},
+		{
+			name:       "a task that records no OMP session",
+			brokenTask: func(x *task.Task) { x.OMPSessionID = "" },
+			want:       "session",
+			noHerdr:    true,
+		},
+		{
+			name:       "a task that records no terminal",
+			brokenTask: func(x *task.Task) { x.TerminalID = "" },
+			want:       "terminal",
+			noHerdr:    true,
 		},
 		{
 			name:   "a stale public pane id that resolves elsewhere",
@@ -639,7 +673,7 @@ func TestFocusVerifiedPaneIsTheOnlyHerdrWrite(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			worker := sampleTask("orch_w1", nil)
+			worker := sampleTask("orch_w1", tc.brokenTask)
 			f := newBoardFixture(t, fixturePlan{})
 			f.seed(t, worker)
 			if tc.broken != nil {
@@ -679,6 +713,11 @@ func TestFocusVerifiedPaneIsTheOnlyHerdrWrite(t *testing.T) {
 					}
 				case len(focusCalls) != 0:
 					t.Errorf("the board focused through a refusal: %v", focusCalls)
+				}
+				if tc.noHerdr {
+					if calls := f.calls(); len(calls) != 0 {
+						t.Errorf("a recorded identity the board could not prove still called Herdr: %v", calls)
+					}
 				}
 				if tc.want != "" && !strings.Contains(m.notice, tc.want) {
 					t.Errorf("refusal %q does not name %q", m.notice, tc.want)
