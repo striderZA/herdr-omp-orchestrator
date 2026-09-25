@@ -398,6 +398,8 @@ func Run(ctx context.Context, store *state.Store, client Herdr, projectKey strin
 // The session comparison goes through the handshake rather than through
 // SameSessionReference: the record holds whichever native identity Herdr
 // reported (an id or the session file), and only the announcement carries both.
+// The handshake is read once (Store.VerifiedAnnouncement), so the announcement
+// and the confirmation that judged it always come from the same row.
 //
 // Nothing is compared approximately and nothing is skipped when it is absent: a
 // refusal focuses nothing, so a stale or under-recorded card can never move the
@@ -433,22 +435,20 @@ func FocusVerified(ctx context.Context, store *state.Store, client Herdr, taskID
 	// recorded value with Herdr's reference directly: OMP exposes two native
 	// identities for one session (an id and the session file), and a record keeps
 	// whichever one Herdr reported when the handshake was confirmed. Only the
-	// confirmed handshake carries both, so only it can bridge them. A handshake
-	// that was never confirmed (or never announced) proves nothing, so the board
+	// confirmed handshake carries both, so only it can bridge them.
+	//
+	// The handshake is read once, as one row: pairing an announcement from one
+	// read with a confirmation from another would let a refresh that kept the
+	// confirmed form (a new id for the same session file) be judged against the
+	// stale identity. A row that is absent, never confirmed, or whose confirmation
+	// no longer describes its own announcement proves nothing, so the board
 	// refuses before it reads anything from Herdr.
-	announced, known, err := store.AnnouncedSession(ctx, launchPaneID)
+	announced, verified, err := store.VerifiedAnnouncement(ctx, launchPaneID)
 	if err != nil {
-		return "", fmt.Errorf("the OMP session handshake recorded for the task's launch pane %s could not be read: %w", launchPaneID, err)
+		return "", fmt.Errorf("the verified OMP session handshake for the task's launch pane %s could not be read: %w", launchPaneID, err)
 	}
-	if !known {
-		return "", fmt.Errorf("the task's launch pane %s has no recorded OMP session handshake, so the pane cannot be proved to be the recorded worker", launchPaneID)
-	}
-	ready, err := store.Ready(ctx, launchPaneID, announced)
-	if err != nil {
-		return "", fmt.Errorf("the OMP session handshake recorded for the task's launch pane %s could not be read: %w", launchPaneID, err)
-	}
-	if !ready {
-		return "", fmt.Errorf("the OMP session handshake recorded for the task's launch pane %s was never confirmed, so the pane cannot be proved to be the recorded worker", launchPaneID)
+	if !verified {
+		return "", fmt.Errorf("the task's launch pane %s has no verified OMP session handshake, so the pane cannot be proved to be the recorded worker", launchPaneID)
 	}
 
 	pane, err := client.PaneGet(ctx, paneID)

@@ -234,6 +234,10 @@ const (
 	handshakeConfirmed = ""
 	handshakeAnnounced = "announced"
 	handshakeNone      = "none"
+	// handshakeRestarted confirms the announced id and then re-announces the same
+	// session file under a new id: the row's confirmation no longer describes its
+	// own announcement.
+	handshakeRestarted = "restarted"
 )
 
 // newBoardFixture wires a real store and a stand-in Herdr CLI. The project key
@@ -316,6 +320,22 @@ func (f *boardFixture) seed(t *testing.T, tasks ...task.Task) {
 		case handshakeAnnounced:
 			if err := f.store.RecordReady(ctx, tsk.LaunchPaneID, announced, 1); err != nil {
 				t.Fatalf("record the announced handshake: %v", err)
+			}
+		case handshakeRestarted:
+			// Confirmed by the id, then re-announced under a new id for the same
+			// session file: the confirmation is left behind by the earlier
+			// announcement.
+			if err := f.store.RecordReady(ctx, tsk.LaunchPaneID, announced, 1); err != nil {
+				t.Fatalf("record the announced handshake: %v", err)
+			}
+			if err := f.store.ConfirmReady(ctx, tsk.LaunchPaneID,
+				task.SessionRef{Kind: task.SessionKindID, Value: announced.ID}); err != nil {
+				t.Fatalf("confirm the handshake by id: %v", err)
+			}
+			restarted := announced
+			restarted.ID = announced.ID + "-restarted"
+			if err := f.store.RecordReady(ctx, tsk.LaunchPaneID, restarted, 1); err != nil {
+				t.Fatalf("re-announce the handshake: %v", err)
 			}
 		default:
 			if err := f.store.RecordReady(ctx, tsk.LaunchPaneID, announced, 1); err != nil {
@@ -685,13 +705,22 @@ func TestFocusVerifiedPaneIsTheOnlyHerdrWrite(t *testing.T) {
 		{
 			name:      "an announced handshake that was never confirmed",
 			handshake: handshakeAnnounced,
-			want:      "handshake",
+			want:      "verified OMP session handshake",
 			noHerdr:   true,
 		},
 		{
 			name:      "no recorded handshake for the task's launch pane",
 			handshake: handshakeNone,
-			want:      "handshake",
+			want:      "verified OMP session handshake",
+			noHerdr:   true,
+		},
+		{
+			// The row was confirmed by an id and then re-announced under a new id
+			// for the same session file, so the confirmation no longer describes
+			// the row it is attached to.
+			name:      "a confirmation left behind by an earlier announcement",
+			handshake: handshakeRestarted,
+			want:      "verified OMP session handshake",
 			noHerdr:   true,
 		},
 		{
