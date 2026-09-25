@@ -2848,6 +2848,19 @@ func TestDialogApprovalAttemptIsTiedToTheApprovedDigest(t *testing.T) {
 		t.Fatalf("the repeat sent the keys again (%d send-keys calls)", got)
 	}
 
+	// The screen has moved on, but the caller still approves the *original* dialog: the
+	// read that would authorise a send does not match what was approved, so nothing is
+	// sent - and the pending attempt is left for the user rather than cleared by a
+	// refusal that proves nothing about it.
+	stub.queueReads(stubRead{Text: movedOn})
+	wantError(t, approve(first.Digest, `["1"]`), "dialog_changed")
+	if got := len(stub.script().SentKeys); got != 1 {
+		t.Fatalf("an approval for a dialog that is not on screen sent keys (%d send-keys calls)", got)
+	}
+	if got := f.task(t, "t1").Blocker; got == "" {
+		t.Error("a refusal that proves nothing about the attempt cleared it")
+	}
+
 	// The dialog moved on, which is what the keys did: the attempt is settled, and a
 	// fresh approval for the dialog that is on screen now goes through.
 	var next coord.DialogPreview
@@ -2858,7 +2871,7 @@ func TestDialogApprovalAttemptIsTiedToTheApprovedDigest(t *testing.T) {
 	}
 	// The stand-in stops refusing, so the fresh approval is the one that lands.
 	stub.update(func(script *stubScript) { script.SendKeysError = "" })
-	stub.queueReads(stubRead{Text: movedOn}, stubRead{Text: movedOn})
+	stub.queueReads(stubRead{Text: movedOn})
 	if resp := approve(next.Digest, `["2"]`); !resp.OK {
 		t.Fatalf("the fresh approval failed: %+v", resp.Error)
 	}
@@ -2877,6 +2890,53 @@ func TestDialogApprovalAttemptIsTiedToTheApprovedDigest(t *testing.T) {
 	}
 	if got := f.task(t, "t1").Blocker; got != "" {
 		t.Errorf("a changed dialog recorded an attempt: %q", got)
+	}
+}
+
+// TestDialogApprovalSettlesAnAttemptWhenTheWorkerIsUnblocked pins the one piece of
+// evidence a key attempt has of its own: once the worker is no longer blocked, the dialog
+// those keys were approved for is gone, which is what a consumed approval looks like. The
+// attempt is settled there, so it cannot block every later approval for a worker that has
+// moved on - while the call itself still refuses, because there is no dialog to approve.
+func TestDialogApprovalSettlesAnAttemptWhenTheWorkerIsUnblocked(t *testing.T) {
+	f := newBridgeFixture(t)
+	f.seedPrimary()
+	f.seedWorker("t1", workerPane, workerPane, workerSession)
+	f.asWorker()
+	f.asPrimary()
+
+	screen := "Choose an option:\r\n  1. Allow once\r\n  2. Deny\r\n"
+	blocked := workerAgent(workerPane, workerSession, f.worktree)
+	blocked.AgentStatus = "blocked"
+	stub := f.useHerdrStub(stubScript{
+		RepoRoot:      f.repoRoot,
+		Agents:        map[string]stubAgent{workerPane: blocked},
+		SendKeysError: "timeout",
+	})
+	ops := CoordinatorOps(f.coordinator(t))
+	approve := func(digest, keys string) bridgeResponse {
+		return f.callWith("approve_dialog", primarySession,
+			fmt.Sprintf(`{"taskId":"t1","observedDigest":%q,"keys":%s}`, digest, keys), ops)
+	}
+
+	var preview coord.DialogPreview
+	stub.queueReads(stubRead{Text: screen})
+	f.callWith("dialog_preview", primarySession, `{"taskId":"t1"}`, ops).decodeResult(t, &preview)
+	stub.queueReads(stubRead{Text: screen})
+	wantError(t, approve(preview.Digest, `["1"]`), "herdr_unavailable")
+	if got := f.task(t, "t1").Blocker; got == "" {
+		t.Fatal("the ambiguous approval left no attempt recorded")
+	}
+
+	// The worker leaves the dialog: the keys landed (or the dialog was dismissed), which
+	// settles the attempt, and the approval itself is still refused.
+	stub.setAgent(workerPane, workerAgent(workerPane, workerSession, f.worktree))
+	wantError(t, approve(preview.Digest, `["1"]`), "not_blocked")
+	if got := f.task(t, "t1").Blocker; got != "" {
+		t.Errorf("the attempt survived a worker that is no longer blocked: %q", got)
+	}
+	if got := len(stub.script().SentKeys); got != 1 {
+		t.Errorf("a refused approval sent keys (%d send-keys calls)", got)
 	}
 }
 

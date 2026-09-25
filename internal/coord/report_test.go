@@ -887,6 +887,52 @@ func TestInputAttemptMarkerNamesTheChannelAndNeverTheText(t *testing.T) {
 	}
 }
 
+// TestBlockerRulesNeverEraseAnAttemptTheyDidNotSettle pins the two rules that make
+// recording and clearing an attempt safe under concurrent calls: a recorded attempt only
+// gives way to the exact attempt a caller proved settled, and only the exact attempt the
+// user decided about is ever cleared.
+func TestBlockerRulesNeverEraseAnAttemptTheyDidNotSettle(t *testing.T) {
+	at := time.UnixMilli(1_700_000_000_123)
+	mine := newAnswerAttempt("keep the old API", at)
+	theirs := newAnswerAttempt("change the API", at)
+	foreign := "task orch_x could not start the worker: the pane is gone"
+
+	cases := []struct {
+		name    string
+		blocker string
+		settled *inputAttempt
+		want    error
+	}{
+		{"an empty record accepts a new attempt", "", nil, nil},
+		{"an attempt nobody settled is never replaced", mine.String(), nil, ErrInputPending},
+		{"another attempt is never replaced", mine.String(), &theirs, ErrInputPending},
+		{"the attempt that was proved settled is replaced", mine.String(), &mine, nil},
+		{"a blocker this coordinator did not write is never sent over", foreign, &mine, ErrBlocked},
+	}
+	for _, tc := range cases {
+		if got := occupiedBlocker(task.Task{Blocker: tc.blocker}, tc.settled); !errors.Is(got, tc.want) {
+			t.Errorf("%s: occupiedBlocker = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+
+	// The same discipline for clearing: only the attempt the user decided about.
+	if err := settleableBlocker(task.Task{Blocker: mine.String()}, mine); err != nil {
+		t.Errorf("settling the recorded attempt = %v, want nil", err)
+	}
+	for name, tc := range map[string]struct {
+		blocker string
+		decided inputAttempt
+	}{
+		"nothing recorded":    {"", mine},
+		"a different attempt": {theirs.String(), mine},
+		"a foreign blocker":   {foreign, mine},
+	} {
+		if err := settleableBlocker(task.Task{Blocker: tc.blocker}, tc.decided); !errors.Is(err, ErrInputPending) {
+			t.Errorf("%s: settleableBlocker = %v, want ErrInputPending", name, err)
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // dialog digests
 // ---------------------------------------------------------------------------

@@ -615,12 +615,11 @@ func (c *Coordinator) Answer(ctx context.Context, primaryLaunchPaneID, taskID, t
 	// The attempt is recorded before anything is typed: from here on the answer may
 	// have reached the worker, and nothing else may be sent to it until that is known.
 	attempt := newAnswerAttempt(answer, time.Now())
-	use, err := c.beginInputAttempt(ctx, st, attempt, func(inputAttempt) (bool, error) {
-		// Nothing the worker's own state says settles an answer: it could have received
-		// the answer, finished the turn and be idle again by now, so a resend would
-		// duplicate it. Only the user, looking at the pane, can settle this.
-		return false, nil
-	})
+	// Nothing the worker's own state says settles an answer: it could have received the
+	// answer, finished the turn and be idle again by now, so a resend would duplicate it.
+	// Only the user, looking at the pane, settles this one — so no recorded attempt is
+	// ever replaceable here.
+	use, err := c.beginInputAttempt(ctx, st, attempt, nil)
 	if err != nil {
 		return AnswerResult{}, err
 	}
@@ -727,36 +726,47 @@ func (c *Coordinator) ApproveDialog(ctx context.Context, primaryLaunchPaneID, ta
 	if err != nil {
 		return ApproveDialogResult{}, err
 	}
+	attempt := newDialogAttempt(digest, approved, time.Now())
 	if !isBlocked(view) {
+		// The dialog an earlier attempt was approved for is gone: that is the one piece of
+		// evidence which settles a key attempt on its own, and it is exactly the state a
+		// worker that consumed the keys is left in. Nothing is approved here — the caller
+		// is told there is no dialog to approve.
+		if recorded, pending := parseInputAttempt(st.Blocker); pending && recorded.channel == channelDialog {
+			if _, err := c.settleInputAttempt(ctx, st, recorded); err != nil {
+				return ApproveDialogResult{}, err
+			}
+		}
 		return ApproveDialogResult{}, fmt.Errorf("%w: the worker on pane %q is %s, not blocked on a dialog", ErrNotBlocked, pane, agentStatus(view))
 	}
-	// The dialog on screen has to be the one the user approved before anything is
-	// recorded or sent: a refused approval leaves no trace at all.
+
+	// One read decides both things: whether the dialog on screen is still the one the user
+	// approved, and whether an earlier attempt has visibly moved on. A read that shows
+	// neither is refused, so those keys are never sent to a screen the user did not
+	// approve.
 	dialog, err := c.visibleDialog(ctx, pane)
 	if err != nil {
 		return ApproveDialogResult{}, err
 	}
-	if got := digestDialog(dialog); got != digest {
-		return ApproveDialogResult{}, fmt.Errorf("%w: pane %q now shows a dialog hashing to %s, not the approved %s; nothing was sent", ErrDialogChanged, pane, got, digest)
+	seen := digestDialog(dialog)
+	if seen != digest {
+		return ApproveDialogResult{}, fmt.Errorf("%w: pane %q now shows a dialog hashing to %s, not the approved %s; nothing was sent", ErrDialogChanged, pane, seen, digest)
+	}
+	var settled *inputAttempt
+	if recorded, pending := parseInputAttempt(st.Blocker); pending && recorded.channel == channelDialog {
+		if recorded.identity == seen {
+			// This very dialog may already hold those keys: only the user can say.
+			return ApproveDialogResult{}, inputPendingError(recorded)
+		}
+		// The attempt was approved for a dialog that has since moved on, which is what the
+		// keys would have done: it is settled by recording this new attempt.
+		settled = &recorded
 	}
 
-	// Only now is the attempt recorded, tied to the exact dialog the user approved:
-	// from here on those keys may be in that dialog, and nothing else may be sent until
-	// that is known. An earlier attempt is settled first when its own dialog has
-	// visibly moved on, which is why this reads the screen once more.
-	attempt := newDialogAttempt(digest, approved, time.Now())
-	use, err := c.beginInputAttempt(ctx, st, attempt, func(recorded inputAttempt) (bool, error) {
-		if !isBlocked(view) {
-			// The dialog this attempt was approved for is gone, so the keys landed.
-			return true, nil
-		}
-		current, readErr := c.visibleDialog(ctx, pane)
-		if readErr != nil {
-			// Nothing is proven either way, so the attempt stays pending.
-			return false, nil
-		}
-		return digestDialog(current) != recorded.identity, nil
-	})
+	// Only now is the attempt recorded, tied to the exact dialog the user approved and to
+	// the screen that was just verified: from here on those keys may be in that dialog, and
+	// nothing else may be sent until that is known.
+	use, err := c.beginInputAttempt(ctx, st, attempt, settled)
 	if err != nil {
 		return ApproveDialogResult{}, err
 	}
@@ -829,6 +839,9 @@ func (c *Coordinator) SettleInput(ctx context.Context, primaryLaunchPaneID, task
 		return SettleInputResult{}, fmt.Errorf("%w: task %s records no input attempt to settle", ErrInvalidRequest, st.ID)
 	}
 	settled, err := c.record(ctx, st, func(next *task.Task) error {
+		if err := settleableBlocker(*next, recorded); err != nil {
+			return err
+		}
 		next.Blocker = ""
 		if choice == decisionDelivered && isQuestionAttention(next.Attention) {
 			next.Attention = ""
@@ -1509,27 +1522,50 @@ func (c *Coordinator) beginInputAttempt(
 	ctx context.Context,
 	st task.Task,
 	attempt inputAttempt,
-	settled func(recorded inputAttempt) (bool, error),
+	settled *inputAttempt,
 ) (task.Task, error) {
-	recorded, pending := parseInputAttempt(st.Blocker)
-	if blocker := strings.TrimSpace(st.Blocker); blocker != "" && !pending {
-		// A blocker this coordinator did not write is a human's to resolve; input is
-		// never sent over it.
-		return st, fmt.Errorf("%w: the task records a blocker that must be resolved before input is sent: %s", ErrBlocked, firstLine(blocker))
-	}
-	if pending {
-		proven, err := settled(recorded)
-		if err != nil {
-			return st, err
-		}
-		if !proven {
-			return st, inputPendingError(recorded)
-		}
+	if err := occupiedBlocker(st, settled); err != nil {
+		return st, err
 	}
 	return c.record(ctx, st, func(next *task.Task) error {
+		// Re-checked against the revision this write lands on: two callers that both saw
+		// an empty blocker must not both write, or the second would erase an attempt whose
+		// write may already have reached the pane.
+		if err := occupiedBlocker(*next, settled); err != nil {
+			return err
+		}
 		next.Blocker = attempt.String()
 		return nil
 	}, "record the input attempt before sending")
+}
+
+// occupiedBlocker reports why an input attempt may not be recorded on this task: a
+// blocker this coordinator did not write is a human's to resolve, and a recorded attempt
+// only ever gives way to the one attempt a caller proved settled.
+func occupiedBlocker(st task.Task, settled *inputAttempt) error {
+	blocker := strings.TrimSpace(st.Blocker)
+	if blocker == "" {
+		return nil
+	}
+	recorded, pending := parseInputAttempt(blocker)
+	if !pending {
+		return fmt.Errorf("%w: the task records a blocker that must be resolved before input is sent: %s", ErrBlocked, firstLine(blocker))
+	}
+	if settled == nil || !recorded.sameAs(*settled) {
+		return inputPendingError(recorded)
+	}
+	return nil
+}
+
+// settleableBlocker reports why the attempt a user decided about may not be cleared:
+// the latest record has to still hold that exact attempt, because a different one means
+// something else is uncertain now and clearing it would silently permit a send.
+func settleableBlocker(st task.Task, decided inputAttempt) error {
+	current, pending := parseInputAttempt(st.Blocker)
+	if !pending || !current.sameAs(decided) {
+		return fmt.Errorf("%w: the attempt the user settled is no longer the recorded one; inspect the worker again", ErrInputPending)
+	}
+	return nil
 }
 
 // settleInputAttempt clears the recorded attempt once its outcome is known. It clears
