@@ -63,6 +63,10 @@ type fixturePlan struct {
 	// RestartBeforeReady makes Herdr report a different native session once the
 	// store already binds the pane, i.e. the agent was restarted.
 	RestartBeforeReady bool `json:"restart_before_ready"`
+	// AdoptBeforeRecord makes the stand-in extension adopt the announced session
+	// through the bridge (as a real fresh session does) before the coordinator
+	// could record it from `agent get`.
+	AdoptBeforeRecord bool `json:"adopt_before_record"`
 	// PromptAmbiguous makes `agent prompt` report Herdr's own timeout code after
 	// recording the submission, the way a real CLI timeout does.
 	PromptAmbiguous bool `json:"prompt_ambiguous"`
@@ -231,6 +235,9 @@ func fixtureAgentGet(dir string, plan fixturePlan, state *fixtureState, argv []s
 	if plan.SuppressSession {
 		session = ""
 	}
+	if plan.AdoptBeforeRecord {
+		adoptFixtureSession(pane, agent.Session)
+	}
 	if plan.RestartBeforeReady && fixtureBound(stateDirOf(), pane, agent.Session, session) {
 		// Herdr restarted the process in this pane: the same pane now reports a
 		// different native session.
@@ -324,6 +331,32 @@ func fixtureBound(storeDir, pane, session, reported string) bool {
 		return binding.Project.LaunchPaneID == pane
 	}
 	return binding.Task.LaunchPaneID == pane
+}
+
+// adoptFixtureSession stands in for the bridge adopting an announced session for
+// the task already keyed to this pane: the extension resolves before the
+// coordinator could have recorded the session it reads from `agent get`.
+func adoptFixtureSession(pane, session string) {
+	storeDir := stateDirOf()
+	if storeDir == "" || session == "" {
+		return
+	}
+	store, err := state.Open(storeDir)
+	if err != nil {
+		return
+	}
+	defer func() { _ = store.Close() }()
+	ctx := context.Background()
+	taskOnPane, err := store.ByLaunchPane(ctx, pane)
+	if err != nil || strings.TrimSpace(taskOnPane.OMPSessionID) != "" {
+		return
+	}
+	if _, err := store.UpdateTask(ctx, taskOnPane.ID, taskOnPane.Revision, func(next *task.Task) error {
+		next.OMPSessionID = session
+		return nil
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "fixture: adopt: %v\n", err)
+	}
 }
 
 // recordFixtureReady stands in for the extension's `ready` call.
@@ -721,7 +754,6 @@ func newCoordFixture(t *testing.T, plan fixturePlan) *coordFixture {
 		CallTimeout:      5 * time.Second,
 		ReadinessTimeout: 2 * time.Second,
 		PollInterval:     10 * time.Millisecond,
-		StateDir:         stateDir,
 	})
 	if err != nil {
 		t.Fatalf("coord.New: %v", err)
@@ -1564,6 +1596,29 @@ func TestDispatchRecordsTheBriefAsOneArgvElement(t *testing.T) {
 		}
 	}
 	t.Fatal("no agent prompt call was made")
+}
+
+func TestDispatchToleratesTheBridgeAdoptingTheSessionFirst(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{AdoptBeforeRecord: true})
+	st, err := f.dispatch("one", "brief one", []string{"go test ./... ok"}, nil, nil, f.base)
+	if err != nil {
+		t.Fatalf("dispatch with the bridge adopting the session first: %v", err)
+	}
+	if st.Phase != task.PromptSubmitted {
+		t.Fatalf("phase = %q, want %q (blocker=%q)", st.Phase, task.PromptSubmitted, st.Blocker)
+	}
+	if st.OMPSessionID == "" {
+		t.Fatal("the adopted session was not recorded on the task")
+	}
+	if st.Blocker != "" || st.Attention != "" {
+		t.Errorf("an adoption race was reported as a problem: blocker=%q attention=%q", st.Blocker, st.Attention)
+	}
+	if f.countCalls("agent start") != 1 {
+		t.Errorf("agent start calls = %d, want 1", f.countCalls("agent start"))
+	}
+	if got := f.prompts(st.PublicPaneID); len(got) != 1 {
+		t.Errorf("prompts = %v, want one brief after readiness was confirmed", got)
+	}
 }
 
 func TestRetryReconcilesAnAmbiguousWorktreeCreate(t *testing.T) {

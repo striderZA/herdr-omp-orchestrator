@@ -167,6 +167,23 @@ func (s *Store) ByLaunchPane(ctx context.Context, launchPaneID string) (task.Tas
 		"task on launch pane "+launchPaneID)
 }
 
+// Tasks reads every task of one project, oldest first and then by id so a caller
+// always sees the same order. It is a read-only projection: the coordinator uses
+// it for the concurrency budget, dependency waiting and reserved-path ownership,
+// and the board uses it for its columns.
+func (s *Store) Tasks(ctx context.Context, projectKey string) ([]task.Task, error) {
+	if strings.TrimSpace(projectKey) == "" {
+		return nil, fmt.Errorf("%w: project key is required", ErrInvalid)
+	}
+	tasks, err := queryFacts[task.Task](ctx, s.db,
+		`SELECT data FROM tasks WHERE project_key = ?
+		 ORDER BY json_extract(data, '$.CreatedAt'), id`, projectKey)
+	if err != nil {
+		return nil, fmt.Errorf("read the tasks of %q: %w", projectKey, err)
+	}
+	return tasks, nil
+}
+
 // UpdateTask applies mutate to the current facts and stores them as one revision
 // later, but only while the stored revision still matches expectedRevision.
 func (s *Store) UpdateTask(ctx context.Context, id string, expectedRevision int64, mutate func(*task.Task) error) (task.Task, error) {
@@ -389,6 +406,30 @@ func (s *Store) Project(ctx context.Context, key string) (task.Project, error) {
 	var p task.Project
 	if err := json.Unmarshal(data, &p); err != nil {
 		return task.Project{}, fmt.Errorf("decode project %q: %w", key, err)
+	}
+	return p, nil
+}
+
+// ProjectByLaunchPane reads the primary project that owns a launch-time pane
+// ID. A viewer of the pane (the bridge, after a restart) identifies the primary
+// by the pane Herdr gave its process, so this lookup is the counterpart of
+// ByLaunchPane for workers.
+func (s *Store) ProjectByLaunchPane(ctx context.Context, launchPaneID string) (task.Project, error) {
+	if strings.TrimSpace(launchPaneID) == "" {
+		return task.Project{}, fmt.Errorf("%w: launch pane is required", ErrInvalid)
+	}
+	var data []byte
+	err := s.db.QueryRowContext(ctx,
+		`SELECT data FROM projects WHERE json_extract(data, '$.LaunchPaneID') = ? LIMIT 1`, launchPaneID).Scan(&data)
+	if errors.Is(err, sql.ErrNoRows) {
+		return task.Project{}, fmt.Errorf("%w: project on launch pane %q", ErrNotFound, launchPaneID)
+	}
+	if err != nil {
+		return task.Project{}, fmt.Errorf("read the project on launch pane %q: %w", launchPaneID, err)
+	}
+	var p task.Project
+	if err := json.Unmarshal(data, &p); err != nil {
+		return task.Project{}, fmt.Errorf("decode the project on launch pane %q: %w", launchPaneID, err)
 	}
 	return p, nil
 }

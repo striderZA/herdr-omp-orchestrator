@@ -4,12 +4,9 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -18,12 +15,6 @@ import (
 	"herdr-omp-orchestrator/internal/state"
 	"herdr-omp-orchestrator/internal/task"
 )
-
-// stateDBName mirrors the database file internal/state.Open creates. The
-// coordinator only ever reads it (internal/state is the only writer of
-// orchestrator facts), and TestProjectTasksReadsTheStateDatabase fails loudly
-// if that file name ever changes.
-const stateDBName = "orchestrator.sqlite"
 
 // DispatchParams is the orch_dispatch request body the OMP extension sends.
 type DispatchParams struct {
@@ -649,29 +640,36 @@ func (c *Coordinator) startWorker(ctx context.Context, st task.Task) (task.Task,
 func (c *Coordinator) recordAgentStart(ctx context.Context, st task.Task, paneID string) (task.Task, error) {
 	workspaces := nonEmpty(st.WorktreeWorkspaceID, st.CurrentWorkspaceID)
 	use := st
-	if _, err := c.awaitAgentReady(ctx, paneID, st.WorktreePath, workspaces, st.OMPSessionID, func(view agentView) error {
-		next, err := c.record(ctx, use, func(record *task.Task) error {
+	write := func(view agentView) error {
+		apply := func(record *task.Task) error {
 			record.AgentName = c.opts.AgentName
 			record.OMPSessionID = view.SessionID
 			record.TerminalID = view.Agent.TerminalID
 			record.CurrentWorkspaceID = view.Agent.WorkspaceID
 			record.Phase = task.AgentStarted
 			return nil
-		}, "record the started agent")
+		}
+		next, err := c.record(ctx, use, apply, "record the started agent")
+		if err == nil {
+			use = next
+			return nil
+		}
+		// Another coordinator call — the bridge adopting the announced session
+		// for this pane — may have recorded it first. The same session on the
+		// same binding is the same fact, so re-apply on the stored revision
+		// instead of reporting a conflict a human cannot act on.
+		current, readErr := c.store.Task(ctx, use.ID)
+		if readErr != nil || (current.OMPSessionID != "" && current.OMPSessionID != view.SessionID) {
+			return err
+		}
+		next, err = c.record(ctx, current, apply, "record the started agent")
 		if err != nil {
-			// Another coordinator call (for example the bridge adopting the
-			// announced session for this pane) may have recorded it first. That
-			// is the same fact, not a failure.
-			current, readErr := c.store.Task(ctx, use.ID)
-			if readErr == nil && current.OMPSessionID == view.SessionID {
-				use = current
-				return nil
-			}
 			return err
 		}
 		use = next
 		return nil
-	}); err != nil {
+	}
+	if _, err := c.awaitAgentReady(ctx, paneID, st.WorktreePath, workspaces, st.OMPSessionID, write); err != nil {
 		return c.failTask(ctx, use, isTerminal(err),
 			fmt.Errorf("task %s: pane %s: %w", st.ID, paneID, err))
 	}
@@ -828,42 +826,16 @@ func (c *Coordinator) project(ctx context.Context, key string) (task.Project, er
 	return project, nil
 }
 
-// projectTasks reads every task of one project.
+// projectTasks reads every task of one project through the store.
 //
-// The read is deliberately read-only and takes no part in writing facts:
-// internal/state owns the database and is its only writer. The coordinator
-// needs the project-wide view to enforce the concurrency budget, to wait for
-// dependencies and to keep two workers from reserving the same paths.
+// The coordinator needs the project-wide view to enforce the concurrency budget,
+// to wait for dependencies and to keep two workers from reserving the same
+// paths; the store owns the schema, so the listing is a store read like any
+// other (and it is read-only: internal/state is the only writer of facts).
 func (c *Coordinator) projectTasks(ctx context.Context, projectKey string) ([]task.Task, error) {
-	path := filepath.Join(c.opts.StateDir, stateDBName)
-	if _, err := os.Stat(path); err != nil {
-		return nil, fmt.Errorf("read the tasks of %q: %w", projectKey, err)
-	}
-	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path)+"?_pragma=busy_timeout(5000)")
+	tasks, err := c.store.Tasks(ctx, projectKey)
 	if err != nil {
 		return nil, fmt.Errorf("read the tasks of %q: %w", projectKey, err)
 	}
-	defer func() { _ = db.Close() }()
-
-	rows, err := db.QueryContext(ctx, `SELECT data FROM tasks WHERE project_key = ? ORDER BY id`, projectKey)
-	if err != nil {
-		return nil, fmt.Errorf("read the tasks of %q: %w", projectKey, err)
-	}
-	defer func() { _ = rows.Close() }()
-	var out []task.Task
-	for rows.Next() {
-		var data []byte
-		if err := rows.Scan(&data); err != nil {
-			return nil, fmt.Errorf("read the tasks of %q: %w", projectKey, err)
-		}
-		var st task.Task
-		if err := json.Unmarshal(data, &st); err != nil {
-			return nil, fmt.Errorf("decode a task of %q: %w", projectKey, err)
-		}
-		out = append(out, st)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("read the tasks of %q: %w", projectKey, err)
-	}
-	return out, nil
+	return tasks, nil
 }

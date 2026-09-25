@@ -122,8 +122,6 @@ type Options struct {
 	Git string
 	// AgentName is the Herdr agent name to start. It defaults to "omp".
 	AgentName string
-	// StateDir is the plugin state directory holding the orchestrator database.
-	StateDir string
 }
 
 // Coordinator is the only writer of dispatch facts. It owns no private state:
@@ -143,9 +141,6 @@ func New(store *state.Store, client *herdr.Client, opts Options) (*Coordinator, 
 	}
 	if client == nil {
 		return nil, fmt.Errorf("%w: no Herdr client", ErrInvalidRequest)
-	}
-	if strings.TrimSpace(opts.StateDir) == "" {
-		return nil, fmt.Errorf("%w: the plugin state directory is required", ErrInvalidRequest)
 	}
 	if opts.Concurrency <= 0 {
 		opts.Concurrency = DefaultConcurrency

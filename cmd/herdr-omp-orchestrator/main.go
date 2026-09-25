@@ -166,7 +166,7 @@ func openCoordinator(env map[string]string) (*coord.Coordinator, func(), error) 
 	if err != nil {
 		return nil, func() {}, fmt.Errorf("open the orchestrator state: %w", err)
 	}
-	coordinator, err := coord.New(store, client, coord.Options{StateDir: stateDir})
+	coordinator, err := coord.New(store, client, coord.Options{})
 	if err != nil {
 		_ = store.Close()
 		return nil, func() {}, err

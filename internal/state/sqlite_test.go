@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"sync"
 	"testing"
+	"time"
 
 	_ "modernc.org/sqlite"
 
@@ -467,6 +468,101 @@ func TestStoreProjectRoundTrips(t *testing.T) {
 	}
 	if after.Key != "repo-a" {
 		t.Errorf("project key changed to %q", after.Key)
+	}
+}
+
+func TestStoreTasksListsOneProjectInStableOrder(t *testing.T) {
+	ctx := context.Background()
+	s := open(t, t.TempDir())
+
+	// Creation order dominates the id: t-z is created last but its id sorts
+	// first, and the distinct creation times make the expectation exact.
+	// The panes stay unbound: the launch-pane index admits one task per pane,
+	// which this listing test does not exercise.
+	seed := func(id string) task.Task {
+		st := seedTask(id)
+		st.LaunchPaneID = ""
+		return st
+	}
+	for _, id := range []string{"t-a", "t-b"} {
+		if err := s.CreateTask(ctx, seed(id)); err != nil {
+			t.Fatalf("CreateTask(%s): %v", id, err)
+		}
+		time.Sleep(3 * time.Millisecond)
+	}
+	other := seed("t-other")
+	other.ProjectKey = "repo-b"
+	if err := s.CreateTask(ctx, other); err != nil {
+		t.Fatalf("CreateTask(t-other): %v", err)
+	}
+	if err := s.CreateTask(ctx, seed("t-z")); err != nil {
+		t.Fatalf("CreateTask(t-z): %v", err)
+	}
+
+	tasks, err := s.Tasks(ctx, "repo-a")
+	if err != nil {
+		t.Fatalf("Tasks: %v", err)
+	}
+	var ids []string
+	for _, st := range tasks {
+		ids = append(ids, st.ID)
+		if st.ProjectKey != "repo-a" {
+			t.Errorf("Tasks returned a task of %q", st.ProjectKey)
+		}
+	}
+	if want := []string{"t-a", "t-b", "t-z"}; !reflect.DeepEqual(ids, want) {
+		t.Fatalf("Tasks order = %v, want %v", ids, want)
+	}
+	// Whatever the clock gave the tasks, the listing is sorted by creation time
+	// and then by id, so repeated reads cannot reorder the same facts.
+	for i := 1; i < len(tasks); i++ {
+		previous, current := tasks[i-1], tasks[i]
+		if previous.CreatedAt > current.CreatedAt {
+			t.Errorf("task %s (created %d) sorts before %s (created %d)",
+				previous.ID, previous.CreatedAt, current.ID, current.CreatedAt)
+		}
+		if previous.CreatedAt == current.CreatedAt && previous.ID > current.ID {
+			t.Errorf("same-millisecond tasks are not id-ordered: %s before %s", previous.ID, current.ID)
+		}
+	}
+
+	projectB, err := s.Tasks(ctx, "repo-b")
+	if err != nil {
+		t.Fatalf("Tasks(repo-b): %v", err)
+	}
+	if len(projectB) != 1 || projectB[0].ID != "t-other" {
+		t.Errorf("Tasks(repo-b) = %+v, want only t-other", projectB)
+	}
+	if _, err := s.Tasks(ctx, "  "); !errors.Is(err, state.ErrInvalid) {
+		t.Errorf("Tasks(\"\") err = %v, want ErrInvalid", err)
+	}
+}
+
+func TestStoreProjectByLaunchPane(t *testing.T) {
+	ctx := context.Background()
+	s := open(t, t.TempDir())
+
+	project := task.Project{
+		Key:          "E:/repo-a",
+		LaunchPaneID: "w3:p1",
+		PublicPaneID: "w3:p1",
+		AgentName:    "omp",
+	}
+	if err := s.CreateProject(ctx, project); err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+	found, err := s.ProjectByLaunchPane(ctx, "w3:p1")
+	if err != nil {
+		t.Fatalf("ProjectByLaunchPane: %v", err)
+	}
+	if found.Key != project.Key || found.LaunchPaneID != project.LaunchPaneID {
+		t.Errorf("found = %+v, want %+v", found, project)
+	}
+	if _, err := s.ProjectByLaunchPane(ctx, "w9:p9"); !errors.Is(err, state.ErrNotFound) {
+		t.Errorf("unknown pane err = %v, want ErrNotFound", err)
+	}
+	if _, err := s.ProjectByLaunchPane(ctx, ""); !errors.Is(err, state.ErrInvalid) {
+		t.Errorf("empty pane err = %v, want ErrInvalid", err)
 	}
 }
 

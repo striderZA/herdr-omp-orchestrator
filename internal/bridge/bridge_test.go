@@ -257,6 +257,222 @@ func (f *bridgeFixture) useHerdrFixtureFiles(panePath, errPath string) string {
 }
 
 // ---------------------------------------------------------------------------
+// fresh-session adoption
+// ---------------------------------------------------------------------------
+
+// seedFreshWorker records a worker the coordinator has provisioned but whose OMP
+// session it cannot know yet: the pane is recorded, the session is not.
+func (f *bridgeFixture) seedFreshWorker(id, launchPane string) task.Task {
+	f.t.Helper()
+	worker := f.seedWorker(id, launchPane, launchPane, "")
+	// seedWorker stores a prompt_submitted task; a fresh one is being started.
+	updated, err := f.store.UpdateTask(context.Background(), worker.ID, worker.Revision, func(next *task.Task) error {
+		next.Phase = task.AgentStarted
+		return nil
+	})
+	if err != nil {
+		f.t.Fatalf("make %s fresh: %v", id, err)
+	}
+	return updated
+}
+
+func TestBridgeResolveAdoptsAFreshWorkerSession(t *testing.T) {
+	f := newBridgeFixture(t)
+	f.seedFreshWorker("t1", workerPane)
+
+	resp := f.call("resolve", "omp-fresh-1", "{}")
+	var result ResolveResult
+	resp.decodeResult(t, &result)
+	if !result.Bound || result.Role != string(state.RoleWorker) || result.TaskID != "t1" {
+		t.Fatalf("resolve = %+v, want the fresh worker bound", result)
+	}
+	if !result.Rebound {
+		t.Errorf("resolve = %+v, want the adoption reported as a rebind of identities", result)
+	}
+
+	stored, err := f.store.Task(context.Background(), "t1")
+	if err != nil {
+		t.Fatalf("Task: %v", err)
+	}
+	if stored.OMPSessionID != "omp-fresh-1" {
+		t.Fatalf("recorded session = %q, want the announced one", stored.OMPSessionID)
+	}
+	// Adoption is provisional: it records the session and never the handshake.
+	ready, err := f.store.Ready(context.Background(), workerPane, "omp-fresh-1")
+	if err != nil {
+		t.Fatalf("Ready: %v", err)
+	}
+	if ready {
+		t.Fatal("adoption marked the readiness handshake verified")
+	}
+
+	// The extension can now announce, and only the coordinator can confirm.
+	readyResp := f.call("ready", "omp-fresh-1", "{}")
+	var readyResult ReadyResult
+	readyResp.decodeResult(t, &readyResult)
+	if !readyResult.Recorded {
+		t.Fatalf("ready = %+v, want the announcement recorded", readyResult)
+	}
+	ready, err = f.store.Ready(context.Background(), workerPane, "omp-fresh-1")
+	if err != nil || ready {
+		t.Fatalf("Ready after the announcement = (%v, %v), want still unverified", ready, err)
+	}
+
+	// A mutating method is still refused while readiness is unconfirmed.
+	f.env["HERDR_PANE_ID"] = workerPane
+	wantError(t, f.call("report", "omp-fresh-1", `{"kind":"result"}`), CodeNotReady)
+
+	f.confirm(workerPane, "omp-fresh-1")
+	calls := 0
+	ops := Ops{Report: func(context.Context, Principal, json.RawMessage) (any, error) {
+		calls++
+		return map[string]any{"ok": true}, nil
+	}}
+	if resp := f.callWith("report", "omp-fresh-1", `{"kind":"result"}`, ops); !resp.OK {
+		t.Fatalf("report after confirmation failed: %+v", resp.Error)
+	}
+	if calls != 1 {
+		t.Errorf("report ran %d times, want 1", calls)
+	}
+}
+
+func TestBridgeResolveAdoptsAFreshPrimarySession(t *testing.T) {
+	f := newBridgeFixture(t)
+	project := f.seedPrimary()
+	if err := f.store.UpdateProject(context.Background(), project.Key, func(next *task.Project) error {
+		next.OMPSessionID = ""
+		return nil
+	}); err != nil {
+		t.Fatalf("make the primary fresh: %v", err)
+	}
+	f.env["HERDR_PANE_ID"] = primaryPane
+
+	resp := f.call("resolve", "omp-fresh-primary", "{}")
+	var result ResolveResult
+	resp.decodeResult(t, &result)
+	if !result.Bound || result.Role != string(state.RolePrimary) || result.ProjectKey != f.repoRoot {
+		t.Fatalf("resolve = %+v, want the fresh primary bound", result)
+	}
+	stored, err := f.store.Project(context.Background(), f.repoRoot)
+	if err != nil {
+		t.Fatalf("Project: %v", err)
+	}
+	if stored.OMPSessionID != "omp-fresh-primary" {
+		t.Fatalf("recorded session = %q, want the announced one", stored.OMPSessionID)
+	}
+	ready, err := f.store.Ready(context.Background(), primaryPane, "omp-fresh-primary")
+	if err != nil || ready {
+		t.Fatalf("Ready after primary adoption = (%v, %v), want unverified", ready, err)
+	}
+}
+
+func TestBridgeResolveRefusesAnAlreadyRecordedDifferentSession(t *testing.T) {
+	f := newBridgeFixture(t)
+	f.seedWorker("t1", workerPane, workerPane, workerSession)
+
+	resp := f.call("resolve", "omp-somebody-else", "{}")
+	var result ResolveResult
+	resp.decodeResult(t, &result)
+	if result.Bound {
+		t.Fatalf("resolve = %+v, want a refusal", result)
+	}
+	if result.Reason != ReasonUnverifiedRestore || result.Attention == "" {
+		t.Fatalf("resolve = %+v, want an attention-carrying refusal", result)
+	}
+	stored, err := f.store.Task(context.Background(), "t1")
+	if err != nil {
+		t.Fatalf("Task: %v", err)
+	}
+	if stored.OMPSessionID != workerSession {
+		t.Fatalf("recorded session = %q, want the original %q untouched", stored.OMPSessionID, workerSession)
+	}
+	if stored.Attention == "" {
+		t.Error("the mismatch was not recorded on the task")
+	}
+}
+
+func TestBridgeResolveAdoptionRaceHasOneWinnerAndNoOverwrite(t *testing.T) {
+	f := newBridgeFixture(t)
+	f.seedFreshWorker("t1", workerPane)
+
+	const racers = 4
+	var wg sync.WaitGroup
+	results := make([]ResolveResult, racers)
+	start := make(chan struct{})
+	for i := range racers {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			env := map[string]string{}
+			for key, value := range f.env {
+				env[key] = value
+			}
+			out, err := HandleWith(context.Background(), env, strings.NewReader(
+				fmt.Sprintf(`{"version":1,"method":"resolve","ompSessionID":"omp-race-%d","params":{}}`, i)), Ops{})
+			if err != nil {
+				t.Errorf("Handle(resolve %d): %v", i, err)
+				return
+			}
+			resp := decodeResponse(t, out)
+			if resp.OK {
+				_ = json.Unmarshal(resp.Result, &results[i])
+			}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	winners := 0
+	for i, result := range results {
+		if result.Bound {
+			winners++
+			if result.TaskID != "t1" {
+				t.Errorf("racer %d bound %q, want t1", i, result.TaskID)
+			}
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("adoption race = %d winners, want exactly 1 (%+v)", winners, results)
+	}
+	// The winner's session is the only one recorded, and no racer overwrote it.
+	stored, err := f.store.Task(context.Background(), "t1")
+	if err != nil {
+		t.Fatalf("Task: %v", err)
+	}
+	if stored.OMPSessionID == "" || !strings.HasPrefix(stored.OMPSessionID, "omp-race-") {
+		t.Fatalf("recorded session = %q, want one of the announced ones", stored.OMPSessionID)
+	}
+	winner := -1
+	for i, result := range results {
+		if result.Bound {
+			winner = i
+		}
+	}
+	if want := fmt.Sprintf("omp-race-%d", winner); stored.OMPSessionID != want {
+		t.Fatalf("recorded session = %q, want the winner's %q", stored.OMPSessionID, want)
+	}
+}
+
+func TestBridgeResolveKeepsAnUnknownPaneUnbound(t *testing.T) {
+	f := newBridgeFixture(t)
+	f.seedPrimary()
+	f.seedWorker("t1", workerPane, workerPane, workerSession)
+	// A pane no record mentions: another project's terminal or a stray shell.
+	f.env["HERDR_PANE_ID"] = "w9:p9"
+
+	resp := f.call("resolve", "omp-unknown", "{}")
+	var result ResolveResult
+	resp.decodeResult(t, &result)
+	if result.Bound || result.Reason != ReasonNotBound {
+		t.Fatalf("resolve = %+v, want not_bound", result)
+	}
+	if _, err := f.store.ByLaunchPane(context.Background(), workerPane); err != nil {
+		t.Errorf("the unrelated worker binding changed: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // protocol plumbing
 // ---------------------------------------------------------------------------
 
