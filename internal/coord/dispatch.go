@@ -856,6 +856,33 @@ func stepError(st task.Task, step string, terminal bool, cause error) *StepError
 	}
 }
 
+// PersistenceError reports that a task's failure could not be recorded.
+//
+// It keeps the whole action context: the step error (which step failed, the phase
+// reached, the recorded worktree/workspace/pane/agent/session facts, the cause and
+// the resume guidance) alongside the write failure. A caller that cannot find a
+// durable reason still knows what happened and what to do, and the error still
+// classifies as ErrPersistence.
+type PersistenceError struct {
+	// Step is the actionable failure that could not be stored.
+	Step *StepError
+	// Recording is the write failure that prevented it.
+	Recording error
+}
+
+func (e *PersistenceError) Error() string {
+	return fmt.Sprintf("%s; that failure could not be recorded (%v), so the task may show no reason",
+		e.Step.Error(), e.Recording)
+}
+
+// Unwrap exposes the step error (and, through it, the underlying cause) and the
+// write failure, so errors.Is and errors.As reach either of them.
+func (e *PersistenceError) Unwrap() []error { return []error{e.Step, e.Recording} }
+
+// Is classifies this as a persistence failure without hiding the step error's own
+// classification.
+func (e *PersistenceError) Is(target error) bool { return target == ErrPersistence }
+
 // failTask records why provisioning stopped and returns the actionable error.
 // Attention marks a failure that a retry repeats safely; a blocker marks an
 // outcome a human must decide, and ResumeDispatch refuses to touch it.
@@ -875,8 +902,7 @@ func (c *Coordinator) failTask(ctx context.Context, st task.Task, step string, t
 		return nil
 	}, "record the dispatch failure")
 	if err != nil {
-		return st, fmt.Errorf("%w: task %s stopped at phase %s with %w, and that failure could not be recorded: %v",
-			ErrPersistence, st.ID, st.Phase, cause, err)
+		return st, &PersistenceError{Step: failure, Recording: err}
 	}
 	return updated, failure
 }

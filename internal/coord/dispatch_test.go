@@ -2104,20 +2104,54 @@ func TestFailureThatCannotBeRecordedIsReportedNotDropped(t *testing.T) {
 	f := newCoordFixture(t, fixturePlan{})
 	f.projectKey()
 	// A task that does not exist cannot be updated: the attempt and its retry both
-	// fail, and the caller has to learn that the durable failure is missing.
-	ghost := task.Task{ID: "orch_000000000000", ProjectKey: f.root, Phase: task.WorktreeCreated, Revision: 7}
+	// fail, and the caller has to learn that the durable failure is missing — while
+	// still being told which step failed, what the task holds and that it is
+	// resumable. Losing that context is the defect this test guards.
+	ghost := task.Task{
+		ID:                  "orch_000000000000",
+		ProjectKey:          f.root,
+		Branch:              "orch/000000000000",
+		WorktreePath:        filepath.Join(f.dir, "worktrees", "orch-000000000000"),
+		WorktreeWorkspaceID: "w2",
+		PublicPaneID:        "w2:p1",
+		AgentName:           "orch_000000000000",
+		Phase:               task.WorktreeCreated,
+		Revision:            7,
+	}
 	updated, err := f.coord.failTask(context.Background(), ghost, "start the worker agent", false,
 		fmt.Errorf("%w: the agent could not start", herdr.ErrCLI))
 	if err == nil {
 		t.Fatal("failTask reported success although it could not write")
 	}
+	// Classification survives: the persistence failure and the underlying cause are
+	// both reachable, and the step error is still the value a caller can inspect.
 	if !errors.Is(err, ErrPersistence) {
 		t.Errorf("err = %v, want ErrPersistence", err)
 	}
 	if !errors.Is(err, herdr.ErrCLI) {
 		t.Errorf("err = %v, want the cause reachable through it", err)
 	}
-	for _, want := range []string{"orch_000000000000", "worktree_created", "could not be recorded"} {
+	var step *StepError
+	if !errors.As(err, &step) {
+		t.Errorf("err = %v, want the *StepError reachable through it", err)
+	} else if step.Step != "start the worker agent" || step.Phase != task.WorktreeCreated {
+		t.Errorf("step error = %+v, want the failed step and phase", step)
+	}
+	// The action context is complete: the step that failed, the phase reached, the
+	// recorded resources, the cause, and what to do next.
+	for _, want := range []string{
+		"orch_000000000000",
+		"start the worker agent",
+		"phase worktree_created",
+		"branch orch/000000000000",
+		"worktree " + ghost.WorktreePath,
+		"workspace w2",
+		"pane w2:p1",
+		"agent orch_000000000000",
+		"the agent could not start",
+		"resumable",
+		"could not be recorded",
+	} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("err %q does not name %q", err, want)
 		}
