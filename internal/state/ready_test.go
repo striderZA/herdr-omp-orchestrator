@@ -256,3 +256,122 @@ func TestStoreMigratesAnOlderReadyTable(t *testing.T) {
 		t.Errorf("Ready after migration = (%v, %v), want (true, nil)", ready, err)
 	}
 }
+
+// TestStoreVerifiedAnnouncementChecksTheRowItReturns pins the one-read handshake a
+// caller may trust: the announcement it gets back is the row it read, and the
+// confirmation it was judged by belongs to that same row.
+//
+// Reading the announcement and the confirmation separately is a race: a refresh
+// that announces a new id for the same session file keeps the path confirmation,
+// so the earlier snapshot still passes Ready while it no longer describes what the
+// pane announces.
+func TestStoreVerifiedAnnouncementChecksTheRowItReturns(t *testing.T) {
+	ctx := context.Background()
+	ref := func(kind, value string) task.SessionRef { return task.SessionRef{Kind: kind, Value: value} }
+
+	t.Run("a confirmed row", func(t *testing.T) {
+		s := open(t, t.TempDir())
+		announced := task.Announcement{ID: sessionOne, File: sessionFile, OnDisk: true}
+		if err := s.RecordReady(ctx, launchPane, announced, 1); err != nil {
+			t.Fatalf("RecordReady: %v", err)
+		}
+		if err := s.ConfirmReady(ctx, launchPane, ref(task.SessionKindPath, sessionFile)); err != nil {
+			t.Fatalf("ConfirmReady: %v", err)
+		}
+
+		got, verified, err := s.VerifiedAnnouncement(ctx, launchPane)
+		if err != nil {
+			t.Fatalf("VerifiedAnnouncement: %v", err)
+		}
+		if !verified {
+			t.Fatal("a confirmed row was not verified")
+		}
+		if got.ID != sessionOne || got.File != sessionFile || !got.OnDisk {
+			t.Errorf("announcement = %+v, want the whole announced identity surface", got)
+		}
+	})
+
+	t.Run("an unverified row", func(t *testing.T) {
+		s := open(t, t.TempDir())
+		if err := s.RecordReady(ctx, launchPane, task.Announcement{ID: sessionOne, File: sessionFile}, 1); err != nil {
+			t.Fatalf("RecordReady: %v", err)
+		}
+		got, verified, err := s.VerifiedAnnouncement(ctx, launchPane)
+		if err != nil {
+			t.Fatalf("VerifiedAnnouncement: %v", err)
+		}
+		if verified || got.ID != "" || got.File != "" {
+			t.Errorf("announced but unconfirmed row = (%+v, %v), want nothing verified", got, verified)
+		}
+	})
+
+	t.Run("no row at all", func(t *testing.T) {
+		s := open(t, t.TempDir())
+		got, verified, err := s.VerifiedAnnouncement(ctx, launchPane)
+		if err != nil || verified || got.ID != "" {
+			t.Errorf("unknown pane = (%+v, %v, %v), want (zero, false, nil)", got, verified, err)
+		}
+		if _, _, err := s.VerifiedAnnouncement(ctx, "  "); !errors.Is(err, state.ErrInvalid) {
+			t.Errorf("empty launch pane err = %v, want ErrInvalid", err)
+		}
+	})
+
+	t.Run("a refreshed row returns the current id, never the stale one", func(t *testing.T) {
+		s := open(t, t.TempDir())
+		// Confirmed the way the installed build confirms: the session file.
+		if err := s.RecordReady(ctx, launchPane, task.Announcement{ID: sessionOne, File: sessionFile}, 1); err != nil {
+			t.Fatalf("RecordReady: %v", err)
+		}
+		if err := s.ConfirmReady(ctx, launchPane, ref(task.SessionKindPath, sessionFile)); err != nil {
+			t.Fatalf("ConfirmReady: %v", err)
+		}
+		stale, found, err := s.AnnouncedSession(ctx, launchPane)
+		if err != nil || !found || stale.ID != sessionOne {
+			t.Fatalf("AnnouncedSession = (%+v, %v, %v), want the first announcement", stale, found, err)
+		}
+
+		// The runtime refreshes the same session file under a new id. The path
+		// confirmation survives, because the announced file is unchanged.
+		if err := s.RecordReady(ctx, launchPane, task.Announcement{ID: sessionTwo, File: sessionFile}, 1); err != nil {
+			t.Fatalf("RecordReady(refresh): %v", err)
+		}
+		// This is the race the one-read API removes: the earlier snapshot still
+		// passes the two-read check, although the pane no longer announces it.
+		if ready, err := s.Ready(ctx, launchPane, stale); err != nil || !ready {
+			t.Errorf("Ready(stale snapshot) = (%v, %v); the trap this API exists for should be (true, nil)", ready, err)
+		}
+
+		got, verified, err := s.VerifiedAnnouncement(ctx, launchPane)
+		if err != nil {
+			t.Fatalf("VerifiedAnnouncement: %v", err)
+		}
+		if !verified {
+			t.Fatal("the refreshed row is still confirmed for the announced path")
+		}
+		if got.ID != sessionTwo || got.File != sessionFile {
+			t.Errorf("announcement = %+v, want the current id %q with the announced file", got, sessionTwo)
+		}
+	})
+
+	t.Run("a confirmation that no longer describes the row is refused", func(t *testing.T) {
+		s := open(t, t.TempDir())
+		if err := s.RecordReady(ctx, launchPane, task.Announcement{ID: sessionOne, File: sessionFile}, 1); err != nil {
+			t.Fatalf("RecordReady: %v", err)
+		}
+		if err := s.ConfirmReady(ctx, launchPane, ref(task.SessionKindID, sessionOne)); err != nil {
+			t.Fatalf("ConfirmReady: %v", err)
+		}
+		// A different process announces a different session: the old confirmation
+		// must not outlive it.
+		if err := s.RecordReady(ctx, launchPane, task.Announcement{ID: sessionTwo, File: sessionFile}, 1); err != nil {
+			t.Fatalf("RecordReady(restart): %v", err)
+		}
+		got, verified, err := s.VerifiedAnnouncement(ctx, launchPane)
+		if err != nil {
+			t.Fatalf("VerifiedAnnouncement: %v", err)
+		}
+		if verified || got.ID != "" {
+			t.Errorf("restarted row = (%+v, %v), want the stale id confirmation to be gone", got, verified)
+		}
+	})
+}

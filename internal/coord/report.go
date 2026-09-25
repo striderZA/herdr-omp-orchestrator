@@ -1133,7 +1133,12 @@ func (c *Coordinator) workerLive(ctx context.Context, st task.Task) (bool, error
 //
 // A recorded session value and a reference Herdr reports now may be in different
 // native forms (an id and a session file), and only the announcement knows both —
-// so this is the fact every identity decision has to be made through.
+// so this is the fact every identity decision has to be made through. The
+// announcement and its confirmation come from one store read
+// (Store.VerifiedAnnouncement): reading them separately could judge a stale
+// identity with a fresh confirmation after the pane announced a new session for the
+// same file.
+//
 // An announcement nothing confirmed proves nothing: the request is refused until
 // the coordinator's own comparison has made it a verified handshake.
 func (c *Coordinator) announcedWorker(ctx context.Context, st task.Task) (task.Announcement, error) {
@@ -1141,16 +1146,12 @@ func (c *Coordinator) announcedWorker(ctx context.Context, st task.Task) (task.A
 	if pane == "" {
 		return task.Announcement{}, fmt.Errorf("%w: task %s records no launch pane, so its worker cannot be identified", ErrAgentChanged, st.ID)
 	}
-	announced, found, err := c.store.AnnouncedSession(ctx, pane)
+	// One read: the announcement and the confirmation it is judged by come from the
+	// same row, so a refresh that announced a new identity for the same session
+	// cannot be judged against the identity this call started with.
+	announced, verified, err := c.store.VerifiedAnnouncement(ctx, pane)
 	if err != nil {
-		return task.Announcement{}, fmt.Errorf("read the announced session of pane %q: %w", pane, err)
-	}
-	if !found {
-		return task.Announcement{}, fmt.Errorf("%w: pane %q announced no OMP session, so the recorded worker cannot be identified", ErrAgentChanged, pane)
-	}
-	verified, err := c.store.Ready(ctx, pane, announced)
-	if err != nil {
-		return task.Announcement{}, fmt.Errorf("read the handshake of pane %q: %w", pane, err)
+		return task.Announcement{}, fmt.Errorf("read the verified handshake of pane %q: %w", pane, err)
 	}
 	if !verified {
 		return task.Announcement{}, fmt.Errorf("%w: pane %q has no verified OMP session, so the recorded worker cannot be trusted", ErrAgentChanged, pane)

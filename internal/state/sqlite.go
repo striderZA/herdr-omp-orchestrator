@@ -533,11 +533,39 @@ func (s *Store) ConfirmReady(ctx context.Context, launchPaneID string, ref task.
 	return nil
 }
 
+// VerifiedAnnouncement reads the handshake a launch pane announced, and returns it
+// only when that very row's confirmation describes that same row's announcement.
+//
+// It is the one-read form of the handshake, and the only form a caller deciding
+// identity or liveness may use: Announcement.Proves bridges two native identities,
+// so pairing an announcement from one read with a confirmation from another would
+// let a refresh that kept the confirmed form (a new id for the same session file)
+// be judged against the stale identity. A row that was never confirmed, a
+// confirmation whose kind this build cannot read, and a confirmation left behind
+// by an earlier announcement all report false.
+func (s *Store) VerifiedAnnouncement(ctx context.Context, launchPaneID string) (task.Announcement, bool, error) {
+	if strings.TrimSpace(launchPaneID) == "" {
+		return task.Announcement{}, false, fmt.Errorf("%w: launch pane is required", ErrInvalid)
+	}
+	recorded, found, err := s.readyRecord(ctx, launchPaneID)
+	if err != nil || !found {
+		return task.Announcement{}, false, err
+	}
+	announced, _, ok := recorded.verifiedRef()
+	return announced, ok, nil
+}
+
 // Ready reports whether an announced identity passed the handshake for a launch
 // pane. The recorded confirmation decides which form is compared: an id is
 // trimmed and compared case-insensitively, a path with the platform's path rules.
 // A record that was never confirmed, or a confirmation whose kind this build does
 // not understand, is never ready.
+//
+// This is the form for a caller that already holds an announcement — the bridge
+// receives one from the process that made the request — and it compares that
+// announcement's identity in the confirmed kind. A caller that reads the
+// announcement from the store must use VerifiedAnnouncement instead, which reads
+// the row once.
 func (s *Store) Ready(ctx context.Context, launchPaneID string, announced task.Announcement) (bool, error) {
 	identity, ok := task.NewAnnouncement(announced.ID, announced.File, announced.OnDisk)
 	if !ok {
@@ -547,18 +575,15 @@ func (s *Store) Ready(ctx context.Context, launchPaneID string, announced task.A
 	if err != nil || !found {
 		return false, err
 	}
-	if recorded.verifiedKind == "" || recorded.verifiedValue == "" {
-		return false, nil
-	}
-	value, ok := recorded.announcement.Ref(recorded.verifiedKind)
+	_, confirmed, ok := recorded.verifiedRef()
 	if !ok {
 		return false, nil
 	}
-	announcedValue, ok := identity.Ref(recorded.verifiedKind)
+	announcedValue, ok := identity.Ref(confirmed.Kind)
 	if !ok {
 		return false, nil
 	}
-	return task.SameSessionReference(recorded.verifiedKind, value.Value, announcedValue.Value), nil
+	return task.SameSessionReference(confirmed.Kind, confirmed.Value, announcedValue.Value), nil
 }
 
 // AnnouncedSession reads what a launch pane announced, including whether the
@@ -583,6 +608,26 @@ type readyRecord struct {
 	announcement  task.Announcement
 	verifiedKind  string
 	verifiedValue string
+}
+
+// verifiedRef reports the reference this row's confirmation recorded, but only
+// when that confirmation describes this row's own announcement.
+//
+// It is the single rule both readers below share, and it works on the row that was
+// read — never on a row read separately — so a concurrent RecordReady cannot make
+// a caller judge one announcement with another announcement's confirmation.
+func (r readyRecord) verifiedRef() (task.Announcement, task.SessionRef, bool) {
+	if r.verifiedKind == "" || r.verifiedValue == "" {
+		return task.Announcement{}, task.SessionRef{}, false
+	}
+	announced, ok := r.announcement.Ref(r.verifiedKind)
+	if !ok {
+		return task.Announcement{}, task.SessionRef{}, false
+	}
+	if !task.SameSessionReference(r.verifiedKind, announced.Value, r.verifiedValue) {
+		return task.Announcement{}, task.SessionRef{}, false
+	}
+	return r.announcement, task.SessionRef{Kind: r.verifiedKind, Value: r.verifiedValue}, true
 }
 
 func (s *Store) readyRecord(ctx context.Context, launchPaneID string) (readyRecord, bool, error) {
