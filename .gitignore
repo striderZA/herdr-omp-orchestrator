@@ -1,0 +1,8 @@
+# Built plugin executable
+/herdr-omp-orchestrator.exe
+/dist/
+
+# Local orchestrator state (real state lives in HERDR_PLUGIN_STATE_DIR)
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
