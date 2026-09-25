@@ -25,6 +25,7 @@ import extension, {
   dialogConfirmRequest,
   refreshIdentity,
   refreshReady,
+  settleConfirmRequest,
   uiGate,
   warnOnce,
 } from "./herdr-orchestrator.ts";
@@ -151,6 +152,7 @@ const wantNames = [
   "orch_question",
   "orch_report",
   "orch_review",
+  "orch_settle_input",
 ];
 check(
   names.join(",") === wantNames.join(","),
@@ -348,6 +350,11 @@ const toolCalls: { name: string; params: Record<string, unknown>; bad: Record<st
     bad: { taskId: "orch_abc", keys: [] },
   },
   { name: "orch_review", params: { taskId: "orch_abc", disposition: "accepted" }, bad: { taskId: "orch_abc" } },
+  {
+    name: "orch_settle_input",
+    params: { taskId: "orch_abc", decision: "not_delivered" },
+    bad: { taskId: "", decision: "not_delivered" },
+  },
   { name: "orch_cleanup", params: { taskId: "orch_abc" }, bad: {} },
 ];
 
@@ -512,6 +519,33 @@ async function checkGates(): Promise<void> {
   );
   check(approved.ok, "the gate refused an approved confirmation");
   check(acted === 1, `the approved gate ran the action ${acted} times, want 1`);
+
+  // A settlement is the user's own report about what they saw, so it is confirmed
+  // before it is recorded, and a decision the user cannot make is refused outright.
+  const delivered = settleConfirmRequest("orch_abc", "delivered");
+  if (!delivered.ok) {
+    failures.push(`the delivered settlement was refused: ${delivered.reason}`);
+  } else {
+    check(
+      delivered.request.title === "Settle worker input",
+      `the settlement confirmation is titled ${JSON.stringify(delivered.request.title)}`,
+    );
+    check(
+      delivered.request.message.includes("orch_abc") && delivered.request.message.includes("DID arrive"),
+      `the settlement confirmation does not say what the user is confirming: ${JSON.stringify(delivered.request.message)}`,
+    );
+  }
+  const notDelivered = settleConfirmRequest("orch_abc", "not_delivered");
+  if (!notDelivered.ok) {
+    failures.push(`the not-delivered settlement was refused: ${notDelivered.reason}`);
+  } else {
+    check(
+      notDelivered.request.message.includes("did NOT arrive"),
+      `the not-delivered confirmation reads ${JSON.stringify(notDelivered.request.message)}`,
+    );
+  }
+  check(!settleConfirmRequest("orch_abc", "maybe").ok, "the settlement accepted a decision the user cannot make");
+  check(!settleConfirmRequest("", "delivered").ok, "the settlement accepted no task");
 
   // The adapter reads the context it was given, never a guess.
   check(uiGate({ hasUI: false, ui: { confirm: async () => true } }).hasUI === false, "uiGate invented a UI");

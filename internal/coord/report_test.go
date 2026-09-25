@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"herdr-omp-orchestrator/internal/herdr"
 	"herdr-omp-orchestrator/internal/state"
@@ -758,6 +759,82 @@ func TestQuestionReportAndProgressRequireTheRecordedWorkerPane(t *testing.T) {
 	}
 	if _, err := f.coord.Question(ctx, unbound.LaunchPaneID, "which branch?"); !errors.Is(err, ErrProjectUnknown) {
 		t.Errorf("Question for an unbound project err = %v, want ErrProjectUnknown", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// recorded input attempts
+// ---------------------------------------------------------------------------
+
+// TestInputAttemptMarkerNamesTheChannelAndNeverTheText pins the durable record of an
+// attempt to write into a worker's pane: it has to identify the channel and exactly
+// what was sent (so a repeat of the same attempt is recognisable, and a different one
+// is not), without storing what the user said or which keys were approved.
+func TestInputAttemptMarkerNamesTheChannelAndNeverTheText(t *testing.T) {
+	now := time.UnixMilli(1_700_000_000_123)
+
+	answer := newAnswerAttempt("the API stays as it is", now)
+	marker := answer.String()
+	if !strings.Contains(marker, inputAttemptPrefix) || !strings.Contains(marker, channelAnswer) {
+		t.Errorf("marker %q does not name an answer attempt", marker)
+	}
+	if strings.Contains(marker, "the API") || strings.Contains(marker, "stays") {
+		t.Errorf("marker %q carries the answer itself", marker)
+	}
+	if !strings.Contains(marker, formatMillis(now)) {
+		t.Errorf("marker %q does not carry when the attempt was made", marker)
+	}
+	parsed, ok := parseInputAttempt(marker)
+	if !ok {
+		t.Fatalf("marker %q does not parse back", marker)
+	}
+	if !parsed.sameAs(answer) {
+		t.Errorf("parsed attempt = %+v, want the recorded one %+v", parsed, answer)
+	}
+	// A different answer is a different attempt, even at the same instant.
+	if other := newAnswerAttempt("the API changes", now); parsed.sameAs(other) {
+		t.Error("two different answers share one attempt identity")
+	}
+
+	keys := newDialogAttempt("0123456789abcdef", []string{"1", "ENTER"}, now)
+	keyMarker := keys.String()
+	if !strings.Contains(keyMarker, channelDialog) || !strings.Contains(keyMarker, "0123456789abcdef") {
+		t.Errorf("marker %q does not tie the keys to the dialog that was approved", keyMarker)
+	}
+	if strings.Contains(keyMarker, "ENTER") {
+		t.Errorf("marker %q carries the approved keys", keyMarker)
+	}
+	parsedKeys, ok := parseInputAttempt(keyMarker)
+	if !ok {
+		t.Fatalf("marker %q does not parse back", keyMarker)
+	}
+	if !parsedKeys.sameAs(keys) {
+		t.Errorf("parsed attempt = %+v, want %+v", parsedKeys, keys)
+	}
+	// The same keys for another dialog, or other keys for the same dialog, are not
+	// the same attempt.
+	if parsedKeys.sameAs(newDialogAttempt("fedcba9876543210", []string{"1", "ENTER"}, now)) {
+		t.Error("two dialogs share one attempt identity")
+	}
+	if parsedKeys.sameAs(newDialogAttempt("0123456789abcdef", []string{"2"}, now)) {
+		t.Error("two approvals share one attempt identity")
+	}
+
+	// Anything that is not an attempt — a dispatch blocker, a truncated or malformed
+	// marker — is never read as a pending attempt, so a task blocked for another
+	// reason is not mistaken for one waiting on input.
+	for _, notAnAttempt := range []string{
+		"",
+		"task orch_x could not start the worker: the pane is gone",
+		inputAttemptPrefix,
+		inputAttemptPrefix + "answer",
+		inputAttemptPrefix + "answer deadbeef",
+		inputAttemptPrefix + "bogus deadbeef - 1700000000123",
+		inputAttemptPrefix + "answer deadbeef - not-a-time",
+	} {
+		if _, ok := parseInputAttempt(notAnAttempt); ok {
+			t.Errorf("%q is read as a pending input attempt", notAnAttempt)
+		}
 	}
 }
 

@@ -2560,6 +2560,326 @@ func TestAnswerRelaysToTheCurrentPublicPaneOnly(t *testing.T) {
 	})
 }
 
+// TestAnswerAttemptIsDurableAndBlocksARepeatedSend pins the fail-closed flow for an
+// ambiguous answer: Herdr may already have delivered it, so the uncertainty has to be
+// durable before the call returns, a repeat must not type into the pane again, and
+// only authoritative state - the worker reporting itself idle, i.e. the answer was
+// not consumed - makes the same answer safe to send.
+func TestAnswerAttemptIsDurableAndBlocksARepeatedSend(t *testing.T) {
+	f := newBridgeFixture(t)
+	f.seedPrimary()
+	f.seedWorker("t1", workerPane, workerPane, workerSession)
+	f.asWorker()
+	f.asPrimary()
+	busy := workerAgent(workerPane, workerSession, f.worktree)
+	stub := f.useHerdrStub(stubScript{
+		RepoRoot:    f.repoRoot,
+		Agents:      map[string]stubAgent{workerPane: busy},
+		PromptError: "timeout",
+	})
+	ops := CoordinatorOps(f.coordinator(t))
+	answer := `{"taskId":"t1","text":"Keep the old API."}`
+
+	// The prompt may already have been written: the ambiguity is durable and names
+	// the attempt without storing the answer.
+	wantError(t, f.callWith("answer", primarySession, answer, ops), "herdr_unavailable")
+	attempt := f.task(t, "t1").Blocker
+	if !strings.Contains(attempt, "input attempt") || !strings.Contains(attempt, "answer") {
+		t.Fatalf("the answer attempt was not recorded: blocker %q", attempt)
+	}
+	if strings.Contains(attempt, "Keep the old API") || strings.Contains(attempt, "old API") {
+		t.Errorf("the durable attempt carries the answer itself: %q", attempt)
+	}
+	if got := len(stub.script().Prompts); got != 1 {
+		t.Fatalf("prompts after the ambiguous answer = %d, want 1", got)
+	}
+
+	// Nothing about the worker's own status settles this: it could have consumed the
+	// answer and be idle again by now. Every further answer is refused - even a
+	// different one - until the user says what they saw.
+	for _, status := range []string{"working", "idle"} {
+		agent := workerAgent(workerPane, workerSession, f.worktree)
+		agent.AgentStatus = status
+		stub.setAgent(workerPane, agent)
+		wantError(t, f.callWith("answer", primarySession, answer, ops), "input_pending")
+		wantError(t, f.callWith("answer", primarySession, `{"taskId":"t1","text":"Something else entirely."}`, ops), "input_pending")
+	}
+	if got := len(stub.script().Prompts); got != 1 {
+		t.Fatalf("a repeat sent the answer again (%d prompts)", got)
+	}
+
+	// The user inspected the worker and reports that the answer never arrived, which is
+	// the only thing that settles an answer attempt.
+	var settled coord.SettleInputResult
+	f.callWith("settle_input", primarySession, `{"taskId":"t1","decision":"not_delivered"}`, ops).decodeResult(t, &settled)
+	if settled.Channel != "answer" || settled.Decision != "not_delivered" {
+		t.Fatalf("settlement = %+v, want the answer attempt resolved as not delivered", settled)
+	}
+	if got := f.task(t, "t1").Blocker; got != "" {
+		t.Fatalf("the settled attempt is still recorded: %q", got)
+	}
+
+	// With the attempt settled the same answer is a deliberate new action and goes
+	// through.
+	stub.update(func(script *stubScript) {
+		script.PromptError = ""
+		script.Agents[workerPane] = workerAgent(workerPane, workerSession, f.worktree)
+	})
+	var result coord.AnswerResult
+	f.callWith("answer", primarySession, answer, ops).decodeResult(t, &result)
+	if !result.Delivered || result.PublicPaneID != workerPane {
+		t.Fatalf("the retried answer = %+v, want it delivered to %q", result, workerPane)
+	}
+	if got := len(stub.script().Prompts); got != 2 {
+		t.Fatalf("prompts after the safe retry = %d, want 2", got)
+	}
+	after := f.task(t, "t1")
+	if after.Blocker != "" {
+		t.Errorf("the delivered answer left an attempt behind: %q", after.Blocker)
+	}
+	if stage := task.StageOf(after); stage != task.Running {
+		t.Errorf("stage after the delivered answer = %q, want %q", stage, task.Running)
+	}
+}
+
+// TestSettleInputDeliveredClosesTheQuestionItAnswered pins the other settlement
+// decision: the user confirms the worker did receive the answer, so the attempt is
+// settled and the question it answered is closed - without anything being sent.
+func TestSettleInputDeliveredClosesTheQuestionItAnswered(t *testing.T) {
+	f := newBridgeFixture(t)
+	f.seedPrimary()
+	f.seedWorker("t1", workerPane, workerPane, workerSession)
+	f.asWorker()
+	stub := f.useHerdrStub(stubScript{
+		RepoRoot:    f.repoRoot,
+		Agents:      map[string]stubAgent{workerPane: workerAgent(workerPane, workerSession, f.worktree)},
+		PromptError: "timeout",
+	})
+	ops := CoordinatorOps(f.coordinator(t))
+
+	// The worker asks, and the answer to it may already have landed.
+	if resp := f.callWith("question", workerSession, `{"text":"Which branch should I target?"}`, ops); !resp.OK {
+		t.Fatalf("question failed: %+v", resp.Error)
+	}
+	f.asPrimary()
+	wantError(t, f.callWith("answer", primarySession, `{"taskId":"t1","text":"Keep the old API."}`, ops), "herdr_unavailable")
+	pending := f.task(t, "t1")
+	if pending.Blocker == "" || !isQuestionAttentionForTest(pending.Attention) {
+		t.Fatalf("the ambiguous answer left the wrong state: blocker %q, attention %q", pending.Blocker, pending.Attention)
+	}
+
+	var settled coord.SettleInputResult
+	f.callWith("settle_input", primarySession, `{"taskId":"t1","decision":"delivered"}`, ops).decodeResult(t, &settled)
+	after := f.task(t, "t1")
+	if after.Blocker != "" || after.Attention != "" {
+		t.Fatalf("a delivered answer left the task waiting: blocker %q, attention %q", after.Blocker, after.Attention)
+	}
+	if stage := task.StageOf(after); stage != task.Running {
+		t.Errorf("stage after the delivered settlement = %q, want %q", stage, task.Running)
+	}
+	if got := len(stub.script().Prompts); got != 1 {
+		t.Errorf("settling an attempt sent something (%d prompts)", got)
+	}
+}
+
+// isQuestionAttentionForTest mirrors the coordinator's question marker: a pending
+// worker question is the only attention a delivered answer may close.
+func isQuestionAttentionForTest(attention string) bool {
+	return strings.HasPrefix(strings.TrimSpace(attention), "worker question: ")
+}
+
+// TestSettleInputRefusesWhenNoAttemptIsRecorded pins the settlements that are not
+// settlements: a task with nothing pending, and a decision that is not one of the two
+// the user can make.
+func TestSettleInputRefusesWhenNoAttemptIsRecorded(t *testing.T) {
+	f := newBridgeFixture(t)
+	f.seedPrimary()
+	f.seedWorker("t1", workerPane, workerPane, workerSession)
+	f.asWorkerWith(workerPane, task.Announcement{ID: workerSession}, task.SessionRef{Kind: task.SessionKindID, Value: workerSession})
+	f.asPrimary()
+	f.useHerdrStub(stubScript{RepoRoot: f.repoRoot})
+	ops := CoordinatorOps(f.coordinator(t))
+
+	wantError(t, f.callWith("settle_input", primarySession, `{"taskId":"t1","decision":"delivered"}`, ops), "bad_request")
+	wantError(t, f.callWith("settle_input", primarySession, `{"taskId":"t1","decision":"maybe"}`, ops), "bad_request")
+	// Only the primary decides what the user saw; the worker it concerns cannot.
+	f.env["HERDR_PANE_ID"] = workerPane
+	wantError(t, f.callWith("settle_input", workerSession, `{"taskId":"t1","decision":"delivered"}`, ops), "forbidden")
+}
+
+// TestDialogApprovalSettlesAnUnchangedDialogOnlyByInspection covers the case the
+// dialog channel cannot settle by itself: the dialog is still blocked and unchanged,
+// so the keys may or may not be in it, and only the user's own inspection resolves it.
+func TestDialogApprovalSettlesAnUnchangedDialogOnlyByInspection(t *testing.T) {
+	f := newBridgeFixture(t)
+	f.seedPrimary()
+	f.seedWorker("t1", workerPane, workerPane, workerSession)
+	f.asWorker()
+	f.asPrimary()
+
+	screen := "Choose an option:\r\n  1. Allow once\r\n  2. Deny\r\n"
+	blocked := workerAgent(workerPane, workerSession, f.worktree)
+	blocked.AgentStatus = "blocked"
+	stub := f.useHerdrStub(stubScript{
+		RepoRoot:      f.repoRoot,
+		Agents:        map[string]stubAgent{workerPane: blocked},
+		SendKeysError: "timeout",
+	})
+	ops := CoordinatorOps(f.coordinator(t))
+	approve := func(digest, keys string) bridgeResponse {
+		return f.callWith("approve_dialog", primarySession,
+			fmt.Sprintf(`{"taskId":"t1","observedDigest":%q,"keys":%s}`, digest, keys), ops)
+	}
+
+	var preview coord.DialogPreview
+	stub.queueReads(stubRead{Text: screen})
+	f.callWith("dialog_preview", primarySession, `{"taskId":"t1"}`, ops).decodeResult(t, &preview)
+
+	stub.queueReads(stubRead{Text: screen})
+	wantError(t, approve(preview.Digest, `["1"]`), "herdr_unavailable")
+	if got := len(stub.script().SentKeys); got != 1 {
+		t.Fatalf("send-keys calls = %d, want the one ambiguous attempt", got)
+	}
+
+	// The same dialog is still up: the keys may already be in it, so a repeat is
+	// refused rather than sent again.
+	stub.queueReads(stubRead{Text: screen})
+	wantError(t, approve(preview.Digest, `["1"]`), "input_pending")
+	if got := len(stub.script().SentKeys); got != 1 {
+		t.Fatalf("the repeat sent the keys again (%d send-keys calls)", got)
+	}
+
+	// The user inspected the dialog and reports the keys never arrived; that settles
+	// the attempt, so the same approval can be made again deliberately.
+	var settled coord.SettleInputResult
+	f.callWith("settle_input", primarySession, `{"taskId":"t1","decision":"not_delivered"}`, ops).decodeResult(t, &settled)
+	if settled.Channel != "dialog" {
+		t.Fatalf("settlement = %+v, want the dialog attempt resolved", settled)
+	}
+	stub.update(func(script *stubScript) { script.SendKeysError = "" })
+	stub.queueReads(stubRead{Text: screen})
+	if resp := approve(preview.Digest, `["1"]`); !resp.OK {
+		t.Fatalf("the deliberate re-approval failed: %+v", resp.Error)
+	}
+	if got := len(stub.script().SentKeys); got != 2 {
+		t.Fatalf("send-keys calls after the re-approval = %d, want 2", got)
+	}
+	if got := f.task(t, "t1").Blocker; got != "" {
+		t.Errorf("the delivered keys left an attempt behind: %q", got)
+	}
+}
+
+// TestAnswerDefiniteRefusalRecordsNoAttempt pins the other half: a refusal that
+// proves Herdr wrote nothing leaves no pending attempt behind, so the answer can be
+// sent again without inspection.
+func TestAnswerDefiniteRefusalRecordsNoAttempt(t *testing.T) {
+	f := newBridgeFixture(t)
+	f.seedPrimary()
+	f.seedWorker("t1", workerPane, workerPane, workerSession)
+	f.asWorker()
+	f.asPrimary()
+	stub := f.useHerdrStub(stubScript{
+		RepoRoot:    f.repoRoot,
+		Agents:      map[string]stubAgent{workerPane: workerAgent(workerPane, workerSession, f.worktree)},
+		PromptError: "agent_not_found",
+	})
+	ops := CoordinatorOps(f.coordinator(t))
+
+	if resp := f.callWith("answer", primarySession, `{"taskId":"t1","text":"Keep the old API."}`, ops); resp.OK {
+		t.Fatal("a definite refusal was reported as delivered")
+	}
+	if got := f.task(t, "t1").Blocker; got != "" {
+		t.Errorf("a definite refusal recorded an attempt: %q", got)
+	}
+	if got := len(stub.script().Prompts); got != 1 {
+		t.Fatalf("prompts = %d, want the one refused attempt", got)
+	}
+}
+
+// TestDialogApprovalAttemptIsTiedToTheApprovedDigest pins the same flow for approved
+// keys: the durable attempt names the exact dialog it was approved for, a repeat is
+// refused while that dialog is unchanged, and a dialog that has moved on settles the
+// attempt so only a fresh approval can send again.
+func TestDialogApprovalAttemptIsTiedToTheApprovedDigest(t *testing.T) {
+	f := newBridgeFixture(t)
+	f.seedPrimary()
+	f.seedWorker("t1", workerPane, workerPane, workerSession)
+	f.asWorker()
+	f.asPrimary()
+
+	approvedScreen := "Choose an option:\r\n  1. Allow once\r\n  2. Deny\r\n"
+	movedOn := "Choose an option:\r\n  1. Allow once\r\n  2. Deny\r\n  3. Always allow\r\n"
+	blocked := workerAgent(workerPane, workerSession, f.worktree)
+	blocked.AgentStatus = "blocked"
+	stub := f.useHerdrStub(stubScript{
+		RepoRoot:      f.repoRoot,
+		Agents:        map[string]stubAgent{workerPane: blocked},
+		SendKeysError: "timeout",
+	})
+	ops := CoordinatorOps(f.coordinator(t))
+	approve := func(digest, keys string) bridgeResponse {
+		return f.callWith("approve_dialog", primarySession,
+			fmt.Sprintf(`{"taskId":"t1","observedDigest":%q,"keys":%s}`, digest, keys), ops)
+	}
+
+	var first coord.DialogPreview
+	stub.queueReads(stubRead{Text: approvedScreen})
+	f.callWith("dialog_preview", primarySession, `{"taskId":"t1"}`, ops).decodeResult(t, &first)
+
+	// The keys may already have been written into that dialog.
+	stub.queueReads(stubRead{Text: approvedScreen})
+	wantError(t, approve(first.Digest, `["1"]`), "herdr_unavailable")
+	attempt := f.task(t, "t1").Blocker
+	if !strings.Contains(attempt, "input attempt") || !strings.Contains(attempt, "dialog") {
+		t.Fatalf("the key attempt was not recorded: blocker %q", attempt)
+	}
+	if !strings.Contains(attempt, first.Digest) {
+		t.Errorf("the attempt does not name the dialog it was approved for: %q", attempt)
+	}
+	if got := len(stub.script().SentKeys); got != 1 {
+		t.Fatalf("send-keys calls = %d, want the one ambiguous attempt", got)
+	}
+
+	// The same dialog is still up, so a repeat of the same approval must not send
+	// those keys a second time.
+	stub.queueReads(stubRead{Text: approvedScreen})
+	wantError(t, approve(first.Digest, `["1"]`), "input_pending")
+	if got := len(stub.script().SentKeys); got != 1 {
+		t.Fatalf("the repeat sent the keys again (%d send-keys calls)", got)
+	}
+
+	// The dialog moved on, which is what the keys did: the attempt is settled, and a
+	// fresh approval for the dialog that is on screen now goes through.
+	var next coord.DialogPreview
+	stub.queueReads(stubRead{Text: movedOn})
+	f.callWith("dialog_preview", primarySession, `{"taskId":"t1"}`, ops).decodeResult(t, &next)
+	if next.Digest == first.Digest {
+		t.Fatal("the two dialogs hash the same, so this test cannot tell them apart")
+	}
+	// The stand-in stops refusing, so the fresh approval is the one that lands.
+	stub.update(func(script *stubScript) { script.SendKeysError = "" })
+	stub.queueReads(stubRead{Text: movedOn}, stubRead{Text: movedOn})
+	if resp := approve(next.Digest, `["2"]`); !resp.OK {
+		t.Fatalf("the fresh approval failed: %+v", resp.Error)
+	}
+	if got := len(stub.script().SentKeys); got != 2 {
+		t.Fatalf("send-keys calls after the fresh approval = %d, want 2", got)
+	}
+	if got := f.task(t, "t1").Blocker; got != "" {
+		t.Errorf("the settled attempt is still recorded: %q", got)
+	}
+
+	// The stale approval is now refused as a changed dialog, and records nothing.
+	stub.queueReads(stubRead{Text: movedOn})
+	wantError(t, approve(first.Digest, `["1"]`), "dialog_changed")
+	if got := len(stub.script().SentKeys); got != 2 {
+		t.Fatalf("a stale approval sent keys (%d send-keys calls)", got)
+	}
+	if got := f.task(t, "t1").Blocker; got != "" {
+		t.Errorf("a changed dialog recorded an attempt: %q", got)
+	}
+}
+
 // TestDialogApprovalRevalidatesTheApprovedScreen pins the approval path: the
 // preview reads the visible screen passively, and the approval is refused unless
 // the pane, the session and the dialog digest are all still the approved ones.

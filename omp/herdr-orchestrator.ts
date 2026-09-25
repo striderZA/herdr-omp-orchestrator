@@ -275,6 +275,32 @@ export function cleanupConfirmRequest(preview: CleanupPreview): ConfirmPlan {
   };
 }
 
+// settleConfirmRequest is the confirmation one settlement needs: the model proposes
+// what the user should have seen in the worker's pane, and only the user's own
+// confirmation turns that into a settlement. Until it is confirmed, nothing else can be
+// sent to that worker, so the user is told what this decision allows or prevents.
+export function settleConfirmRequest(taskId: string, decision: string): ConfirmPlan {
+  if (taskId.length === 0) {
+    return { ok: false, reason: "no task was named for the settlement" };
+  }
+  if (decision !== "delivered" && decision !== "not_delivered") {
+    return {
+      ok: false,
+      reason: `"${decision}" is not a settlement; the user reports that the input either "delivered" or "not_delivered"`,
+    };
+  }
+  const observed = decision === "delivered" ? "DID arrive" : "did NOT arrive";
+  return {
+    ok: true,
+    request: {
+      title: "Settle worker input",
+      message:
+        `Task ${taskId}: confirm that the input sent to this worker earlier ${observed}. ` +
+        "Inspect the worker's pane first: this decides whether anything else may be sent to it.",
+    },
+  };
+}
+
 // confirmThen is the gate itself: without an interactive UI nothing happens, and
 // a failed or declined confirmation returns before act() is ever called.
 export async function confirmThen<T>(
@@ -580,7 +606,14 @@ export default function (pi: ExtensionAPI) {
   // A primary decides and relays; a worker reports. The tool sets are disjoint,
   // and the bridge enforces the same split on every call, so an active tool is
   // never the only thing standing between a role and the other role's actions.
-  const primaryNames = ["orch_dispatch", "orch_answer", "orch_approve_dialog", "orch_review", "orch_cleanup"];
+  const primaryNames = [
+    "orch_dispatch",
+    "orch_answer",
+    "orch_approve_dialog",
+    "orch_review",
+    "orch_settle_input",
+    "orch_cleanup",
+  ];
   const workerNames = ["orch_progress", "orch_question", "orch_report"];
   const ownNames = [...primaryNames, ...workerNames];
   let role: Role | null = null;
@@ -657,7 +690,7 @@ export default function (pi: ExtensionAPI) {
       systemPrompt: [
         ...event.systemPrompt,
         currentRole === "primary"
-          ? "You are the sole user liaison. Delegate independent bounded work with orch_dispatch, avoid editing paths reserved for workers, and keep the user in the loop: relay an ordinary worker question with orch_answer, approve a blocked worker's exact dialog keys with orch_approve_dialog only after the user confirms them, record the user's decision on a reviewed report with orch_review, and remove a reviewed checkout with orch_cleanup only after the user confirms it. A worker's report is never a merge and never completes the task: only a disposition the user recorded does. Never approve keys or remove a checkout the user has not confirmed."
+          ? "You are the sole user liaison. Delegate independent bounded work with orch_dispatch, avoid editing paths reserved for workers, and keep the user in the loop: relay an ordinary worker question with orch_answer, approve a blocked worker's exact dialog keys with orch_approve_dialog only after the user confirms them, record the user's decision on a reviewed report with orch_review, and remove a reviewed checkout with orch_cleanup only after the user confirms it. A worker's report is never a merge and never completes the task: only a disposition the user recorded does. Never approve keys or remove a checkout the user has not confirmed. If sending an answer or approved keys is left uncertain (a timeout), nothing else may be sent to that worker until you inspect its pane with the user and settle it with orch_settle_input."
           : "Work only in this assigned worktree. Use orch_progress for partial progress, orch_question when you are blocked and need the primary to ask the user, and orch_report with a complete result — summary, branch, changed-file/commit evidence, checks and a stated risk — when you are finished. Only the primary records the user's disposition for your result; do not merge and do not remove the branch or the checkout.",
       ],
     };
@@ -793,6 +826,28 @@ export default function (pi: ExtensionAPI) {
     async execute(_callId, params, signal, _update, ctx) {
       const result = await callBridge("review", params, sessionIdentity(ctx.sessionManager), signal);
       return toolResult(result);
+    },
+  });
+
+  pi.registerTool({
+    name: "orch_settle_input",
+    label: "Settle worker input",
+    defaultInactive: true,
+    description:
+      "Record what the user saw in a worker's pane after an input attempt was left uncertain (a timeout or an unreadable answer): whether it arrived. Until the user confirms this, nothing else may be sent to that worker.",
+    parameters: z.object({
+      taskId: z.string().min(1),
+      decision: z.string().min(1).max(20),
+    }),
+    async execute(_callId, params, signal, _update, ctx) {
+      const identity = sessionIdentity(ctx.sessionManager);
+      const plan = settleConfirmRequest(params.taskId, params.decision);
+      if (!plan.ok) return toolRefusal(plan.reason);
+      const gated = await confirmThen(uiGate(ctx), plan.request, () =>
+        callBridge("settle_input", { taskId: params.taskId, decision: params.decision }, identity, signal),
+      );
+      if (!gated.ok) return toolRefusal(gated.reason);
+      return toolResult(gated.value);
     },
   });
 

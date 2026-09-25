@@ -79,6 +79,7 @@ const (
 	MethodDialogPreview  = "dialog_preview"
 	MethodApproveDialog  = "approve_dialog"
 	MethodReview         = "review"
+	MethodSettleInput    = "settle_input"
 	MethodCleanupPreview = "cleanup_preview"
 	MethodCleanup        = "cleanup"
 )
@@ -175,6 +176,7 @@ type Ops struct {
 	DialogPreview  func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
 	ApproveDialog  func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
 	Review         func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
+	SettleInput    func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
 	CleanupPreview func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
 	Cleanup        func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
 }
@@ -272,6 +274,14 @@ func CoordinatorOps(c *coord.Coordinator) Ops {
 			result, err := c.CleanupPreview(ctx, p.LaunchPaneID, request.TaskID)
 			return result, coordError(err)
 		},
+		SettleInput: func(ctx context.Context, p Principal, params json.RawMessage) (any, error) {
+			var request coord.SettleInputParams
+			if err := decodeParams(params, &request); err != nil {
+				return nil, err
+			}
+			result, err := c.SettleInput(ctx, p.LaunchPaneID, request.TaskID, request.Decision)
+			return result, coordError(err)
+		},
 		Cleanup: func(ctx context.Context, p Principal, params json.RawMessage) (any, error) {
 			var request coord.CleanupParams
 			if err := decodeParams(params, &request); err != nil {
@@ -303,6 +313,7 @@ func UnavailableOps(cause error) Ops {
 		ApproveDialog:  unavailable,
 		Review:         unavailable,
 		CleanupPreview: unavailable,
+		SettleInput:    unavailable,
 		Cleanup:        unavailable,
 	}
 }
@@ -349,6 +360,8 @@ func coordErrorCode(err error) string {
 		return "dialog_changed"
 	case errors.Is(err, coord.ErrNotBlocked):
 		return "not_blocked"
+	case errors.Is(err, coord.ErrInputPending):
+		return "input_pending"
 	case errors.Is(err, coord.ErrBlocked):
 		return "blocked"
 	case errors.Is(err, coord.ErrAgentChanged):
@@ -481,6 +494,8 @@ func run(ctx context.Context, env map[string]string, input io.Reader, opts Optio
 		return h.mutate(req, state.RolePrimary, announced, h.ops.Review)
 	case MethodCleanupPreview:
 		return h.mutate(req, state.RolePrimary, announced, h.ops.CleanupPreview)
+	case MethodSettleInput:
+		return h.mutate(req, state.RolePrimary, announced, h.ops.SettleInput)
 	case MethodCleanup:
 		return h.mutate(req, state.RolePrimary, announced, h.ops.Cleanup)
 	default:
