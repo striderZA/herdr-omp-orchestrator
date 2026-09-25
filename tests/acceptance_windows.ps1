@@ -1065,15 +1065,15 @@ function Invoke-BridgeAs {
             Invocation = $result
         }
     }
-    # Envelopes are read with safe defaults and validated structurally: parseable
-    # JSON that is not a v1 envelope ({} or an unrelated object) must NOT be
-    # reported as an envelope, or the assertions below would pass on garbage.
+    # Envelopes are read with safe defaults and validated structurally (one rule,
+    # implemented once in Test-BridgeEnvelopeShape so the helper harness can
+    # exercise it): parseable JSON that is not a v1 envelope ({} or an unrelated
+    # object) must NOT be reported as an envelope, or the assertions below would
+    # pass on garbage.
+    $isEnvelope = (Test-BridgeEnvelopeShape -Answer $answer)
     $ok = (Get-Flag $answer 'ok')
     $resultField = Get-Field $answer 'result' $null
     $errorField = Get-Field $answer 'error' $null
-    $hasOk = ($null -ne $answer.PSObject.Properties['ok'])
-    $hasError = ($null -ne $errorField) -and ([string](Get-Field $errorField 'code') -ne '')
-    $isEnvelope = ($hasOk -and (($ok -and ($null -ne $resultField)) -or ((-not $ok) -and $hasError)))
     if (-not $isEnvelope) {
         return [pscustomobject]@{
             Envelope   = $false
@@ -1582,6 +1582,29 @@ function Invoke-TempRepo {
 # ---------------------------------------------------------------------------
 # Phase 6: the explicit setup action installs the extension
 # ---------------------------------------------------------------------------
+
+function Test-BridgeEnvelopeShape {
+    <#
+        Whether one parsed bridge answer is a v1 envelope. A success carries
+        `ok: true` and a `result`; a failure carries `ok: false` and an error with
+        a code. Anything else - parseable JSON that is not an envelope, or an `ok`
+        that is not a real boolean - is not an envelope, so the callers cannot
+        mistake junk for a coded answer.
+    #>
+    param($Answer)
+    if ($null -eq $Answer) { return $false }
+    $okProperty = $Answer.PSObject.Properties['ok']
+    if ($null -eq $okProperty) { return $false }
+    # `ok` must be a real JSON boolean. Get-Flag would coerce a non-empty string
+    # ("false") or a number to true, which would let malformed output pass as a
+    # successful v1 envelope.
+    if ($okProperty.Value -isnot [bool]) { return $false }
+    $ok = [bool]$okProperty.Value
+    $resultField = Get-Field $Answer 'result' $null
+    $errorField = Get-Field $Answer 'error' $null
+    $hasError = ($null -ne $errorField) -and ([string](Get-Field $errorField 'code') -ne '')
+    return (($ok -and ($null -ne $resultField)) -or ((-not $ok) -and $hasError))
+}
 
 function Get-ExpectedExtensionContent {
     <#
