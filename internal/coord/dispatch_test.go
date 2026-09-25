@@ -3496,11 +3496,11 @@ func TestStaleFailureIsNotRecordedOntoThePhaseThatAdvanced(t *testing.T) {
 	if advanced.Attention != "" {
 		t.Fatalf("attention after the retry = %q, want it cleared", advanced.Attention)
 	}
-	// The retry's own claim for the step it now runs must be in place, so the stale
-	// failure cannot release it: it belongs to the phase this writer failed, not to
-	// the one the retry reached.
-	if took, err := f.store.ClaimStep(ctx, advanced.ID, task.PromptSubmitted, "probe", time.Minute); err != nil || !took {
-		t.Fatalf("ClaimStep for the retry's phase = (%v, %v), want it free of stale claims", took, err)
+	// Another caller holds the step the retry left the task on. The stale failure
+	// belongs to the phase it failed, so it must not release this claim: a release
+	// that matched nothing would have to be caught here, not assumed.
+	if took, err := f.store.ClaimStep(ctx, advanced.ID, advanced.Phase, "probe", time.Minute); err != nil || !took {
+		t.Fatalf("ClaimStep for the retry's phase = (%v, %v), want the claim", took, err)
 	}
 
 	// Now the stale writer records its failure. It must fail closed, leave the task
@@ -3524,6 +3524,10 @@ func TestStaleFailureIsNotRecordedOntoThePhaseThatAdvanced(t *testing.T) {
 	// The failed create never reached the worker, so the retry's brief is the only one.
 	if got := f.countCalls("agent prompt"); got != 1 {
 		t.Errorf("agent prompt calls = %d, want 1 (the retry's brief)", got)
+	}
+	// The claim that was not this writer's is still where it was.
+	if took, err := f.store.ClaimStep(ctx, advanced.ID, advanced.Phase, "probe-2", time.Minute); err != nil || took {
+		t.Errorf("ClaimStep after the stale failure = (%v, %v), want the other caller's claim kept", took, err)
 	}
 	_ = sibling
 }
