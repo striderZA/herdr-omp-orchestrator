@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/mattn/go-runewidth"
 	"github.com/muesli/termenv"
@@ -126,6 +127,96 @@ func TestProjectionAnUnknownStageIsNotAColumn(t *testing.T) {
 // ---------------------------------------------------------------------------
 // selected task details
 // ---------------------------------------------------------------------------
+
+// TestBoardWrapKeepsMultibyteWordsWhole pins the wrap boundary: a word wider
+// than the line is cut on rune boundaries, so no line ever carries half a rune.
+// Advancing by a byte offset computed from a rune count would split a CJK or
+// emoji word and lose or duplicate every rune around the cut.
+func TestBoardWrapKeepsMultibyteWordsWhole(t *testing.T) {
+	words := []string{
+		"日本語日本語日本語日本語日本語",
+		strings.Repeat("🎉", 12),
+		"a日本b語c日d本e語",
+		"日本語🎉日本語🎉日本語",
+	}
+	for _, word := range words {
+		for _, width := range []int{1, 2, 3, 4, 5, 7, 11, 16, 24} {
+			lines := wrap(word, width)
+			joined := strings.Join(lines, "")
+			if !utf8.ValidString(joined) {
+				t.Errorf("wrap(%q, %d) is not valid UTF-8: %q", word, width, lines)
+			}
+			if joined != word {
+				t.Errorf("wrap(%q, %d) = %q, want the whole word with no rune lost or duplicated", word, width, joined)
+			}
+			for _, line := range lines {
+				// Only a single rune that cannot fit in the line may be over it.
+				if got := runeWidth(line); got > width && utf8.RuneCountInString(line) > 1 {
+					t.Errorf("wrap(%q, %d) produced %q, %d columns wide", word, width, line, got)
+				}
+			}
+		}
+	}
+}
+
+// TestBoardNarrowLayoutKeepsMultibyteTextWhole renders a card whose title, brief
+// and blocker are single unspaced wide-script words longer than the pane, and
+// checks the board's own output: valid UTF-8, no replacement rune, every input
+// rune preserved, and every line inside the width.
+func TestBoardNarrowLayoutKeepsMultibyteTextWhole(t *testing.T) {
+	title := strings.Repeat("日本語", 8)
+	brief := strings.Repeat("🎉", 20)
+	blocker := strings.Repeat("日本語🎉", 10)
+	card := sampleTask("orch_mb", func(x *task.Task) {
+		x.Title = title
+		x.Brief = brief
+		x.Blocker = blocker
+	})
+	board := NewBoard([]Card{{Task: card, Stage: task.NeedsInput}})
+	const width = 24
+	out := Render(board, Detail{SelectedID: card.ID, Expanded: true}, width, Theme{Profile: termenv.Ascii})
+	if !utf8.ValidString(out) {
+		t.Fatalf("the board rendered invalid UTF-8:\n%q", out)
+	}
+	if strings.ContainsRune(out, utf8.RuneError) {
+		t.Errorf("the board rendered a replacement rune:\n%s", out)
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if got := runeWidth(line); got > width && utf8.RuneCountInString(line) > 1 {
+			t.Errorf("line %q is %d columns wide, want at most %d", line, got, width)
+		}
+	}
+
+	// The brief and the blocker are wrapped word for word, so the lines they own
+	// reconstruct the original text exactly: nothing was lost, duplicated or
+	// replaced at a cut. A word wider than the line pushes its label onto its own
+	// line, which is why the labels are matched without their trailing space.
+	lines := strings.Split(out, "\n")
+	if got := wrappedField(t, lines, "Brief:", "Blocked:"); got != brief {
+		t.Errorf("the wrapped brief = %q, want %q", got, brief)
+	}
+	if got := wrappedField(t, lines, "Blocked:", "Last observation:"); got != blocker {
+		t.Errorf("the wrapped blocker = %q, want %q", got, blocker)
+	}
+}
+
+// wrappedField is the text one wrapped label owns: from its own line up to the
+// line where the next label begins, joined back together.
+func wrappedField(t *testing.T, lines []string, label, next string) string {
+	t.Helper()
+	start := indexContaining(t, lines, label)
+	end := len(lines)
+	for i := start + 1; i < len(lines); i++ {
+		if strings.HasPrefix(lines[i], next) {
+			end = i
+			break
+		}
+	}
+	if end == len(lines) {
+		t.Fatalf("no line after %q begins with %q:\n%s", label, next, strings.Join(lines, "\n"))
+	}
+	return strings.TrimPrefix(strings.Join(lines[start:end], ""), label)
+}
 
 // TestBoardWideRunesAndNewlinesStayOnOneBoundedLine keeps the bound true for the
 // text a user actually writes: a title in a wide script takes two columns per

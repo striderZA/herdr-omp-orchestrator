@@ -556,7 +556,11 @@ func wrap(text string, width int) []string {
 				runes := []rune(word)
 				piece, word = string(runes[0]), string(runes[1:])
 			} else {
-				word = word[len([]rune(piece)):]
+				// piece is a whole-rune prefix of word, so its byte length is the
+				// offset of the next rune. Advancing by a rune count here would
+				// split a multibyte rune and lose or duplicate the text around the
+				// cut.
+				word = word[len(piece):]
 			}
 			lines = append(lines, piece)
 		}
