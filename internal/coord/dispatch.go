@@ -114,15 +114,30 @@ func (c *Coordinator) Dispatch(
 	if err := checkDependencies(existing, request.dependencies); err != nil {
 		return task.Task{}, err
 	}
-	if err := checkReservations(existing, request.reservedPaths); err != nil {
-		return task.Task{}, err
-	}
 
-	st, err := c.createTask(ctx, project.Key, request, base)
+	// Queued work goes first: a free slot belongs to the tasks that have been
+	// waiting, not to the request that happens to arrive after them. The drain
+	// claims its slots durably, so a request that arrives when the queue takes the
+	// last slot is queued rather than provisioned past the budget.
+	c.drainQueued(ctx, project.Key, "")
+
+	// The budget and the reserved paths are decided by the durable gate, in one
+	// transaction with the task's own creation: a second coordinator process
+	// cannot pass the same checks and provision past the limit or take paths this
+	// request holds.
+	st, claimed, err := c.createTask(ctx, project.Key, request, base)
 	if err != nil {
 		return task.Task{}, err
 	}
+	if !claimed {
+		// The durable gate refused the slot: the task is recorded queued and
+		// records no side effect.
+		return st, nil
+	}
 	if ok, _ := c.dispatchable(existing, st); !ok {
+		// Gated by a dependency that a concurrent writer has not reviewed yet:
+		// give the slot back so another queued task can use it.
+		c.releaseSlot(ctx, st)
 		return st, nil
 	}
 	return c.provision(ctx, st)
@@ -152,6 +167,15 @@ func (c *Coordinator) ResumeDispatch(ctx context.Context, taskID string) (task.T
 	if ok, _ := c.dispatchable(existing, st); !ok {
 		return st, nil
 	}
+	// A resume provisions, so it takes the same durable slot a dispatch takes:
+	// a project that already holds every slot its budget allows leaves the task
+	// queued instead of provisioning past the limit.
+	if err := c.store.ClaimProvisioningSlot(ctx, st.ID, c.opts.Concurrency); err != nil {
+		if errors.Is(err, state.ErrBudgetExhausted) {
+			return st, nil
+		}
+		return st, err
+	}
 	if st.Attention != "" {
 		cleared, err := c.record(ctx, st, func(next *task.Task) error {
 			next.Attention = ""
@@ -162,7 +186,12 @@ func (c *Coordinator) ResumeDispatch(ctx context.Context, taskID string) (task.T
 		}
 		st = cleared
 	}
-	return c.provision(ctx, st)
+	provisioned, err := c.provision(ctx, st)
+	if err != nil {
+		return provisioned, err
+	}
+	c.drainQueued(ctx, st.ProjectKey, st.ID)
+	return provisioned, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -273,43 +302,19 @@ func normalizeReservedPath(path string) (string, error) {
 // gates: dependencies, reservations, concurrency
 // ---------------------------------------------------------------------------
 
-// dispatchable reports whether a task may take provisioning resources now.
+// dispatchable reports whether a task's dependencies allow it to provision now.
+//
+// The concurrency budget is deliberately not decided here: it is decided by the
+// durable gate (Store.ClaimTask / Store.ClaimProvisioningSlot), in the same
+// transaction that records the task or claims its slot, so two coordinator
+// processes cannot both pass this check and provision past the limit. Dependencies
+// are monotone — a dependency only ever becomes reviewed — so a stale read can
+// only queue a task that could have run, never the other way around.
 func (c *Coordinator) dispatchable(existing []task.Task, st task.Task) (bool, string) {
 	if reason := unsatisfiedDependency(existing, st); reason != "" {
 		return false, reason
 	}
-	if occupied := occupiedCount(existing, st.ID); occupied >= c.opts.Concurrency {
-		return false, fmt.Sprintf("the concurrency budget of %d is full", c.opts.Concurrency)
-	}
 	return true, ""
-}
-
-// occupiedCount counts the tasks that hold provisioning or running resources,
-// ignoring the task itself. A task keeps its slot until the primary records a
-// disposition for it, because its pane and checkout still exist.
-func occupiedCount(existing []task.Task, excludeID string) int {
-	count := 0
-	for _, other := range existing {
-		if other.ID == excludeID || !holdsResources(other) {
-			continue
-		}
-		count++
-	}
-	return count
-}
-
-// holdsResources reports whether a task currently owns a worker pane and
-// checkout.
-func holdsResources(st task.Task) bool {
-	if st.Disposition != "" {
-		return false
-	}
-	switch st.Phase {
-	case task.WorktreeCreated, task.AgentStarted, task.PromptSubmitted:
-		return true
-	default:
-		return false
-	}
 }
 
 // unsatisfiedDependency names the first dependency that is not reviewed yet.
@@ -339,48 +344,13 @@ func checkDependencies(existing []task.Task, dependencies []string) error {
 	return nil
 }
 
-// checkReservations refuses a request whose reserved paths overlap a task that
-// already holds them. Two workers never own the same file or directory.
-func checkReservations(existing []task.Task, reserved []string) error {
-	for _, other := range existing {
-		if other.Disposition != "" || len(other.ReservedPaths) == 0 {
-			continue
-		}
-		for _, mine := range reserved {
-			for _, theirs := range other.ReservedPaths {
-				if overlap, ok := pathsOverlap(mine, theirs); ok {
-					return fmt.Errorf("%w: task %s reserved %q (requested %q)",
-						ErrReservedConflict, other.ID, overlap, mine)
-				}
-			}
-		}
-	}
-	return nil
-}
-
-// pathsOverlap reports whether one reservation covers the other: the same path,
-// or one is a directory containing the other.
-func pathsOverlap(a, b string) (string, bool) {
-	a, b = filepath.ToSlash(a), filepath.ToSlash(b)
-	if isCaseInsensitivePath() {
-		a, b = strings.ToLower(a), strings.ToLower(b)
-	}
-	switch {
-	case a == b:
-		return a, true
-	case strings.HasPrefix(b, a+"/"):
-		return a, true
-	case strings.HasPrefix(a, b+"/"):
-		return b, true
-	default:
-		return "", false
-	}
-}
-
+// isCaseInsensitivePath reports whether this platform compares paths without
+// case, which is how a reservation is normalized before it is stored.
 func isCaseInsensitivePath() bool {
 	return filepath.Separator == '\\'
 }
 
+// findTask reads one task out of a project listing.
 func findTask(existing []task.Task, id string) (task.Task, bool) {
 	for _, st := range existing {
 		if st.ID == id {
@@ -394,14 +364,17 @@ func findTask(existing []task.Task, id string) (task.Task, bool) {
 // task creation
 // ---------------------------------------------------------------------------
 
-// createTask records one task in its intent phase, retrying only the identity
-// collision, which is the one failure that touches nothing.
-func (c *Coordinator) createTask(ctx context.Context, projectKey string, request dispatchRequest, base string) (task.Task, error) {
+// createTask records one task in its intent phase through the durable dispatch
+// gate, which decides the concurrency budget and the reserved paths in the same
+// transaction. It reports whether the task also claimed a provisioning slot;
+// only the identity collision and the id-less insert are retried, because both
+// touch nothing.
+func (c *Coordinator) createTask(ctx context.Context, projectKey string, request dispatchRequest, base string) (task.Task, bool, error) {
 	var lastErr error
 	for range idAttempts {
 		id, branch, err := c.newIdentity()
 		if err != nil {
-			return task.Task{}, err
+			return task.Task{}, false, err
 		}
 		st := task.Task{
 			ID:            id,
@@ -415,20 +388,98 @@ func (c *Coordinator) createTask(ctx context.Context, projectKey string, request
 			Branch:        branch,
 			Phase:         task.Intent,
 		}
-		lastErr = c.store.CreateTask(ctx, st)
-		if lastErr == nil {
-			// Re-read so every later compare-and-swap uses the stored revision.
-			created, readErr := c.store.Task(ctx, st.ID)
-			if readErr != nil {
-				return task.Task{}, fmt.Errorf("read the recorded task %s: %w", st.ID, readErr)
-			}
-			return created, nil
+		claimed, created, err := c.store.ClaimTask(ctx, st, c.opts.Concurrency)
+		if err == nil {
+			return created, claimed, nil
 		}
-		if !errors.Is(lastErr, state.ErrConflict) {
-			return task.Task{}, fmt.Errorf("record task intent for %q: %w", projectKey, lastErr)
+		lastErr = err
+		if errors.Is(err, state.ErrReservedConflict) {
+			// The reservation is held by another task: the request is refused and
+			// nothing was recorded. Report it as the coordinator's own refusal so
+			// callers classify it the same way as before.
+			return task.Task{}, false, fmt.Errorf("%w: %s", ErrReservedConflict, err)
+		}
+		if !errors.Is(err, state.ErrConflict) {
+			return task.Task{}, false, fmt.Errorf("record task intent for %q: %w", projectKey, err)
 		}
 	}
-	return task.Task{}, fmt.Errorf("record task intent for %q: %w", projectKey, lastErr)
+	return task.Task{}, false, fmt.Errorf("record task intent for %q: %w", projectKey, lastErr)
+}
+
+// releaseSlot gives a claimed provisioning slot back after a step failed before
+// recording any resource. A failure here is not fatal: the slot stays with this
+// task, which can hold at most one, so nothing is over-provisioned and the next
+// resume of this task uses it.
+func (c *Coordinator) releaseSlot(ctx context.Context, st task.Task) {
+	_ = c.store.ReleaseProvisioningSlot(ctx, st.ID)
+}
+
+// DrainQueued provisions the project's queued tasks that a freed slot or a
+// reviewed prerequisite now allows, oldest first, and returns what it
+// provisioned.
+//
+// It is the surface that makes a queued task progress at the moment its gate
+// opens, instead of waiting for a future dispatch: a task becomes eligible when
+// the primary records a disposition for the worker that held a slot (Review) or
+// when a prerequisite reaches ready_for_review (a worker's final report), so
+// whoever records those facts calls this. It is idempotent, safe to call
+// concurrently (every candidate is re-gated and claims its slot through the
+// durable gate), and it never repeats a recorded step.
+//
+// Capacity semantics: a slot is held from the moment a task claims it until the
+// primary records a disposition for it. A worker's final report does not free a
+// slot — its pane and checkout still exist — so draining after a report only
+// helps a task whose *dependency* that report unblocked.
+func (c *Coordinator) DrainQueued(ctx context.Context, projectKey string) ([]task.Task, error) {
+	if strings.TrimSpace(projectKey) == "" {
+		return nil, fmt.Errorf("%w: project key is required", ErrInvalidRequest)
+	}
+	return c.drainQueued(ctx, projectKey, ""), nil
+}
+
+// drainQueued provisions the project's queued tasks whose gates now allow it,
+// oldest first, bounded by the concurrency budget. It returns what it provisioned.
+//
+// It is the automatic drain behind a freed slot or a reviewed prerequisite: a
+// task that was queued because the budget was full or a dependency was not
+// reviewed is re-read, re-gated and claimed through the same durable gate a
+// dispatch uses, so draining in two processes cannot provision past the budget
+// and cannot take a path another task holds. The queue is ordered, so a task the
+// gate still refuses stops the walk: a later task must not overtake it. excluded
+// is the task the caller has just handled itself. A task that fails while being
+// drained records its own attention or blocker, and the drain continues with the
+// next candidate.
+func (c *Coordinator) drainQueued(ctx context.Context, projectKey, excluded string) []task.Task {
+	if strings.TrimSpace(projectKey) == "" {
+		return nil
+	}
+	queued, err := c.projectTasks(ctx, projectKey)
+	if err != nil {
+		return nil
+	}
+	var drained []task.Task
+	for _, cand := range queued {
+		if cand.ID == excluded || cand.Phase != task.Intent || cand.Blocker != "" ||
+			cand.Disposition != "" || len(cand.Checks) == 0 {
+			continue
+		}
+		if ok, _ := c.dispatchable(queued, cand); !ok {
+			return drained
+		}
+		if err := c.store.ClaimProvisioningSlot(ctx, cand.ID, c.opts.Concurrency); err != nil {
+			// No slot is left: every later candidate would be refused for the same
+			// reason, and the ones before it were not eligible.
+			return drained
+		}
+		provisioned, err := c.provision(ctx, cand)
+		if err != nil {
+			// The task recorded its own attention or blocker; the next candidate can
+			// still use the slot if this one gave it back.
+			continue
+		}
+		drained = append(drained, provisioned)
+	}
+	return drained
 }
 
 // newIdentity returns a fresh task id and its branch. Herdr labels are never
@@ -525,6 +576,9 @@ func (c *Coordinator) createWorktree(ctx context.Context, st task.Task) (task.Ta
 	}
 
 	if !errors.Is(err, herdr.ErrAmbiguous) {
+		// A definite failure created nothing, so the claimed slot goes back and
+		// another queued task can use it.
+		c.releaseSlot(ctx, st)
 		return c.failTask(ctx, st, "create the worktree", false,
 			fmt.Errorf("worktree create for root %s branch %q base %s failed: %w",
 				st.ProjectKey, st.Branch, st.BaseRevision, err))

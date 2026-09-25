@@ -225,7 +225,7 @@ func fixtureWorktreeCreate(dir string, plan fixturePlan, state *fixtureState, ar
 	}
 	path := filepath.Join(dir, "worktrees", strings.ReplaceAll(branch, "/", "-"))
 	if !plan.SkipGitWorktree {
-		if out, err := runGit(root, "worktree", "add", "-b", branch, path, base); err != nil {
+		if out, err := runGitWorktreeAdd(root, branch, path, base); err != nil {
 			fmt.Fprintf(os.Stderr, "fixture: git worktree add: %v: %s\n", err, out)
 			return 24
 		}
@@ -914,6 +914,37 @@ func runGit(dir string, args ...string) (string, error) {
 	return string(out), err
 }
 
+// runGitWorktreeAdd runs the one git command Herdr's `worktree create` runs, and
+// retries briefly while another invocation holds git's lock.
+//
+// Herdr serializes worktree creation inside one session; the stand-in CLI is
+// invoked as one process per call, so two concurrent dispatches can reach `git
+// worktree add` at the same moment. Retrying on git's own lock keeps that
+// fixture artefact from looking like a coordinator failure: what the tests
+// measure is the durable dispatch gate and the recorded facts, not git's locking.
+func runGitWorktreeAdd(root, branch, path, base string) (string, error) {
+	var lastOut string
+	var lastErr error
+	for attempt := range 40 {
+		if _, err := os.Stat(path); err == nil {
+			// Another invocation already created it: the branch and path are what
+			// this call asked for, so report success.
+			return "", nil
+		}
+		out, err := runGit(root, "worktree", "add", "-b", branch, path, base)
+		if err == nil {
+			return out, nil
+		}
+		lastOut, lastErr = out, err
+		if !strings.Contains(out, "index.lock") && !strings.Contains(out, "Unable to create") &&
+			!strings.Contains(out, "already checked out") && !strings.Contains(out, "locked") {
+			return out, err
+		}
+		time.Sleep(time.Duration(attempt+1) * 5 * time.Millisecond)
+	}
+	return lastOut, lastErr
+}
+
 func workspaceOfPane(pane string) string {
 	ws, _, _ := strings.Cut(pane, ":")
 	return ws
@@ -924,15 +955,46 @@ func workspaceOfPane(pane string) string {
 // ---------------------------------------------------------------------------
 
 type coordFixture struct {
-	t       *testing.T
-	root    string
-	base    string
-	dir     string
-	plan    fixturePlan
-	store   *state.Store
-	coord   *Coordinator
-	client  *herdr.Client
-	project string
+	t        *testing.T
+	root     string
+	base     string
+	dir      string
+	plan     fixturePlan
+	store    *state.Store
+	coord    *Coordinator
+	client   *herdr.Client
+	project  string
+	stateDir string
+}
+
+// sibling opens a second store and coordinator over the same plugin state
+// directory, standing in for a second bridge process dispatching for the same
+// project: separate connections, one shared database.
+func (f *coordFixture) sibling() *Coordinator {
+	f.t.Helper()
+	store, err := state.Open(f.stateDir)
+	if err != nil {
+		f.t.Fatalf("sibling state.Open: %v", err)
+	}
+	f.t.Cleanup(func() { _ = store.Close() })
+	coordinator, err := New(store, f.client, Options{
+		Concurrency:      3,
+		CallTimeout:      5 * time.Second,
+		ReadinessTimeout: 2 * time.Second,
+		PollInterval:     10 * time.Millisecond,
+	})
+	if err != nil {
+		f.t.Fatalf("sibling coord.New: %v", err)
+	}
+	return coordinator
+}
+
+// spec describes one dispatch request for the concurrency tests.
+type spec struct {
+	title    string
+	checks   []string
+	deps     []string
+	reserved []string
 }
 
 // newCoordFixture builds a real repository with two commits, a stand-in Herdr
@@ -975,6 +1037,7 @@ func newCoordFixture(t *testing.T, plan fixturePlan) *coordFixture {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	f.store = store
+	f.stateDir = stateDir
 
 	client, err := herdr.NewClient(exe)
 	if err != nil {
@@ -2379,6 +2442,428 @@ func TestAmbiguousFailureThatCannotBeRecordedAdvisesInspectionNotResume(t *testi
 	}
 	if updated.Attention != "" || updated.Blocker != "" {
 		t.Errorf("a ghost task was reported as updated: %+v", updated)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the durable dispatch gate
+// ---------------------------------------------------------------------------
+
+// dispatchSpec runs one dispatch request through one coordinator.
+func (f *coordFixture) dispatchSpec(c *Coordinator, s spec) (task.Task, error) {
+	f.t.Helper()
+	return c.Dispatch(context.Background(), f.projectKey(), s.title, "brief "+s.title, s.checks, s.deps, s.reserved, f.base)
+}
+
+func (f *coordFixture) stages() map[task.Stage]int {
+	f.t.Helper()
+	tasks, err := f.store.Tasks(context.Background(), f.root)
+	if err != nil {
+		f.t.Fatalf("Tasks: %v", err)
+	}
+	counts := map[task.Stage]int{}
+	for _, st := range tasks {
+		counts[task.StageOf(st)]++
+	}
+	return counts
+}
+
+func TestConcurrentDispatchesCannotExceedTheBudget(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	sibling := f.sibling()
+	checks := []string{"go test ./... ok"}
+
+	// Two workers are running, so one slot is left for two requests that are
+	// decided at the same time.
+	for _, s := range []spec{
+		{title: "one", checks: checks, reserved: []string{"a.txt"}},
+		{title: "two", checks: checks, reserved: []string{"b.txt"}},
+	} {
+		if _, err := f.dispatchSpec(f.coord, s); err != nil {
+			t.Fatalf("dispatch %s: %v", s.title, err)
+		}
+	}
+	before := f.countCalls("worktree create")
+
+	type outcome struct {
+		st  task.Task
+		err error
+	}
+	results := make(chan outcome, 2)
+	start := make(chan struct{})
+	go func() {
+		<-start
+		st, err := f.dispatchSpec(f.coord, spec{title: "three", checks: checks, reserved: []string{"c.txt"}})
+		results <- outcome{st, err}
+	}()
+	go func() {
+		<-start
+		st, err := f.dispatchSpec(sibling, spec{title: "four", checks: checks, reserved: []string{"d.txt"}})
+		results <- outcome{st, err}
+	}()
+	close(start)
+	for range 2 {
+		got := <-results
+		if got.err != nil {
+			t.Fatalf("concurrent dispatch failed: %v", got.err)
+		}
+	}
+
+	// The budget is a property of the project, not of one connection: exactly one
+	// of the two requests could take the last slot.
+	if created := f.countCalls("worktree create"); created != before+1 {
+		t.Errorf("worktree create calls = %d, want %d: two processes provisioned past the budget", created, before+1)
+	}
+	stages := f.stages()
+	if stages[task.Running] != 3 {
+		t.Errorf("running tasks = %d, want 3 (%v)", stages[task.Running], stages)
+	}
+	if stages[task.Queued] != 1 {
+		t.Errorf("queued tasks = %d, want 1 (%v)", stages[task.Queued], stages)
+	}
+}
+
+func TestConcurrentDispatchesCannotShareReservedPaths(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	sibling := f.sibling()
+	checks := []string{"go test ./... ok"}
+	owner, err := f.dispatchSpec(f.coord, spec{title: "owner", checks: checks, reserved: []string{"notes.md"}})
+	if err != nil {
+		t.Fatalf("dispatch owner: %v", err)
+	}
+
+	// A second process, choosing the same reservation at the same time as a third
+	// request, must not both take it: the gate decides on the database's contents.
+	type outcome struct {
+		title string
+		err   error
+		st    task.Task
+	}
+	results := make(chan outcome, 2)
+	start := make(chan struct{})
+	for i, c := range []*Coordinator{f.coord, sibling} {
+		go func(i int, c *Coordinator) {
+			<-start
+			st, err := f.dispatchSpec(c, spec{title: fmt.Sprintf("thief-%d", i), checks: checks, reserved: []string{"notes.md"}})
+			results <- outcome{fmt.Sprintf("thief-%d", i), err, st}
+		}(i, c)
+	}
+	close(start)
+	refused := 0
+	for range 2 {
+		got := <-results
+		if got.err != nil {
+			if !errors.Is(got.err, ErrReservedConflict) {
+				t.Fatalf("dispatch %s err = %v, want ErrReservedConflict", got.title, got.err)
+			}
+			if !strings.Contains(got.err.Error(), owner.ID) {
+				t.Errorf("refusal %q does not name the owner %q", got.err, owner.ID)
+			}
+			refused++
+		}
+	}
+	if refused != 2 {
+		t.Errorf("refusals = %d, want 2: the reservation is held by %s", refused, owner.ID)
+	}
+	if created := f.countCalls("worktree create"); created != 1 {
+		t.Errorf("worktree create calls = %d, want 1", created)
+	}
+	// Only the owner holds the path, and no thief task was recorded.
+	tasks, err := f.store.Tasks(context.Background(), f.root)
+	if err != nil {
+		t.Fatalf("Tasks: %v", err)
+	}
+	for _, st := range tasks {
+		if st.ID == owner.ID {
+			continue
+		}
+		for _, path := range st.ReservedPaths {
+			if path == "notes.md" {
+				t.Errorf("task %s also reserved notes.md", st.ID)
+			}
+		}
+	}
+}
+
+func TestQueuedTasksDrainWhenASlotFrees(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	checks := []string{"go test ./... ok"}
+	var workers []task.Task
+	for i, title := range []string{"one", "two", "three"} {
+		st, err := f.dispatchSpec(f.coord, spec{title: title, checks: checks, reserved: []string{fmt.Sprintf("src/%d.txt", i)}})
+		if err != nil {
+			t.Fatalf("dispatch %s: %v", title, err)
+		}
+		workers = append(workers, st)
+	}
+	queued, err := f.dispatchSpec(f.coord, spec{title: "four", checks: checks})
+	if err != nil {
+		t.Fatalf("dispatch four: %v", err)
+	}
+	if queued.Phase != task.Intent {
+		t.Fatalf("fourth task phase = %q, want %q", queued.Phase, task.Intent)
+	}
+
+	// The primary reviews a worker (the write Task 5's review makes), which frees
+	// its slot, and dispatches one more request: the queue has been waiting longer,
+	// so it goes first and the new request is queued instead.
+	f.block(workers[0], func(next *task.Task) {
+		next.Disposition = "integrated"
+	})
+	fresh, err := f.dispatchSpec(f.coord, spec{title: "five", checks: checks})
+	if err != nil {
+		t.Fatalf("dispatch five: %v", err)
+	}
+	drained, err := f.store.Task(context.Background(), queued.ID)
+	if err != nil {
+		t.Fatalf("Task: %v", err)
+	}
+	if drained.Phase != task.PromptSubmitted {
+		t.Fatalf("the queued task is still %q, want %q (attention=%q)", drained.Phase, task.PromptSubmitted, drained.Attention)
+	}
+	if got := f.prompts(drained.PublicPaneID); len(got) != 1 {
+		t.Errorf("prompts for the drained task = %v, want one brief", got)
+	}
+	if fresh.Phase != task.Intent {
+		t.Errorf("the newest request phase = %q, want %q: it overtook the queue", fresh.Phase, task.Intent)
+	}
+	if created := f.countCalls("worktree create"); created != 4 {
+		t.Errorf("worktree create calls = %d, want 4 (three workers plus the drained task)", created)
+	}
+}
+
+func TestDependentTasksDrainWhenThePrerequisiteIsReviewed(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	checks := []string{"go test ./... ok"}
+	prereq, err := f.dispatchSpec(f.coord, spec{title: "prereq", checks: checks})
+	if err != nil {
+		t.Fatalf("dispatch prereq: %v", err)
+	}
+	dependent, err := f.dispatchSpec(f.coord, spec{title: "dependent", checks: checks, deps: []string{prereq.ID}})
+	if err != nil {
+		t.Fatalf("dispatch dependent: %v", err)
+	}
+	if dependent.Phase != task.Intent {
+		t.Fatalf("dependent phase = %q, want %q", dependent.Phase, task.Intent)
+	}
+
+	// The prerequisite is reviewed (the write Task 5's final report and review
+	// make); no one resumes the dependent explicitly.
+	f.satisfyReview(prereq)
+	// A perfectly ordinary dispatch is what carries the drain: the queue is
+	// checked before a new request takes resources.
+	if _, err := f.dispatchSpec(f.coord, spec{title: "unrelated", checks: checks}); err != nil {
+		t.Fatalf("dispatch after the review: %v", err)
+	}
+	provisioned, err := f.store.Task(context.Background(), dependent.ID)
+	if err != nil {
+		t.Fatalf("Task: %v", err)
+	}
+	if provisioned.Phase != task.PromptSubmitted {
+		t.Fatalf("the dependent task is still %q, want %q (attention=%q)",
+			provisioned.Phase, task.PromptSubmitted, provisioned.Attention)
+	}
+	if got := f.prompts(provisioned.PublicPaneID); len(got) != 1 {
+		t.Errorf("prompts for the dependent task = %v, want one brief", got)
+	}
+}
+
+func TestDrainStopsAtTheBudgetAndKeepsQueuedWorkQueued(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	checks := []string{"go test ./... ok"}
+	for i, title := range []string{"one", "two", "three"} {
+		if _, err := f.dispatchSpec(f.coord, spec{title: title, checks: checks, reserved: []string{fmt.Sprintf("src/%d.txt", i)}}); err != nil {
+			t.Fatalf("dispatch %s: %v", title, err)
+		}
+	}
+	queued, err := f.dispatchSpec(f.coord, spec{title: "four", checks: checks})
+	if err != nil {
+		t.Fatalf("dispatch four: %v", err)
+	}
+	// Nothing has freed a slot, so a drain changes nothing at all.
+	if _, err := f.dispatchSpec(f.coord, spec{title: "five", checks: checks}); err != nil {
+		t.Fatalf("dispatch five: %v", err)
+	}
+	still, err := f.store.Task(context.Background(), queued.ID)
+	if err != nil {
+		t.Fatalf("Task: %v", err)
+	}
+	if still.Phase != task.Intent || still.Attention != "" || still.Blocker != "" {
+		t.Errorf("the queued task changed without a free slot: phase=%q attention=%q", still.Phase, still.Attention)
+	}
+	if created := f.countCalls("worktree create"); created != 3 {
+		t.Errorf("worktree create calls = %d, want 3", created)
+	}
+}
+
+func TestDrainQueuedSurfaceProgressesAQueuedTaskAfterReview(t *testing.T) {
+	// Task 5's Review records the disposition and then calls this surface: the
+	// queued task must progress without waiting for another dispatch.
+	f := newCoordFixture(t, fixturePlan{})
+	checks := []string{"go test ./... ok"}
+	var workers []task.Task
+	for i, title := range []string{"one", "two", "three"} {
+		st, err := f.dispatchSpec(f.coord, spec{title: title, checks: checks, reserved: []string{fmt.Sprintf("src/%d.txt", i)}})
+		if err != nil {
+			t.Fatalf("dispatch %s: %v", title, err)
+		}
+		workers = append(workers, st)
+	}
+	queued, err := f.dispatchSpec(f.coord, spec{title: "four", checks: checks})
+	if err != nil {
+		t.Fatalf("dispatch four: %v", err)
+	}
+
+	// Before the slot is freed the drain changes nothing.
+	if drained, err := f.coord.DrainQueued(context.Background(), f.root); err != nil || len(drained) != 0 {
+		t.Fatalf("DrainQueued with a full budget = (%v, %v), want no progress", drained, err)
+	}
+	still, err := f.store.Task(context.Background(), queued.ID)
+	if err != nil {
+		t.Fatalf("Task: %v", err)
+	}
+	if still.Phase != task.Intent {
+		t.Fatalf("phase = %q, want %q", still.Phase, task.Intent)
+	}
+
+	// The review frees the slot, and the drain is what carries it.
+	f.block(workers[1], func(next *task.Task) {
+		next.Disposition = "integrated"
+	})
+	drained, err := f.coord.DrainQueued(context.Background(), f.root)
+	if err != nil {
+		t.Fatalf("DrainQueued: %v", err)
+	}
+	if len(drained) != 1 || drained[0].ID != queued.ID {
+		t.Fatalf("DrainQueued = %+v, want the queued task %s", drained, queued.ID)
+	}
+	if drained[0].Phase != task.PromptSubmitted {
+		t.Errorf("drained phase = %q, want %q", drained[0].Phase, task.PromptSubmitted)
+	}
+	if got := f.prompts(drained[0].PublicPaneID); len(got) != 1 {
+		t.Errorf("prompts = %v, want one brief", got)
+	}
+	// The drain is idempotent: again changes nothing, and no step is repeated.
+	again, err := f.coord.DrainQueued(context.Background(), f.root)
+	if err != nil || len(again) != 0 {
+		t.Errorf("second DrainQueued = (%v, %v), want no progress", again, err)
+	}
+	if created := f.countCalls("worktree create"); created != 4 {
+		t.Errorf("worktree create calls = %d, want 4", created)
+	}
+	// A project key is required: an empty one is a caller error, not a silent
+	// no-op that would hide a missing project.
+	if _, err := f.coord.DrainQueued(context.Background(), "  "); !errors.Is(err, ErrInvalidRequest) {
+		t.Errorf("DrainQueued(\"\") err = %v, want ErrInvalidRequest", err)
+	}
+}
+
+func TestGatedIntentTasksHoldNoSlot(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	checks := []string{"go test ./... ok"}
+	slots := func() int {
+		f.t.Helper()
+		count, err := f.store.ProvisioningSlots(context.Background(), f.root)
+		if err != nil {
+			f.t.Fatalf("ProvisioningSlots: %v", err)
+		}
+		return count
+	}
+
+	// A dependency-gated request is recorded without a slot: the admitted task
+	// would otherwise hold capacity it cannot use.
+	prereq, err := f.dispatchSpec(f.coord, spec{title: "prereq", checks: checks})
+	if err != nil {
+		t.Fatalf("dispatch prereq: %v", err)
+	}
+	dependent, err := f.dispatchSpec(f.coord, spec{title: "dependent", checks: checks, deps: []string{prereq.ID}})
+	if err != nil {
+		t.Fatalf("dispatch dependent: %v", err)
+	}
+	if dependent.Phase != task.Intent {
+		t.Fatalf("dependent phase = %q, want %q", dependent.Phase, task.Intent)
+	}
+	if got := slots(); got != 1 {
+		t.Fatalf("slots held = %d, want only the running prerequisite", got)
+	}
+
+	// Fill the budget: the next request is recorded queued and holds nothing.
+	for i, title := range []string{"two", "three"} {
+		if _, err := f.dispatchSpec(f.coord, spec{title: title, checks: checks, reserved: []string{fmt.Sprintf("src/%d.txt", i)}}); err != nil {
+			t.Fatalf("dispatch %s: %v", title, err)
+		}
+	}
+	if got := slots(); got != 3 {
+		t.Fatalf("slots held = %d, want the full budget of 3", got)
+	}
+	refused, err := f.dispatchSpec(f.coord, spec{title: "four", checks: checks})
+	if err != nil {
+		t.Fatalf("dispatch four: %v", err)
+	}
+	if refused.Phase != task.Intent {
+		t.Fatalf("fourth phase = %q, want %q", refused.Phase, task.Intent)
+	}
+	if got := slots(); got != 3 {
+		t.Errorf("a budget-refused task holds a slot: %d held, want 3", got)
+	}
+	// A definite failure before any resource goes back too.
+	failed, err := f.coord.Dispatch(context.Background(), f.root, "five", "brief five",
+		[]string{"go test ./... ok"}, nil, []string{"other.txt"}, strings.Repeat("b", 40))
+	if !errors.Is(err, ErrBaseRevision) {
+		t.Fatalf("dispatch with an unknown base err = %v, want ErrBaseRevision", err)
+	}
+	_ = failed
+	if got := slots(); got != 3 {
+		t.Errorf("a refused request changed the slots: %d held, want 3", got)
+	}
+}
+
+func TestResumeReusesTheClaimACrashLeft(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	checks := []string{"go test ./... ok"}
+	st, err := f.dispatchSpec(f.coord, spec{title: "one", checks: checks})
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	// Rewind the task to just after it was admitted: the claim is durable, the
+	// process died before any Herdr call.
+	admitted := f.block(st, func(next *task.Task) {
+		next.Phase = task.Intent
+		next.WorktreePath, next.WorktreeWorkspaceID, next.CurrentWorkspaceID = "", "", ""
+		next.LaunchPaneID, next.PublicPaneID = "", ""
+		next.AgentName, next.OMPSessionID, next.TerminalID = "", "", ""
+	})
+	if err := f.store.ClaimProvisioningSlot(context.Background(), admitted.ID, 3); err != nil {
+		t.Fatalf("claim the slot the dead dispatch held: %v", err)
+	}
+	slots, err := f.store.ProvisioningSlots(context.Background(), f.root)
+	if err != nil || slots != 1 {
+		t.Fatalf("ProvisioningSlots = (%d, %v), want the one claim", slots, err)
+	}
+
+	// The retry reconciles that same claim: it does not take a second slot, it
+	// adopts the checkout the dead attempt left, and it starts no second agent.
+	beforeCreate := f.countCalls("worktree create")
+	beforeStart := f.countCalls("agent start")
+	resumed, err := f.resume(admitted.ID)
+	if err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if resumed.Phase != task.PromptSubmitted {
+		t.Fatalf("resumed phase = %q, want %q", resumed.Phase, task.PromptSubmitted)
+	}
+	if slots, err = f.store.ProvisioningSlots(context.Background(), f.root); err != nil || slots != 1 {
+		t.Errorf("ProvisioningSlots after the retry = (%d, %v), want 1: the claim was double counted", slots, err)
+	}
+	if created := f.countCalls("worktree create"); created != beforeCreate {
+		t.Errorf("worktree create calls = %d, want %d: the retry created a second checkout", created, beforeCreate)
+	}
+	if started := f.countCalls("agent start"); started != beforeStart {
+		t.Errorf("agent start calls = %d, want %d: the retry started a second agent", started, beforeStart)
+	}
+	list := gitOutput(t, f.root, "worktree", "list", "--porcelain")
+	if strings.Count(list, "orch/"+strings.TrimPrefix(admitted.Branch, "orch/")) != 1 {
+		t.Errorf("the repository has more than one checkout for %s:\n%s", admitted.Branch, list)
 	}
 }
 

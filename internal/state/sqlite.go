@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -30,6 +31,12 @@ var (
 	// record was confirmed (or announced) with. It is never a reason to replace
 	// the recorded identity: a human decides which process owns the pane.
 	ErrMismatch = errors.New("state: announced session does not match the recorded reference")
+	// ErrBudgetExhausted reports that a project already holds every provisioning
+	// slot its concurrency budget allows. The claim changes nothing.
+	ErrBudgetExhausted = errors.New("state: the provisioning budget is exhausted")
+	// ErrReservedConflict reports reserved paths that a task of the same project
+	// already holds. The claim changes nothing either.
+	ErrReservedConflict = errors.New("state: reserved paths overlap another task")
 )
 
 // Role identifies whether an OMP session belongs to a primary project or a worker task.
@@ -64,6 +71,7 @@ CREATE TABLE IF NOT EXISTS tasks (
 	launch_pane_id TEXT NULL,
 	public_pane_id TEXT NOT NULL DEFAULT '',
 	revision INTEGER NOT NULL,
+	slot_claimed_at INTEGER NOT NULL DEFAULT 0,
 	data JSON NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS tasks_launch_pane_id
@@ -110,6 +118,14 @@ var inboxColumns = []struct{ name, ddl string }{
 	{"delivery_detail", `ALTER TABLE inbox ADD COLUMN delivery_detail TEXT NOT NULL DEFAULT ''`},
 }
 
+// taskColumns are the columns a task needs beyond its first release shape. The
+// provisioning slot is the one the dispatch gate uses: an older state database
+// has no claimed slots, and every existing task is judged by the phase it
+// recorded, which the gate reads as well.
+var taskColumns = []struct{ name, ddl string }{
+	{"slot_claimed_at", `ALTER TABLE tasks ADD COLUMN slot_claimed_at INTEGER NOT NULL DEFAULT 0`},
+}
+
 // migratedColumns are the additive columns of every table, in the order they are
 // applied. SQLite has no ADD COLUMN IF NOT EXISTS, so each table's existing
 // columns are read before the missing ones are added.
@@ -119,6 +135,7 @@ var migratedColumns = []struct {
 }{
 	{"ready_sessions", readySessionColumns},
 	{"inbox", inboxColumns},
+	{"tasks", taskColumns},
 }
 
 // postMigrateIndexes creates the indexes that name a column an older state
@@ -862,6 +879,252 @@ func (s *Store) RecoverInbox(ctx context.Context) (int, error) {
 		return 0, fmt.Errorf("recover inbox deliveries: %w", err)
 	}
 	return int(rows), nil
+}
+
+// ---------------------------------------------------------------------------
+// the durable dispatch gate
+// ---------------------------------------------------------------------------
+
+// slotHolder is the condition under which a task holds one of its project's
+// provisioning slots: it claimed one explicitly, or it already recorded a phase
+// that owns a checkout and a pane, and nothing has closed it.
+//
+// The phase is part of the rule as well as the claim, because a state database
+// written before the claim existed has rows whose resources are visible only
+// through their phase, and a record that reached a resource-owning phase must
+// never stop counting as one.
+const slotHolder = `(slot_claimed_at > 0 OR COALESCE(json_extract(data, '$.Phase'), '') IN ('worktree_created', 'agent_started', 'prompt_submitted'))
+	AND COALESCE(json_extract(data, '$.Disposition'), '') = ''`
+
+// claimedSlots counts the provisioning slots a project holds, ignoring one task
+// (the task being claimed, which is judged by its own facts instead).
+func claimedSlots(ctx context.Context, q rowQueryer, projectKey, excludeID string) (int, error) {
+	var count int
+	err := q.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM tasks WHERE project_key = ? AND id <> ? AND `+slotHolder,
+		projectKey, excludeID).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count the provisioning slots of %q: %w", projectKey, err)
+	}
+	return count, nil
+}
+
+// taskHoldsSlot reports whether one recorded task already holds a slot.
+func taskHoldsSlot(ctx context.Context, q rowQueryer, id string) (bool, error) {
+	var holds int
+	err := q.QueryRowContext(ctx,
+		`SELECT CASE WHEN `+slotHolder+` THEN 1 ELSE 0 END FROM tasks WHERE id = ?`, id).Scan(&holds)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, fmt.Errorf("%w: task %s", ErrNotFound, id)
+	}
+	if err != nil {
+		return false, fmt.Errorf("read the slot of task %s: %w", id, err)
+	}
+	return holds == 1, nil
+}
+
+// ClaimTask records a new task and, when the project still has a provisioning
+// slot, claims one for it in the same write transaction.
+//
+// This is the dispatch gate: the concurrency budget and the reserved paths are
+// decided against the database's current contents inside one transaction, so two
+// coordinator processes cannot both pass and provision workers past the limit,
+// and cannot both take the same reserved paths. Both outcomes are durable: a task
+// whose claim was refused for the budget is recorded (a queued task holds no
+// resource) and must be claimed again before it is provisioned, while a
+// reservation that another task holds refuses the whole request and records
+// nothing.
+func (s *Store) ClaimTask(ctx context.Context, t task.Task, budget int) (bool, task.Task, error) {
+	if t.ID == "" || t.ProjectKey == "" {
+		return false, task.Task{}, fmt.Errorf("%w: task id and project key are required", ErrInvalid)
+	}
+	if budget < 1 {
+		return false, task.Task{}, fmt.Errorf("%w: a provisioning budget of at least one is required", ErrInvalid)
+	}
+	now := time.Now().UnixMilli()
+	t.Revision = 1
+	t.CreatedAt, t.UpdatedAt = now, now
+	data, err := json.Marshal(t)
+	if err != nil {
+		return false, task.Task{}, fmt.Errorf("encode task %q: %w", t.ID, err)
+	}
+
+	tx, err := s.begin(ctx, "claim task "+t.ID)
+	if err != nil {
+		return false, task.Task{}, err
+	}
+	defer tx.rollback()
+
+	if taken, err := rowExists(ctx, tx, `SELECT 1 FROM tasks WHERE id = ?`, t.ID); err != nil {
+		return false, task.Task{}, err
+	} else if taken {
+		return false, task.Task{}, fmt.Errorf("%w: task %q already exists", ErrConflict, t.ID)
+	}
+	if err := checkPaneFree(ctx, tx, t.LaunchPaneID, t.ID); err != nil {
+		return false, task.Task{}, err
+	}
+	if len(t.ReservedPaths) > 0 {
+		existing, err := queryFacts[task.Task](ctx, tx, `SELECT data FROM tasks WHERE project_key = ?`, t.ProjectKey)
+		if err != nil {
+			return false, task.Task{}, fmt.Errorf("read the tasks of %q: %w", t.ProjectKey, err)
+		}
+		if owner, mine, theirs, ok := reservedConflict(existing, t.ReservedPaths); ok {
+			return false, task.Task{}, fmt.Errorf("%w: task %s reserved %q (requested %q)",
+				ErrReservedConflict, owner, theirs, mine)
+		}
+	}
+	count, err := claimedSlots(ctx, tx, t.ProjectKey, t.ID)
+	if err != nil {
+		return false, task.Task{}, err
+	}
+	claimed := count < budget
+	claimValue := int64(0)
+	if claimed {
+		claimValue = now
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO tasks (id, project_key, launch_pane_id, public_pane_id, revision, slot_claimed_at, data)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		t.ID, t.ProjectKey, nullablePane(t.LaunchPaneID), t.PublicPaneID, t.Revision, claimValue, string(data),
+	); err != nil {
+		return false, task.Task{}, fmt.Errorf("claim task %q: %w", t.ID, err)
+	}
+	if err := tx.commit("claim task " + t.ID); err != nil {
+		return false, task.Task{}, err
+	}
+	return claimed, t, nil
+}
+
+// ClaimProvisioningSlot claims a slot for a task that is already recorded, before
+// any side effect touches Herdr. It is idempotent: a task that already holds a
+// slot keeps it. A project that holds every slot its budget allows reports
+// ErrBudgetExhausted and changes nothing.
+func (s *Store) ClaimProvisioningSlot(ctx context.Context, id string, budget int) error {
+	if strings.TrimSpace(id) == "" {
+		return fmt.Errorf("%w: task id is required", ErrInvalid)
+	}
+	if budget < 1 {
+		return fmt.Errorf("%w: a provisioning budget of at least one is required", ErrInvalid)
+	}
+	tx, err := s.begin(ctx, "claim provisioning slot for "+id)
+	if err != nil {
+		return err
+	}
+	defer tx.rollback()
+
+	t, err := scanTask(tx.QueryRowContext(ctx, `SELECT data FROM tasks WHERE id = ?`, id), "task "+id)
+	if err != nil {
+		return err
+	}
+	holds, err := taskHoldsSlot(ctx, tx, id)
+	if err != nil {
+		return err
+	}
+	if holds {
+		return tx.commit("claim provisioning slot for " + id)
+	}
+	count, err := claimedSlots(ctx, tx, t.ProjectKey, id)
+	if err != nil {
+		return err
+	}
+	if count >= budget {
+		return fmt.Errorf("%w: %q already holds %d of %d provisioning slots",
+			ErrBudgetExhausted, t.ProjectKey, count, budget)
+	}
+	res, err := tx.ExecContext(ctx,
+		`UPDATE tasks SET slot_claimed_at = ? WHERE id = ? AND slot_claimed_at = 0`,
+		time.Now().UnixMilli(), id)
+	if err != nil {
+		return fmt.Errorf("claim provisioning slot for %s: %w", id, err)
+	}
+	if err := requireOneRow(res, ErrConflict, "claim provisioning slot for "+id); err != nil {
+		return err
+	}
+	return tx.commit("claim provisioning slot for " + id)
+}
+
+// ReleaseProvisioningSlot gives a claimed slot back, for a task whose
+// provisioning failed before it recorded any resource. The phase still decides
+// the slot for a task that reached one, so releasing a claim never frees a
+// checkout or a live worker.
+func (s *Store) ReleaseProvisioningSlot(ctx context.Context, id string) error {
+	if strings.TrimSpace(id) == "" {
+		return fmt.Errorf("%w: task id is required", ErrInvalid)
+	}
+	var holds int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT CASE WHEN COALESCE(json_extract(data, '$.Phase'), '') IN ('worktree_created', 'agent_started', 'prompt_submitted') THEN 1 ELSE 0 END
+		 FROM tasks WHERE id = ?`, id).Scan(&holds)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("%w: task %s", ErrNotFound, id)
+	}
+	if err != nil {
+		return fmt.Errorf("read the phase of task %s: %w", id, err)
+	}
+	if holds == 1 {
+		return fmt.Errorf("%w: task %s recorded a phase that owns its resources", ErrInvalid, id)
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE tasks SET slot_claimed_at = 0 WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("release the provisioning slot of %s: %w", id, err)
+	}
+	if err := requireOneRow(res, ErrNotFound, "release the provisioning slot of "+id); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ProvisioningSlots counts the slots one project currently holds, so a caller can
+// describe why a task is queued.
+func (s *Store) ProvisioningSlots(ctx context.Context, projectKey string) (int, error) {
+	if strings.TrimSpace(projectKey) == "" {
+		return 0, fmt.Errorf("%w: project key is required", ErrInvalid)
+	}
+	return claimedSlots(ctx, s.db, projectKey, "")
+}
+
+// reservedConflict finds the first pair of overlapping reservations between a
+// request and the tasks of one project: the same path, or one path containing the
+// other. Paths are compared as stored (repository-relative, forward slashes,
+// case-folded on Windows), and the comparison follows the platform's rules.
+func reservedConflict(existing []task.Task, requested []string) (owner, mine, theirs string, ok bool) {
+	for _, other := range existing {
+		if other.Disposition != "" || len(other.ReservedPaths) == 0 {
+			continue
+		}
+		for _, want := range requested {
+			for _, held := range other.ReservedPaths {
+				if overlap, found := pathsOverlap(want, held); found {
+					return other.ID, want, overlap, true
+				}
+			}
+		}
+	}
+	return "", "", "", false
+}
+
+// pathsOverlap reports whether one reservation covers the other: the same path,
+// or one is a directory containing the other.
+func pathsOverlap(a, b string) (string, bool) {
+	a, b = filepath.ToSlash(a), filepath.ToSlash(b)
+	if runtime.GOOS == "windows" {
+		a, b = strings.ToLower(a), strings.ToLower(b)
+	}
+	switch {
+	case a == b:
+		return a, true
+	case strings.HasPrefix(b, a+"/"):
+		return a, true
+	case strings.HasPrefix(a, b+"/"):
+		return b, true
+	default:
+		return "", false
+	}
+}
+
+// rowQueryer is the read surface shared by *sql.DB and one write transaction.
+type rowQueryer interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
 // CreateProject records a new primary project.
