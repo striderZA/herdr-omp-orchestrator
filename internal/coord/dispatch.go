@@ -674,13 +674,21 @@ func (c *Coordinator) createWorktree(ctx context.Context, st task.Task) (task.Ta
 
 	if !errors.Is(err, herdr.ErrAmbiguous) {
 		// A definite failure created nothing, so the claimed slot goes back and
-		// another queued task can use it — and so does the step claim, so a retry
-		// does not have to wait out its lease.
-		c.releaseSlot(ctx, st)
-		c.releaseStep(ctx, st)
-		return c.failTask(ctx, st, "create the worktree", false,
+		// another queued task can use it. The slot is released only after the failure
+		// is stored: releasing it first would hand the task's own slot to another
+		// caller while this one still had to write, and the step claim is released by
+		// the same store transaction that records the failure.
+		failed, failureErr := c.failTask(ctx, st, "create the worktree", false,
 			fmt.Errorf("worktree create for root %s branch %q base %s failed: %w",
 				st.ProjectKey, st.Branch, st.BaseRevision, err))
+		// failTask returns the recorded failure as its report, so the slot goes back
+		// unless recording itself failed (a PersistenceError): a failure nobody could
+		// store must not free the slot of the task it belongs to.
+		var unrecorded *PersistenceError
+		if !errors.As(failureErr, &unrecorded) {
+			c.releaseSlot(ctx, failed)
+		}
+		return failed, failureErr
 	}
 	// The create may have taken effect. Inspect the repository before deciding.
 	listed, listErr := c.findWorktree(ctx, st.ProjectKey, st.Branch)
@@ -1189,7 +1197,13 @@ func (c *Coordinator) adjudicate(
 
 	// Apply on the inspected revision, re-checking the state inside the compare and
 	// swap so a task that changed under the decision is refused rather than adjusted.
-	decided, err := c.store.UpdateTaskAndClearStepClaim(ctx, st.ID, expectedRevision, func(next *task.Task) error {
+	// The decision, the claim retirement and the note that records it are one fact,
+	// so they are one transaction: a note that cannot be stored must leave the task
+	// exactly as adjudicable as it was, not decided with a silent hole where the
+	// audit trail and the resume should be.
+	summary := fmt.Sprintf("the user decided the brief for task %s was %s after inspecting pane %s",
+		st.ID, decision, paneID)
+	decided, err := c.store.RetireStepWithNote(ctx, st.ID, expectedRevision, func(next *task.Task) error {
 		if !IsAmbiguousBriefTask(*next) {
 			return fmt.Errorf("%w: task %s changed while it was being adjudicated", ErrNotAdjudicable, next.ID)
 		}
@@ -1198,15 +1212,9 @@ func (c *Coordinator) adjudicate(
 			next.Phase = task.PromptSubmitted
 		}
 		return nil
-	})
+	}, inboxNote(st.ProjectKey, st.ID, "adjudication", summary, "recorded by the user"))
 	if err != nil {
 		return st, err
-	}
-	summary := fmt.Sprintf("the user decided the brief for task %s was %s after inspecting pane %s",
-		decided.ID, decision, paneID)
-	if err := c.notify(ctx, decided.ProjectKey, decided.ID, "adjudication",
-		summary, "recorded by the user"); err != nil {
-		return decided, err
 	}
 	if decision == BriefDelivered {
 		return decided, nil
@@ -1293,6 +1301,52 @@ func (c *Coordinator) record(ctx context.Context, st task.Task, mutate func(*tas
 			return st, fmt.Errorf("task %s: %s: %w", st.ID, what, err)
 		}
 		updated, err := c.store.UpdateTask(ctx, st.ID, current.Revision, mutate)
+		if err == nil {
+			return updated, nil
+		}
+		if !errors.Is(err, state.ErrConflict) {
+			return st, fmt.Errorf("task %s: %s: %w", st.ID, what, err)
+		}
+		lastErr = err
+	}
+	return st, fmt.Errorf("task %s: %s: %w", st.ID, what, lastErr)
+}
+
+// recordStepFailure records a failed step on the task it was read from, releasing
+// this owner's matching step claim only when the task still stands on the phase the
+// step ran. It retries a conflicting write, because another writer that only bumped
+// the revision (a report, a question) must not lose the failure — but every attempt
+// refuses a task that advanced past the failed phase, so a concurrent resume that
+// took the step can never have a stale failure recorded onto the phase it reached.
+func (c *Coordinator) recordStepFailure(
+	ctx context.Context,
+	st task.Task,
+	failure *StepError,
+	release bool,
+	mutate func(*task.Task) error,
+	what string,
+) (task.Task, error) {
+	var lastErr error
+	for range recordAttempts {
+		current, err := c.store.Task(ctx, st.ID)
+		if err != nil {
+			return st, fmt.Errorf("task %s: %s: %w", st.ID, what, err)
+		}
+		if current.Phase != st.Phase {
+			return st, fmt.Errorf("task %s: %s: %w", st.ID, what, fmt.Errorf(
+				"%w: task %s advanced from %s to %s while its failed step was being recorded",
+				state.ErrConflict, st.ID, st.Phase, current.Phase))
+		}
+		// The phase is checked again inside the mutation, because the assertion above
+		// is only against the snapshot this attempt read.
+		guard := func(next *task.Task) error {
+			if next.Phase != st.Phase {
+				return fmt.Errorf("%w: task %s advanced from %s to %s while its failed step was being recorded",
+					state.ErrConflict, next.ID, st.Phase, next.Phase)
+			}
+			return mutate(next)
+		}
+		updated, _, err := c.store.RecordStepFailure(ctx, st.ID, current.Revision, guard, c.owner, st.Phase, release)
 		if err == nil {
 			return updated, nil
 		}
@@ -1429,11 +1483,13 @@ func (c *Coordinator) failTask(ctx context.Context, st task.Task, step string, t
 	// this build cannot interpret all leave the outcome undecided: their claim is
 	// kept until its lease expires, so a retry waits for live inspection instead of
 	// racing a side effect that may already have happened.
-	if definiteFailure(cause) {
-		c.releaseStep(ctx, st)
-	}
 	failure := stepError(st, step, terminal, cause)
-	updated, err := c.record(ctx, st, func(next *task.Task) error {
+	// The failure and the release of this owner's claim for that exact step are one
+	// transaction: releasing first would let a concurrent resume take the step and
+	// advance the task, after which this call would write a stale failure onto the
+	// phase it reached. A definite failure releases the claim (a retry does not have
+	// to wait out the lease); an undecided one keeps it until the lease expires.
+	updated, err := c.recordStepFailure(ctx, st, failure, definiteFailure(cause), func(next *task.Task) error {
 		if terminal {
 			next.Blocker = failure.Error()
 			return nil
@@ -1447,14 +1503,11 @@ func (c *Coordinator) failTask(ctx context.Context, st task.Task, step string, t
 	return updated, failure
 }
 
-// notify records one deduplicated inbox note for the project, so a failure that
-// has no primary session to report to is still durable and visible.
-func (c *Coordinator) notify(ctx context.Context, projectKey, taskID, kind, summary, delivery string) error {
-	if strings.TrimSpace(projectKey) == "" {
-		return nil
-	}
+// inboxNote builds the durable note for one task fact. The id is derived from the
+// fact itself, so recording the same fact twice stores it once.
+func inboxNote(projectKey, taskID, kind, summary, delivery string) task.Inbox {
 	sum := sha256.Sum256([]byte(kind + "\x00" + taskID + "\x00" + summary))
-	note := task.Inbox{
+	return task.Inbox{
 		ID:         kind + ":" + taskID + ":" + hex.EncodeToString(sum[:6]),
 		ProjectKey: projectKey,
 		TaskID:     taskID,
@@ -1462,6 +1515,15 @@ func (c *Coordinator) notify(ctx context.Context, projectKey, taskID, kind, summ
 		Summary:    summary,
 		Delivery:   delivery,
 	}
+}
+
+// notify records one deduplicated inbox note for the project, so a failure that
+// has no primary session to report to is still durable and visible.
+func (c *Coordinator) notify(ctx context.Context, projectKey, taskID, kind, summary, delivery string) error {
+	if strings.TrimSpace(projectKey) == "" {
+		return nil
+	}
+	note := inboxNote(projectKey, taskID, kind, summary, delivery)
 	if _, err := c.store.AddInbox(ctx, note); err != nil {
 		return fmt.Errorf("record the %s note for %q: %w", kind, projectKey, err)
 	}

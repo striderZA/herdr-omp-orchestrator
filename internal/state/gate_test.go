@@ -266,12 +266,121 @@ func TestStoreClaimStepIsExclusivePerPhase(t *testing.T) {
 	}
 }
 
-// TestStoreDecisionLeavesTheClaimIntactWhenItRefuses pins the both-or-neither half
-// of a decision: a mutation that fails or a stale revision must not retire the step
-// claim of a step that may still be running. The single-transaction half is not
-// observable from outside the store (there is no window to inspect), so it is
-// structural: UpdateTaskAndClearStepClaim is the only path a decision takes.
-func TestStoreDecisionLeavesTheClaimIntactWhenItRefuses(t *testing.T) {
+// gateNote is the durable note a decision records, empty enough to be valid.
+func gateNote(summary string) task.Inbox {
+	return task.Inbox{
+		ID:         "adjudication:t1:" + summary,
+		ProjectKey: "repo-a",
+		TaskID:     "t1",
+		Kind:       "adjudication",
+		Summary:    summary,
+		Delivery:   "recorded by the user",
+	}
+}
+
+// TestStoreDecisionIsOneTransaction pins what one decision means: the task change,
+// the retirement of the step claim and the note that records it are stored together
+// or not at all. A decision that cannot be recorded must leave the task exactly as
+// decidable as it was, with the step still claimed.
+func TestStoreDecisionIsOneTransaction(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	s := open(t, dir)
+	other := open(t, dir)
+	raw := rawState(t, dir)
+	trigger := func(query string) {
+		t.Helper()
+		if _, err := raw.ExecContext(ctx, query); err != nil {
+			t.Fatalf("exec %q: %v", query, err)
+		}
+	}
+
+	st := gateTask(t, "t1", "repo-a", nil)
+	if err := s.CreateTask(ctx, st); err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	current, err := s.Task(ctx, "t1")
+	if err != nil {
+		t.Fatalf("Task: %v", err)
+	}
+	if took, err := s.ClaimStep(ctx, "t1", task.Intent, "owner-a", time.Minute); err != nil || !took {
+		t.Fatalf("ClaimStep = (%v, %v), want the claim", took, err)
+	}
+	advance := func(next *task.Task) error {
+		next.Blocker = ""
+		next.Phase = task.PromptSubmitted
+		return nil
+	}
+
+	// A failed mutation leaves the task and the claim alone: a decision that cannot
+	// be stored must not retire the claim of a step that may still be running.
+	if _, err := s.RetireStepWithNote(ctx, "t1", current.Revision, func(*task.Task) error {
+		return errors.New("refused")
+	}, gateNote("refused")); err == nil {
+		t.Fatal("RetireStepWithNote with a failing mutation = nil, want an error")
+	}
+	if took, err := other.ClaimStep(ctx, "t1", task.Intent, "owner-b", time.Minute); err != nil || took {
+		t.Fatalf("ClaimStep after a failed mutation = (%v, %v), want the claim still held", took, err)
+	}
+
+	// A stale revision is refused the same way.
+	if _, err := s.RetireStepWithNote(ctx, "t1", current.Revision+9, advance, gateNote("stale")); !errors.Is(err, state.ErrConflict) {
+		t.Fatalf("stale revision err = %v, want ErrConflict", err)
+	}
+	if took, err := other.ClaimStep(ctx, "t1", task.Intent, "owner-b", time.Minute); err != nil || took {
+		t.Fatalf("ClaimStep after a stale decision = (%v, %v), want the claim still held", took, err)
+	}
+
+	// A note that cannot be stored rolls the whole decision back: the task keeps its
+	// phase and its claim, and stays decidable, instead of being decided with a
+	// silent hole where its audit trail should be.
+	trigger(`CREATE TRIGGER refuse_inbox BEFORE INSERT ON inbox BEGIN SELECT RAISE(ABORT, 'inbox is not writable'); END`)
+	if _, err := s.RetireStepWithNote(ctx, "t1", current.Revision, advance, gateNote("unwritable")); err == nil {
+		t.Fatal("RetireStepWithNote with an unwritable note = nil, want an error")
+	}
+	after, err := s.Task(ctx, "t1")
+	if err != nil {
+		t.Fatalf("Task: %v", err)
+	}
+	if after.Phase != task.Intent || after.Revision != current.Revision {
+		t.Errorf("task after a refused note = %+v, want it unchanged", after)
+	}
+	if took, err := other.ClaimStep(ctx, "t1", task.Intent, "owner-b", time.Minute); err != nil || took {
+		t.Fatalf("ClaimStep after a refused note = (%v, %v), want the claim still held", took, err)
+	}
+	if notes, err := s.PendingInbox(ctx, "repo-a"); err != nil || len(notes) != 0 {
+		t.Fatalf("inbox after a refused note = (%d, %v), want nothing stored", len(notes), err)
+	}
+	trigger(`DROP TRIGGER refuse_inbox`)
+
+	// With the note writable again, one call stores the task change, the note and the
+	// freed claim together: the next caller can take the step the decision resolved.
+	decided, err := s.RetireStepWithNote(ctx, "t1", current.Revision, advance, gateNote("decided"))
+	if err != nil {
+		t.Fatalf("RetireStepWithNote: %v", err)
+	}
+	if decided.Phase != task.PromptSubmitted || decided.Blocker != "" || decided.Revision != current.Revision+1 {
+		t.Fatalf("decided task = %+v, want the mutation stored once", decided)
+	}
+	if _, err := s.RetireStepWithNote(ctx, "t1", current.Revision, advance, gateNote("decided")); !errors.Is(err, state.ErrConflict) {
+		t.Fatalf("replayed decision err = %v, want ErrConflict", err)
+	}
+	notes, err := s.PendingInbox(ctx, "repo-a")
+	if err != nil {
+		t.Fatalf("PendingInbox: %v", err)
+	}
+	if len(notes) != 1 || notes[0].Summary != "decided" {
+		t.Errorf("inbox = %+v, want exactly the one decision note", notes)
+	}
+	if took, err := other.ClaimStep(ctx, "t1", task.PromptSubmitted, "owner-b", time.Minute); err != nil || !took {
+		t.Fatalf("ClaimStep for the next step = (%v, %v), want it free", took, err)
+	}
+}
+
+// TestStoreRecordStepFailureReleasesOnlyItsOwnClaim pins the failure half: the
+// failure is stored with the release of this owner's claim for that exact phase, in
+// one transaction, and nothing is released when the write does not happen.
+func TestStoreRecordStepFailureReleasesOnlyItsOwnClaim(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 	s := open(t, dir)
@@ -288,43 +397,127 @@ func TestStoreDecisionLeavesTheClaimIntactWhenItRefuses(t *testing.T) {
 	if took, err := s.ClaimStep(ctx, "t1", task.Intent, "owner-a", time.Minute); err != nil || !took {
 		t.Fatalf("ClaimStep = (%v, %v), want the claim", took, err)
 	}
+	note := func(next *task.Task) error {
+		next.Attention = "the create failed"
+		return nil
+	}
 
-	// A failed mutation leaves the task AND the claim alone: a decision that cannot
-	// be stored must not retire the claim of a step that may still be running.
-	if _, err := s.UpdateTaskAndClearStepClaim(ctx, "t1", current.Revision, func(*task.Task) error {
-		return errors.New("refused")
-	}); err == nil {
-		t.Fatal("UpdateTaskAndClearStepClaim with a failing mutation = nil, want an error")
+	// Another owner's release attempt does not touch this claim, even in the same
+	// transaction that records a failure.
+	if _, released, err := s.RecordStepFailure(ctx, "t1", current.Revision, note, "owner-b", task.Intent, true); err != nil || released {
+		t.Fatalf("RecordStepFailure(other owner) = (%v, %v), want no release", released, err)
 	}
 	if took, err := other.ClaimStep(ctx, "t1", task.Intent, "owner-b", time.Minute); err != nil || took {
-		t.Fatalf("ClaimStep after a failed decision = (%v, %v), want the claim still held", took, err)
+		t.Fatalf("ClaimStep after a foreign release = (%v, %v), want the claim still held", took, err)
 	}
-
-	// A stale revision is refused the same way.
-	if _, err := s.UpdateTaskAndClearStepClaim(ctx, "t1", current.Revision+9, func(next *task.Task) error {
-		next.Blocker = ""
-		return nil
-	}); !errors.Is(err, state.ErrConflict) {
-		t.Fatalf("stale revision err = %v, want ErrConflict", err)
-	}
-	if took, err := other.ClaimStep(ctx, "t1", task.Intent, "owner-b", time.Minute); err != nil || took {
-		t.Fatalf("ClaimStep after a stale decision = (%v, %v), want the claim still held", took, err)
-	}
-
-	// Both changes land together: the mutation is stored and the claim is gone, so
-	// the next caller can take the step the decision resolved.
-	decided, err := s.UpdateTaskAndClearStepClaim(ctx, "t1", current.Revision, func(next *task.Task) error {
-		next.Blocker = ""
-		next.Phase = task.PromptSubmitted
-		return nil
-	})
+	// Nor does the right owner on the wrong phase: the claim belongs to the phase it
+	// was taken for.
+	recorded, err := s.Task(ctx, "t1")
 	if err != nil {
-		t.Fatalf("UpdateTaskAndClearStepClaim: %v", err)
+		t.Fatalf("Task: %v", err)
 	}
-	if decided.Phase != task.PromptSubmitted || decided.Blocker != "" || decided.Revision != current.Revision+1 {
-		t.Fatalf("decided task = %+v, want the mutation stored once", decided)
+	if _, released, err := s.RecordStepFailure(ctx, "t1", recorded.Revision, note, "owner-a", task.WorktreeCreated, true); err != nil || released {
+		t.Fatalf("RecordStepFailure(wrong phase) = (%v, %v), want no release", released, err)
 	}
-	if took, err := other.ClaimStep(ctx, "t1", task.PromptSubmitted, "owner-b", time.Minute); err != nil || !took {
-		t.Fatalf("ClaimStep for the next step = (%v, %v), want it free", took, err)
+
+	// A write that does not land releases nothing: a stale revision is refused and
+	// the claim stays exactly where it was.
+	recorded, err = s.Task(ctx, "t1")
+	if err != nil {
+		t.Fatalf("Task: %v", err)
+	}
+	refuse := func(next *task.Task) error {
+		next.Attention = "stale"
+		return errors.New("the task moved on")
+	}
+	if _, released, err := s.RecordStepFailure(ctx, "t1", recorded.Revision, refuse, "owner-a", task.Intent, true); err == nil || released {
+		t.Fatalf("RecordStepFailure(refused mutation) = (%v, %v), want an error and no release", released, err)
+	}
+	if _, released, err := s.RecordStepFailure(ctx, "t1", recorded.Revision+9, note, "owner-a", task.Intent, true); !errors.Is(err, state.ErrConflict) || released {
+		t.Fatalf("RecordStepFailure(stale revision) = (%v, %v), want ErrConflict and no release", released, err)
+	}
+	failed2, err := s.Task(ctx, "t1")
+	if err != nil {
+		t.Fatalf("Task: %v", err)
+	}
+	if failed2.Revision != recorded.Revision || failed2.Attention != "the create failed" {
+		t.Fatalf("task after refused failures = %+v, want nothing further stored", failed2)
+	}
+
+	// The matching owner and phase release it, and the failure is stored with it.
+	failed, released, err := s.RecordStepFailure(ctx, "t1", recorded.Revision, note, "owner-a", task.Intent, true)
+	if err != nil || !released {
+		t.Fatalf("RecordStepFailure = (%v, %v), want the release", released, err)
+	}
+	if failed.Attention != "the create failed" || failed.Revision != recorded.Revision+1 {
+		t.Fatalf("failed task = %+v, want the failure stored", failed)
+	}
+	if took, err := other.ClaimStep(ctx, "t1", task.Intent, "owner-b", time.Minute); err != nil || !took {
+		t.Fatalf("ClaimStep after the release = (%v, %v), want it free", took, err)
+	}
+}
+
+// TestStoreRecordStepFailureFailsClosedWhenTheReleaseCannotBeWritten pins that the
+// claim release is part of the failure's transaction, not a follow-up write. If the
+// release cannot be stored, the failure must not be stored either: a task with a
+// recorded failure and a claim nobody can release is a task stuck behind a lease,
+// and a caller that was told the write failed must find nothing changed.
+func TestStoreRecordStepFailureFailsClosedWhenTheReleaseCannotBeWritten(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	s := open(t, dir)
+	other := open(t, dir)
+	raw := rawState(t, dir)
+
+	st := gateTask(t, "t1", "repo-a", nil)
+	if err := s.CreateTask(ctx, st); err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	current, err := s.Task(ctx, "t1")
+	if err != nil {
+		t.Fatalf("Task: %v", err)
+	}
+	if took, err := s.ClaimStep(ctx, "t1", task.Intent, "owner-a", time.Minute); err != nil || !took {
+		t.Fatalf("ClaimStep = (%v, %v), want the claim", took, err)
+	}
+	if _, err := raw.ExecContext(ctx,
+		`CREATE TRIGGER refuse_release BEFORE UPDATE OF step_claim_owner ON tasks BEGIN SELECT RAISE(ABORT, 'the claim is not writable'); END`); err != nil {
+		t.Fatalf("create the trigger: %v", err)
+	}
+
+	if _, released, err := s.RecordStepFailure(ctx, "t1", current.Revision, func(next *task.Task) error {
+		next.Attention = "the create failed"
+		return nil
+	}, "owner-a", task.Intent, true); err == nil || released {
+		t.Fatalf("RecordStepFailure with an unwritable release = (%v, %v), want an error and no release", released, err)
+	}
+	after, err := s.Task(ctx, "t1")
+	if err != nil {
+		t.Fatalf("Task: %v", err)
+	}
+	if after.Attention != "" || after.Revision != current.Revision {
+		t.Errorf("task after a refused release = %+v, want the failure rolled back with it", after)
+	}
+	if took, err := other.ClaimStep(ctx, "t1", task.Intent, "owner-b", time.Minute); err != nil || took {
+		t.Fatalf("ClaimStep after a refused release = (%v, %v), want the claim still held", took, err)
+	}
+
+	// The same call on the undecided path writes no release, so the trigger cannot
+	// matter: the failure is recorded and the claim stays with its owner.
+	if _, err := raw.ExecContext(ctx, `DROP TRIGGER refuse_release`); err != nil {
+		t.Fatalf("drop the trigger: %v", err)
+	}
+	failed, released, err := s.RecordStepFailure(ctx, "t1", current.Revision, func(next *task.Task) error {
+		next.Blocker = "the outcome is unknown"
+		return nil
+	}, "owner-a", task.Intent, false)
+	if err != nil || released {
+		t.Fatalf("RecordStepFailure(release=false) = (%v, %v), want the failure stored without a release", released, err)
+	}
+	if failed.Blocker == "" {
+		t.Errorf("failed task = %+v, want the blocker stored", failed)
+	}
+	if took, err := other.ClaimStep(ctx, "t1", task.Intent, "owner-b", time.Minute); err != nil || took {
+		t.Fatalf("ClaimStep after an undecided failure = (%v, %v), want the claim kept", took, err)
 	}
 }

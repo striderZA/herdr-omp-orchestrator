@@ -1217,21 +1217,29 @@ func (s *Store) ClaimStep(ctx context.Context, taskID string, phase task.Phase, 
 	return true, nil
 }
 
-// UpdateTaskAndClearStepClaim applies a compare-and-swap update to one task and
-// retires its step claim in the same transaction.
+// RetireStepWithNote applies a compare-and-swap update to one task and retires the
+// step claim that the update resolved, storing the note that records the decision —
+// all in one transaction.
 //
-// The single transaction is the point. A step claim is what stops two callers from
-// running the same step, so a decision that resolves the step (a user who inspected
-// it and said what happened) must retire the claim at the same instant it makes the
-// task eligible again: clearing the claim first would leave a decision with no
-// effect, and clearing it after would let a concurrent resume take the step in
-// between and then have its live claim removed underneath it, submitting the brief
-// twice. Either both changes are stored or neither is.
-func (s *Store) UpdateTaskAndClearStepClaim(
+// The single transaction is the point, and it covers three things that are one fact.
+// A step claim is what stops two callers from running the same step, so a decision
+// that resolves a step (a user who inspected it and said what happened) must retire
+// the claim at the same instant it makes the task eligible again: retiring the claim
+// first would leave a decision with no effect, and retiring it afterwards would let a
+// concurrent resume take the step in between and then have its live claim removed
+// underneath it, submitting the brief twice. The note belongs to the same fact
+// because it is the audit trail of the decision, so a decision that cannot be
+// recorded must not be half stored — the caller sees the error and the task is
+// exactly as decidable as it was.
+//
+// This retires any owner's claim, which only a user's decision may do; a caller that
+// failed its own step uses RecordStepFailure, which releases only its own claim.
+func (s *Store) RetireStepWithNote(
 	ctx context.Context,
 	id string,
 	expectedRevision int64,
 	mutate func(*task.Task) error,
+	note task.Inbox,
 ) (task.Task, error) {
 	if mutate == nil {
 		return task.Task{}, fmt.Errorf("%w: nil mutation for task %q", ErrInvalid, id)
@@ -1246,18 +1254,87 @@ func (s *Store) UpdateTaskAndClearStepClaim(
 	if err != nil {
 		return task.Task{}, err
 	}
-	res, err := tx.ExecContext(ctx,
-		`UPDATE tasks SET step_claim_owner = '', step_claim_phase = '', step_claim_until = 0 WHERE id = ?`, id)
-	if err != nil {
-		return task.Task{}, fmt.Errorf("clear the step claim of %s: %w", id, err)
+	if _, err := clearStepClaim(ctx, tx, id, "", ""); err != nil {
+		return task.Task{}, err
 	}
-	if err := requireOneRow(res, ErrNotFound, "clear the step claim of "+id); err != nil {
+	if _, err := addInbox(ctx, tx, note); err != nil {
 		return task.Task{}, err
 	}
 	if err := tx.commit("decide task " + id); err != nil {
 		return task.Task{}, err
 	}
 	return next, nil
+}
+
+// RecordStepFailure records a failed step on its own task and releases this owner's
+// step claim for that exact phase, in one transaction. It reports whether the claim
+// was released.
+//
+// Persisting the failure and releasing the claim cannot be separate writes: a claim
+// released before the failure is stored lets a concurrent resume take the step and
+// advance the task, after which this call would write a stale failure onto whatever
+// phase the task reached. The caller's mutation owns the phase check (it refuses a
+// task that moved on), and a mutation that refuses rolls the release back with it, so
+// an uncertain failure leaves the claim held and the task untouched.
+//
+// release is false for an undecided outcome (a timeout, an ambiguity): the claim then
+// stays until its lease expires, and the failure is recorded as a blocker that
+// refuses automatic retries.
+func (s *Store) RecordStepFailure(
+	ctx context.Context,
+	id string,
+	expectedRevision int64,
+	mutate func(*task.Task) error,
+	owner string,
+	phase task.Phase,
+	release bool,
+) (task.Task, bool, error) {
+	if mutate == nil {
+		return task.Task{}, false, fmt.Errorf("%w: nil mutation for task %q", ErrInvalid, id)
+	}
+	tx, err := s.begin(ctx, "record the failure of task "+id)
+	if err != nil {
+		return task.Task{}, false, err
+	}
+	defer tx.rollback()
+
+	next, err := updateTask(ctx, tx, id, expectedRevision, mutate)
+	if err != nil {
+		return task.Task{}, false, err
+	}
+	released := false
+	if release {
+		released, err = clearStepClaim(ctx, tx, id, owner, phase)
+		if err != nil {
+			return task.Task{}, false, err
+		}
+	}
+	if err := tx.commit("record the failure of task " + id); err != nil {
+		return task.Task{}, false, err
+	}
+	return next, released, nil
+}
+
+// clearStepClaim drops the step claim of one task through q. An empty owner clears
+// whatever claim is there (a user's decision); otherwise only the claim that the
+// owner and phase still match is cleared, so a caller can never take a step away
+// from the caller that holds it.
+func clearStepClaim(ctx context.Context, q execer, id, owner string, phase task.Phase) (bool, error) {
+	query := `UPDATE tasks SET step_claim_owner = '', step_claim_phase = '', step_claim_until = 0 WHERE id = ?`
+	args := []any{id}
+	if owner != "" || phase != "" {
+		query += ` AND step_claim_owner = ? AND step_claim_phase = ?`
+		args = append(args, owner, phase)
+	}
+	res, err := q.ExecContext(ctx, query, args...)
+	if err != nil {
+		return false, fmt.Errorf("clear the step claim of %s: %w", id, err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("clear the step claim of %s: %w", id, err)
+	}
+	return rows == 1, nil
 }
 
 // ReleaseStep gives up this owner's step claim, for a step that failed without

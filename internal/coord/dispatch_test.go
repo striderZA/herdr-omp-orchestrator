@@ -3465,6 +3465,69 @@ func TestAmbiguousAgentStartKeepsItsBlockerAndClaimUntilInspected(t *testing.T) 
 	}
 }
 
+func TestStaleFailureIsNotRecordedOntoThePhaseThatAdvanced(t *testing.T) {
+	// A definite failure releases its step claim so a retry can run at once, which
+	// means another coordinator can advance the task before the failure that released
+	// the claim is written. That writer must then refuse: recording its failure onto
+	// the newer phase would undo the progress and, worse, hide it behind a failure
+	// that describes a step nobody is running any more.
+	f := newCoordFixture(t, fixturePlan{WorktreeCreateError: "worktree_create_failed"})
+	ctx := context.Background()
+	stale, err := f.dispatchSpec(f.coord, spec{title: "one", checks: []string{"go test ./... ok"}})
+	if !errors.Is(err, herdr.ErrCLI) {
+		t.Fatalf("dispatch err = %v, want a definite Herdr failure", err)
+	}
+	// The create step runs *from* the intent phase, so a definite create failure
+	// leaves the task recorded exactly there.
+	if stale.Phase != task.Intent {
+		t.Fatalf("phase = %q, want %q", stale.Phase, task.Intent)
+	}
+
+	// The retry another coordinator runs takes the step and advances the task past it.
+	f.updatePlan(func(p *fixturePlan) { p.WorktreeCreateError = "" })
+	sibling := f.sibling()
+	advanced, err := f.resume(stale.ID)
+	if err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if advanced.Phase != task.PromptSubmitted {
+		t.Fatalf("phase after the retry = %q, want %q", advanced.Phase, task.PromptSubmitted)
+	}
+	if advanced.Attention != "" {
+		t.Fatalf("attention after the retry = %q, want it cleared", advanced.Attention)
+	}
+	// The retry's own claim for the step it now runs must be in place, so the stale
+	// failure cannot release it: it belongs to the phase this writer failed, not to
+	// the one the retry reached.
+	if took, err := f.store.ClaimStep(ctx, advanced.ID, task.PromptSubmitted, "probe", time.Minute); err != nil || !took {
+		t.Fatalf("ClaimStep for the retry's phase = (%v, %v), want it free of stale claims", took, err)
+	}
+
+	// Now the stale writer records its failure. It must fail closed, leave the task
+	// and its progress alone, and say that recording failed.
+	_, err = f.coord.failTask(ctx, stale, "create the worktree", false,
+		fmt.Errorf("worktree create for %s failed", stale.ProjectKey))
+	var persistence *PersistenceError
+	if !errors.As(err, &persistence) {
+		t.Fatalf("stale failure err = %v, want a PersistenceError", err)
+	}
+	if !errors.Is(err, state.ErrConflict) {
+		t.Errorf("stale failure err = %v, want it to report the conflict", err)
+	}
+	after, err := f.store.Task(ctx, stale.ID)
+	if err != nil {
+		t.Fatalf("Task: %v", err)
+	}
+	if after.Phase != task.PromptSubmitted || after.Attention != "" || after.Revision != advanced.Revision {
+		t.Fatalf("task after the stale failure = %+v, want the retry's progress untouched", after)
+	}
+	// The failed create never reached the worker, so the retry's brief is the only one.
+	if got := f.countCalls("agent prompt"); got != 1 {
+		t.Errorf("agent prompt calls = %d, want 1 (the retry's brief)", got)
+	}
+	_ = sibling
+}
+
 func TestStepClaimLeaseKeepsCrashRecovery(t *testing.T) {
 	f := newCoordFixture(t, fixturePlan{})
 	ctx := context.Background()
