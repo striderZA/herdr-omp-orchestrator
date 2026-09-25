@@ -16,6 +16,27 @@ platforms = ["windows"]
 [[build]]
 command = ["go", "build", "-o", "herdr-omp-orchestrator.exe", "./cmd/herdr-omp-orchestrator"]
 
+# Herdr runs the startup hook once per enabled plugin after it restores the
+# session and its API socket is ready (and again when a new server takes over).
+# The plugin reconciles every recorded pane binding from `herdr api snapshot` and
+# `worktree list`, because event hooks are one-shot and subscriptions are not
+# replayed: a move or a status change that happened while the plugin was not
+# running exists only in Herdr's live state.
+[[startup]]
+command = ["./herdr-omp-orchestrator.exe", "startup"]
+
+# Both hook names are declared by the installed Herdr build's own
+# `herdr api schema --json` (event kinds pane_agent_status_changed and
+# pane_moved). A name Herdr does not know is only a link warning, which is why
+# `herdr plugin list --json` warnings are inspected after linking.
+[[events]]
+on = "pane.agent_status_changed"
+command = ["./herdr-omp-orchestrator.exe", "event"]
+
+[[events]]
+on = "pane.moved"
+command = ["./herdr-omp-orchestrator.exe", "event"]
+
 [[actions]]
 id = "setup"
 title = "Setup OMP orchestrator extension"

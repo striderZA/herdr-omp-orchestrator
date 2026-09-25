@@ -36,18 +36,34 @@ const bridgeTimeout = 2 * time.Minute
 // agent and wait for the extension's readiness handshake.
 const bindTimeout = 90 * time.Second
 
+// startupTimeout bounds the startup reconciliation pass. It reads Herdr's
+// snapshot and the repository's worktree listing, and may prompt a verified idle
+// primary, so it is bounded well inside the timeout a failing plugin command is
+// given.
+const startupTimeout = 2 * time.Minute
+
+// eventTimeout bounds one hook. A hook applies a single observation and may
+// prompt a verified idle primary, which is one bounded Herdr call.
+const eventTimeout = 60 * time.Second
+
 // contextLimit bounds the plugin invocation context this executable accepts.
 const contextLimit = 1 << 20
 
-// Environment the bind route requires, and the Herdr binary it may read.
+// Environment the bind route requires, the hook payload Herdr injects, and the
+// Herdr binary the routes may read.
 const (
 	envStateDir      = "HERDR_PLUGIN_STATE_DIR"
 	envContextJSON   = "HERDR_PLUGIN_CONTEXT_JSON"
 	envHerdrBinary   = "HERDR_BIN_PATH"
 	envHerdrBinaryAt = "HERDR_ORCH_HERDR_BIN_PATH"
+	// envPluginEvent and envPluginEventJSON are what Herdr injects into every
+	// hook: the hook name and the event payload. Both are read as-is, never
+	// reconstructed from argv.
+	envPluginEvent     = "HERDR_PLUGIN_EVENT"
+	envPluginEventJSON = "HERDR_PLUGIN_EVENT_JSON"
 )
 
-const usage = "usage: herdr-omp-orchestrator <setup|bind|bridge <method>>"
+const usage = "usage: herdr-omp-orchestrator <setup|bind|bridge <method>|startup|event>"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -60,6 +76,10 @@ func main() {
 		os.Exit(runSetup(env, os.Stdout, os.Stderr))
 	case "bind":
 		os.Exit(runBind(env, os.Stdout, os.Stderr))
+	case "startup":
+		os.Exit(runStartup(env, os.Stdout, os.Stderr))
+	case "event":
+		os.Exit(runEvent(env, os.Stdout, os.Stderr))
 	case "bridge":
 		os.Exit(runBridge(env, os.Stdin, os.Stdout, os.Stderr, os.Args[2:]))
 	default:
@@ -130,6 +150,59 @@ func runBind(env map[string]string, stdout, stderr io.Writer) int {
 		}
 	}
 	return emit(stdout, stderr, answer)
+}
+
+// runStartup is Herdr's `[[startup]]` hook: it reconciles the recorded
+// identities against Herdr's live snapshot and the repository's worktree
+// listing, because event history is not replayed. It is repeat-safe, so a
+// restarted server (which runs the hook again) cannot double-apply anything.
+func runStartup(env map[string]string, stdout, stderr io.Writer) int {
+	coordinator, closeCoordinator, err := openCoordinator(env)
+	if err != nil {
+		return emit(stdout, stderr, failureBody(coordCode(err), err.Error()))
+	}
+	defer closeCoordinator()
+
+	ctx, cancel := context.WithTimeout(context.Background(), startupTimeout)
+	defer cancel()
+	if err := coordinator.Reconcile(ctx); err != nil {
+		return emit(stdout, stderr, failureBody(coordCode(err), err.Error()))
+	}
+	return emit(stdout, stderr, map[string]any{"ok": true, "reconciled": true})
+}
+
+// runEvent is Herdr's `[[events]]` hook: one observation from
+// HERDR_PLUGIN_EVENT_JSON, applied to the facts the store already holds.
+//
+// A failure answers with the same envelope every other route uses and exits
+// nonzero, so Herdr records it in the plugin log; the event itself is never
+// interpreted through a shell or from argv.
+func runEvent(env map[string]string, stdout, stderr io.Writer) int {
+	eventName := strings.TrimSpace(env[envPluginEvent])
+	if eventName == "" {
+		return emit(stdout, stderr, failureBody("event_unavailable", envPluginEvent+" is not set"))
+	}
+	payload := strings.TrimSpace(env[envPluginEventJSON])
+	if payload == "" {
+		return emit(stdout, stderr, failureBody("event_payload_unavailable", envPluginEventJSON+" is not set"))
+	}
+	if len(payload) > coord.MaxEventPayloadBytes {
+		return emit(stdout, stderr, failureBody("event_payload_too_large",
+			fmt.Sprintf("the %s payload exceeds the %d byte bound", eventName, coord.MaxEventPayloadBytes)))
+	}
+
+	coordinator, closeCoordinator, err := openCoordinator(env)
+	if err != nil {
+		return emit(stdout, stderr, failureBody(coordCode(err), err.Error()))
+	}
+	defer closeCoordinator()
+
+	ctx, cancel := context.WithTimeout(context.Background(), eventTimeout)
+	defer cancel()
+	if err := coordinator.HandleEvent(ctx, eventName, []byte(payload)); err != nil {
+		return emit(stdout, stderr, failureBody(coordCode(err), err.Error()))
+	}
+	return emit(stdout, stderr, map[string]any{"ok": true, "event": eventName})
 }
 
 // runBridge answers one extension call. The request is read from stdin with a

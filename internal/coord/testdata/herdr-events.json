@@ -1,0 +1,115 @@
+{
+  "_comment": "Sanitized excerpt of `herdr api schema --json` (protocol 22), taken from the server binary Herdr injects as HERDR_BIN_PATH on the development machine (herdr 0.9.0-preview.2026-09-08-62431dbd033b). Only enum names and required/optional field lists are kept; no ids, paths or payload values. The plugin's herdr-plugin.toml hook names and its event adapter are checked against this file.",
+  "protocol": 22,
+  "schema_version": 1,
+  "event_kinds": [
+    "workspace_created",
+    "workspace_updated",
+    "workspace_metadata_updated",
+    "workspace_closed",
+    "workspace_renamed",
+    "workspace_moved",
+    "workspace_reordered",
+    "workspace_focused",
+    "worktree_created",
+    "worktree_opened",
+    "worktree_removed",
+    "tab_created",
+    "tab_closed",
+    "tab_renamed",
+    "tab_moved",
+    "tab_focused",
+    "pane_created",
+    "pane_closed",
+    "pane_updated",
+    "pane_focused",
+    "pane_moved",
+    "pane_output_changed",
+    "pane_exited",
+    "pane_agent_detected",
+    "pane_agent_status_changed",
+    "layout_updated"
+  ],
+  "hook_events": {
+    "pane.agent_status_changed": {
+      "data_type": "pane_agent_status_changed",
+      "required": [
+        "type",
+        "pane_id",
+        "workspace_id",
+        "agent_status"
+      ],
+      "properties": {
+        "agent": "optional",
+        "agent_status": "required",
+        "display_agent": "optional",
+        "pane_id": "required",
+        "state_labels": "optional",
+        "title": "optional",
+        "type": "required",
+        "workspace_id": "required"
+      }
+    },
+    "pane.moved": {
+      "data_type": "pane_moved",
+      "required": [
+        "type",
+        "previous_pane_id",
+        "previous_workspace_id",
+        "previous_tab_id",
+        "pane"
+      ],
+      "properties": {
+        "closed_tab_id": "optional",
+        "closed_workspace_id": "optional",
+        "created_tab": "optional",
+        "created_workspace": "optional",
+        "pane": "required",
+        "previous_pane_id": "required",
+        "previous_tab_id": "required",
+        "previous_workspace_id": "required",
+        "type": "required"
+      }
+    }
+  },
+  "pane_info_required": [
+    "pane_id",
+    "terminal_id",
+    "workspace_id",
+    "tab_id",
+    "focused",
+    "agent_status",
+    "revision"
+  ],
+  "pane_info_optional": [
+    "agent",
+    "agent_session",
+    "cwd",
+    "display_agent",
+    "foreground_cwd",
+    "label",
+    "scroll",
+    "state_labels",
+    "terminal_title",
+    "terminal_title_stripped",
+    "title",
+    "tokens"
+  ],
+  "agent_statuses": [
+    "idle",
+    "working",
+    "blocked",
+    "done",
+    "unknown"
+  ],
+  "agent_session_required": [
+    "source",
+    "agent",
+    "kind",
+    "value"
+  ],
+  "agent_session_kinds": [
+    "id",
+    "path"
+  ]
+}

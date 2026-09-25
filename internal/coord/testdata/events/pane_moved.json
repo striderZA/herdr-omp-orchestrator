@@ -1,0 +1,31 @@
+{
+  "type": "pane_moved",
+  "previous_pane_id": "w2:p1",
+  "previous_workspace_id": "w2",
+  "previous_tab_id": "w2:t1",
+  "pane": {
+    "pane_id": "w3:p1",
+    "terminal_id": "term-w2-p1",
+    "workspace_id": "w3",
+    "tab_id": "w3:t1",
+    "label": "",
+    "title": "pwsh",
+    "agent": "omp",
+    "display_agent": "omp",
+    "agent_status": "idle",
+    "cwd": "{{checkout}}",
+    "foreground_cwd": "{{checkout}}",
+    "agent_session": {
+      "source": "herdr:omp",
+      "agent": "omp",
+      "kind": "path",
+      "value": "{{session_file}}"
+    },
+    "focused": false,
+    "revision": 7
+  },
+  "closed_workspace_id": "w2",
+  "closed_tab_id": "w2:t1",
+  "created_workspace": null,
+  "created_tab": null
+}

@@ -1,0 +1,1412 @@
+package coord
+
+// Task 6: Herdr event hooks, public pane moves, durable inbox delivery and
+// restart reconciliation.
+//
+// # Hooks are observations, never history
+//
+// A Herdr plugin event hook is a one-shot command: an event that happened while
+// the plugin was not running is gone, and Herdr does not replay subscriptions.
+// So no hook reconstructs state. A hook applies one observation to facts the
+// store already holds, and the startup pass (`Reconcile`) re-derives every
+// identity from `herdr api snapshot` plus `worktree list`.
+//
+// # Two pane identities, one process
+//
+// A pane has a launch-time id (the value its process inherited in
+// HERDR_PANE_ID, and the key the bridge resolves a caller by) and a current
+// public id (what Herdr CLI calls must target). A cross-workspace move changes
+// only the public identity: the launch id, the terminal id and the original
+// worktree workspace stay recorded, so a worker whose pane moved is still
+// addressable from its own process and still identified by its checkout
+// provenance after Herdr closed the workspace it was created in.
+//
+// # Activity is not stage
+//
+// A status hook records what Herdr observed (`Activity`, `ActivitySeenAt`) and
+// one deduplicated note. It never touches `Phase`, `Report`, `Disposition` or
+// the stage projection: Herdr's `done`/`idle` describes a terminal, and a
+// terminal that stopped is not a task that finished.
+//
+// # Delivery is claimed, never assumed
+//
+// A note is written pending by whoever recorded the fact. Only `FlushInbox`
+// claims it (`pending -> sending`) and settles it (`delivered`, or `uncertain`
+// when the attempt's outcome could not be determined). An `uncertain` note is
+// inspected by a human - `agent get` / `agent read` - and never resent.
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"herdr-omp-orchestrator/internal/herdr"
+	"herdr-omp-orchestrator/internal/state"
+	"herdr-omp-orchestrator/internal/task"
+)
+
+// The event hooks this plugin subscribes to in herdr-plugin.toml, and the
+// payload `type`/`event` each one names. Herdr's hook names use dots; the event
+// data carries underscores.
+const (
+	// EventAgentStatus is the hook Herdr fires when a pane's agent status changes.
+	EventAgentStatus = "pane.agent_status_changed"
+	// EventPaneMoved is the hook Herdr fires when a pane moves between tabs or
+	// workspaces.
+	EventPaneMoved = "pane.moved"
+
+	eventKindAgentStatus = "pane_agent_status_changed"
+	eventKindPaneMoved   = "pane_moved"
+
+	// MaxEventPayloadBytes bounds one HERDR_PLUGIN_EVENT_JSON payload. It is the
+	// same bound the bridge accepts for a request: a hook that carries more than
+	// this is not an event this plugin can interpret, and it is refused whole
+	// rather than truncated.
+	MaxEventPayloadBytes = 1 << 20
+)
+
+// The kinds of durable note this file records, and the labels that explain them
+// to a human reading the inbox.
+const (
+	noteKindActivity  = "activity"
+	noteKindAttention = "attention"
+	noteKindExit      = "exit"
+
+	activityDelivery  = "worker status"
+	reconcileDelivery = "reconcile"
+)
+
+// Bounds for the one prompt a flush submits, so a backlog cannot become an
+// unbounded turn for the primary.
+const (
+	inboxPromptNoteLimit = 20
+	inboxPromptLineLimit = 400
+	inboxPromptLimit     = 4000
+)
+
+// errSuperseded reports that a newer binding was recorded between this caller's
+// read and its write. Nothing is wrong: the newer value wins and the caller
+// treats the write as a no-op.
+var errSuperseded = errors.New("coord: a newer binding already landed")
+
+// herdrAgentStatuses is the status enum of Herdr's schema. A status outside it
+// is not an observation this plugin can store, so the hook is refused instead of
+// recording something Herdr never reported.
+var herdrAgentStatuses = map[string]bool{
+	"idle":    true,
+	"working": true,
+	"blocked": true,
+	"done":    true,
+	"unknown": true,
+}
+
+// ---------------------------------------------------------------------------
+// hook payloads
+// ---------------------------------------------------------------------------
+
+// AgentStatusEvent is the `pane.agent_status_changed` data object. Agent,
+// DisplayAgent and Title are optional: Herdr reports them as null for a pane
+// whose agent state is unknown.
+type AgentStatusEvent struct {
+	Type         string  `json:"type"`
+	PaneID       string  `json:"pane_id"`
+	WorkspaceID  string  `json:"workspace_id"`
+	AgentStatus  string  `json:"agent_status"`
+	Agent        *string `json:"agent"`
+	DisplayAgent *string `json:"display_agent"`
+	Title        *string `json:"title"`
+}
+
+// MovedPaneInfo is the authoritative pane object of a `pane.moved` event. It is
+// the same PaneInfo `pane get` returns, including the native session reference
+// the typed client deliberately leaves to this adapter.
+type MovedPaneInfo struct {
+	PaneID        string            `json:"pane_id"`
+	TerminalID    string            `json:"terminal_id"`
+	WorkspaceID   string            `json:"workspace_id"`
+	TabID         string            `json:"tab_id"`
+	Cwd           string            `json:"cwd"`
+	ForegroundCwd string            `json:"foreground_cwd"`
+	Agent         string            `json:"agent"`
+	AgentStatus   string            `json:"agent_status"`
+	AgentSession  *herdr.SessionRef `json:"agent_session"`
+}
+
+// PaneMovedEvent is the `pane.moved` data object: the pane's previous
+// workspace-qualified identity, its new identity, and - when moving the last
+// pane out of a workspace closed that workspace - what was closed.
+type PaneMovedEvent struct {
+	Type                string        `json:"type"`
+	PreviousPaneID      string        `json:"previous_pane_id"`
+	PreviousWorkspaceID string        `json:"previous_workspace_id"`
+	PreviousTabID       string        `json:"previous_tab_id"`
+	Pane                MovedPaneInfo `json:"pane"`
+	ClosedWorkspaceID   *string       `json:"closed_workspace_id"`
+	ClosedTabID         *string       `json:"closed_tab_id"`
+}
+
+// ---------------------------------------------------------------------------
+// HandleEvent
+// ---------------------------------------------------------------------------
+
+// HandleEvent applies one Herdr hook to the durable facts. The event name comes
+// from HERDR_PLUGIN_EVENT and the payload from HERDR_PLUGIN_EVENT_JSON; both are
+// validated before anything is read or written.
+//
+// An event about a pane this plugin does not own is a no-op, not an error:
+// Herdr's session is shared with the user's own terminals. A malformed payload,
+// an unknown event name, or an event whose identities contradict the recorded
+// facts is an error, so the hook exits nonzero and Herdr records it in the
+// plugin log.
+func (c *Coordinator) HandleEvent(ctx context.Context, eventName string, payload []byte) error {
+	data, err := decodeHookPayload(eventName, payload)
+	if err != nil {
+		return err
+	}
+	switch strings.TrimSpace(eventName) {
+	case EventAgentStatus:
+		var event AgentStatusEvent
+		if err := decodeEventData(data, &event, eventKindAgentStatus); err != nil {
+			return err
+		}
+		return c.handleAgentStatus(ctx, event)
+	case EventPaneMoved:
+		var event PaneMovedEvent
+		if err := decodeEventData(data, &event, eventKindPaneMoved); err != nil {
+			return err
+		}
+		return c.handlePaneMoved(ctx, event)
+	default:
+		return fmt.Errorf("%w: %q is not an event this plugin subscribes to", ErrInvalidRequest, eventName)
+	}
+}
+
+// decodeHookPayload validates the event name and the payload envelope, and
+// returns the event data object.
+//
+// Herdr documents two shapes and this adapter accepts both: the socket event
+// envelope `{"event": ..., "data": {...}}` and the standalone event object that
+// carries `type` itself. The hook name decides which event this is; an envelope
+// that names a different event is a contradiction, not a reinterpretation.
+func decodeHookPayload(eventName string, payload []byte) (json.RawMessage, error) {
+	name := strings.TrimSpace(eventName)
+	switch name {
+	case EventAgentStatus, EventPaneMoved:
+	default:
+		return nil, fmt.Errorf("%w: %q is not an event this plugin subscribes to", ErrInvalidRequest, eventName)
+	}
+	raw := bytes.TrimSpace(payload)
+	switch {
+	case len(raw) == 0:
+		return nil, fmt.Errorf("%w: the %s event carries no payload", ErrInvalidRequest, name)
+	case len(raw) > MaxEventPayloadBytes:
+		return nil, fmt.Errorf("%w: the %s payload is %d bytes, larger than the %d byte bound",
+			ErrInvalidRequest, name, len(raw), MaxEventPayloadBytes)
+	case !json.Valid(raw):
+		return nil, fmt.Errorf("%w: the %s payload is not JSON", ErrInvalidRequest, name)
+	}
+	var envelope struct {
+		Event string          `json:"event"`
+		Data  json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return nil, fmt.Errorf("%w: the %s payload is not a JSON object", ErrInvalidRequest, name)
+	}
+	if len(envelope.Data) > 0 && strings.TrimSpace(envelope.Event) != "" {
+		if kind := underscoreKind(envelope.Event); kind != hookKind(name) {
+			return nil, fmt.Errorf("%w: the %s hook carries an envelope for event %q",
+				ErrInvalidRequest, name, envelope.Event)
+		}
+		if !json.Valid(envelope.Data) {
+			return nil, fmt.Errorf("%w: the %s envelope carries no event data object", ErrInvalidRequest, name)
+		}
+		return envelope.Data, nil
+	}
+	return raw, nil
+}
+
+// decodeEventData decodes one event data object and refuses a `type` that
+// contradicts the hook Herdr invoked.
+func decodeEventData(data json.RawMessage, out any, kind string) error {
+	if err := json.Unmarshal(data, out); err != nil {
+		return fmt.Errorf("%w: the %s event data cannot be decoded: %v", ErrInvalidRequest, kind, err)
+	}
+	var named struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(data, &named); err != nil {
+		return fmt.Errorf("%w: the %s event data cannot be decoded: %v", ErrInvalidRequest, kind, err)
+	}
+	if typed := strings.TrimSpace(named.Type); typed != "" && typed != kind {
+		return fmt.Errorf("%w: a %s hook carries %q event data", ErrInvalidRequest, kind, typed)
+	}
+	return nil
+}
+
+// hookKind is the event data kind one hook name names.
+func hookKind(eventName string) string {
+	switch strings.TrimSpace(eventName) {
+	case EventAgentStatus:
+		return eventKindAgentStatus
+	case EventPaneMoved:
+		return eventKindPaneMoved
+	default:
+		return ""
+	}
+}
+
+// underscoreKind renders a dotted event name in the underscore spelling the
+// event data uses, so an envelope can be compared with the hook it arrived on.
+func underscoreKind(event string) string {
+	return strings.ReplaceAll(strings.TrimSpace(event), ".", "_")
+}
+
+// ---------------------------------------------------------------------------
+// agent status
+// ---------------------------------------------------------------------------
+
+// handleAgentStatus applies one observed agent-status change.
+//
+// A primary's own status is never a worker notice: the primary's activity is
+// the user's conversation, and notifying it about itself would be noise. An
+// idle transition is the one useful signal - it says delivery may now be safe -
+// and FlushInbox re-verifies the primary itself before anything is sent, which
+// is also what keeps this hook from echoing its own prompt back as a notice.
+func (c *Coordinator) handleAgentStatus(ctx context.Context, event AgentStatusEvent) error {
+	paneID := strings.TrimSpace(event.PaneID)
+	status := strings.ToLower(strings.TrimSpace(event.AgentStatus))
+	switch {
+	case paneID == "":
+		return fmt.Errorf("%w: a %s event names no pane", ErrInvalidRequest, EventAgentStatus)
+	case strings.TrimSpace(event.WorkspaceID) == "":
+		return fmt.Errorf("%w: a %s event for pane %q names no workspace", ErrInvalidRequest, EventAgentStatus, paneID)
+	case !herdrAgentStatuses[status]:
+		return fmt.Errorf("%w: %q is not a Herdr agent status", ErrInvalidRequest, event.AgentStatus)
+	}
+	if hosted := strings.TrimSpace(deref(event.Agent)); hosted != "" && !strings.EqualFold(hosted, c.opts.AgentKind) {
+		// The pane holds a different agent (or a plain shell): whatever the
+		// store once recorded, this terminal is not this plugin's business.
+		return nil
+	}
+
+	binding, err := c.store.ByPane(ctx, paneID)
+	switch {
+	case errors.Is(err, state.ErrNotFound):
+		// A pane this plugin does not own. Herdr shares its session with the
+		// user's own terminals, so this is expected, not an error.
+		return nil
+	case err != nil:
+		return fmt.Errorf("resolve pane %q: %w", paneID, err)
+	}
+	if binding.Role == state.RolePrimary {
+		if status != "idle" {
+			return nil
+		}
+		return c.FlushInbox(ctx, binding.Project.Key)
+	}
+	return c.observeWorkerStatus(ctx, binding.Task, status, event)
+}
+
+// observeWorkerStatus records one observed status transition for a worker the
+// pane really belongs to.
+//
+// The verification is deliberate: the pane must still be occupied by the
+// session, terminal and checkout this task was dispatched with. A pane a
+// stranger now holds is a changed occupant, and its activity is not this task's
+// fact - the task is marked for a human instead, and its binding is never
+// re-keyed here.
+func (c *Coordinator) observeWorkerStatus(ctx context.Context, st task.Task, status string, event AgentStatusEvent) error {
+	probe, err := c.probePane(ctx, st.PublicPaneID, st.OMPSessionID, st.TerminalID, st.WorktreePath)
+	if err != nil {
+		return err
+	}
+	switch {
+	case probe.Refutes:
+		return c.taskAttention(ctx, st, fmt.Sprintf("a %s event for pane %s describes %s", EventAgentStatus, event.PaneID, probe.Refusal))
+	case !probe.Ours:
+		// The recorded pane holds nothing this task can claim: no agent, or no
+		// pane at all. Nothing is recorded from a terminal that cannot be proven
+		// to be the worker's.
+		return nil
+	case strings.TrimSpace(st.Activity) == status:
+		// The same observation, already recorded: replaying an event changes
+		// nothing, which is what makes a retried hook harmless.
+		return nil
+	}
+
+	previous := strings.TrimSpace(st.Activity)
+	note := c.activityNote(st, previous, status, eventDigest(event))
+	updated, _, err := c.recordWithNote(ctx, st, func(next *task.Task) error {
+		next.Activity = status
+		next.ActivitySeenAt = time.Now().UnixMilli()
+		return nil
+	}, note, "record the observed worker status")
+	if err != nil {
+		return err
+	}
+	// The observation is durable; telling the primary is best effort. FlushInbox
+	// prompts only a verified idle primary, so a working primary keeps the note
+	// queued for its next safe turn.
+	return c.FlushInbox(ctx, updated.ProjectKey)
+}
+
+// eventDigest is the identity of one observed payload: the fields that say which
+// pane Herdr observed and what it saw. It is part of a note's identity, so the
+// same event replayed cannot leave a second note behind.
+func eventDigest(event AgentStatusEvent) string {
+	sum := sha256.Sum256([]byte(strings.Join([]string{
+		strings.TrimSpace(event.PaneID),
+		strings.TrimSpace(event.WorkspaceID),
+		strings.ToLower(strings.TrimSpace(event.AgentStatus)),
+	}, "\x00")))
+	return hex.EncodeToString(sum[:6])
+}
+
+// activityNote is the durable note one observed status transition leaves behind.
+//
+// Its identity is (task, kind, payload digest, observed transition): the
+// transition starts at the previous observation - its value and when it was
+// seen - so a replay is the same note while the worker's next idle -> working
+// cycle, seen from a different observation, is news again.
+func (c *Coordinator) activityNote(st task.Task, previous, status, digest string) task.Inbox {
+	sum := sha256.Sum256([]byte(strings.Join([]string{
+		noteKindActivity, st.ID, previous, fmt.Sprint(st.ActivitySeenAt), status, digest,
+	}, "\x00")))
+	return task.Inbox{
+		ID:         noteKindActivity + ":" + st.ID + ":" + hex.EncodeToString(sum[:6]),
+		ProjectKey: st.ProjectKey,
+		TaskID:     st.ID,
+		Kind:       noteKindActivity,
+		Summary:    activitySummary(previous, status),
+		Delivery:   activityDelivery,
+	}
+}
+
+// activitySummary renders one transition for a human, saying plainly that Herdr
+// observed terminal activity and that no task stage moved.
+func activitySummary(previous, status string) string {
+	from := previous
+	if from == "" {
+		from = "unobserved"
+	}
+	return fmt.Sprintf("worker status %s -> %s (Herdr activity only; the task's stage is unchanged)", from, status)
+}
+
+// ---------------------------------------------------------------------------
+// pane moves
+// ---------------------------------------------------------------------------
+
+// handlePaneMoved re-binds the public identity of a pane that Herdr moved.
+//
+// The authoritative previous and current identities come from the event, and the
+// update is a compare-and-swap on the recorded public id: only the current public
+// pane and workspace change. The launch-time id, the terminal id and the
+// original worktree workspace are what the binding is, so they stay exactly as
+// they were recorded.
+func (c *Coordinator) handlePaneMoved(ctx context.Context, event PaneMovedEvent) error {
+	previous := strings.TrimSpace(event.PreviousPaneID)
+	pane := event.Pane
+	switch {
+	case previous == "":
+		return fmt.Errorf("%w: a %s event names no previous pane", ErrInvalidRequest, EventPaneMoved)
+	case strings.TrimSpace(pane.PaneID) == "":
+		return fmt.Errorf("%w: a %s event names no current pane", ErrInvalidRequest, EventPaneMoved)
+	case strings.TrimSpace(pane.TerminalID) == "":
+		return fmt.Errorf("%w: a %s event for pane %q names no terminal", ErrInvalidRequest, EventPaneMoved, pane.PaneID)
+	case strings.TrimSpace(pane.WorkspaceID) == "":
+		return fmt.Errorf("%w: a %s event for pane %q names no workspace", ErrInvalidRequest, EventPaneMoved, pane.PaneID)
+	}
+	if workspace, ok := paneWorkspace(pane.PaneID); !ok || workspace != pane.WorkspaceID {
+		return fmt.Errorf("%w: a %s event reports pane %q in workspace %q",
+			ErrInvalidRequest, EventPaneMoved, pane.PaneID, pane.WorkspaceID)
+	}
+
+	binding, found, err := c.bindingForMove(ctx, previous, pane.PaneID)
+	switch {
+	case err != nil:
+		return err
+	case !found:
+		return nil
+	}
+	if binding.Role == state.RolePrimary {
+		return c.applyProjectMove(ctx, binding.Project, previous, pane)
+	}
+	return c.applyTaskMove(ctx, binding.Task, previous, pane)
+}
+
+// bindingForMove resolves the record a move belongs to.
+//
+// `previous_pane_id` is the id the pane had before this move, which is either the
+// launch-time id or the public id recorded for it. A pane that moved more than
+// once has a public id the store may already have recorded from an earlier event
+// or snapshot, so the current id is a second, equally exact chance. Anything else
+// is somebody else's pane.
+func (c *Coordinator) bindingForMove(ctx context.Context, previous, current string) (state.Binding, bool, error) {
+	binding, err := c.store.ByPane(ctx, previous)
+	switch {
+	case err == nil:
+		return binding, true, nil
+	case !errors.Is(err, state.ErrNotFound):
+		return state.Binding{}, false, fmt.Errorf("resolve the moved pane %q: %w", previous, err)
+	}
+	binding, err = c.store.ByPane(ctx, current)
+	switch {
+	case err == nil:
+		return binding, true, nil
+	case errors.Is(err, state.ErrNotFound):
+		return state.Binding{}, false, nil
+	default:
+		return state.Binding{}, false, fmt.Errorf("resolve the moved pane %q: %w", current, err)
+	}
+}
+
+// applyTaskMove records a worker's new public identity.
+func (c *Coordinator) applyTaskMove(ctx context.Context, st task.Task, previous string, pane MovedPaneInfo) error {
+	if st.PublicPaneID == pane.PaneID && st.CurrentWorkspaceID == pane.WorkspaceID {
+		// The move is already recorded: a replayed event changes nothing.
+		return nil
+	}
+	switch previous {
+	case st.PublicPaneID:
+		// The ordinary case: the pane's recorded public id is where it moved from.
+	case st.LaunchPaneID:
+		if st.PublicPaneID != st.LaunchPaneID {
+			return c.taskAttention(ctx, st, fmt.Sprintf(
+				"a %s event reports pane %s moving from its launch id %s, but the task already recorded the public pane %s",
+				EventPaneMoved, pane.PaneID, previous, st.PublicPaneID))
+		}
+	default:
+		return c.taskAttention(ctx, st, fmt.Sprintf(
+			"a %s event reports pane %s moving from %s, which is neither the task's launch pane %s nor its public pane %s",
+			EventPaneMoved, pane.PaneID, previous, st.LaunchPaneID, st.PublicPaneID))
+	}
+	if reason := movedIdentityProblem(st.TerminalID, st.OMPSessionID, st.WorktreePath, pane); reason != "" {
+		return c.taskAttention(ctx, st, fmt.Sprintf("the moved pane %s no longer matches task %s: %s", pane.PaneID, st.ID, reason))
+	}
+	if err := c.store.MovePublicPane(ctx, st.LaunchPaneID, previous, pane.PaneID); err != nil {
+		if errors.Is(err, state.ErrConflict) {
+			// Another hook or the startup pass recorded the same move first.
+			return nil
+		}
+		return fmt.Errorf("record the moved public pane of task %s: %w", st.ID, err)
+	}
+	return nil
+}
+
+// applyProjectMove records a primary's new public identity. The project key, its
+// launch pane and its terminal stay what they were.
+func (c *Coordinator) applyProjectMove(ctx context.Context, project task.Project, previous string, pane MovedPaneInfo) error {
+	if project.PublicPaneID == pane.PaneID && project.CurrentWorkspaceID == pane.WorkspaceID {
+		return nil
+	}
+	switch previous {
+	case project.PublicPaneID:
+	case project.LaunchPaneID:
+		if project.PublicPaneID != project.LaunchPaneID {
+			return c.projectAttention(ctx, project, fmt.Sprintf(
+				"a %s event reports the primary pane %s moving from its launch id %s, but project %s already recorded the public pane %s",
+				EventPaneMoved, pane.PaneID, previous, project.Key, project.PublicPaneID))
+		}
+	default:
+		return c.projectAttention(ctx, project, fmt.Sprintf(
+			"a %s event reports pane %s moving from %s, which is neither the primary's launch pane %s nor its public pane %s",
+			EventPaneMoved, pane.PaneID, previous, project.LaunchPaneID, project.PublicPaneID))
+	}
+	if reason := movedIdentityProblem(project.TerminalID, project.OMPSessionID, project.Key, pane); reason != "" {
+		return c.projectAttention(ctx, project, fmt.Sprintf("the moved primary pane %s no longer matches project %s: %s", pane.PaneID, project.Key, reason))
+	}
+	err := c.store.UpdateProject(ctx, project.Key, func(next *task.Project) error {
+		if next.LaunchPaneID != project.LaunchPaneID {
+			return errSuperseded
+		}
+		if next.PublicPaneID != previous && next.PublicPaneID != pane.PaneID {
+			// A newer move of the same pane was recorded first.
+			return errSuperseded
+		}
+		next.PublicPaneID = pane.PaneID
+		next.CurrentWorkspaceID = pane.WorkspaceID
+		return nil
+	})
+	if errors.Is(err, errSuperseded) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("record the moved public pane of project %s: %w", project.Key, err)
+	}
+	return nil
+}
+
+// movedIdentityProblem reports why a moved pane is not the process a binding was
+// recorded against, or the empty string when it is.
+//
+// The terminal id is the strong proof: it follows the terminal across a move, so
+// the same terminal is the same process. A session reference the event carries is
+// a second proof and must agree with the recorded one. The checkout is checked
+// against the terminal's own working directory: the pane may live in another
+// workspace while its foreground cwd still points at the worktree, so a reported
+// directory that matches either one is the task's own.
+func movedIdentityProblem(terminal, session, checkout string, pane MovedPaneInfo) string {
+	if recorded := strings.TrimSpace(terminal); recorded != "" && !strings.EqualFold(strings.TrimSpace(pane.TerminalID), recorded) {
+		return fmt.Sprintf("the moved pane reports terminal %q, not the terminal %q it was dispatched with", pane.TerminalID, recorded)
+	}
+	if pane.AgentSession != nil {
+		kind, value, err := pane.AgentSession.Identity()
+		switch {
+		case err != nil:
+			return fmt.Sprintf("the moved pane reports a session reference this build cannot read (%v)", err)
+		case !sessionMatchesRef(session, task.SessionRef{Kind: kind, Value: value}):
+			return fmt.Sprintf("the moved pane reports %s session %q, not the recorded worker session %q", kind, value, session)
+		}
+	}
+	if recorded := strings.TrimSpace(checkout); recorded != "" && strings.TrimSpace(session) != "" {
+		if reported := paneCheckout(pane); reported != "" && !samePath(reported, recorded) {
+			return fmt.Sprintf("the moved pane works in %s, not the task's checkout %s", reported, recorded)
+		}
+	}
+	return ""
+}
+
+// paneCheckout is where a moved pane says it is: the terminal's foreground
+// directory when Herdr reports one, otherwise the pane's own working directory.
+func paneCheckout(pane MovedPaneInfo) string {
+	if cwd := strings.TrimSpace(pane.ForegroundCwd); cwd != "" {
+		return cwd
+	}
+	return strings.TrimSpace(pane.Cwd)
+}
+
+// ---------------------------------------------------------------------------
+// tasks / projects attention
+// ---------------------------------------------------------------------------
+
+// taskAttention records a durable attention for a task and returns the refusal.
+//
+// The recorded reason is what makes the state inspectable later; the note is
+// what tells the primary. A reason already recorded - in the attention field or
+// in a blocker a dispatch step left - is never rewritten, and a repeated pass
+// writes nothing but the deduplicated note.
+func (c *Coordinator) taskAttention(ctx context.Context, st task.Task, reason string) error {
+	note := c.noteFor(st, noteKindAttention, reason, reconcileDelivery)
+	switch {
+	case st.Attention == reason || st.Blocker != "" || st.Blocker == reason:
+		// The task already needs a human; this finding only adds its note. A
+		// blocker is never replaced by a later reconciliation.
+		if _, err := c.store.AddInbox(ctx, note); err != nil {
+			return errors.Join(refusal(ErrAgentChanged, st.ID, reason), err)
+		}
+	default:
+		if _, _, err := c.recordWithNote(ctx, st, func(next *task.Task) error {
+			if next.Attention == "" && next.Blocker == "" {
+				next.Attention = reason
+			}
+			return nil
+		}, note, "record the reconciliation attention"); err != nil {
+			return errors.Join(refusal(ErrAgentChanged, st.ID, reason), err)
+		}
+	}
+	return refusal(ErrAgentChanged, st.ID, reason)
+}
+
+// projectAttention records a durable attention note for a project. A project has
+// no attention field of its own - its facts are the binding - so the inbox note
+// is where a human reads it.
+func (c *Coordinator) projectAttention(ctx context.Context, project task.Project, reason string) error {
+	if err := c.notify(ctx, project.Key, "", noteKindAttention, reason, reconcileDelivery); err != nil {
+		return errors.Join(refusal(ErrPrimaryNotLive, project.Key, reason), err)
+	}
+	return refusal(ErrPrimaryNotLive, project.Key, reason)
+}
+
+// refusal renders one stable refusal naming the recorded identity and the
+// contradiction.
+func refusal(sentinel error, id, reason string) error {
+	return fmt.Errorf("%w: %s: %s", sentinel, id, reason)
+}
+
+// ---------------------------------------------------------------------------
+// FlushInbox
+// ---------------------------------------------------------------------------
+
+// FlushInbox delivers a project's pending notes to its primary, once.
+//
+// It never sends unless the primary is verified and idle: the recorded public
+// pane must still resolve to itself, still run the required agent kind, still
+// report the recorded session, still work in the project's checkout and report
+// `idle`. A working, blocked, missing or unverifiable primary keeps its inbox
+// pending for the next safe turn - which is safe, because nothing here is
+// time-critical and a prompt is a turn in the user's own conversation.
+//
+// Delivery is claimed transactionally. The notes are moved pending -> sending
+// before the prompt and settled afterwards, so a retry after a crash or a
+// duplicate idle event finds either pending notes (nothing was claimed) or a
+// claimed batch (one attempt owns them). A timeout or an uninterpretable answer
+// leaves the batch `uncertain`: the prompt may already be in the primary's
+// conversation, so it is inspected, never resent.
+func (c *Coordinator) FlushInbox(ctx context.Context, projectKey string) error {
+	key := strings.TrimSpace(projectKey)
+	if key == "" {
+		return fmt.Errorf("%w: no project key was given", ErrInvalidRequest)
+	}
+	project, err := c.store.Project(ctx, key)
+	switch {
+	case errors.Is(err, state.ErrNotFound):
+		return fmt.Errorf("%w: %q is not a bound project", ErrProjectUnknown, key)
+	case err != nil:
+		return err
+	}
+	pending, err := c.store.PendingInbox(ctx, key)
+	if err != nil {
+		return err
+	}
+	if len(pending) == 0 {
+		// Nothing queued: no prompt, so a status event can never become a notice
+		// about itself.
+		return nil
+	}
+	probe, err := c.probePrimary(ctx, project)
+	if err != nil {
+		return err
+	}
+	if !probe.Ours || !probe.Idle {
+		return nil
+	}
+	claimed, err := c.store.ClaimInbox(ctx, inboxIDs(pending))
+	if err != nil {
+		return err
+	}
+	if len(claimed) == 0 {
+		// Another flush claimed the same notes first; it owns the delivery.
+		return nil
+	}
+	return c.deliverInbox(ctx, probe.Pane.PaneID, claimed)
+}
+
+// deliverInbox submits one claimed batch as a single prompt and settles it.
+//
+// The prompt text names the note's task ids and summaries and is bounded, so a
+// backlog cannot become an unbounded turn. Only one attempt per claim exists in
+// this process: whatever the answer was, the notes are settled before returning.
+func (c *Coordinator) deliverInbox(ctx context.Context, paneID string, notes []task.Inbox) error {
+	ids := inboxIDs(notes)
+	text := inboxPrompt(notes)
+	callCtx, cancel := c.callContext(ctx)
+	defer cancel()
+	_, err := c.herdr.AgentPrompt(callCtx, paneID, text)
+	switch {
+	case err == nil:
+		if _, settleErr := c.store.SettleInbox(ctx, ids, task.DeliveryDelivered, "prompted to "+paneID); settleErr != nil {
+			return fmt.Errorf("settle the delivered inbox of pane %s: %w", paneID, settleErr)
+		}
+		return nil
+	case errors.Is(err, herdr.ErrAmbiguous):
+		reason := fmt.Sprintf("the notification prompt to %s may already have been delivered; inspect `agent get`/`agent read` before retrying: %v", paneID, err)
+		if _, settleErr := c.store.SettleInbox(ctx, ids, task.DeliveryUncertain, reason); settleErr != nil {
+			return errors.Join(err, fmt.Errorf("settle the uncertain inbox of pane %s: %w", paneID, settleErr))
+		}
+		return fmt.Errorf("%w: %v", ErrAmbiguousStep, err)
+	case isNonDelivery(err):
+		// Herdr refused before any input was written, so the notes stay queued
+		// for a later safe turn instead of being marked uncertain.
+		if _, settleErr := c.store.SettleInbox(ctx, ids, task.DeliveryPending,
+			"the primary refused the prompt before any input was written: "+err.Error()); settleErr != nil {
+			return errors.Join(err, fmt.Errorf("requeue the inbox of pane %s: %w", paneID, settleErr))
+		}
+		return err
+	default:
+		// A failure that proves nothing about whether the input was written is
+		// never retried blindly.
+		reason := fmt.Sprintf("the notification prompt to %s failed without proof that nothing was written; inspect `agent get`/`agent read` before retrying: %v", paneID, err)
+		if _, settleErr := c.store.SettleInbox(ctx, ids, task.DeliveryUncertain, reason); settleErr != nil {
+			return errors.Join(err, fmt.Errorf("settle the uncertain inbox of pane %s: %w", paneID, settleErr))
+		}
+		return err
+	}
+}
+
+// inboxPrompt renders the one turn a flush submits: the task each note belongs
+// to, its kind and its summary, bounded per line and in total.
+func inboxPrompt(notes []task.Inbox) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "orchestrator: %d pending worker note(s)\n", len(notes))
+	for i, note := range notes {
+		if i >= inboxPromptNoteLimit {
+			fmt.Fprintf(&b, "- … %d more note(s) are queued\n", len(notes)-i)
+			break
+		}
+		b.WriteString("- " + truncateRunes(inboxPromptLine(note), inboxPromptLineLimit) + "\n")
+	}
+	return truncateRunes(b.String(), inboxPromptLimit)
+}
+
+// inboxPromptLine names one note. A project-scoped note (a bind failure, say)
+// has no task id, and saying so beats printing an empty slot.
+func inboxPromptLine(note task.Inbox) string {
+	subject := strings.TrimSpace(note.TaskID)
+	if subject == "" {
+		subject = "project " + strings.TrimSpace(note.ProjectKey)
+	}
+	return fmt.Sprintf("%s [%s]: %s", subject, note.Kind, strings.TrimSpace(note.Summary))
+}
+
+// inboxIDs names a batch for a claim or a settlement.
+func inboxIDs(notes []task.Inbox) []string {
+	ids := make([]string, 0, len(notes))
+	for _, note := range notes {
+		ids = append(ids, note.ID)
+	}
+	return ids
+}
+
+// probePrimary verifies the live primary of one project, freshly from Herdr.
+//
+// Verification is exact and by identity, never by label: the recorded public pane
+// (or the launch pane the process inherited) must resolve to itself, still run
+// the required agent kind, still report the recorded session, and still work in
+// the project's checkout. Only then does its status mean anything.
+func (c *Coordinator) probePrimary(ctx context.Context, project task.Project) (paneProbe, error) {
+	paneID, found := firstPane(project.PublicPaneID, project.LaunchPaneID)
+	if !found {
+		return paneProbe{Refusal: "the project records no primary pane"}, nil
+	}
+	if strings.TrimSpace(project.OMPSessionID) == "" {
+		return paneProbe{Refusal: "the project records no OMP session, so its primary cannot be identified"}, nil
+	}
+	probe, err := c.probePane(ctx, paneID, project.OMPSessionID, project.TerminalID, project.Key)
+	if err != nil {
+		return paneProbe{}, err
+	}
+	if probe.Ours {
+		probe.Idle = strings.EqualFold(strings.TrimSpace(probe.Pane.AgentStatus), "idle")
+	}
+	return probe, nil
+}
+
+// ---------------------------------------------------------------------------
+// Reconcile
+// ---------------------------------------------------------------------------
+
+// Reconcile is the startup pass: it re-derives every recorded pane binding from
+// Herdr's own snapshot and Git's worktree listing, because event history is not
+// replayed.
+//
+// It is repeat-safe. Every write is a compare-and-swap on the recorded identity
+// and is skipped when the facts already match, so a second pass over the same
+// Herdr state writes nothing. It never starts an agent, never closes a pane and
+// never discards a task or an inbox note: a worker whose pane is gone leaves its
+// facts (and one deduplicated note) behind, and only an explicit human action
+// replaces it. An identity it cannot prove is left as recorded and marked for a
+// human rather than re-keyed - and that finding is returned, so the startup hook
+// exits nonzero and Herdr records it in the plugin log. The durable facts are
+// written before the error is returned.
+func (c *Coordinator) Reconcile(ctx context.Context) error {
+	snapshot, err := c.snapshotView(ctx)
+	if err != nil {
+		return err
+	}
+	// A delivery that was in flight when the previous process stopped cannot be
+	// resolved by anyone: it becomes uncertain before anything is sent again.
+	if _, err := c.store.RecoverInbox(ctx); err != nil {
+		return err
+	}
+	projects, err := c.store.Projects(ctx)
+	if err != nil {
+		return err
+	}
+	var failures []error
+	for _, project := range projects {
+		if err := c.reconcileProject(ctx, project, snapshot); err != nil {
+			failures = append(failures, err)
+		}
+	}
+	// Identities are repaired; a verified idle primary can now take what is
+	// queued. FlushInbox itself re-verifies, so a project with nothing pending
+	// submits no prompt.
+	for _, project := range projects {
+		if err := c.FlushInbox(ctx, project.Key); err != nil {
+			failures = append(failures, err)
+		}
+	}
+	return errors.Join(failures...)
+}
+
+// reconcileProject reconciles one project's primary and workers.
+func (c *Coordinator) reconcileProject(ctx context.Context, project task.Project, snapshot *snapshotView) error {
+	var failures []error
+	if err := c.reconcilePrimary(ctx, project, snapshot); err != nil {
+		failures = append(failures, err)
+	}
+	tasks, err := c.store.Tasks(ctx, project.Key)
+	if err != nil {
+		return errors.Join(append(failures, fmt.Errorf("read the tasks of %q: %w", project.Key, err))...)
+	}
+	var unfinished []task.Task
+	for _, st := range tasks {
+		if reconciles(st) {
+			unfinished = append(unfinished, st)
+		}
+	}
+	if len(unfinished) == 0 {
+		return errors.Join(failures...)
+	}
+	// The checkout listing is corroborating evidence, not a prerequisite: if it
+	// cannot be read the pane evidence still decides, and the failure is
+	// reported instead of being hidden.
+	listed, listErr := c.worktreeList(ctx, project.Key)
+	if listErr != nil {
+		failures = append(failures, listErr)
+	}
+	for _, st := range unfinished {
+		if err := c.reconcileTask(ctx, project, st, snapshot, listed); err != nil {
+			failures = append(failures, err)
+		}
+	}
+	return errors.Join(failures...)
+}
+
+// reconciles reports whether a task still has live identities to reconcile. A
+// closed task (a recorded disposition) is history, and its checkout may
+// legitimately be gone.
+func reconciles(st task.Task) bool {
+	if strings.TrimSpace(st.Disposition) != "" {
+		return false
+	}
+	switch st.Phase {
+	case task.WorktreeCreated, task.AgentStarted, task.PromptSubmitted:
+		return true
+	default:
+		return false
+	}
+}
+
+// reconcilePrimary re-derives a primary's pane from the snapshot.
+//
+// A primary that is not found is left alone: re-establishing a lost primary is
+// the user's explicit launch action, and nothing here may substitute a different
+// session for the one the user was talking to.
+func (c *Coordinator) reconcilePrimary(ctx context.Context, project task.Project, snapshot *snapshotView) error {
+	probes, err := c.probeCandidates(ctx, snapshot, []string{project.LaunchPaneID, project.PublicPaneID}, project.OMPSessionID, project.TerminalID, project.Key)
+	if err != nil {
+		return err
+	}
+	ours := oursOnly(probes)
+	switch {
+	case len(ours) == 1:
+		return c.applyPrimaryPane(ctx, project, ours[0])
+	case len(ours) > 1:
+		return c.projectAttention(ctx, project, fmt.Sprintf(
+			"%d panes report the primary session of project %s (%s); the binding was not re-keyed",
+			len(ours), project.Key, strings.Join(paneIDs(ours), ", ")))
+	}
+	if refuted := refutedOnly(probes); len(refuted) > 0 {
+		return c.projectAttention(ctx, project, fmt.Sprintf("pane %s is not the primary of project %s: %s",
+			refuted[0].Pane.PaneID, project.Key, refuted[0].Refusal))
+	}
+	return nil
+}
+
+// reconcileTask re-derives one unfinished worker's pane from the snapshot.
+func (c *Coordinator) reconcileTask(ctx context.Context, project task.Project, st task.Task, snapshot *snapshotView, listed *herdr.WorktreeList) error {
+	probes, err := c.probeCandidates(ctx, snapshot, []string{st.LaunchPaneID, st.PublicPaneID}, st.OMPSessionID, st.TerminalID, st.WorktreePath)
+	if err != nil {
+		return err
+	}
+	ours := oursOnly(probes)
+	switch {
+	case len(ours) == 1:
+		if !checkoutListed(listed, st.WorktreePath) {
+			return c.taskAttention(ctx, st, fmt.Sprintf(
+				"the checkout %s of task %s is no longer listed by `worktree list`; its pane binding was left as recorded",
+				st.WorktreePath, st.ID))
+		}
+		return c.applyTaskPane(ctx, st, ours[0])
+	case len(ours) > 1:
+		return c.taskAttention(ctx, st, fmt.Sprintf(
+			"%d panes report the worker session of task %s (%s); the binding was not re-keyed",
+			len(ours), st.ID, strings.Join(paneIDs(ours), ", ")))
+	}
+	// No pane proved to be this worker's. A pane that positively contradicts the
+	// recorded identity is an unknown occupant: a human decides, and nothing is
+	// started in its place. A pane that cannot be judged either way is the same
+	// answer - an identity this pass may not guess at.
+	if refuted := refutedOnly(probes); len(refuted) > 0 {
+		return c.taskAttention(ctx, st, fmt.Sprintf(
+			"pane %s is not the worker of task %s and no agent was started in its place: %s",
+			refuted[0].Pane.PaneID, st.ID, refuted[0].Refusal))
+	}
+	if unproven := unprovenOnly(probes); len(unproven) > 0 {
+		return c.taskAttention(ctx, st, fmt.Sprintf(
+			"pane %s could not be proven to be the worker of task %s, so its binding was left as recorded: %s",
+			unproven[0].Pane.PaneID, st.ID, unproven[0].Refusal))
+	}
+	if !checkoutListed(listed, st.WorktreePath) {
+		return c.taskAttention(ctx, st, fmt.Sprintf(
+			"the checkout %s of task %s is no longer listed by `worktree list`; its pane binding was left as recorded",
+			st.WorktreePath, st.ID))
+	}
+	return c.reconcileExit(ctx, project, st)
+}
+
+// reconcileExit queues one deduplicated note for a worker that is no longer
+// running, and changes nothing else.
+//
+// The task keeps its facts - the checkout, the branch, the phase it reached - so
+// a human can inspect or resume it deliberately. Nothing is started in the
+// vanished pane, and a worker whose final report is already recorded is not news.
+func (c *Coordinator) reconcileExit(ctx context.Context, project task.Project, st task.Task) error {
+	if isReviewed(st) {
+		return nil
+	}
+	summary := fmt.Sprintf(
+		"worker %s is no longer running: its pane is absent from Herdr's snapshot; the task was left at phase %s and nothing was started in its place",
+		st.ID, st.Phase)
+	if _, err := c.store.AddInbox(ctx, c.noteFor(st, noteKindExit, summary, reconcileDelivery)); err != nil {
+		return fmt.Errorf("queue the exit note of task %s: %w", st.ID, err)
+	}
+	return nil
+}
+
+// applyPrimaryPane records the public identity a verified primary pane has now,
+// adopting a new launch id only for a verified restored session in a new
+// terminal.
+func (c *Coordinator) applyPrimaryPane(ctx context.Context, project task.Project, probe paneProbe) error {
+	next := project
+	if adoptsLaunchID(project.LaunchPaneID, probe) {
+		next.LaunchPaneID = probe.Pane.PaneID
+	}
+	next.PublicPaneID = probe.Pane.PaneID
+	next.CurrentWorkspaceID = probe.Pane.WorkspaceID
+	if terminal := strings.TrimSpace(probe.Pane.TerminalID); terminal != "" {
+		next.TerminalID = terminal
+	}
+	if next == project {
+		return nil
+	}
+	err := c.store.UpdateProject(ctx, project.Key, func(record *task.Project) error {
+		if record.LaunchPaneID != project.LaunchPaneID {
+			return errSuperseded
+		}
+		record.LaunchPaneID = next.LaunchPaneID
+		record.PublicPaneID = next.PublicPaneID
+		record.CurrentWorkspaceID = next.CurrentWorkspaceID
+		record.TerminalID = next.TerminalID
+		return nil
+	})
+	if errors.Is(err, errSuperseded) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("reconcile the primary pane of %s: %w", project.Key, err)
+	}
+	return nil
+}
+
+// applyTaskPane records the public identity a verified worker pane has now, and
+// refreshes the observed activity, in one write.
+//
+// Only the public pane, the current workspace and (when it changed with the
+// process) the terminal move. The launch id changes only for a verified restored
+// session in a new terminal - a Herdr restore - and the original worktree
+// workspace is never rewritten: it is the provenance that keeps identifying the
+// task after the workspace it was created in is closed.
+func (c *Coordinator) applyTaskPane(ctx context.Context, st task.Task, probe paneProbe) error {
+	next := st
+	if adoptsLaunchID(st.LaunchPaneID, probe) {
+		next.LaunchPaneID = probe.Pane.PaneID
+	}
+	next.PublicPaneID = probe.Pane.PaneID
+	next.CurrentWorkspaceID = probe.Pane.WorkspaceID
+	if terminal := strings.TrimSpace(probe.Pane.TerminalID); terminal != "" {
+		next.TerminalID = terminal
+	}
+	activity := strings.ToLower(strings.TrimSpace(probe.Pane.AgentStatus))
+	if !herdrAgentStatuses[activity] {
+		activity = ""
+	}
+	identityChanged := next.LaunchPaneID != st.LaunchPaneID ||
+		next.PublicPaneID != st.PublicPaneID ||
+		next.CurrentWorkspaceID != st.CurrentWorkspaceID ||
+		next.TerminalID != st.TerminalID
+	if !identityChanged && (activity == "" || activity == st.Activity) {
+		return nil
+	}
+	_, err := c.record(ctx, st, func(record *task.Task) error {
+		if record.LaunchPaneID != st.LaunchPaneID {
+			return errSuperseded
+		}
+		if record.PublicPaneID != st.PublicPaneID && record.PublicPaneID != next.PublicPaneID {
+			// A newer move of the same pane was recorded first.
+			return errSuperseded
+		}
+		record.LaunchPaneID = next.LaunchPaneID
+		record.PublicPaneID = next.PublicPaneID
+		record.CurrentWorkspaceID = next.CurrentWorkspaceID
+		record.TerminalID = next.TerminalID
+		if activity != "" && record.Activity != activity {
+			record.Activity = activity
+			record.ActivitySeenAt = time.Now().UnixMilli()
+		}
+		return nil
+	}, "reconcile the worker's pane binding")
+	if errors.Is(err, errSuperseded) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("reconcile the pane binding of task %s: %w", st.ID, err)
+	}
+	return nil
+}
+
+// adoptsLaunchID reports whether a verified probe is a restored session in a new
+// terminal, which is the only case in which a launch id may change.
+//
+// The proof has to be positive on both counts: the pane reports the recorded
+// session (so it is the same OMP conversation) and it is not the same terminal
+// (so the process really moved). A move keeps the terminal, and therefore never
+// changes the launch id.
+func adoptsLaunchID(launchPaneID string, probe paneProbe) bool {
+	if strings.TrimSpace(launchPaneID) == "" || probe.Pane.PaneID == launchPaneID {
+		return false
+	}
+	return !probe.SameTerminal && probe.HasRef && probe.SessionOK
+}
+
+// ---------------------------------------------------------------------------
+// the snapshot
+// ---------------------------------------------------------------------------
+
+// snapshotPane is one pane of `herdr api snapshot`: the typed projection plus
+// the two fields no other caller needs - the native session reference and the
+// terminal's foreground directory - which the typed client deliberately drops.
+type snapshotPane struct {
+	herdr.PaneInfo
+	ForegroundCwd string            `json:"foreground_cwd"`
+	AgentSession  *herdr.SessionRef `json:"agent_session"`
+}
+
+// snapshotView is the part of Herdr's live state this pass decides from.
+type snapshotView struct {
+	Version  string
+	Protocol int
+	Panes    []snapshotPane
+	Agents   []herdr.AgentInfo
+}
+
+// snapshotView reads Herdr's authoritative live state.
+//
+// The raw body is decoded because the snapshot's panes carry the native session
+// reference; everything else is validated as strictly as the typed client does,
+// so a snapshot whose panes lack their identities is refused rather than used.
+func (c *Coordinator) snapshotView(ctx context.Context) (*snapshotView, error) {
+	ctx, cancel := c.callContext(ctx)
+	defer cancel()
+	raw, err := c.herdr.Call(ctx, "api", "snapshot")
+	if err != nil {
+		return nil, fmt.Errorf("read the Herdr snapshot: %w", err)
+	}
+	var res struct {
+		Type     string `json:"type"`
+		Snapshot struct {
+			Version  string            `json:"version"`
+			Protocol int               `json:"protocol"`
+			Panes    []snapshotPane    `json:"panes"`
+			Agents   []herdr.AgentInfo `json:"agents"`
+		} `json:"snapshot"`
+	}
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return nil, fmt.Errorf("%w: api snapshot: decode result: %v", herdr.ErrMalformedResponse, err)
+	}
+	if res.Type != "session_snapshot" {
+		return nil, fmt.Errorf("%w: api snapshot: expected result type %q, got %q",
+			herdr.ErrMalformedResponse, "session_snapshot", res.Type)
+	}
+	if strings.TrimSpace(res.Snapshot.Version) == "" {
+		return nil, &herdr.IdentityError{Op: "api snapshot", Field: "snapshot.version", Detail: "snapshot carries no server version"}
+	}
+	for i, pane := range res.Snapshot.Panes {
+		for _, field := range []struct{ name, value string }{
+			{"pane_id", pane.PaneID},
+			{"terminal_id", pane.TerminalID},
+			{"workspace_id", pane.WorkspaceID},
+			{"tab_id", pane.TabID},
+		} {
+			if strings.TrimSpace(field.value) == "" {
+				return nil, &herdr.IdentityError{
+					Op:     "api snapshot",
+					Field:  fmt.Sprintf("snapshot.panes[%d].%s", i, field.name),
+					Detail: "required identity is empty",
+				}
+			}
+		}
+	}
+	return &snapshotView{
+		Version:  res.Snapshot.Version,
+		Protocol: res.Snapshot.Protocol,
+		Panes:    res.Snapshot.Panes,
+		Agents:   res.Snapshot.Agents,
+	}, nil
+}
+
+// snapshotCandidates narrows a snapshot to the panes a binding could be: the
+// panes whose id is one the binding recorded, the pane on the recorded terminal,
+// and the panes working in the recorded checkout. Nothing is guessed from a
+// label, and the order is the snapshot's own, so a pass is deterministic.
+func snapshotCandidates(panes []snapshotPane, ids []string, terminal, checkout string) []snapshotPane {
+	var out []snapshotPane
+	seen := map[string]bool{}
+	for _, pane := range panes {
+		if seen[pane.PaneID] || !candidatePane(pane, ids, terminal, checkout) {
+			continue
+		}
+		seen[pane.PaneID] = true
+		out = append(out, pane)
+	}
+	return out
+}
+
+// candidatePane reports whether a snapshot pane could be the binding's own.
+func candidatePane(pane snapshotPane, ids []string, terminal, checkout string) bool {
+	for _, id := range ids {
+		if strings.TrimSpace(id) != "" && pane.PaneID == id {
+			return true
+		}
+	}
+	if recorded := strings.TrimSpace(terminal); recorded != "" && strings.EqualFold(strings.TrimSpace(pane.TerminalID), recorded) {
+		return true
+	}
+	return snapshotWorksIn(pane, checkout)
+}
+
+// snapshotWorksIn reports whether a snapshot pane says it works in checkout.
+func snapshotWorksIn(pane snapshotPane, checkout string) bool {
+	checkout = strings.TrimSpace(checkout)
+	if checkout == "" {
+		return false
+	}
+	if cwd := strings.TrimSpace(pane.Cwd); cwd != "" && samePath(cwd, checkout) {
+		return true
+	}
+	cwd := strings.TrimSpace(pane.ForegroundCwd)
+	return cwd != "" && samePath(cwd, checkout)
+}
+
+// ---------------------------------------------------------------------------
+// pane probes
+// ---------------------------------------------------------------------------
+
+// paneProbe is what one authoritative `agent get` proved about a candidate pane.
+type paneProbe struct {
+	// Pane is Herdr's live projection of the pane.
+	Pane herdr.AgentInfo
+	// Ref is the native session reference Herdr reported, when it reported one.
+	Ref task.SessionRef
+	// HasRef reports whether a reference was reported at all.
+	HasRef bool
+	// SameTerminal reports whether the pane is on the terminal the binding
+	// recorded (true when nothing was recorded: nothing contradicts).
+	SameTerminal bool
+	// SameCheckout reports whether the pane works in the recorded checkout (true
+	// when nothing useful was reported).
+	SameCheckout bool
+	// SessionOK reports whether a recorded session was matched.
+	SessionOK bool
+	// Ours reports that this pane is provably the binding's own pane.
+	Ours bool
+	// Refutes reports that the pane positively contradicts the recorded
+	// identity: it runs another agent, or reports a different session.
+	Refutes bool
+	// Vacant reports that the pane holds no agent at all, so its recorded
+	// process is gone rather than unidentified.
+	Vacant bool
+	// Refusal is why the pane is not this binding's own.
+	Refusal string
+	// Idle reports the observed idle status, for a caller that asks.
+	Idle bool
+}
+
+// probeCandidates probes every snapshot pane a binding could be.
+func (c *Coordinator) probeCandidates(ctx context.Context, snapshot *snapshotView, ids []string, session, terminal, checkout string) ([]paneProbe, error) {
+	candidates := snapshotCandidates(snapshot.Panes, ids, terminal, checkout)
+	var probes []paneProbe
+	for _, pane := range candidates {
+		probe, err := c.probePane(ctx, pane.PaneID, session, terminal, checkout)
+		if err != nil {
+			return nil, err
+		}
+		probes = append(probes, probe)
+	}
+	return probes, nil
+}
+
+// probePane verifies one pane against a recorded identity, using Herdr's live
+// agent projection rather than the payload that raised the question.
+func (c *Coordinator) probePane(ctx context.Context, paneID, session, terminal, checkout string) (paneProbe, error) {
+	probe := paneProbe{}
+	if strings.TrimSpace(paneID) == "" {
+		probe.Refusal = "no pane is recorded"
+		return probe, nil
+	}
+	view, err := c.agentGet(ctx, paneID)
+	switch {
+	case isMissingTarget(err):
+		probe.Vacant = true
+		probe.Refusal = fmt.Sprintf("pane %s holds no agent", paneID)
+		return probe, nil
+	case err != nil:
+		return paneProbe{}, err
+	}
+	probe.Pane = view.Agent
+	if view.Agent.PaneID != paneID {
+		probe.Refusal = fmt.Sprintf("pane %s now resolves to %s", paneID, view.Agent.PaneID)
+		return probe, nil
+	}
+	if kind := strings.ToLower(strings.TrimSpace(view.Agent.Agent)); kind == "" || kind == "shell" {
+		probe.Vacant = true
+		probe.Refusal = fmt.Sprintf("pane %s holds a plain terminal, not %q", paneID, c.opts.AgentKind)
+		return probe, nil
+	}
+	probe.HasRef, probe.Ref = view.HasRef, view.Ref
+	probe.SameTerminal = strings.TrimSpace(terminal) == "" ||
+		strings.EqualFold(strings.TrimSpace(view.Agent.TerminalID), strings.TrimSpace(terminal))
+	cwd := strings.TrimSpace(view.Agent.Cwd)
+	probe.SameCheckout = strings.TrimSpace(checkout) == "" || cwd == "" || samePath(cwd, checkout)
+	recordedSession := strings.TrimSpace(session)
+	switch {
+	case !strings.EqualFold(strings.TrimSpace(view.Agent.Agent), c.opts.AgentKind):
+		probe.Refutes = true
+		probe.Refusal = fmt.Sprintf("the pane runs %q, not %q", view.Agent.Agent, c.opts.AgentKind)
+	case view.RefErr != nil:
+		probe.Refutes = true
+		probe.Refusal = fmt.Sprintf("the pane reports a session reference this build cannot read (%v)", view.RefErr)
+	case recordedSession != "" && view.HasRef && !sessionMatchesRef(recordedSession, view.Ref):
+		probe.Refutes = true
+		probe.Refusal = fmt.Sprintf("the pane reports %s session %q, not the recorded %q", view.Ref.Kind, view.Ref.Value, recordedSession)
+	case recordedSession != "" && !view.HasRef && !probe.SameTerminal:
+		probe.Refusal = "the pane reports no session reference and is not the terminal the binding recorded"
+	case !probe.SameCheckout:
+		probe.Refusal = fmt.Sprintf("the pane works in %s, not the recorded checkout %s", cwd, checkout)
+	default:
+		probe.Ours = true
+		probe.SessionOK = recordedSession == "" || view.HasRef
+	}
+	return probe, nil
+}
+
+// oursOnly and refutedOnly split a probe batch, so the decision reads the same
+// way whether a hook or the startup pass produced it.
+func oursOnly(probes []paneProbe) []paneProbe {
+	var out []paneProbe
+	for _, probe := range probes {
+		if probe.Ours {
+			out = append(out, probe)
+		}
+	}
+	return out
+}
+
+func refutedOnly(probes []paneProbe) []paneProbe {
+	var out []paneProbe
+	for _, probe := range probes {
+		if probe.Refutes {
+			out = append(out, probe)
+		}
+	}
+	return out
+}
+
+// unprovenOnly collects the candidate panes that neither proved nor refuted the
+// recorded identity: an agent that reports no usable session, or one on a
+// terminal this binding never recorded. Such a probe is ambiguous, and an
+// ambiguous probe is a question for a human rather than a value to adopt.
+func unprovenOnly(probes []paneProbe) []paneProbe {
+	var out []paneProbe
+	for _, probe := range probes {
+		if !probe.Ours && !probe.Refutes && !probe.Vacant {
+			out = append(out, probe)
+		}
+	}
+	return out
+}
+
+// paneIDs names the panes of a probe batch for a message a human reads.
+func paneIDs(probes []paneProbe) []string {
+	ids := make([]string, 0, len(probes))
+	for _, probe := range probes {
+		ids = append(ids, probe.Pane.PaneID)
+	}
+	return ids
+}
+
+// ---------------------------------------------------------------------------
+// worktree provenance
+// ---------------------------------------------------------------------------
+
+// worktreeList reads the repository's worktree listing and checks that it
+// describes the repository that was asked about.
+func (c *Coordinator) worktreeList(ctx context.Context, root string) (*herdr.WorktreeList, error) {
+	ctx, cancel := c.callContext(ctx)
+	defer cancel()
+	list, err := c.herdr.WorktreeList(ctx, root)
+	if err != nil {
+		return nil, fmt.Errorf("list the worktrees of %s: %w", root, err)
+	}
+	if !samePath(list.Source.RepoRoot, root) {
+		return nil, fmt.Errorf("%w: `worktree list` for %s reported repository root %q",
+			ErrDifferentRepository, root, list.Source.RepoRoot)
+	}
+	return list, nil
+}
+
+// checkoutListed reports whether a checkout is still one of the repository's
+// worktrees. A listing that could not be read, or a task that recorded no
+// checkout, proves nothing and is not a refusal.
+func checkoutListed(listed *herdr.WorktreeList, checkout string) bool {
+	checkout = strings.TrimSpace(checkout)
+	if listed == nil || checkout == "" {
+		return true
+	}
+	for _, worktree := range listed.Worktrees {
+		if samePath(worktree.Path, checkout) {
+			return true
+		}
+	}
+	return false
+}
+
+// ---------------------------------------------------------------------------
+// small helpers
+// ---------------------------------------------------------------------------
+
+// deref reads an optional JSON string.
+func deref(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
+}
+
+// firstPane returns the first non-empty pane id and whether one was found.
+func firstPane(ids ...string) (string, bool) {
+	for _, id := range ids {
+		if strings.TrimSpace(id) != "" {
+			return strings.TrimSpace(id), true
+		}
+	}
+	return "", false
+}
+
+// paneWorkspace splits a workspace-qualified pane id ("w1:p2") into its
+// workspace. Herdr qualifies every public pane id this way, and a payload whose
+// pane id and workspace id disagree is a contradiction, not a value to guess at.
+func paneWorkspace(paneID string) (string, bool) {
+	workspace, _, ok := strings.Cut(strings.TrimSpace(paneID), ":")
+	if !ok || strings.TrimSpace(workspace) == "" {
+		return "", false
+	}
+	return workspace, true
+}

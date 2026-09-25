@@ -92,6 +92,9 @@ type fixturePlan struct {
 	// PromptAmbiguous makes `agent prompt` report Herdr's own timeout code after
 	// recording the submission, the way a real CLI timeout does.
 	PromptAmbiguous bool `json:"prompt_ambiguous"`
+	// PromptError makes `agent prompt` refuse with that Herdr code before any
+	// input is written, the way a blocked or vanished agent is refused.
+	PromptError string `json:"prompt_error"`
 	// WorktreeCreateError makes `worktree create` fail with that Herdr code
 	// before any checkout exists.
 	WorktreeCreateError string `json:"worktree_create_error"`
@@ -105,9 +108,12 @@ type fixturePlan struct {
 	SkipGitWorktree bool `json:"skip_git_worktree"`
 }
 
-// fixtureAgent is one live agent the stand-in CLI remembers.
+// fixtureAgent is one live agent the stand-in CLI remembers. Terminal is the
+// terminal the agent's process runs on: it follows the terminal across a pane
+// move and is what a binding proves a moved pane with.
 type fixtureAgent struct {
 	Name     string `json:"name"`
+	Terminal string `json:"terminal"`
 	Session  string `json:"session"`
 	Status   string `json:"status"`
 	Prompted int    `json:"prompted"`
@@ -184,6 +190,8 @@ func runFixture() int {
 		return fixtureResult(sessionSnapshotResult(plan, state))
 	case "pane get":
 		return fixturePaneGet(plan, state, argv)
+	case "pane move":
+		return fixturePaneMove(dir, plan, &state, argv)
 	case "agent get":
 		return fixtureAgentGet(dir, plan, &state, argv)
 	case "agent start":
@@ -234,7 +242,7 @@ func fixturePaneGet(plan fixturePlan, state fixtureState, argv []string) int {
 		}
 		return fixtureResult(map[string]any{
 			"type": "pane_info",
-			"pane": paneInfo(pane, ws, state.Workspaces[ws], agent),
+			"pane": paneInfo(state, pane, ws, state.Workspaces[ws], agent),
 		})
 	}
 	if plan.BindPaneID == "" || pane != plan.BindPaneID {
@@ -242,7 +250,52 @@ func fixturePaneGet(plan fixturePlan, state fixtureState, argv []string) int {
 	}
 	return fixtureResult(map[string]any{
 		"type": "pane_info",
-		"pane": paneInfo(plan.BindPaneID, plan.BindPaneWorkspace, plan.BindPaneCwd, plan.BindPaneAgent),
+		"pane": paneInfo(state, plan.BindPaneID, plan.BindPaneWorkspace, plan.BindPaneCwd, plan.BindPaneAgent),
+	})
+}
+
+// fixturePaneMove moves one pane to a new workspace, the way `herdr pane move
+// --new-workspace` does. Moving the last pane out of a workspace closes that
+// workspace, and the result reports exactly that. The terminal - and therefore
+// the agent process - keeps its terminal id across the move.
+func fixturePaneMove(dir string, plan fixturePlan, state *fixtureState, argv []string) int {
+	pane := argv[2]
+	workspace := workspaceOfPane(pane)
+	if state.Workspaces[workspace] == "" {
+		return fixtureError("pane_not_found", "pane "+pane+" not found")
+	}
+	if !fixtureHasFlag(argv, "--new-workspace") {
+		return fixtureUnexpected(argv, "only a --new-workspace move is supported")
+	}
+	cwd := state.Workspaces[workspace]
+	next := state.newWorkspace(cwd)
+	moved := next + ":p1"
+	movedPane := paneInfo(*state, moved, next, cwd, "")
+	if agent := state.Agents[pane]; agent != nil {
+		delete(state.Agents, pane)
+		state.Agents[moved] = agent
+		movedPane = paneInfo(*state, moved, next, cwd, "omp")
+		movedPane["foreground_cwd"] = cwd
+		// A real PaneInfo carries the pane's native session reference, so the
+		// move result does too.
+		if ref := fixtureReference(plan, fixtureAnnouncement(plan, agent.Session)); ref != nil {
+			movedPane["agent_session"] = sessionInfo(*ref)
+		}
+	}
+	// The source workspace held this pane alone, so the move closed it.
+	delete(state.Workspaces, workspace)
+	state.save(dir)
+	return fixtureResult(map[string]any{
+		"type": "pane_move",
+		"move_result": map[string]any{
+			"changed":               true,
+			"previous_pane_id":      pane,
+			"previous_workspace_id": workspace,
+			"previous_tab_id":       workspace + ":t1",
+			"closed_workspace_id":   workspace,
+			"closed_tab_id":         workspace + ":t1",
+			"pane":                  movedPane,
+		},
 	})
 }
 
@@ -277,7 +330,7 @@ func fixtureAgentGet(dir string, plan fixturePlan, state *fixtureState, argv []s
 	state.save(dir)
 	return fixtureResult(map[string]any{
 		"type":  "agent_info",
-		"agent": agentInfo(pane, fixtureCwd(plan, *state, pane), agent, reported),
+		"agent": agentInfo(*state, pane, fixtureCwd(plan, *state, pane), agent, reported),
 	})
 }
 
@@ -351,9 +404,10 @@ func fixtureAgentStart(dir string, plan fixturePlan, state *fixtureState, argv [
 	}
 	state.NextSession++
 	agent := &fixtureAgent{
-		Name:    argv[2],
-		Session: fmt.Sprintf("omp-session-%d", state.NextSession),
-		Status:  "idle",
+		Name:     argv[2],
+		Terminal: "term-" + strings.ReplaceAll(pane, ":", "-"),
+		Session:  fmt.Sprintf("omp-session-%d", state.NextSession),
+		Status:   "idle",
 	}
 	state.Agents[pane] = agent
 	state.save(dir)
@@ -364,7 +418,7 @@ func fixtureAgentStart(dir string, plan fixturePlan, state *fixtureState, argv [
 	}
 	return fixtureResult(map[string]any{
 		"type":  "agent_started",
-		"agent": agentInfo(pane, fixtureCwd(plan, *state, pane), agent, fixtureReference(plan, fixtureAnnouncement(plan, agent.Session))),
+		"agent": agentInfo(*state, pane, fixtureCwd(plan, *state, pane), agent, fixtureReference(plan, fixtureAnnouncement(plan, agent.Session))),
 		"argv":  []string{"omp"},
 	})
 }
@@ -374,6 +428,11 @@ func fixtureAgentPrompt(dir string, plan fixturePlan, state *fixtureState, argv 
 	agent := state.Agents[pane]
 	if agent == nil {
 		return fixtureError("agent_not_found", "agent target "+pane+" not found")
+	}
+	if plan.PromptError != "" {
+		// Refused before anything was written: Herdr rejects a prompt to a
+		// blocked or vanished agent without sending input.
+		return fixtureError(plan.PromptError, "the prompt was refused before any input was written")
 	}
 	// The submission is recorded before the answer: a timeout here means the
 	// brief may already have been delivered.
@@ -386,7 +445,7 @@ func fixtureAgentPrompt(dir string, plan fixturePlan, state *fixtureState, argv 
 	}
 	return fixtureResult(map[string]any{
 		"type":  "agent_prompted",
-		"agent": agentInfo(pane, fixtureCwd(plan, *state, pane), agent, fixtureReference(plan, fixtureAnnouncement(plan, agent.Session))),
+		"agent": agentInfo(*state, pane, fixtureCwd(plan, *state, pane), agent, fixtureReference(plan, fixtureAnnouncement(plan, agent.Session))),
 	})
 }
 
@@ -488,7 +547,7 @@ func (s *fixtureState) save(dir string) {
 // ---------------------------------------------------------------------------
 
 func workspaceCreatedResult(ws, cwd string) map[string]any {
-	pane := paneInfo(ws+":p1", ws, cwd, "")
+	pane := paneInfo(fixtureState{}, ws+":p1", ws, cwd, "")
 	return map[string]any{
 		"type":      "workspace_created",
 		"workspace": workspaceInfo(ws),
@@ -498,7 +557,7 @@ func workspaceCreatedResult(ws, cwd string) map[string]any {
 }
 
 func worktreeCreatedResult(wt fixtureWorktree, root string) map[string]any {
-	pane := paneInfo(wt.PaneID, wt.WorkspaceID, wt.Path, "")
+	pane := paneInfo(fixtureState{}, wt.PaneID, wt.WorkspaceID, wt.Path, "")
 	ws := workspaceInfo(wt.WorkspaceID)
 	ws["worktree"] = map[string]any{
 		"checkout_path":      wt.Path,
@@ -562,19 +621,44 @@ func worktreeListResult(root string, state fixtureState) map[string]any {
 	}
 }
 
-// sessionSnapshotResult renders Herdr's authoritative live state: one pane per
-// known workspace, plus the agents running in them.
+// sessionSnapshotResult renders Herdr's authoritative live state: the panes of
+// every workspace, including the agents running in them.
+//
+// A pane is emitted at the id its agent actually occupies, so a pane the session
+// moved to a different workspace appears where it is now; a workspace with no
+// agent contributes its root pane. The pane objects carry the same fields
+// `pane get` answers with, including the native session reference and the
+// terminal's foreground directory (`herdr api schema --json`: PaneInfo requires
+// pane_id, terminal_id, workspace_id, tab_id and allows agent_session and
+// foreground_cwd).
 func sessionSnapshotResult(plan fixturePlan, state fixtureState) map[string]any {
 	panes := []map[string]any{}
 	agents := []map[string]any{}
+	occupied := map[string]bool{}
+	for _, pane := range sortedPanes(state.Agents) {
+		occupied[workspaceOfPane(pane)] = true
+	}
 	for _, ws := range sortedWorkspaces(state.Workspaces) {
-		cwd := state.Workspaces[ws]
-		panes = append(panes, paneInfo(ws+":p1", ws, cwd, ""))
-		agent := state.Agents[ws+":p1"]
+		if occupied[ws] {
+			continue
+		}
+		panes = append(panes, paneInfo(state, ws+":p1", ws, state.Workspaces[ws], ""))
+	}
+	for _, pane := range sortedPanes(state.Agents) {
+		agent := state.Agents[pane]
 		if agent == nil {
 			continue
 		}
-		agents = append(agents, agentInfo(ws+":p1", cwd, agent, fixtureReference(plan, fixtureAnnouncement(plan, agent.Session))))
+		ws := workspaceOfPane(pane)
+		cwd := state.Workspaces[ws]
+		reported := fixtureReference(plan, fixtureAnnouncement(plan, agent.Session))
+		info := paneInfo(state, pane, ws, cwd, "omp")
+		info["foreground_cwd"] = cwd
+		if reported != nil {
+			info["agent_session"] = sessionInfo(*reported)
+		}
+		panes = append(panes, info)
+		agents = append(agents, agentInfo(state, pane, cwd, agent, reported))
 	}
 	return map[string]any{
 		"type": "session_snapshot",
@@ -590,6 +674,18 @@ func sessionSnapshotResult(plan fixturePlan, state fixtureState) map[string]any 
 	}
 }
 
+// sessionInfo renders Herdr's AgentSessionInfo: a typed reference, captured from
+// a real `herdr agent get` (kind "PATH" carrying the session file on the
+// installed preview build).
+func sessionInfo(ref task.SessionRef) map[string]any {
+	return map[string]any{
+		"source": "herdr:omp",
+		"agent":  "omp",
+		"kind":   ref.Kind,
+		"value":  ref.Value,
+	}
+}
+
 func sortedWorkspaces(workspaces map[string]string) []string {
 	ids := make([]string, 0, len(workspaces))
 	for id := range workspaces {
@@ -597,6 +693,34 @@ func sortedWorkspaces(workspaces map[string]string) []string {
 	}
 	sort.Strings(ids)
 	return ids
+}
+
+func sortedPanes(agents map[string]*fixtureAgent) []string {
+	panes := make([]string, 0, len(agents))
+	for pane := range agents {
+		panes = append(panes, pane)
+	}
+	sort.Strings(panes)
+	return panes
+}
+
+// fixtureTerminal is the terminal Herdr reports for a pane. The terminal id
+// follows the terminal across a move, so an agent remembers its own.
+func fixtureTerminal(state fixtureState, pane string) string {
+	if agent := state.Agents[pane]; agent != nil && strings.TrimSpace(agent.Terminal) != "" {
+		return agent.Terminal
+	}
+	return "term-" + strings.ReplaceAll(pane, ":", "-")
+}
+
+// fixtureHasFlag reports whether one flag is present in an argv.
+func fixtureHasFlag(argv []string, name string) bool {
+	for _, arg := range argv {
+		if arg == name {
+			return true
+		}
+	}
+	return false
 }
 
 func workspaceInfo(ws string) map[string]any {
@@ -621,10 +745,10 @@ func tabInfo(ws string) map[string]any {
 	}
 }
 
-func paneInfo(pane, ws, cwd, agent string) map[string]any {
+func paneInfo(state fixtureState, pane, ws, cwd, agent string) map[string]any {
 	return map[string]any{
 		"pane_id":       pane,
-		"terminal_id":   "term-" + strings.ReplaceAll(pane, ":", "-"),
+		"terminal_id":   fixtureTerminal(state, pane),
 		"workspace_id":  ws,
 		"tab_id":        ws + ":t1",
 		"label":         "",
@@ -641,7 +765,7 @@ func paneInfo(pane, ws, cwd, agent string) map[string]any {
 // agentInfo renders Herdr's AgentInfo, including the native session reference
 // (AgentSessionInfo) that `herdr api schema --json` documents. The reference is
 // optional: the integration reports it asynchronously.
-func agentInfo(pane, cwd string, agent *fixtureAgent, reported *task.SessionRef) map[string]any {
+func agentInfo(state fixtureState, pane, cwd string, agent *fixtureAgent, reported *task.SessionRef) map[string]any {
 	ws := workspaceOfPane(pane)
 	info := map[string]any{
 		"name":                    agent.Name,
@@ -649,7 +773,7 @@ func agentInfo(pane, cwd string, agent *fixtureAgent, reported *task.SessionRef)
 		"display_agent":           "omp",
 		"agent_status":            agent.Status,
 		"pane_id":                 pane,
-		"terminal_id":             "term-" + strings.ReplaceAll(pane, ":", "-"),
+		"terminal_id":             fixtureTerminal(state, pane),
 		"workspace_id":            ws,
 		"tab_id":                  ws + ":t1",
 		"cwd":                     cwd,
@@ -662,14 +786,7 @@ func agentInfo(pane, cwd string, agent *fixtureAgent, reported *task.SessionRef)
 		"terminal_title_stripped": "omp",
 	}
 	if reported != nil {
-		// Herdr's AgentSessionInfo: a typed pair, captured from a real
-		// `herdr agent get` (kind "PATH" carrying the session file).
-		info["agent_session"] = map[string]any{
-			"source": "herdr:omp",
-			"agent":  "omp",
-			"kind":   reported.Kind,
-			"value":  reported.Value,
-		}
+		info["agent_session"] = sessionInfo(*reported)
 	}
 	return info
 }

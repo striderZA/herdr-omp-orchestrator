@@ -1,0 +1,10 @@
+{
+  "type": "pane_agent_status_changed",
+  "pane_id": "w2:p1",
+  "workspace_id": "w2",
+  "agent_status": "blocked",
+  "agent": "omp",
+  "display_agent": "omp",
+  "title": "omp",
+  "state_labels": {}
+}

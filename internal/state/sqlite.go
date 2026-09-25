@@ -75,8 +75,11 @@ CREATE TABLE IF NOT EXISTS inbox (
 	task_id TEXT NOT NULL DEFAULT '',
 	kind TEXT NOT NULL,
 	summary TEXT NOT NULL,
-	delivery TEXT NOT NULL
+	delivery TEXT NOT NULL,
+	delivery_state TEXT NOT NULL DEFAULT 'pending',
+	delivery_detail TEXT NOT NULL DEFAULT ''
 );
+CREATE INDEX IF NOT EXISTS inbox_pending ON inbox (project_key, delivery_state);
 CREATE TABLE IF NOT EXISTS ready_sessions (
 	launch_pane_id TEXT PRIMARY KEY,
 	omp_session_id TEXT NOT NULL DEFAULT '',
@@ -100,12 +103,49 @@ var readySessionColumns = []struct{ name, ddl string }{
 	{"verified_value", `ALTER TABLE ready_sessions ADD COLUMN verified_value TEXT NOT NULL DEFAULT ''`},
 }
 
-// migrate adds the columns an older state database is missing. SQLite has no
-// ADD COLUMN IF NOT EXISTS, so the existing columns are read first.
+// inboxColumns are the columns an inbox note needs beyond its first release
+// shape. The state and its detail are additive: a note written by an older
+// revision is pending, and its Delivery label keeps whatever it said.
+var inboxColumns = []struct{ name, ddl string }{
+	{"delivery_state", `ALTER TABLE inbox ADD COLUMN delivery_state TEXT NOT NULL DEFAULT 'pending'`},
+	{"delivery_detail", `ALTER TABLE inbox ADD COLUMN delivery_detail TEXT NOT NULL DEFAULT ''`},
+}
+
+// migratedColumns are the additive columns of every table, in the order they are
+// applied. SQLite has no ADD COLUMN IF NOT EXISTS, so each table's existing
+// columns are read before the missing ones are added.
+var migratedColumns = []struct {
+	table   string
+	columns []struct{ name, ddl string }
+}{
+	{"ready_sessions", readySessionColumns},
+	{"inbox", inboxColumns},
+}
+
+// migrate adds the columns an older state database is missing.
 func migrate(ctx context.Context, db *sql.DB) error {
-	rows, err := db.QueryContext(ctx, `PRAGMA table_info(ready_sessions)`)
+	for _, table := range migratedColumns {
+		existing, err := columnNames(ctx, db, table.table)
+		if err != nil {
+			return err
+		}
+		for _, column := range table.columns {
+			if existing[column.name] {
+				continue
+			}
+			if _, err := db.ExecContext(ctx, column.ddl); err != nil {
+				return fmt.Errorf("add %s.%s: %w", table.table, column.name, err)
+			}
+		}
+	}
+	return nil
+}
+
+// columnNames reads the column names of one table.
+func columnNames(ctx context.Context, db *sql.DB, table string) (map[string]bool, error) {
+	rows, err := db.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
 	if err != nil {
-		return fmt.Errorf("inspect ready_sessions: %w", err)
+		return nil, fmt.Errorf("inspect %s: %w", table, err)
 	}
 	existing := map[string]bool{}
 	for rows.Next() {
@@ -119,26 +159,18 @@ func migrate(ctx context.Context, db *sql.DB) error {
 		)
 		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultV, &primaryKey); err != nil {
 			_ = rows.Close()
-			return fmt.Errorf("read ready_sessions columns: %w", err)
+			return nil, fmt.Errorf("read %s columns: %w", table, err)
 		}
 		existing[name] = true
 	}
 	if err := rows.Err(); err != nil {
 		_ = rows.Close()
-		return fmt.Errorf("read ready_sessions columns: %w", err)
+		return nil, fmt.Errorf("read %s columns: %w", table, err)
 	}
 	if err := rows.Close(); err != nil {
-		return fmt.Errorf("close ready_sessions columns: %w", err)
+		return nil, fmt.Errorf("close %s columns: %w", table, err)
 	}
-	for _, column := range readySessionColumns {
-		if existing[column.name] {
-			continue
-		}
-		if _, err := db.ExecContext(ctx, column.ddl); err != nil {
-			return fmt.Errorf("add ready_sessions.%s: %w", column.name, err)
-		}
-	}
-	return nil
+	return existing, nil
 }
 
 // Store owns the orchestrator database.
@@ -572,15 +604,24 @@ type execer interface {
 // addInbox stores one deduplicated note through q and reports whether it was
 // new. The note's id is the identity: an insert that would only repeat it
 // changes nothing.
+//
+// A note is always created pending: the caller that records a fact does not
+// deliver it, and a flush claims it later. The state a caller passes is
+// therefore validated and must be pending, so no path can start a note in a
+// state only the claim machinery may produce.
 func addInbox(ctx context.Context, q execer, in task.Inbox) (bool, error) {
 	if in.ID == "" {
 		return false, fmt.Errorf("%w: inbox id is required", ErrInvalid)
 	}
+	state, err := inboxState(in.DeliveryState, task.DeliveryPending)
+	if err != nil {
+		return false, err
+	}
 	res, err := q.ExecContext(ctx, `
-		INSERT INTO inbox (id, project_key, task_id, kind, summary, delivery)
-		VALUES (?, ?, ?, ?, ?, ?)
+		INSERT INTO inbox (id, project_key, task_id, kind, summary, delivery, delivery_state, delivery_detail)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (id) DO NOTHING`,
-		in.ID, in.ProjectKey, in.TaskID, in.Kind, in.Summary, in.Delivery)
+		in.ID, in.ProjectKey, in.TaskID, in.Kind, in.Summary, in.Delivery, state, in.DeliveryDetail)
 	if err != nil {
 		return false, fmt.Errorf("add inbox %q: %w", in.ID, err)
 	}
@@ -589,6 +630,180 @@ func addInbox(ctx context.Context, q execer, in task.Inbox) (bool, error) {
 		return false, fmt.Errorf("add inbox %q: %w", in.ID, err)
 	}
 	return rows == 1, nil
+}
+
+// The columns every inbox read selects, in scanInbox's order.
+const inboxSelect = `id, project_key, task_id, kind, summary, delivery, delivery_state, delivery_detail`
+
+// inboxState validates one delivery state, defaulting an empty value.
+func inboxState(state, fallback string) (string, error) {
+	trimmed := strings.TrimSpace(state)
+	if trimmed == "" {
+		return fallback, nil
+	}
+	switch trimmed {
+	case task.DeliveryPending, task.DeliverySending, task.DeliveryDelivered, task.DeliveryUncertain:
+		return trimmed, nil
+	default:
+		return "", fmt.Errorf("%w: %q is not a delivery state", ErrInvalid, state)
+	}
+}
+
+func scanInbox(row interface{ Scan(...any) error }, what string) (task.Inbox, error) {
+	var in task.Inbox
+	err := row.Scan(&in.ID, &in.ProjectKey, &in.TaskID, &in.Kind, &in.Summary, &in.Delivery,
+		&in.DeliveryState, &in.DeliveryDetail)
+	if errors.Is(err, sql.ErrNoRows) {
+		return task.Inbox{}, fmt.Errorf("%w: %s", ErrNotFound, what)
+	}
+	if err != nil {
+		return task.Inbox{}, fmt.Errorf("read %s: %w", what, err)
+	}
+	return in, nil
+}
+
+// Inbox reads one durable note by id, including its delivery state.
+func (s *Store) Inbox(ctx context.Context, id string) (task.Inbox, error) {
+	if strings.TrimSpace(id) == "" {
+		return task.Inbox{}, fmt.Errorf("%w: inbox id is required", ErrInvalid)
+	}
+	return scanInbox(s.db.QueryRowContext(ctx, `SELECT `+inboxSelect+` FROM inbox WHERE id = ?`, id),
+		"inbox "+id)
+}
+
+// PendingInbox reads the notes of one project that no flush has claimed yet,
+// oldest first, so a flush batches a backlog in the order it happened.
+func (s *Store) PendingInbox(ctx context.Context, projectKey string) ([]task.Inbox, error) {
+	if strings.TrimSpace(projectKey) == "" {
+		return nil, fmt.Errorf("%w: project key is required", ErrInvalid)
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+inboxSelect+` FROM inbox WHERE project_key = ? AND delivery_state = ?
+		 ORDER BY rowid`, projectKey, task.DeliveryPending)
+	if err != nil {
+		return nil, fmt.Errorf("read the pending inbox of %q: %w", projectKey, err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []task.Inbox
+	for rows.Next() {
+		in, err := scanInbox(rows, "pending inbox row")
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, in)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read the pending inbox of %q: %w", projectKey, err)
+	}
+	return out, nil
+}
+
+// ClaimInbox moves the named notes from pending to sending and returns the ones
+// this caller claimed, in the order they were named.
+//
+// The claim is one compare-and-swap per note, so two flushes racing over the
+// same backlog end with exactly one owner per note: a note another caller
+// already claimed is simply not returned. A claimed note is never pending
+// again until its attempt is settled, which is what keeps a retried flush from
+// delivering the same note twice.
+func (s *Store) ClaimInbox(ctx context.Context, ids []string) ([]task.Inbox, error) {
+	claimed := make([]task.Inbox, 0, len(ids))
+	tx, err := s.begin(ctx, "claim inbox notes")
+	if err != nil {
+		return nil, err
+	}
+	defer tx.rollback()
+	for _, id := range ids {
+		if strings.TrimSpace(id) == "" {
+			return nil, fmt.Errorf("%w: inbox id is required", ErrInvalid)
+		}
+		res, err := tx.ExecContext(ctx,
+			`UPDATE inbox SET delivery_state = ? WHERE id = ? AND delivery_state = ?`,
+			task.DeliverySending, id, task.DeliveryPending)
+		if err != nil {
+			return nil, fmt.Errorf("claim inbox %q: %w", id, err)
+		}
+		rows, err := res.RowsAffected()
+		if err != nil {
+			return nil, fmt.Errorf("claim inbox %q: %w", id, err)
+		}
+		if rows != 1 {
+			continue
+		}
+		in, err := scanInbox(tx.QueryRowContext(ctx, `SELECT `+inboxSelect+` FROM inbox WHERE id = ?`, id),
+			"claimed inbox "+id)
+		if err != nil {
+			return nil, err
+		}
+		claimed = append(claimed, in)
+	}
+	if err := tx.commit("claim inbox notes"); err != nil {
+		return nil, err
+	}
+	return claimed, nil
+}
+
+// SettleInbox moves claimed notes to their outcome and returns how many were
+// settled. Only a note in sending may be settled, so a late result cannot
+// reopen or overwrite a note another attempt already resolved.
+func (s *Store) SettleInbox(ctx context.Context, ids []string, state, detail string) (int, error) {
+	next, err := inboxState(state, "")
+	if err != nil {
+		return 0, err
+	}
+	if next == task.DeliveryPending && strings.TrimSpace(detail) == "" {
+		detail = "released for a later attempt"
+	}
+	tx, err := s.begin(ctx, "settle inbox notes")
+	if err != nil {
+		return 0, err
+	}
+	defer tx.rollback()
+	settled := 0
+	for _, id := range ids {
+		if strings.TrimSpace(id) == "" {
+			return 0, fmt.Errorf("%w: inbox id is required", ErrInvalid)
+		}
+		res, err := tx.ExecContext(ctx,
+			`UPDATE inbox SET delivery_state = ?, delivery_detail = ? WHERE id = ? AND delivery_state = ?`,
+			next, detail, id, task.DeliverySending)
+		if err != nil {
+			return 0, fmt.Errorf("settle inbox %q: %w", id, err)
+		}
+		rows, err := res.RowsAffected()
+		if err != nil {
+			return 0, fmt.Errorf("settle inbox %q: %w", id, err)
+		}
+		settled += int(rows)
+	}
+	if err := tx.commit("settle inbox notes"); err != nil {
+		return 0, err
+	}
+	return settled, nil
+}
+
+// RecoverInbox settles the notes a previous process left mid-delivery. A claim
+// whose outcome nobody recorded is uncertain, never delivered: the note may or
+// may not have reached the primary, so a human inspects before anything is
+// retried. It reports how many notes it recovered.
+//
+// It is the startup counterpart of a claim: nothing else may resolve a sending
+// note, because the only process that could have resolved it is gone.
+func (s *Store) RecoverInbox(ctx context.Context) (int, error) {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE inbox SET delivery_state = ?, delivery_detail = ?
+		 WHERE delivery_state = ?`,
+		task.DeliveryUncertain,
+		"the plugin stopped while this delivery was in flight; inspect `agent get`/`agent read` before retrying",
+		task.DeliverySending)
+	if err != nil {
+		return 0, fmt.Errorf("recover inbox deliveries: %w", err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("recover inbox deliveries: %w", err)
+	}
+	return int(rows), nil
 }
 
 // CreateProject records a new primary project.
@@ -761,6 +976,64 @@ func (s *Store) ByOMPSession(ctx context.Context, announced task.Announcement) (
 		return Binding{}, fmt.Errorf("%w: announced session %s matches %d records",
 			ErrAmbiguous, identity.Describe(), len(matches))
 	}
+}
+
+// ByPane finds the single project or task that owns a pane, either by its
+// launch-time id or by its current public id.
+//
+// The pairing is deliberate: a pane's launch-time id is what its process
+// inherited, while the current public id is what Herdr's events and CLI calls
+// name after a move, and a hook payload may carry either. A pane claimed by more
+// than one record is ambiguous, and nothing may be derived from it: the caller
+// refuses instead of picking one.
+func (s *Store) ByPane(ctx context.Context, paneID string) (Binding, error) {
+	pane := strings.TrimSpace(paneID)
+	if pane == "" {
+		return Binding{}, fmt.Errorf("%w: pane id is required", ErrInvalid)
+	}
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return Binding{}, fmt.Errorf("begin read for pane %q: %w", pane, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	workers, err := queryFacts[task.Task](ctx, tx,
+		`SELECT data FROM tasks WHERE launch_pane_id = ? OR public_pane_id = ?`, pane, pane)
+	if err != nil {
+		return Binding{}, fmt.Errorf("read tasks for pane %q: %w", pane, err)
+	}
+	primaries, err := queryFacts[task.Project](ctx, tx,
+		`SELECT data FROM projects
+		  WHERE json_extract(data, '$.LaunchPaneID') = ? OR json_extract(data, '$.PublicPaneID') = ?`,
+		pane, pane)
+	if err != nil {
+		return Binding{}, fmt.Errorf("read projects for pane %q: %w", pane, err)
+	}
+	var matches []Binding
+	for _, worker := range workers {
+		matches = append(matches, Binding{Role: RoleWorker, Task: worker})
+	}
+	for _, primary := range primaries {
+		matches = append(matches, Binding{Role: RolePrimary, Project: primary})
+	}
+	switch len(matches) {
+	case 0:
+		return Binding{}, fmt.Errorf("%w: pane %q", ErrNotFound, pane)
+	case 1:
+		return matches[0], nil
+	default:
+		return Binding{}, fmt.Errorf("%w: pane %q is claimed by %d records", ErrAmbiguous, pane, len(matches))
+	}
+}
+
+// Projects reads every bound primary project, ordered by key so a startup pass
+// always walks them in the same order.
+func (s *Store) Projects(ctx context.Context) ([]task.Project, error) {
+	projects, err := queryFacts[task.Project](ctx, s.db, `SELECT data FROM projects ORDER BY key`)
+	if err != nil {
+		return nil, fmt.Errorf("read the bound projects: %w", err)
+	}
+	return projects, nil
 }
 
 // announcedMatchesRecorded reports whether a recorded session identity is one of

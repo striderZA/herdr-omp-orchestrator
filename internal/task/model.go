@@ -62,8 +62,47 @@ type Project struct {
 }
 
 // Inbox is one durable note addressed to a project or task.
+//
+// Two facts travel together and are deliberately separate:
+//
+//   - Delivery is the human-readable reason the note exists ("worker result",
+//     "worktree removed"), written by whoever recorded it. It is a label, not a
+//     state, so it never decides whether the note may be sent.
+//   - DeliveryState is the transactional claim state of that note's journey to
+//     the primary: pending until a flush claims it, sending while one attempt is
+//     in flight, delivered once the primary acknowledged it, and uncertain when
+//     an attempt's outcome could not be determined (a timeout, or the plugin
+//     stopping mid-delivery). Uncertain is inspected by a human, never resent.
+//
+// DeliveryDetail names the pane that took the note, or the reason an attempt
+// did not settle.
 type Inbox struct {
 	ID, ProjectKey, TaskID, Kind, Summary, Delivery string
+	DeliveryState                                   string
+	DeliveryDetail                                  string
+}
+
+// The delivery states one durable note moves through. A note is created pending
+// and only a claimed flush may settle it.
+const (
+	// DeliveryPending is a note no flush has claimed yet.
+	DeliveryPending = "pending"
+	// DeliverySending is a note claimed by one in-flight delivery attempt.
+	DeliverySending = "sending"
+	// DeliveryDelivered is a note the primary accepted.
+	DeliveryDelivered = "delivered"
+	// DeliveryUncertain is a note whose attempt could not be resolved. It is
+	// inspected (agent get/read) before anything is retried.
+	DeliveryUncertain = "uncertain"
+)
+
+// State is the note's delivery state, defaulting to pending for a note that was
+// never claimed.
+func (i Inbox) State() string {
+	if strings.TrimSpace(i.DeliveryState) == "" {
+		return DeliveryPending
+	}
+	return i.DeliveryState
 }
 
 // StageOf projects recorded facts onto a Stage in priority order.
