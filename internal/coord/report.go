@@ -116,6 +116,9 @@ const (
 
 	inputAttemptPrefix = "input attempt: "
 	attemptNoKeys      = "-"
+	// attemptNonceBytes sizes the random identity one attempt carries, so two attempts
+	// with the same payload stay distinguishable.
+	attemptNonceBytes = 8
 )
 
 // inputAttempt is the durable record of one attempt to write into a worker's pane.
@@ -126,29 +129,51 @@ const (
 // write and cleared only once its outcome is known: a confirmed send, a refusal that
 // proves nothing was written, or the user saying what they saw in the pane.
 //
-// It identifies the attempt — its channel, a digest of what was sent, and for a dialog
-// the exact dialog it was approved for — and never carries what the user said.
+// It identifies the attempt — its channel, a digest of what was sent, for a dialog the
+// exact dialog it was approved for, and a nonce that makes this attempt distinguishable
+// from every other one — and never carries what the user said. The nonce is what lets a
+// settlement or a settlement-proof apply to *this* attempt: two attempts with the same
+// payload are otherwise indistinguishable, so a decision about the first could clear the
+// second.
 type inputAttempt struct {
 	channel  string
 	identity string
 	keysHash string
+	nonce    string
 	at       int64
 }
 
 // newAnswerAttempt is the attempt one ordinary answer makes.
-func newAnswerAttempt(answer string, at time.Time) inputAttempt {
-	return inputAttempt{channel: channelAnswer, identity: hashInput(channelAnswer, answer), at: at.UnixMilli()}
+func newAnswerAttempt(answer, nonce string, at time.Time) inputAttempt {
+	return inputAttempt{
+		channel:  channelAnswer,
+		identity: hashInput(channelAnswer, answer),
+		nonce:    nonce,
+		at:       at.UnixMilli(),
+	}
 }
 
 // newDialogAttempt is the attempt one approved key sequence makes, tied to the exact
 // dialog it was approved for and identified by a digest of the keys.
-func newDialogAttempt(dialogDigest string, keys []string, at time.Time) inputAttempt {
+func newDialogAttempt(dialogDigest string, keys []string, nonce string, at time.Time) inputAttempt {
 	return inputAttempt{
 		channel:  channelDialog,
 		identity: strings.TrimSpace(dialogDigest),
 		keysHash: hashInput(channelDialog, strings.Join(keys, "\x1f")),
+		nonce:    nonce,
 		at:       at.UnixMilli(),
 	}
+}
+
+// attemptNonce is a fresh identity for one attempt. It is random rather than a counter
+// because the coordinator owns no private state between calls, and it only has to be
+// unique among the attempts of one task.
+func (c *Coordinator) attemptNonce() (string, error) {
+	raw := make([]byte, attemptNonceBytes)
+	if err := c.random(raw); err != nil {
+		return "", fmt.Errorf("generate an input attempt identity: %w", err)
+	}
+	return hex.EncodeToString(raw), nil
 }
 
 // String renders the attempt as the marker a task's blocker carries.
@@ -157,36 +182,42 @@ func (a inputAttempt) String() string {
 	if keys == "" {
 		keys = attemptNoKeys
 	}
-	return fmt.Sprintf("%s%s %s %s %d", inputAttemptPrefix, a.channel, a.identity, keys, a.at)
+	return fmt.Sprintf("%s%s %s %s %s %d", inputAttemptPrefix, a.channel, a.identity, keys, a.nonce, a.at)
 }
 
-// sameAs reports whether two records describe the same attempt, so a settlement only
-// ever clears the attempt it settles.
+// sameAs reports whether two records describe the same attempt *instance*, which is what
+// a settlement, a settlement proof and a clear are all about: the same payload sent again
+// is a different attempt, because the first one's outcome is what the user decided about.
 func (a inputAttempt) sameAs(other inputAttempt) bool {
-	return a.channel == other.channel && a.identity == other.identity && a.keysHash == other.keysHash
+	return a.channel == other.channel && a.identity == other.identity &&
+		a.keysHash == other.keysHash && a.nonce == other.nonce
 }
 
 // parseInputAttempt reads a recorded attempt. Anything that is not one — a dispatch
-// blocker, a truncated or malformed marker — is refused, so a task blocked for another
-// reason is never treated as waiting on input.
+// blocker, a truncated or malformed marker, an attempt without an identity — is refused,
+// so a task blocked for another reason is never treated as waiting on input.
 func parseInputAttempt(marker string) (inputAttempt, bool) {
 	marker = strings.TrimSpace(marker)
 	if !strings.HasPrefix(marker, inputAttemptPrefix) {
 		return inputAttempt{}, false
 	}
 	fields := strings.Fields(strings.TrimPrefix(marker, inputAttemptPrefix))
-	if len(fields) != 4 || (fields[0] != channelAnswer && fields[0] != channelDialog) {
+	if len(fields) != 5 || (fields[0] != channelAnswer && fields[0] != channelDialog) {
 		return inputAttempt{}, false
 	}
 	keys := fields[2]
 	if keys == attemptNoKeys {
 		keys = ""
 	}
-	at, err := strconv.ParseInt(fields[3], 10, 64)
+	nonce := strings.TrimSpace(fields[3])
+	if len(nonce) != attemptNonceBytes*2 {
+		return inputAttempt{}, false
+	}
+	at, err := strconv.ParseInt(fields[4], 10, 64)
 	if err != nil || at <= 0 {
 		return inputAttempt{}, false
 	}
-	return inputAttempt{channel: fields[0], identity: fields[1], keysHash: keys, at: at}, true
+	return inputAttempt{channel: fields[0], identity: fields[1], keysHash: keys, nonce: nonce, at: at}, true
 }
 
 // hashInput is the identity one attempt's payload gets: the payload itself is never
@@ -202,8 +233,8 @@ func formatMillis(at time.Time) string { return strconv.FormatInt(at.UnixMilli()
 // inputPendingError names the attempt a caller has to settle before anything else is
 // written into that pane.
 func inputPendingError(attempt inputAttempt) error {
-	return fmt.Errorf("%w: a %s attempt of %s recorded at %s has not been settled; inspect the worker and confirm what it received with orch_settle_input before sending anything else",
-		ErrInputPending, attempt.channel, attempt.identity,
+	return fmt.Errorf("%w: a %s attempt of %s (%s) recorded at %s has not been settled; inspect the worker and confirm what it received with orch_settle_input before sending anything else",
+		ErrInputPending, attempt.channel, attempt.identity, attempt.nonce,
 		time.UnixMilli(attempt.at).UTC().Format(time.RFC3339))
 }
 
@@ -614,7 +645,11 @@ func (c *Coordinator) Answer(ctx context.Context, primaryLaunchPaneID, taskID, t
 
 	// The attempt is recorded before anything is typed: from here on the answer may
 	// have reached the worker, and nothing else may be sent to it until that is known.
-	attempt := newAnswerAttempt(answer, time.Now())
+	nonce, err := c.attemptNonce()
+	if err != nil {
+		return AnswerResult{}, err
+	}
+	attempt := newAnswerAttempt(answer, nonce, time.Now())
 	// Nothing the worker's own state says settles an answer: it could have received the
 	// answer, finished the turn and be idle again by now, so a resend would duplicate it.
 	// Only the user, looking at the pane, settles this one — so no recorded attempt is
@@ -726,7 +761,11 @@ func (c *Coordinator) ApproveDialog(ctx context.Context, primaryLaunchPaneID, ta
 	if err != nil {
 		return ApproveDialogResult{}, err
 	}
-	attempt := newDialogAttempt(digest, approved, time.Now())
+	nonce, err := c.attemptNonce()
+	if err != nil {
+		return ApproveDialogResult{}, err
+	}
+	attempt := newDialogAttempt(digest, approved, nonce, time.Now())
 	if !isBlocked(view) {
 		// The dialog an earlier attempt was approved for is gone: that is the one piece of
 		// evidence which settles a key attempt on its own, and it is exactly the state a

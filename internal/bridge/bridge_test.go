@@ -2769,6 +2769,51 @@ func TestDialogApprovalSettlesAnUnchangedDialogOnlyByInspection(t *testing.T) {
 	}
 }
 
+// TestAttemptsWithTheSamePayloadStayDistinguishable pins the per-attempt identity: the
+// same answer sent twice leaves two different records, so a decision the user makes about
+// the first attempt cannot clear the second one - whose outcome nobody has looked at.
+func TestAttemptsWithTheSamePayloadStayDistinguishable(t *testing.T) {
+	f := newBridgeFixture(t)
+	f.seedPrimary()
+	f.seedWorker("t1", workerPane, workerPane, workerSession)
+	f.asWorker()
+	f.asPrimary()
+	stub := f.useHerdrStub(stubScript{
+		RepoRoot:    f.repoRoot,
+		Agents:      map[string]stubAgent{workerPane: workerAgent(workerPane, workerSession, f.worktree)},
+		PromptError: "timeout",
+	})
+	ops := CoordinatorOps(f.coordinator(t))
+	answer := `{"taskId":"t1","text":"Keep the old API."}`
+
+	wantError(t, f.callWith("answer", primarySession, answer, ops), "herdr_unavailable")
+	first := f.task(t, "t1").Blocker
+	if !strings.Contains(first, "input attempt") {
+		t.Fatalf("the first attempt was not recorded: blocker %q", first)
+	}
+
+	// The user says the first one never arrived, so the same answer is sent again - and it
+	// is just as uncertain as the first was.
+	f.callWith("settle_input", primarySession, `{"taskId":"t1","decision":"not_delivered"}`, ops)
+	wantError(t, f.callWith("answer", primarySession, answer, ops), "herdr_unavailable")
+	second := f.task(t, "t1").Blocker
+	if !strings.Contains(second, "input attempt") {
+		t.Fatalf("the second attempt was not recorded: blocker %q", second)
+	}
+	if first == second {
+		t.Fatalf("the same answer sent twice recorded one attempt: %q", first)
+	}
+	if got := len(stub.script().Prompts); got != 2 {
+		t.Fatalf("prompts = %d, want the two attempts", got)
+	}
+
+	// The second attempt is the pending one, so nothing else may be sent.
+	wantError(t, f.callWith("answer", primarySession, answer, ops), "input_pending")
+	if got := len(stub.script().Prompts); got != 2 {
+		t.Fatalf("a repeat sent the answer again (%d prompts)", got)
+	}
+}
+
 // TestAnswerDefiniteRefusalRecordsNoAttempt pins the other half: a refusal that
 // proves Herdr wrote nothing leaves no pending attempt behind, so the answer can be
 // sent again without inspection.

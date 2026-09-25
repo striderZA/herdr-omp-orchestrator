@@ -867,8 +867,9 @@ func TestQuestionReportAndProgressRequireTheRecordedWorkerPane(t *testing.T) {
 // is not), without storing what the user said or which keys were approved.
 func TestInputAttemptMarkerNamesTheChannelAndNeverTheText(t *testing.T) {
 	now := time.UnixMilli(1_700_000_000_123)
+	const nonce = "0123456789abcdef"
 
-	answer := newAnswerAttempt("the API stays as it is", now)
+	answer := newAnswerAttempt("the API stays as it is", nonce, now)
 	marker := answer.String()
 	if !strings.Contains(marker, inputAttemptPrefix) || !strings.Contains(marker, channelAnswer) {
 		t.Errorf("marker %q does not name an answer attempt", marker)
@@ -887,11 +888,16 @@ func TestInputAttemptMarkerNamesTheChannelAndNeverTheText(t *testing.T) {
 		t.Errorf("parsed attempt = %+v, want the recorded one %+v", parsed, answer)
 	}
 	// A different answer is a different attempt, even at the same instant.
-	if other := newAnswerAttempt("the API changes", now); parsed.sameAs(other) {
+	if other := newAnswerAttempt("the API changes", nonce, now); parsed.sameAs(other) {
 		t.Error("two different answers share one attempt identity")
 	}
+	// So is the *same* answer sent again: the first one's outcome is what a settlement
+	// decides about, so the second is a new attempt and not the one that was settled.
+	if repeat := newAnswerAttempt("the API stays as it is", "fedcba9876543210", now); parsed.sameAs(repeat) {
+		t.Error("the same answer sent again shares the first attempt's identity")
+	}
 
-	keys := newDialogAttempt("0123456789abcdef", []string{"1", "ENTER"}, now)
+	keys := newDialogAttempt("0123456789abcdef", []string{"1", "ENTER"}, nonce, now)
 	keyMarker := keys.String()
 	if !strings.Contains(keyMarker, channelDialog) || !strings.Contains(keyMarker, "0123456789abcdef") {
 		t.Errorf("marker %q does not tie the keys to the dialog that was approved", keyMarker)
@@ -908,11 +914,14 @@ func TestInputAttemptMarkerNamesTheChannelAndNeverTheText(t *testing.T) {
 	}
 	// The same keys for another dialog, or other keys for the same dialog, are not
 	// the same attempt.
-	if parsedKeys.sameAs(newDialogAttempt("fedcba9876543210", []string{"1", "ENTER"}, now)) {
+	if parsedKeys.sameAs(newDialogAttempt("fedcba9876543210", []string{"1", "ENTER"}, nonce, now)) {
 		t.Error("two dialogs share one attempt identity")
 	}
-	if parsedKeys.sameAs(newDialogAttempt("0123456789abcdef", []string{"2"}, now)) {
+	if parsedKeys.sameAs(newDialogAttempt("0123456789abcdef", []string{"2"}, nonce, now)) {
 		t.Error("two approvals share one attempt identity")
+	}
+	if parsedKeys.sameAs(newDialogAttempt("0123456789abcdef", []string{"1", "ENTER"}, "fedcba9876543210", now)) {
+		t.Error("the same approval made again shares the first attempt's identity")
 	}
 
 	// Anything that is not an attempt — a dispatch blocker, a truncated or malformed
@@ -939,8 +948,11 @@ func TestInputAttemptMarkerNamesTheChannelAndNeverTheText(t *testing.T) {
 // user decided about is ever cleared.
 func TestBlockerRulesNeverEraseAnAttemptTheyDidNotSettle(t *testing.T) {
 	at := time.UnixMilli(1_700_000_000_123)
-	mine := newAnswerAttempt("keep the old API", at)
-	theirs := newAnswerAttempt("change the API", at)
+	mine := newAnswerAttempt("keep the old API", "0123456789abcdef", at)
+	theirs := newAnswerAttempt("change the API", "fedcba9876543210", at)
+	// The same words sent again are a different attempt: a decision about the first must
+	// not clear the second, whose outcome nobody has looked at yet.
+	repeatOfMine := newAnswerAttempt("keep the old API", "0011223344556677", at)
 	foreign := "task orch_x could not start the worker: the pane is gone"
 
 	cases := []struct {
@@ -952,6 +964,7 @@ func TestBlockerRulesNeverEraseAnAttemptTheyDidNotSettle(t *testing.T) {
 		{"an empty record accepts a new attempt", "", nil, nil},
 		{"an attempt nobody settled is never replaced", mine.String(), nil, ErrInputPending},
 		{"another attempt is never replaced", mine.String(), &theirs, ErrInputPending},
+		{"the same payload sent again is another attempt", mine.String(), &repeatOfMine, ErrInputPending},
 		{"the attempt that was proved settled is replaced", mine.String(), &mine, nil},
 		{"a blocker this coordinator did not write is never sent over", foreign, &mine, ErrBlocked},
 	}
