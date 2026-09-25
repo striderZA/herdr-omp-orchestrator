@@ -223,7 +223,18 @@ type boardFixture struct {
 	store   *state.Store
 	client  *herdr.Client
 	project string
+	// handshake selects the session handshake the fixture's tasks carry:
+	// handshakeConfirmed (the zero value) is a real dispatched worker, and the
+	// other values make a focus refusal reproducible.
+	handshake string
 }
+
+// The handshake a fixture task was seeded with.
+const (
+	handshakeConfirmed = ""
+	handshakeAnnounced = "announced"
+	handshakeNone      = "none"
+)
 
 // newBoardFixture wires a real store and a stand-in Herdr CLI. The project key
 // is the canonical root a bind records.
@@ -258,6 +269,14 @@ func newBoardFixture(t *testing.T, plan fixturePlan) *boardFixture {
 
 // seed records the bound project and one healthy pane per task, so a test only
 // has to state the facts it cares about.
+//
+// A healthy worker also has its confirmed session handshake: the extension
+// announced both native identities (the id and the session file) and the
+// coordinator confirmed the one Herdr reported, which on the installed build is
+// the session file. The task records the native id, exactly as a real dispatch
+// does, so a board that compares the recorded value with the live reference
+// directly cannot focus a healthy worker. handshake selects an unconfirmed or
+// absent handshake instead.
 func (f *boardFixture) seed(t *testing.T, tasks ...task.Task) {
 	t.Helper()
 	ctx := context.Background()
@@ -285,7 +304,27 @@ func (f *boardFixture) seed(t *testing.T, tasks ...task.Task) {
 			Cwd:          tsk.WorktreePath,
 			AgentStatus:  "working",
 			SessionKind:  task.SessionKindPath,
-			SessionValue: tsk.OMPSessionID,
+			SessionValue: sampleSessionFile(tsk.ID),
+		}
+		announced := task.Announcement{
+			ID:     sampleSessionID(tsk.ID),
+			File:   sampleSessionFile(tsk.ID),
+			OnDisk: true,
+		}
+		switch f.handshake {
+		case handshakeNone:
+		case handshakeAnnounced:
+			if err := f.store.RecordReady(ctx, tsk.LaunchPaneID, announced, 1); err != nil {
+				t.Fatalf("record the announced handshake: %v", err)
+			}
+		default:
+			if err := f.store.RecordReady(ctx, tsk.LaunchPaneID, announced, 1); err != nil {
+				t.Fatalf("record the announced handshake: %v", err)
+			}
+			if err := f.store.ConfirmReady(ctx, tsk.LaunchPaneID,
+				task.SessionRef{Kind: task.SessionKindPath, Value: announced.File}); err != nil {
+				t.Fatalf("confirm the handshake: %v", err)
+			}
 		}
 	}
 	f.writePlan()
@@ -352,6 +391,8 @@ func (f *boardFixture) model(t *testing.T, opts Options) *Model {
 }
 
 // sampleTask is one task with healthy facts. A test states only what it breaks.
+// The recorded session is the native id, which is what a real dispatch stores;
+// the live reference Herdr reports is the session file (see sampleSessionFile).
 func sampleTask(id string, mutate func(*task.Task)) task.Task {
 	tsk := task.Task{
 		ID:                  id,
@@ -365,7 +406,7 @@ func sampleTask(id string, mutate func(*task.Task)) task.Task {
 		TerminalID:          "term_" + id,
 		LaunchPaneID:        samplePane(id),
 		PublicPaneID:        samplePane(id),
-		OMPSessionID:        sampleSession(id),
+		OMPSessionID:        sampleSessionID(id),
 		Phase:               task.PromptSubmitted,
 		Activity:            "working",
 		ActivitySeenAt:      1753000000000,
@@ -376,8 +417,14 @@ func sampleTask(id string, mutate func(*task.Task)) task.Task {
 	return tsk
 }
 
-func samplePane(id string) string    { return "w-" + id + ":p1" }
-func sampleSession(id string) string { return `C:\herdr\sessions\` + id + ".jsonl" }
+func samplePane(id string) string { return "w-" + id + ":p1" }
+
+// sampleSessionID is the native OMP session id, the identity a task records.
+func sampleSessionID(id string) string { return "01a0d886-c907-7000-80ce-" + id }
+
+// sampleSessionFile is the session file Herdr's integration reports for the
+// same session on the installed build.
+func sampleSessionFile(id string) string { return `C:\herdr\sessions\` + id + ".jsonl" }
 
 // ---------------------------------------------------------------------------
 // navigation
@@ -580,15 +627,20 @@ func TestFocusVerifiedPaneIsTheOnlyHerdrWrite(t *testing.T) {
 		brokenTask func(*task.Task)
 		want       string // substring the refusal must name
 		focused    bool
+		// chosen per case
+		handshake string
 		// attempted marks a case where Herdr was asked to focus and answered
 		// something the board refused to accept: exactly one focus on the
 		// recorded pane, which is still a refusal to claim success.
 		attempted bool
-		// noHerdr marks a recorded-identity gap: the board must refuse before it
-		// calls Herdr at all.
+		// noHerdr marks a recorded-identity or handshake gap: the board must
+		// refuse before it calls Herdr at all.
 		noHerdr bool
 	}{
-		{name: "verified", focused: true},
+		// The recorded value is the native session id and the live reference is
+		// the session file: the two forms of one session, which only the
+		// confirmed handshake can correlate.
+		{name: "verified through the confirmed handshake", focused: true},
 		{
 			name:    "verified, with a Herdr that only acknowledges the focus",
 			broken:  breakPane(func(p *fixturePane) { p.FocusResultType = "ok" }),
@@ -621,6 +673,26 @@ func TestFocusVerifiedPaneIsTheOnlyHerdrWrite(t *testing.T) {
 			brokenTask: func(x *task.Task) { x.TerminalID = "" },
 			want:       "terminal",
 			noHerdr:    true,
+		},
+		{
+			// The recorded id is spelled inside this file name. Identity is a
+			// whole-value comparison, never a substring match, so a file that
+			// merely contains the id proves nothing.
+			name:   "a live session file that merely spells the recorded id",
+			broken: breakPane(func(p *fixturePane) { p.SessionValue = `C:\herdr\sessions\` + sampleSessionID("orch_w1") + `.jsonl` }),
+			want:   "not the recorded worker session",
+		},
+		{
+			name:      "an announced handshake that was never confirmed",
+			handshake: handshakeAnnounced,
+			want:      "handshake",
+			noHerdr:   true,
+		},
+		{
+			name:      "no recorded handshake for the task's launch pane",
+			handshake: handshakeNone,
+			want:      "handshake",
+			noHerdr:   true,
 		},
 		{
 			name:   "a stale public pane id that resolves elsewhere",
@@ -675,6 +747,7 @@ func TestFocusVerifiedPaneIsTheOnlyHerdrWrite(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			worker := sampleTask("orch_w1", tc.brokenTask)
 			f := newBoardFixture(t, fixturePlan{})
+			f.handshake = tc.handshake
 			f.seed(t, worker)
 			if tc.broken != nil {
 				f.updatePlan(tc.broken)
@@ -767,7 +840,7 @@ func TestFocusReReadsTheTaskBeforeItActs(t *testing.T) {
 			TabID:        "w-moved:t1",
 			Cwd:          worker.WorktreePath,
 			SessionKind:  task.SessionKindPath,
-			SessionValue: worker.OMPSessionID,
+			SessionValue: sampleSessionFile(worker.ID),
 		}
 	})
 	current := f.task(worker.ID)

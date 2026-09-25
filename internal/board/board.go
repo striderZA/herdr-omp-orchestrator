@@ -384,13 +384,20 @@ func Run(ctx context.Context, store *state.Store, client Herdr, projectKey strin
 // still hosts the recorded worker, and focuses that pane. It returns the pane it
 // focused.
 //
-// A verified worker is one whose recorded checkout, terminal, workspace and OMP
-// session are all present and all still match the live pane: a public ID that
-// resolves to a different pane (the record is stale), a different terminal,
-// workspace or checkout, a pane that reports no working directory, a missing
-// session reference, a different OMP session, or a session reference this build
-// cannot read are all refusals. A task that records none of those facts never
-// reached a worker pane, so it is refused before Herdr is called at all.
+// A verified worker is one whose recorded launch pane, pane, checkout, terminal,
+// workspace and OMP session are all present, whose session handshake was
+// announced and confirmed for that launch pane, and whose live pane still
+// matches all of them: a public ID that resolves to a different pane (the record
+// is stale), a different terminal, workspace or checkout, a pane that reports no
+// working directory, a missing session reference, or a session that the
+// confirmed handshake does not correlate with the recorded value are all
+// refusals. A task that records none of those facts, or whose handshake was
+// never confirmed, never reached a verified worker pane, so it is refused before
+// Herdr is called at all.
+//
+// The session comparison goes through the handshake rather than through
+// SameSessionReference: the record holds whichever native identity Herdr
+// reported (an id or the session file), and only the announcement carries both.
 //
 // Nothing is compared approximately and nothing is skipped when it is absent: a
 // refusal focuses nothing, so a stale or under-recorded card can never move the
@@ -404,12 +411,14 @@ func FocusVerified(ctx context.Context, store *state.Store, client Herdr, taskID
 		return "", fmt.Errorf("the task facts could not be read: %w", err)
 	}
 	paneID := strings.TrimSpace(fact.PublicPaneID)
+	launchPaneID := strings.TrimSpace(fact.LaunchPaneID)
 	checkout := strings.TrimSpace(fact.WorktreePath)
 	terminal := strings.TrimSpace(fact.TerminalID)
 	workspace := recordedWorkspace(fact)
 	session := strings.TrimSpace(fact.OMPSessionID)
 	for _, recorded := range []struct{ field, value string }{
 		{"worker pane", paneID},
+		{"launch pane", launchPaneID},
 		{"checkout", checkout},
 		{"terminal", terminal},
 		{"workspace", workspace},
@@ -418,6 +427,28 @@ func FocusVerified(ctx context.Context, store *state.Store, client Herdr, taskID
 		if recorded.value == "" {
 			return "", fmt.Errorf("the task records no %s, so it is not a verified worker", recorded.field)
 		}
+	}
+
+	// The session identity is proved through the handshake, not by comparing the
+	// recorded value with Herdr's reference directly: OMP exposes two native
+	// identities for one session (an id and the session file), and a record keeps
+	// whichever one Herdr reported when the handshake was confirmed. Only the
+	// confirmed handshake carries both, so only it can bridge them. A handshake
+	// that was never confirmed (or never announced) proves nothing, so the board
+	// refuses before it reads anything from Herdr.
+	announced, known, err := store.AnnouncedSession(ctx, launchPaneID)
+	if err != nil {
+		return "", fmt.Errorf("the OMP session handshake recorded for the task's launch pane %s could not be read: %w", launchPaneID, err)
+	}
+	if !known {
+		return "", fmt.Errorf("the task's launch pane %s has no recorded OMP session handshake, so the pane cannot be proved to be the recorded worker", launchPaneID)
+	}
+	ready, err := store.Ready(ctx, launchPaneID, announced)
+	if err != nil {
+		return "", fmt.Errorf("the OMP session handshake recorded for the task's launch pane %s could not be read: %w", launchPaneID, err)
+	}
+	if !ready {
+		return "", fmt.Errorf("the OMP session handshake recorded for the task's launch pane %s was never confirmed, so the pane cannot be proved to be the recorded worker", launchPaneID)
 	}
 
 	pane, err := client.PaneGet(ctx, paneID)
@@ -458,8 +489,8 @@ func FocusVerified(ctx context.Context, store *state.Store, client Herdr, taskID
 		// session reference is an identity it cannot prove.
 		return "", fmt.Errorf("pane %s reports no OMP session reference, so it cannot be proved to be the recorded worker session %s", paneID, session)
 	}
-	if !task.SameSessionReference(kind, session, value) {
-		return "", fmt.Errorf("pane %s runs %s session %s, not the recorded %s", paneID, kind, value, session)
+	if !announced.Proves(session, task.SessionRef{Kind: kind, Value: value}) {
+		return "", fmt.Errorf("pane %s runs %s session %s, which is not the recorded worker session %s", paneID, kind, value, session)
 	}
 
 	focused, err := client.AgentFocus(ctx, paneID)
