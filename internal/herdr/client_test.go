@@ -351,6 +351,12 @@ func TestMoveExposesPreviousAndCurrentPublicPaneID(t *testing.T) {
 	if moved.TerminalID != "term_0000000000000001" {
 		t.Errorf("TerminalID = %q, want the unchanged terminal identity", moved.TerminalID)
 	}
+	// The captured move closed the source workspace (its last pane left), so the
+	// client must not drop the closed layout it was told about.
+	if moved.ClosedWorkspaceID != "w2" || moved.ClosedTabID != "w2:t1" {
+		t.Errorf("closed = %q/%q, want w2/w2:t1 (from .result.move_result.closed_workspace_id/closed_tab_id)",
+			moved.ClosedWorkspaceID, moved.ClosedTabID)
+	}
 	if !moved.Changed {
 		t.Error("Changed = false, want true")
 	}
@@ -752,9 +758,33 @@ func TestDecodeBoundedOutputFailsClosed(t *testing.T) {
 }
 
 func TestDecodeOutputAtTheLimitIsAccepted(t *testing.T) {
-	f := newFixture(t).streams(`{"id":"x","result":{"type":"ok"}}`, "", 0)
-	if _, err := f.client.Call(shortCtx(t, 5*time.Second), "x"); err != nil {
-		t.Fatalf("Call: %v", err)
+	// The bound is a comparison against MaxOutputBytes, so the boundary case is
+	// equality: build a valid envelope whose stdout is exactly MaxOutputBytes
+	// long (a shorter payload would assert nothing about the comparison).
+	const prefix = `{"id":"x","result":{"type":"ok","pad":"`
+	const suffix = `"}}`
+	padLen := MaxOutputBytes - len(prefix) - len(suffix)
+	if padLen <= 0 {
+		t.Fatalf("MaxOutputBytes (%d) is too small to build an at-the-limit envelope", MaxOutputBytes)
+	}
+	payload := prefix + strings.Repeat("p", padLen) + suffix
+	if len(payload) != MaxOutputBytes {
+		t.Fatalf("fixture is %d bytes, want exactly MaxOutputBytes (%d)", len(payload), MaxOutputBytes)
+	}
+	f := newFixture(t).streams(payload, "", 0)
+	raw, err := f.client.Call(shortCtx(t, 5*time.Second), "x")
+	if err != nil {
+		t.Fatalf("Call with exactly MaxOutputBytes on stdout: %v", err)
+	}
+	var res struct {
+		Type string `json:"type"`
+		Pad  string `json:"pad"`
+	}
+	if err := json.Unmarshal(raw, &res); err != nil {
+		t.Fatalf("decode result at exactly MaxOutputBytes: %v", err)
+	}
+	if res.Type != "ok" || len(res.Pad) != padLen {
+		t.Errorf("result = type %q, pad %d bytes; want type \"ok\" and %d bytes", res.Type, len(res.Pad), padLen)
 	}
 }
 
@@ -763,6 +793,13 @@ func TestDecodeOutputAtTheLimitIsAccepted(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestCLIErrorAgentBlockedIsDefiniteAndStaysACLIError(t *testing.T) {
+	// Provenance: this envelope is documented, not captured. `agent prompt` was
+	// never run against a live agent (that would spend the user's tokens), so
+	// testdata/cli-error-agent-blocked.json is the CLI reference's literal
+	// agent_blocked envelope. The capturedError helper only models where the
+	// installed CLI writes an error envelope (stderr, exit status 1) — it does
+	// not vouch for the provenance of the bytes. The file header's "captured"
+	// claim applies to the other fixtures in testdata/, not to this one.
 	f := newFixture(t).capturedError("cli-error-agent-blocked.json")
 	_, err := f.client.AgentPrompt(shortCtx(t, 5*time.Second), "w2:p1", "do the thing")
 	if err == nil {
@@ -936,6 +973,249 @@ func TestCLIWorktreeCreateTimeoutIsAmbiguous(t *testing.T) {
 	var ambiguous *AmbiguousError
 	if !errors.As(err, &ambiguous) {
 		t.Fatalf("err = %v (%T), want *AmbiguousError: the checkout may exist", err, err)
+	}
+}
+
+// TestCLIUninterpretableResponseOnMutatingCommandIsAmbiguous pins the invariant
+// that failing to interpret a response is not proof that nothing happened. For
+// a command whose side effect may already have been applied — the brief was
+// written into the pane, the checkout was created — the failure must be
+// ambiguous, because a coordinator that retries definite failures would
+// otherwise resubmit a delivered brief or create a second checkout. The
+// underlying decoding failure stays reachable through errors.As.
+func TestCLIUninterpretableResponseOnMutatingCommandIsAmbiguous(t *testing.T) {
+	cases := []struct {
+		name     string
+		payload  string // child answers with this on stdout (when non-empty)
+		oversize bool   // child writes more than MaxOutputBytes on stdout instead
+		want     error  // sentinel the cause must still satisfy errors.Is for
+		wantType func(error) bool
+		call     func(context.Context, *Client) error
+	}{
+		{
+			name:    "agent prompt with an unrecognized result type",
+			payload: `{"id":"cli:agent:prompt","result":{"type":"agent_prompted_v2","agent":{}}}`,
+			want:    ErrMalformedResponse,
+			call: func(ctx context.Context, c *Client) error {
+				_, err := c.AgentPrompt(ctx, "w2:p1", "do the thing")
+				return err
+			},
+		},
+		{
+			name:    "agent prompt with a contradictory envelope",
+			payload: `{"id":"cli:agent:prompt","result":null}`,
+			want:    ErrMalformedResponse,
+			call: func(ctx context.Context, c *Client) error {
+				_, err := c.AgentPrompt(ctx, "w2:p1", "do the thing")
+				return err
+			},
+		},
+		{
+			name:     "agent prompt with an oversized stream",
+			oversize: true,
+			want:     ErrOutputTooLarge,
+			wantType: func(err error) bool {
+				var limit *OutputLimitError
+				return errors.As(err, &limit)
+			},
+			call: func(ctx context.Context, c *Client) error {
+				_, err := c.AgentPrompt(ctx, "w2:p1", "do the thing")
+				return err
+			},
+		},
+		{
+			name:    "agent send-keys with an unrecognized result type",
+			payload: `{"id":"cli:agent:send-keys","result":{"type":"something_new"}}`,
+			want:    ErrMalformedResponse,
+			call: func(ctx context.Context, c *Client) error {
+				return c.AgentSendKeys(ctx, "w2:p1", "enter")
+			},
+		},
+		{
+			name:     "agent send-keys with an oversized stream",
+			oversize: true,
+			want:     ErrOutputTooLarge,
+			wantType: func(err error) bool {
+				var limit *OutputLimitError
+				return errors.As(err, &limit)
+			},
+			call: func(ctx context.Context, c *Client) error {
+				return c.AgentSendKeys(ctx, "w2:p1", "enter")
+			},
+		},
+		{
+			name:    "worktree create with an absent required identity",
+			payload: `{"id":"cli:worktree:create","result":{"type":"worktree_created"}}`,
+			want:    ErrIdentity,
+			wantType: func(err error) bool {
+				var identity *IdentityError
+				return errors.As(err, &identity)
+			},
+			call: func(ctx context.Context, c *Client) error {
+				_, err := c.WorktreeCreate(ctx, `C:\work\demo-repo`, "demo-branch", "abc1234")
+				return err
+			},
+		},
+		{
+			name:    "workspace create with an absent required identity",
+			payload: `{"id":"cli:workspace:create","result":{"type":"workspace_created"}}`,
+			want:    ErrIdentity,
+			call: func(ctx context.Context, c *Client) error {
+				_, err := c.WorkspaceCreate(ctx, `C:\work\demo-repo`, "demo")
+				return err
+			},
+		},
+		{
+			name:    "worktree remove with an absent required identity",
+			payload: `{"id":"cli:worktree:remove","result":{"forced":false,"path":"C:\\herdr\\wt","type":"worktree_removed","workspace_id":""}}`,
+			want:    ErrIdentity,
+			call: func(ctx context.Context, c *Client) error {
+				_, err := c.WorktreeRemove(ctx, "w2", false)
+				return err
+			},
+		},
+		{
+			name:    "agent start with an unrecognized result type",
+			payload: `{"id":"cli:agent:start","result":{"type":"agent_started_v2","agent":{}}}`,
+			want:    ErrMalformedResponse,
+			call: func(ctx context.Context, c *Client) error {
+				_, err := c.AgentStart(ctx, "orchestrator", "w2:p1")
+				return err
+			},
+		},
+		{
+			name:    "pane move with an absent required identity",
+			payload: `{"id":"cli:pane:move","result":{"type":"pane_move","move_result":{"changed":false}}}`,
+			want:    ErrIdentity,
+			wantType: func(err error) bool {
+				var identity *IdentityError
+				return errors.As(err, &identity)
+			},
+			call: func(ctx context.Context, c *Client) error {
+				_, err := c.PaneMove(ctx, "w2:p1", PaneMoveOptions{NewWorkspace: true})
+				return err
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			if tc.oversize {
+				f.big("stdout", MaxOutputBytes+1)
+			} else {
+				f.stdout(tc.payload)
+			}
+			err := tc.call(shortCtx(t, 30*time.Second), f.client)
+			var ambiguous *AmbiguousError
+			if !errors.As(err, &ambiguous) {
+				t.Fatalf("err = %v (%T), want *AmbiguousError: the effect may already have happened", err, err)
+			}
+			if !errors.Is(err, ErrAmbiguous) {
+				t.Errorf("errors.Is(err, ErrAmbiguous) = false for %v", err)
+			}
+			if !errors.Is(err, tc.want) {
+				t.Errorf("err = %v, want the cause to stay reachable through errors.Is(err, %v)", err, tc.want)
+			}
+			if tc.wantType != nil && !tc.wantType(err) {
+				t.Errorf("err = %v, want the concrete cause to stay reachable through errors.As", err)
+			}
+			if !strings.Contains(ambiguous.Error(), "inspect") {
+				t.Errorf("message %q should tell the caller to inspect state instead of retrying", ambiguous.Error())
+			}
+			if strings.Contains(ambiguous.Error(), "timeout") {
+				t.Errorf("message %q describes a timeout that never happened; the response could not be interpreted", ambiguous.Error())
+			}
+		})
+	}
+}
+
+// TestCLIUninterpretableResponseOnReadOnlyCommandStaysDefinite is the other half
+// of the same invariant: a command that changes nothing reports an
+// uninterpretable response as the definite decoding failure it is, so callers
+// do not inspect state over a read.
+func TestCLIUninterpretableResponseOnReadOnlyCommandStaysDefinite(t *testing.T) {
+	cases := []struct {
+		name     string
+		payload  string
+		oversize bool
+		want     error
+		call     func(context.Context, *Client) error
+	}{
+		{
+			name:    "pane get with an unrecognized result type",
+			payload: `{"id":"cli:pane:get","result":{"type":"pane_list","panes":[]}}`,
+			want:    ErrMalformedResponse,
+			call: func(ctx context.Context, c *Client) error {
+				_, err := c.PaneGet(ctx, "w1:p2")
+				return err
+			},
+		},
+		{
+			name:    "pane get with a contradictory envelope",
+			payload: `{"id":"cli:pane:get","result":null}`,
+			want:    ErrMalformedResponse,
+			call: func(ctx context.Context, c *Client) error {
+				_, err := c.PaneGet(ctx, "w1:p2")
+				return err
+			},
+		},
+		{
+			name:    "agent get with an absent required identity",
+			payload: `{"id":"cli:agent:get","result":{"agent":{"agent_status":"idle","pane_id":"","terminal_id":"t","workspace_id":"w1","tab_id":"w1:t1"},"type":"agent_info"}}`,
+			want:    ErrIdentity,
+			call: func(ctx context.Context, c *Client) error {
+				_, err := c.AgentGet(ctx, "w1:p2")
+				return err
+			},
+		},
+		{
+			name:    "snapshot with an unrecognized result type",
+			payload: `{"id":"cli:api:snapshot","result":{"snapshot":{},"type":"session_snapshot_v2"}}`,
+			want:    ErrMalformedResponse,
+			call: func(ctx context.Context, c *Client) error {
+				_, err := c.Snapshot(ctx)
+				return err
+			},
+		},
+		{
+			name:    "worktree list with an absent source root",
+			payload: `{"id":"cli:worktree:list","result":{"source":{},"type":"worktree_list","worktrees":[]}}`,
+			want:    ErrIdentity,
+			call: func(ctx context.Context, c *Client) error {
+				_, err := c.WorktreeList(ctx, `C:\work\demo-repo`)
+				return err
+			},
+		},
+		{
+			name:     "worktree list with an oversized stream",
+			oversize: true,
+			want:     ErrOutputTooLarge,
+			call: func(ctx context.Context, c *Client) error {
+				_, err := c.WorktreeList(ctx, `C:\work\demo-repo`)
+				return err
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			if tc.oversize {
+				f.big("stdout", MaxOutputBytes+1)
+			} else {
+				f.stdout(tc.payload)
+			}
+			err := tc.call(shortCtx(t, 30*time.Second), f.client)
+			if err == nil {
+				t.Fatal("call succeeded, want a definite decoding failure")
+			}
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("err = %v, want %v", err, tc.want)
+			}
+			var ambiguous *AmbiguousError
+			if errors.As(err, &ambiguous) {
+				t.Fatalf("err = %v, want a definite failure: a read-only command cannot have changed anything", err)
+			}
+		})
 	}
 }
 

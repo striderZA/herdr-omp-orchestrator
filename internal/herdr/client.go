@@ -47,6 +47,12 @@
 // instead of resubmitting. `agent_blocked` is the opposite: Herdr rejects it
 // before sending any input, so it stays a plain *CLIError.
 //
+// A response this client cannot interpret leaves the outcome equally undecided:
+// for a command whose side effect may already have happened (input written or
+// topology mutated), a body with an unrecognized result type, a contradicted
+// identity or a stream over the bound is reported as ambiguous too. A read-only
+// command reports the same body as a definite decoding failure.
+//
 // # Bounds
 //
 // Each stream is bounded to MaxOutputBytes. The bound is enforced by a writer
@@ -212,13 +218,30 @@ func (c *Client) call(ctx context.Context, op string, args []string, semantics t
 	return raw, nil
 }
 
-// classify turns a transport-level failure into the classification callers act
-// on. Ambiguity is decided here, once, from the command's semantics.
+// classify turns a failure into the classification callers act on. Ambiguity is
+// decided here, once, from the command's semantics: every typed method whose
+// side effect may already have happened runs its whole response interpretation
+// through this function, so an uninterpretable response is classified exactly
+// like a timeout instead of surfacing as a definite failure.
 func (c *Client) classify(op string, semantics timeoutSemantics, err error) error {
-	if semantics != timeoutDefinite && mayHaveTakenEffect(err, semantics) {
+	if err == nil || semantics == timeoutDefinite {
+		return err
+	}
+	// Ambiguity is decided once. A typed method re-runs classification over an
+	// error the transport path already classified, so an existing
+	// *AmbiguousError must not be wrapped again.
+	var ambiguous *AmbiguousError
+	if errors.As(err, &ambiguous) {
+		return err
+	}
+	if mayHaveTakenEffect(err, semantics) {
+		reason := ambiguityReason(semantics)
+		if isUninterpretableResponse(err) {
+			reason = ambiguityReasonUninterpretable
+		}
 		return &AmbiguousError{
 			Op:     op,
-			Reason: ambiguityReason(semantics),
+			Reason: reason,
 			Err:    err,
 		}
 	}
@@ -400,10 +423,29 @@ func ambiguityReason(s timeoutSemantics) string {
 	return "timeout during a mutating command: the change may already have been applied; inspect the matching Herdr state before retrying"
 }
 
+// ambiguityReasonUninterpretable is used when the response itself could not be
+// interpreted. No timeout was observed, but the effect is just as undecided.
+const ambiguityReasonUninterpretable = "uninterpretable response: the command's effect could not be determined; inspect the matching Herdr state before retrying"
+
+// isUninterpretableResponse reports whether err means "this response cannot be
+// interpreted": a rejected envelope or decode failure, an absent or
+// contradictory identity, or a stream that exceeded MaxOutputBytes. Such an
+// error says nothing about whether the command ran.
+func isUninterpretableResponse(err error) bool {
+	return errors.Is(err, ErrMalformedResponse) ||
+		errors.Is(err, ErrIdentity) ||
+		errors.Is(err, ErrOutputTooLarge)
+}
+
 // mayHaveTakenEffect reports whether err leaves the outcome of the command
 // undecided for the given semantics.
 func mayHaveTakenEffect(err error, semantics timeoutSemantics) bool {
 	if errors.Is(err, ErrTimeout) {
+		return true
+	}
+	// A response that cannot be interpreted is a failure to observe, not proof
+	// that nothing happened: the side effect may already have been applied.
+	if isUninterpretableResponse(err) {
 		return true
 	}
 	var cliErr *CLIError
@@ -637,11 +679,16 @@ type WorktreeRemoved struct {
 // PaneMoved is the result of `pane move`. PreviousPaneID is the launch-time
 // identity (Herdr keeps it as an alias); PaneID is the current public identity
 // that later commands must target, and the only one that may be re-bound.
+// ClosedWorkspaceID and ClosedTabID report a source workspace or tab the move
+// closed — moving the last pane out of a workspace closes it — and are empty
+// when the move closed nothing.
 type PaneMoved struct {
 	Changed             bool
 	PreviousPaneID      string
 	PreviousWorkspaceID string
 	PreviousTabID       string
+	ClosedWorkspaceID   string
+	ClosedTabID         string
 	PaneID              string
 	WorkspaceID         string
 	TabID               string
@@ -694,7 +741,7 @@ type PaneMoveOptions struct {
 // ---------------------------------------------------------------------------
 
 // WorkspaceCreate creates a workspace for cwd without stealing focus.
-func (c *Client) WorkspaceCreate(ctx context.Context, cwd, label string) (*WorkspaceCreated, error) {
+func (c *Client) WorkspaceCreate(ctx context.Context, cwd, label string) (created *WorkspaceCreated, err error) {
 	const op = "workspace create"
 	if strings.TrimSpace(cwd) == "" {
 		return nil, fmt.Errorf("%w: %s: cwd is empty", ErrInvalidArgument, op)
@@ -704,6 +751,10 @@ func (c *Client) WorkspaceCreate(ctx context.Context, cwd, label string) (*Works
 		args = append(args, "--label", label)
 	}
 	args = append(args, "--no-focus")
+
+	// The workspace may already exist: every failure from here on, including a
+	// response this client cannot interpret, is classified by the semantics.
+	defer func() { err = c.classify(op, timeoutAfterMutation, err) }()
 
 	raw, err := c.call(ctx, op, args, timeoutAfterMutation)
 	if err != nil {
@@ -747,7 +798,7 @@ func (c *Client) WorkspaceCreate(ctx context.Context, cwd, label string) (*Works
 // WorktreeCreate creates a Git worktree checkout for branch from base and opens
 // it as a grouped workspace, without stealing focus. The response must carry
 // workspace, root pane and worktree provenance or it is rejected.
-func (c *Client) WorktreeCreate(ctx context.Context, root, branch, base string) (*WorktreeCreated, error) {
+func (c *Client) WorktreeCreate(ctx context.Context, root, branch, base string) (created *WorktreeCreated, err error) {
 	const op = "worktree create"
 	for _, arg := range []struct{ name, value string }{
 		{"cwd", root}, {"branch", branch}, {"base", base},
@@ -757,6 +808,10 @@ func (c *Client) WorktreeCreate(ctx context.Context, root, branch, base string) 
 		}
 	}
 	args := []string{"worktree", "create", "--cwd", root, "--branch", branch, "--base", base, "--no-focus"}
+
+	// The checkout may already exist: every failure from here on, including a
+	// response this client cannot interpret, is classified by the semantics.
+	defer func() { err = c.classify(op, timeoutAfterMutation, err) }()
 
 	raw, err := c.call(ctx, op, args, timeoutAfterMutation)
 	if err != nil {
@@ -864,7 +919,7 @@ func (c *Client) WorktreeList(ctx context.Context, cwd string) (*WorktreeList, e
 // WorktreeRemove deletes the checkout of the worktree workspace. It never
 // deletes the branch. force must only be used after confirming the checkout is
 // not carrying work that matters.
-func (c *Client) WorktreeRemove(ctx context.Context, workspaceID string, force bool) (*WorktreeRemoved, error) {
+func (c *Client) WorktreeRemove(ctx context.Context, workspaceID string, force bool) (removed *WorktreeRemoved, err error) {
 	const op = "worktree remove"
 	if strings.TrimSpace(workspaceID) == "" {
 		return nil, fmt.Errorf("%w: %s: workspace id is empty", ErrInvalidArgument, op)
@@ -873,6 +928,11 @@ func (c *Client) WorktreeRemove(ctx context.Context, workspaceID string, force b
 	if force {
 		args = append(args, "--force")
 	}
+
+	// The checkout may already be gone: every failure from here on, including a
+	// response this client cannot interpret, is classified by the semantics.
+	defer func() { err = c.classify(op, timeoutAfterMutation, err) }()
+
 	raw, err := c.call(ctx, op, args, timeoutAfterMutation)
 	if err != nil {
 		return nil, err
@@ -933,7 +993,7 @@ func (c *Client) PaneGet(ctx context.Context, paneID string) (*PaneInfo, error) 
 // PaneMove moves a pane to a tab or a new layout. The result exposes the
 // launch-time identity and the current public identity separately; only the
 // public one may be re-bound.
-func (c *Client) PaneMove(ctx context.Context, paneID string, opts PaneMoveOptions) (*PaneMoved, error) {
+func (c *Client) PaneMove(ctx context.Context, paneID string, opts PaneMoveOptions) (moved *PaneMoved, err error) {
 	const op = "pane move"
 	if strings.TrimSpace(paneID) == "" {
 		return nil, fmt.Errorf("%w: %s: pane id is empty", ErrInvalidArgument, op)
@@ -977,6 +1037,10 @@ func (c *Client) PaneMove(ctx context.Context, paneID string, opts PaneMoveOptio
 	}
 	args = append(args, "--no-focus")
 
+	// The pane may already have moved: every failure from here on, including a
+	// response this client cannot interpret, is classified by the semantics.
+	defer func() { err = c.classify(op, timeoutAfterMutation, err) }()
+
 	raw, err := c.call(ctx, op, args, timeoutAfterMutation)
 	if err != nil {
 		return nil, err
@@ -988,6 +1052,8 @@ func (c *Client) PaneMove(ctx context.Context, paneID string, opts PaneMoveOptio
 			PreviousPaneID      string   `json:"previous_pane_id"`
 			PreviousWorkspaceID string   `json:"previous_workspace_id"`
 			PreviousTabID       string   `json:"previous_tab_id"`
+			ClosedWorkspaceID   string   `json:"closed_workspace_id"`
+			ClosedTabID         string   `json:"closed_tab_id"`
 			Pane                PaneInfo `json:"pane"`
 		} `json:"move_result"`
 	}
@@ -1009,6 +1075,8 @@ func (c *Client) PaneMove(ctx context.Context, paneID string, opts PaneMoveOptio
 		PreviousPaneID:      move.PreviousPaneID,
 		PreviousWorkspaceID: move.PreviousWorkspaceID,
 		PreviousTabID:       move.PreviousTabID,
+		ClosedWorkspaceID:   move.ClosedWorkspaceID,
+		ClosedTabID:         move.ClosedTabID,
 		PaneID:              move.Pane.PaneID,
 		WorkspaceID:         move.Pane.WorkspaceID,
 		TabID:               move.Pane.TabID,
@@ -1019,7 +1087,7 @@ func (c *Client) PaneMove(ctx context.Context, paneID string, opts PaneMoveOptio
 // AgentStart activates an available shell pane with kind omp under a live agent
 // name. The name must match [a-z][a-z0-9_-]{0,31} and top-level topology must
 // already exist.
-func (c *Client) AgentStart(ctx context.Context, name, paneID string) (*AgentStarted, error) {
+func (c *Client) AgentStart(ctx context.Context, name, paneID string) (started *AgentStarted, err error) {
 	const op = "agent start"
 	if !agentNamePattern.MatchString(name) {
 		return nil, fmt.Errorf("%w: %s: %q is not a legal agent name", ErrInvalidArgument, op, name)
@@ -1028,6 +1096,10 @@ func (c *Client) AgentStart(ctx context.Context, name, paneID string) (*AgentSta
 		return nil, fmt.Errorf("%w: %s: pane id is empty", ErrInvalidArgument, op)
 	}
 	args := []string{"agent", "start", name, "--kind", "omp", "--pane", paneID}
+
+	// The agent may already be running: every failure from here on, including a
+	// response this client cannot interpret, is classified by the semantics.
+	defer func() { err = c.classify(op, timeoutAfterMutation, err) }()
 
 	raw, err := c.call(ctx, op, args, timeoutAfterMutation)
 	if err != nil {
@@ -1061,7 +1133,7 @@ func (c *Client) AgentStart(ctx context.Context, name, paneID string) (*AgentSta
 // ordered write plus Enter. A timeout here is ambiguous: the brief may already
 // have been submitted. Never resubmit on an ambiguous result; inspect state
 // first.
-func (c *Client) AgentPrompt(ctx context.Context, paneID, brief string) (*AgentInfo, error) {
+func (c *Client) AgentPrompt(ctx context.Context, paneID, brief string) (prompted *AgentInfo, err error) {
 	const op = "agent prompt"
 	if strings.TrimSpace(paneID) == "" {
 		return nil, fmt.Errorf("%w: %s: pane id is empty", ErrInvalidArgument, op)
@@ -1073,12 +1145,19 @@ func (c *Client) AgentPrompt(ctx context.Context, paneID, brief string) (*AgentI
 	// data, not shell syntax.
 	args := []string{"agent", "prompt", paneID, brief}
 
-	raw, err := c.call(ctx, op, args, timeoutAfterInput)
-	if err != nil {
+	// The brief may already have been submitted: every failure from here on,
+	// including a response this client cannot interpret, is classified by the
+	// semantics, and every ambiguous outcome keeps the pane it concerns.
+	defer func() {
+		err = c.classify(op, timeoutAfterInput, err)
 		var ambiguous *AmbiguousError
 		if errors.As(err, &ambiguous) {
 			ambiguous.PaneID = paneID
 		}
+	}()
+
+	raw, err := c.call(ctx, op, args, timeoutAfterInput)
+	if err != nil {
 		return nil, err
 	}
 	var res struct {
@@ -1164,7 +1243,7 @@ func (c *Client) AgentRead(ctx context.Context, target string, opts AgentReadOpt
 
 // AgentSendKeys sends logical terminal keys. Herdr validates every key before
 // writing any bytes, so a rejection here means nothing was written.
-func (c *Client) AgentSendKeys(ctx context.Context, target string, keys ...string) error {
+func (c *Client) AgentSendKeys(ctx context.Context, target string, keys ...string) (err error) {
 	const op = "agent send-keys"
 	if strings.TrimSpace(target) == "" {
 		return fmt.Errorf("%w: %s: target is empty", ErrInvalidArgument, op)
@@ -1178,6 +1257,11 @@ func (c *Client) AgentSendKeys(ctx context.Context, target string, keys ...strin
 		}
 	}
 	args := append([]string{"agent", "send-keys", target}, keys...)
+
+	// The keys may already have been delivered: every failure from here on,
+	// including a response this client cannot interpret, is classified by the
+	// semantics.
+	defer func() { err = c.classify(op, timeoutAfterInput, err) }()
 
 	raw, err := c.call(ctx, op, args, timeoutAfterInput)
 	if err != nil {
