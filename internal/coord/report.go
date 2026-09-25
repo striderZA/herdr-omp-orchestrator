@@ -256,13 +256,16 @@ type CleanupPreview struct {
 }
 
 // CleanupResult is the answer to one removed checkout. Branch is reported
-// because cleanup preserves it.
+// because cleanup preserves it, and Forced carries what Herdr reported for the
+// removal the plugin asked for: it is always false, because a forced removal is
+// refused rather than accepted, and reporting the real value keeps that visible.
 type CleanupResult struct {
 	TaskID      string     `json:"taskId"`
 	Branch      string     `json:"branch"`
 	Path        string     `json:"path"`
 	WorkspaceID string     `json:"workspaceId"`
 	Removed     bool       `json:"removed"`
+	Forced      bool       `json:"forced"`
 	Stage       task.Stage `json:"stage"`
 }
 
@@ -757,14 +760,19 @@ func (c *Coordinator) Cleanup(ctx context.Context, primaryLaunchPaneID, taskID s
 		return CleanupResult{}, err
 	}
 
-	// The checkout is gone, so the task's live identities are cleared and its
-	// branch and path stay as the provenance of what was removed.
+	// The checkout is gone, so every live routing and runtime identity is cleared:
+	// the panes, the terminal, the workspaces, the worker's agent name and its OMP
+	// session all described a process that no longer has a checkout. The branch, the
+	// path, the reviewed report and the user's disposition stay as the history of
+	// what was removed.
 	updated, err := c.record(ctx, st, func(next *task.Task) error {
 		next.LaunchPaneID = ""
 		next.PublicPaneID = ""
 		next.TerminalID = ""
 		next.WorktreeWorkspaceID = ""
 		next.CurrentWorkspaceID = ""
+		next.AgentName = ""
+		next.OMPSessionID = ""
 		return nil
 	}, "record the removed checkout")
 	if err != nil {
@@ -781,6 +789,7 @@ func (c *Coordinator) Cleanup(ctx context.Context, primaryLaunchPaneID, taskID s
 		Path:        removed.Path,
 		WorkspaceID: removed.WorkspaceID,
 		Removed:     true,
+		Forced:      removed.Forced,
 		Stage:       task.StageOf(updated),
 	}, nil
 }

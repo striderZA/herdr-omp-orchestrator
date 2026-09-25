@@ -1626,6 +1626,9 @@ type stubScript struct {
 	OpenContradiction string `json:"openContradiction"`
 	// RemoveError makes `worktree remove` refuse; a dirty checkout is one way.
 	RemoveError string `json:"removeError"`
+	// RemoveEchoesForced makes a successful `worktree remove` answer claim the
+	// removal was forced, which this plugin never asks for and must never accept.
+	RemoveEchoesForced bool `json:"removeEchoesForced"`
 
 	Prompts  []stubPrompt   `json:"prompts"`
 	SentKeys []stubSendKeys `json:"sentKeys"`
@@ -1814,7 +1817,7 @@ func runHerdrScript(path string) int {
 			"type":         "worktree_removed",
 			"workspace_id": workspace,
 			"path":         checkout,
-			"forced":       slices.Contains(argv, "--force"),
+			"forced":       script.RemoveEchoesForced || slices.Contains(argv, "--force"),
 		})
 	default:
 		fmt.Fprintf(os.Stderr, "stub: unsupported command: argv %q\n", argv)
@@ -2722,6 +2725,7 @@ func TestCleanupRequiresReviewedDoneAndACleanProvenanceCheckout(t *testing.T) {
 		if !preview.Removable || preview.WorkspaceID != workerWorktree {
 			t.Fatalf("preview of a removable checkout = %+v", preview)
 		}
+		reviewed := f.task(t, "t1")
 
 		var result coord.CleanupResult
 		f.callWith("cleanup", primarySession, `{"taskId":"t1"}`, ops).decodeResult(t, &result)
@@ -2752,12 +2756,41 @@ func TestCleanupRequiresReviewedDoneAndACleanProvenanceCheckout(t *testing.T) {
 				t.Errorf("cleanup touched a branch: %q", call)
 			}
 		}
-		after := f.task(t, "t1")
-		if after.WorktreeWorkspaceID != "" || after.LaunchPaneID != "" || after.PublicPaneID != "" {
-			t.Errorf("the task still records live resources: %+v", after)
+		if result.Forced {
+			t.Error("Forced = true, want the removal the plugin asked for (never --force)")
 		}
-		if after.WorktreePath != checkout || after.Branch != worker.Branch || task.StageOf(after) != task.Done {
-			t.Errorf("the task lost its provenance or its decision: %+v", after)
+
+		// Every live routing and runtime identity is gone: the checkout no longer
+		// exists, so nothing may still point at a pane, workspace or agent.
+		after := f.task(t, "t1")
+		for _, live := range []struct{ name, value string }{
+			{"launch pane", after.LaunchPaneID},
+			{"public pane", after.PublicPaneID},
+			{"terminal", after.TerminalID},
+			{"worktree workspace", after.WorktreeWorkspaceID},
+			{"current workspace", after.CurrentWorkspaceID},
+			{"agent name", after.AgentName},
+			{"OMP session", after.OMPSessionID},
+		} {
+			if live.value != "" {
+				t.Errorf("the task still records its %s: %q", live.name, live.value)
+			}
+		}
+
+		// The reviewed report, the user's decision and the provenance are history:
+		// cleanup may not rewrite any of them.
+		if after.Branch != reviewed.Branch || after.WorktreePath != reviewed.WorktreePath {
+			t.Errorf("cleanup changed the provenance: branch %q -> %q, path %q -> %q",
+				reviewed.Branch, after.Branch, reviewed.WorktreePath, after.WorktreePath)
+		}
+		if after.Disposition != reviewed.Disposition || after.Disposition == "" {
+			t.Errorf("cleanup changed the user's disposition: %q -> %q", reviewed.Disposition, after.Disposition)
+		}
+		if !sameReportText(after.Report, reviewed.Report) || after.Report == nil {
+			t.Errorf("cleanup changed the reviewed report: %+v -> %+v", reviewed.Report, after.Report)
+		}
+		if task.StageOf(after) != task.Done {
+			t.Errorf("stage after cleanup = %q, want %q", task.StageOf(after), task.Done)
 		}
 		if got := notesOf(t, f, "cleanup"); len(got) != 1 {
 			t.Errorf("cleanup notes = %d, want 1 durable entry", len(got))
@@ -2831,6 +2864,60 @@ func TestCleanupRemovesNothingWhenTheOpenResponseContradictsItself(t *testing.T)
 	}
 }
 
+// sameReportText reports whether two recorded reports say exactly the same thing,
+// field by field, which is how "cleanup did not rewrite the review" is asserted
+// without depending on pointer identity.
+func sameReportText(a, b *task.Report) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.Kind == b.Kind && a.Summary == b.Summary && a.Branch == b.Branch && a.Risk == b.Risk &&
+		slices.Equal(a.Evidence, b.Evidence) && slices.Equal(a.Checks, b.Checks)
+}
+
+// TestCleanupRefusesARemovalHerdrClaimsItForced pins the other half of the
+// Forced contract: this plugin never asks for a forced removal, so an answer
+// claiming one is refused rather than reported as a successful cleanup. Herdr
+// says it removed the checkout by force, so the task must keep its identities and
+// nothing may be recorded as removed.
+func TestCleanupRefusesARemovalHerdrClaimsItForced(t *testing.T) {
+	f := newBridgeFixture(t)
+	f.seedPrimary()
+	worker := f.seedWorker("t1", workerPane, workerPane, workerSession)
+	f.asPrimary()
+
+	root, checkout := bridgeRepoWithWorktree(t, worker.Branch)
+	if _, err := f.store.UpdateTask(context.Background(), worker.ID, worker.Revision, func(next *task.Task) error {
+		next.WorktreePath = checkout
+		return nil
+	}); err != nil {
+		t.Fatalf("record the checkout: %v", err)
+	}
+	stub := f.useHerdrStub(stubScript{
+		RepoRoot:           root,
+		Worktree:           []stubWorktree{{Path: checkout, Branch: worker.Branch, OpenWorkspaceID: workerWorktree}},
+		RemoveEchoesForced: true,
+	})
+	ops := CoordinatorOps(f.coordinator(t))
+	f.approve(t, ops)
+	before := f.task(t, "t1")
+
+	wantError(t, f.callWith("cleanup", primarySession, `{"taskId":"t1"}`, ops), "provenance_unconfirmed")
+	if stub.forced() {
+		t.Error("cleanup asked Herdr to force the removal")
+	}
+	after := f.task(t, "t1")
+	if after.WorktreeWorkspaceID != before.WorktreeWorkspaceID || after.LaunchPaneID != before.LaunchPaneID || after.AgentName != before.AgentName {
+		t.Errorf("a refused forced removal changed the task: %+v", after)
+	}
+	if got := notesOf(t, f, "cleanup"); len(got) != 0 {
+		t.Errorf("a refused forced removal left %d cleanup notes: %+v", len(got), got)
+	}
+	if task.StageOf(after) != task.Done {
+		t.Errorf("stage after the refused removal = %q, want the disposition to still close the task", task.StageOf(after))
+	}
+}
+
 // assertCheckoutNotOpened pins the ordering the cleanup gate requires: the
 // live-worker and dirty-checkout refusals happen before anything is opened, so a
 // refused cleanup has no side effect to undo.
@@ -2896,6 +2983,9 @@ func TestCleanupRecoversAMovedWorkerCheckout(t *testing.T) {
 	if !result.Removed || result.Path != checkout {
 		t.Fatalf("cleanup = %+v, want the recorded checkout %s removed", result, checkout)
 	}
+	if result.Forced {
+		t.Error("Forced = true, want the removal the plugin asked for (never --force)")
+	}
 
 	// The open names the *recorded* checkout, not the listing's spelling of it.
 	open := []string{"worktree", "open", "--cwd", f.repoRoot, "--path", checkout, "--no-focus"}
@@ -2949,6 +3039,9 @@ func TestCleanupOpensACheckoutNoWorkspaceHolds(t *testing.T) {
 	f.callWith("cleanup", primarySession, `{"taskId":"t1"}`, ops).decodeResult(t, &result)
 	if !result.Removed || result.Path != checkout || result.WorkspaceID != "wT" {
 		t.Fatalf("cleanup = %+v, want the recorded checkout removed from the re-opened workspace", result)
+	}
+	if result.Forced {
+		t.Error("Forced = true, want the removal the plugin asked for (never --force)")
 	}
 
 	open := []string{"worktree", "open", "--cwd", f.repoRoot, "--path", checkout, "--no-focus"}
