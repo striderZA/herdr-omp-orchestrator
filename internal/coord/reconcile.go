@@ -1028,7 +1028,8 @@ func (c *Coordinator) reconcileProject(ctx context.Context, project task.Project
 			unfinished = append(unfinished, st)
 		}
 	}
-	proved := map[string]bool{}
+	continuable := map[string]bool{}
+	identityFailures := len(failures)
 	if len(unfinished) > 0 {
 		// The checkout listing is corroborating evidence, not a prerequisite: if it
 		// cannot be read the pane evidence still decides, and the failure is
@@ -1038,21 +1039,28 @@ func (c *Coordinator) reconcileProject(ctx context.Context, project task.Project
 			failures = append(failures, listErr)
 		}
 		for _, st := range unfinished {
-			verified, err := c.reconcileTask(ctx, project, st, snapshot, listed)
-			if verified {
-				proved[st.ID] = true
+			decision, err := c.reconcileTask(ctx, project, st, snapshot, listed)
+			if decision.Continue {
+				continuable[st.ID] = true
 			}
 			if err != nil {
 				failures = append(failures, err)
 			}
 		}
 	}
-	// The identities of this project are repaired and proved, so the work a
-	// restart interrupted may continue, and the queue may be walked. Both go
-	// through the durable gate the dispatcher uses, so neither can provision past
-	// the budget, repeat a recorded step, or touch a pane this pass did not stand
-	// behind.
-	if err := c.resumeProvedSteps(ctx, unfinished, proved); err != nil {
+	// Nothing new is admitted for a project whose identities this pass could not
+	// all stand behind: an unreconciled worker or primary means the ledger is not
+	// trustworthy yet, and provisioning on top of it would create resources for a
+	// binding nobody has verified. The findings are already recorded (and returned)
+	// for a human; the queue simply waits for the next pass.
+	if len(failures) > identityFailures {
+		return errors.Join(failures...)
+	}
+	// The identities are repaired and proved, so the work a restart interrupted may
+	// continue and the queue may be walked. Both go through the durable gate the
+	// dispatcher uses, so neither can provision past the budget, repeat a recorded
+	// step, or touch a pane this pass did not stand behind.
+	if err := c.resumeProvedSteps(ctx, unfinished, continuable); err != nil {
 		failures = append(failures, err)
 	}
 	if _, err := c.DrainQueued(ctx, project.Key); err != nil {
@@ -1082,9 +1090,11 @@ func resumableStep(st task.Task) bool {
 // restart interrupted, oldest first, and only for the tasks whose pane this pass
 // proved.
 //
-// The proof is the gate: continuing a step starts an agent or submits a brief in
-// the pane, so a pane holding a session the binding cannot prove is never touched
-// - the attention this pass recorded for it stands, and a human decides. A
+// The evidence is the gate: continuing a step starts an agent or submits a brief
+// in the pane, so a pane holding a session the task never recorded is never
+// touched - the attention this pass recorded for it stands, and a human decides.
+// An empty pane of the task's own checkout is the exception, because there is
+// nothing there to adopt. A
 // queued (intent) task is deliberately not resumed here: the queue is the drain's,
 // and resuming one directly could take a slot ahead of a task that has been
 // waiting longer.
@@ -1092,10 +1102,10 @@ func resumableStep(st task.Task) bool {
 // A step's own failure is recorded on the task by the step machine, exactly as
 // DrainQueued leaves a candidate's failure, so it is not this pass's error; only
 // a task the pass could not read is reported.
-func (c *Coordinator) resumeProvedSteps(ctx context.Context, unfinished []task.Task, proved map[string]bool) error {
+func (c *Coordinator) resumeProvedSteps(ctx context.Context, unfinished []task.Task, continuable map[string]bool) error {
 	var failures []error
 	for _, st := range unfinished {
-		if !resumableStep(st) || !proved[st.ID] {
+		if !resumableStep(st) || !continuable[st.ID] {
 			continue
 		}
 		// Re-read: the identity pass may have recorded attention on the task for a
@@ -1161,31 +1171,54 @@ func (c *Coordinator) reconcilePrimary(ctx context.Context, project task.Project
 	return nil
 }
 
-// reconcileTask re-derives one unfinished worker's pane from the snapshot. It
-// reports whether this pass proved the pane, which is what lets the caller
-// continue a recorded step: a pane it could not prove is never resumed.
-func (c *Coordinator) reconcileTask(ctx context.Context, project task.Project, st task.Task, snapshot *snapshotView, listed *herdr.WorktreeList) (bool, error) {
+// taskReconcile is what the identity pass decided about one unfinished task.
+type taskReconcile struct {
+	// Proved reports that the pane is provably the binding's own, so the binding
+	// may be re-keyed to it.
+	Proved bool
+	// Continue reports that the task's recorded provisioning step may be continued.
+	// It is narrower than Proved: an empty pane of the task's own checkout holds
+	// nothing to adopt, so the step that never started an agent may still finish,
+	// while the binding itself is not re-keyed.
+	Continue bool
+}
+
+// reconcileTask re-derives one unfinished worker's pane from the snapshot.
+//
+// Nothing is continued here: the decision is returned, because continuing a step
+// starts an agent or submits a brief, and that only happens for a pane this pass
+// has real evidence for.
+func (c *Coordinator) reconcileTask(ctx context.Context, project task.Project, st task.Task, snapshot *snapshotView, listed *herdr.WorktreeList) (taskReconcile, error) {
 	identity, err := c.identityOf(ctx, st.LaunchPaneID, st.OMPSessionID)
 	if err != nil {
-		return false, fmt.Errorf("read the confirmed session of task %s: %w", st.ID, err)
+		return taskReconcile{}, fmt.Errorf("read the confirmed session of task %s: %w", st.ID, err)
 	}
 	// An interrupted provisioning step is allowed the same-form fallback: its
 	// handshake is exactly what it never completed.
 	probes, err := c.probeCandidates(ctx, snapshot, []string{st.LaunchPaneID, st.PublicPaneID}, identity, st.TerminalID, st.WorktreePath, resumableStep(st))
 	if err != nil {
-		return false, err
+		return taskReconcile{}, err
 	}
 	ours := oursOnly(probes)
 	switch {
 	case len(ours) == 1:
 		if !checkoutListed(listed, st.WorktreePath) {
-			return false, c.taskAttention(ctx, st, fmt.Sprintf(
+			return taskReconcile{}, c.taskAttention(ctx, st, fmt.Sprintf(
 				"the checkout %s of task %s is no longer listed by `worktree list`; its pane binding was left as recorded",
 				st.WorktreePath, st.ID))
 		}
-		return true, c.applyTaskPane(ctx, st, ours[0])
+		if strings.TrimSpace(identity.Session) == "" {
+			// An agent runs in the task's pane, but the binding never recorded which
+			// session it is. Continuing the step would adopt that agent - whatever
+			// session it belongs to - and hand it this task's brief, so a human
+			// decides instead.
+			return taskReconcile{}, c.taskAttention(ctx, st, fmt.Sprintf(
+				"pane %s runs an agent whose session task %s never recorded, so the recorded step was not continued and no brief was submitted to it",
+				ours[0].Pane.PaneID, st.ID))
+		}
+		return taskReconcile{Proved: true, Continue: true}, c.applyTaskPane(ctx, st, ours[0])
 	case len(ours) > 1:
-		return false, c.taskAttention(ctx, st, fmt.Sprintf(
+		return taskReconcile{}, c.taskAttention(ctx, st, fmt.Sprintf(
 			"%d panes report the worker session of task %s (%s); the binding was not re-keyed",
 			len(ours), st.ID, strings.Join(paneIDs(ours), ", ")))
 	}
@@ -1194,21 +1227,61 @@ func (c *Coordinator) reconcileTask(ctx context.Context, project task.Project, s
 	// started in its place. A pane that cannot be judged either way is the same
 	// answer - an identity this pass may not guess at.
 	if refuted := refutedOnly(probes); len(refuted) > 0 {
-		return false, c.taskAttention(ctx, st, fmt.Sprintf(
+		return taskReconcile{}, c.taskAttention(ctx, st, fmt.Sprintf(
 			"pane %s is not the worker of task %s and no agent was started in its place: %s",
 			refuted[0].Pane.PaneID, st.ID, refuted[0].Refusal))
 	}
 	if unproven := unprovenOnly(probes); len(unproven) > 0 {
-		return false, c.taskAttention(ctx, st, fmt.Sprintf(
+		return taskReconcile{}, c.taskAttention(ctx, st, fmt.Sprintf(
 			"pane %s could not be proven to be the worker of task %s, so its binding was left as recorded: %s",
 			unproven[0].Pane.PaneID, st.ID, unproven[0].Refusal))
 	}
 	if !checkoutListed(listed, st.WorktreePath) {
-		return false, c.taskAttention(ctx, st, fmt.Sprintf(
+		return taskReconcile{}, c.taskAttention(ctx, st, fmt.Sprintf(
 			"the checkout %s of task %s is no longer listed by `worktree list`; its pane binding was left as recorded",
 			st.WorktreePath, st.ID))
 	}
-	return false, c.reconcileExit(ctx, project, st)
+	if resumableStep(st) {
+		if _, ok := vacantTaskPane(probes, st); ok {
+			// The task's own pane is empty: nothing runs there to adopt, and the
+			// checkout is the task's. An interrupted step that never started its agent
+			// may finish - starting an agent in this pane adds no identity claim, so
+			// the binding itself is not re-keyed.
+			return taskReconcile{Continue: true}, nil
+		}
+	}
+	return taskReconcile{}, c.reconcileExit(ctx, project, st)
+}
+
+// vacantTaskPane reports whether one of the probed panes is the task's own pane
+// with no agent running in it, which is the one case an interrupted step may be
+// continued without any session evidence.
+func vacantTaskPane(probes []paneProbe, st task.Task) (paneProbe, bool) {
+	for _, probe := range probes {
+		if !probe.Vacant {
+			continue
+		}
+		if !taskPaneCandidate(probe.Snapshot, st) {
+			continue
+		}
+		if recorded := strings.TrimSpace(st.TerminalID); recorded != "" &&
+			!strings.EqualFold(strings.TrimSpace(probe.Snapshot.TerminalID), recorded) {
+			continue
+		}
+		return probe, true
+	}
+	return paneProbe{}, false
+}
+
+// taskPaneCandidate reports whether a snapshot pane is one the task could own: its
+// recorded launch or public pane, or a pane working in the task's checkout.
+func taskPaneCandidate(pane snapshotPane, st task.Task) bool {
+	for _, id := range []string{st.PublicPaneID, st.LaunchPaneID} {
+		if strings.TrimSpace(id) != "" && pane.PaneID == id {
+			return true
+		}
+	}
+	return snapshotWorksIn(pane, st.WorktreePath)
 }
 
 // reconcileExit queues one deduplicated note for a worker that is no longer
@@ -1501,6 +1574,9 @@ type paneProbe struct {
 	Refusal string
 	// Idle reports the observed idle status, for a caller that asks.
 	Idle bool
+	// Snapshot is the pane this probe started from. A vacant pane has no live
+	// projection, so its snapshot entry is the only thing that can identify it.
+	Snapshot snapshotPane
 }
 
 // probeCandidates probes every snapshot pane a binding could be.
@@ -1512,6 +1588,10 @@ func (c *Coordinator) probeCandidates(ctx context.Context, snapshot *snapshotVie
 		if err != nil {
 			return nil, err
 		}
+		// The snapshot entry is what a vacant candidate can be judged by: a pane
+		// with no agent has no `agent get` projection, but the snapshot still says
+		// which pane it is and where it works.
+		probe.Snapshot = pane
 		probes = append(probes, probe)
 	}
 	return probes, nil

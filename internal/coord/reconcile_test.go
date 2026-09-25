@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"herdr-omp-orchestrator/internal/task"
 )
@@ -2289,61 +2290,64 @@ func TestReconcileLeavesAQueuedTaskWhoseGateIsStillClosed(t *testing.T) {
 }
 
 // TestReconcileCompletesAnInterruptedProvisioningStep pins the other half of the
-// recheck: a step that stopped before recording its phase is continued by the
-// next startup, from the recorded phase, without repeating anything.
+// recheck: a step that stopped before the brief is continued by the next startup,
+// from the recorded phase, without repeating anything.
+//
+// This coordinator takes a short step lease on purpose: the failed attempt left its
+// durable step claim behind (today only the worktree-create path releases it), and
+// a resumed step may not steal a live claim. Recovery after a crash is therefore
+// gated by that lease, which is what this test waits out.
 func TestReconcileCompletesAnInterruptedProvisioningStep(t *testing.T) {
-	t.Run("the step stopped before it recorded any session", func(t *testing.T) {
-		// The agent started but Herdr never published its session, so nothing of the
-		// handshake was recorded and the task is still at worktree_created.
-		f := newCoordFixture(t, fixturePlan{SuppressSession: true})
-		worker, err := f.dispatchSpec(f.coord, spec{title: "interrupted", checks: []string{"go test ./... ok"}})
-		if err == nil {
-			t.Fatalf("dispatch succeeded, want the readiness wait to stop the step")
-		}
-		interrupted := f.taskByID(t, worker.ID)
-		if interrupted.Phase != task.WorktreeCreated {
-			t.Fatalf("phase = %q, want %q", interrupted.Phase, task.WorktreeCreated)
-		}
-		if interrupted.Attention == "" {
-			t.Fatalf("an interrupted step left no reason on the task")
-		}
+	ctx := context.Background()
+	f := newCoordFixture(t, fixturePlan{SuppressReady: true})
+	coord := f.shortLeaseCoordinator(t)
+	worker, err := coord.Dispatch(ctx, f.projectKey(), "interrupted", "brief interrupted",
+		[]string{"go test ./... ok"}, nil, nil, f.base)
+	if err == nil {
+		t.Fatalf("dispatch succeeded, want the readiness wait to stop the step")
+	}
+	interrupted := f.taskByID(t, worker.ID)
+	if interrupted.Phase != task.AgentStarted {
+		t.Fatalf("phase = %q, want %q", interrupted.Phase, task.AgentStarted)
+	}
+	if prompts := f.prompts(interrupted.PublicPaneID); len(prompts) != 0 {
+		t.Fatalf("briefs = %v, want none before the interrupted step is continued", prompts)
+	}
 
-		// The cause is fixed, and a restart finishes the recorded step.
-		f.updatePlan(func(plan *fixturePlan) { plan.SuppressSession = false })
-		if err := f.coord.Reconcile(context.Background()); err != nil {
-			t.Fatalf("Reconcile: %v", err)
-		}
-		assertStepCompleted(t, f, worker.ID, 1)
+	// The cause is fixed and the failed attempt's claim has expired: a restart
+	// finishes the recorded step.
+	f.updatePlan(func(plan *fixturePlan) { plan.SuppressReady = false })
+	time.Sleep(150 * time.Millisecond)
+	if err := coord.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	// The interrupted attempt already tried to start an agent and was refused; the
+	// resumed step starts the one it owes.
+	assertStepCompleted(t, f, worker.ID, 1, 1)
+}
+
+// shortLeaseCoordinator builds a second coordinator over the fixture's store and
+// Herdr stand-in with a short step lease, so a test that continues a step a failed
+// attempt left behind does not wait out the default two-minute lease.
+func (f *coordFixture) shortLeaseCoordinator(t *testing.T) *Coordinator {
+	t.Helper()
+	coord, err := New(f.store, f.client, Options{
+		Concurrency:      3,
+		CallTimeout:      5 * time.Second,
+		ReadinessTimeout: 2 * time.Second,
+		PollInterval:     10 * time.Millisecond,
+		StepLease:        50 * time.Millisecond,
 	})
-
-	t.Run("the step stopped before the brief", func(t *testing.T) {
-		// The pane's session was recorded, but the extension never confirmed the
-		// handshake, so the brief the phase still owes was never submitted.
-		f := newCoordFixture(t, fixturePlan{SuppressReady: true})
-		worker, err := f.dispatchSpec(f.coord, spec{title: "interrupted", checks: []string{"go test ./... ok"}})
-		if err == nil {
-			t.Fatalf("dispatch succeeded, want the readiness wait to stop the step")
-		}
-		interrupted := f.taskByID(t, worker.ID)
-		if interrupted.Phase != task.AgentStarted {
-			t.Fatalf("phase = %q, want %q", interrupted.Phase, task.AgentStarted)
-		}
-		if prompts := f.prompts(interrupted.PublicPaneID); len(prompts) != 0 {
-			t.Fatalf("briefs = %v, want none before the interrupted step is continued", prompts)
-		}
-
-		f.updatePlan(func(plan *fixturePlan) { plan.SuppressReady = false })
-		if err := f.coord.Reconcile(context.Background()); err != nil {
-			t.Fatalf("Reconcile: %v", err)
-		}
-		assertStepCompleted(t, f, worker.ID, 1)
-	})
+	if err != nil {
+		t.Fatalf("New (short lease): %v", err)
+	}
+	return coord
 }
 
 // assertStepCompleted checks the durable outcome of continuing an interrupted
-// step: the recorded phase reached its end, exactly one brief was submitted, and
-// no step was repeated.
-func assertStepCompleted(t *testing.T, f *coordFixture, taskID string, briefs int) {
+// step: the recorded phase reached its end, exactly briefs briefs were submitted,
+// and no step ran more often than the interrupted attempt plus this one.
+func assertStepCompleted(t *testing.T, f *coordFixture, taskID string, briefs, starts int) {
 	t.Helper()
 	after := f.taskByID(t, taskID)
 	if after.Phase != task.PromptSubmitted {
@@ -2358,8 +2362,8 @@ func assertStepCompleted(t *testing.T, f *coordFixture, taskID string, briefs in
 	if prompts := f.prompts(after.PublicPaneID); len(prompts) != briefs {
 		t.Fatalf("briefs = %v, want exactly %d", prompts, briefs)
 	}
-	if starts := f.countCalls("agent start"); starts != 1 {
-		t.Fatalf("agent start calls = %d, want 1: the recorded step never starts a second agent", starts)
+	if got := f.countCalls("agent start"); got != starts {
+		t.Fatalf("agent start calls = %d, want %d: the recorded step starts no agent the attempt did not owe", got, starts)
 	}
 }
 
@@ -2432,6 +2436,124 @@ func TestReconcileLeavesAnInterruptedStepWithNoSessionOnAStrangeTerminalAlone(t 
 	if got := len(f.promptsTo(t, worker.PublicPaneID)); got != before {
 		t.Fatalf("a brief was submitted to an unprovable pane (%d -> %d)", before, got)
 	}
+}
+
+// TestReconcileDoesNotAdmitQueuedWorkAfterAnIdentityFinding pins the review's
+// second finding: the drain runs only for a project whose identities this pass
+// stood behind, so a project with an unreconciled worker does not create new
+// worktrees and workers on top of a ledger nobody verified.
+func TestReconcileDoesNotAdmitQueuedWorkAfterAnIdentityFinding(t *testing.T) {
+	ctx := context.Background()
+	f := newCoordFixture(t, fixturePlan{})
+	checks := []string{"go test ./... ok"}
+	var workers []task.Task
+	for i, title := range []string{"one", "two", "three"} {
+		st, err := f.dispatchSpec(f.coord, spec{title: title, checks: checks, reserved: []string{fmt.Sprintf("src/%d.txt", i)}})
+		if err != nil {
+			t.Fatalf("dispatch %s: %v", title, err)
+		}
+		workers = append(workers, st)
+	}
+	// The budget is full, so this one queues - with no dependency, so nothing but
+	// the budget holds it.
+	queued, err := f.dispatchSpec(f.coord, spec{title: "four", checks: checks, reserved: []string{"src/four.txt"}})
+	if err != nil {
+		t.Fatalf("dispatch four: %v", err)
+	}
+	if queued.Phase != task.Intent {
+		t.Fatalf("phase = %q, want %q with the budget full", queued.Phase, task.Intent)
+	}
+	// A slot frees, so the queue is now drainable - but another worker's identity no
+	// longer matches what Herdr reports.
+	f.block(workers[0], func(next *task.Task) { next.Disposition = "integrated" })
+	f.rewriteState(func(current *fixtureState) {
+		current.Agents[workers[1].PublicPaneID].Session = "someone-elses-session"
+	})
+	created := f.countCalls("worktree create")
+
+	if err := f.coord.Reconcile(ctx); !errors.Is(err, ErrAgentChanged) {
+		t.Fatalf("Reconcile err = %v, want the recorded refusal", err)
+	}
+	after := f.taskByID(t, queued.ID)
+	if after.Phase != task.Intent || after.WorktreePath != "" || after.PublicPaneID != "" {
+		t.Fatalf("a project whose identity this pass could not repair admitted queued work: %+v", after)
+	}
+	if got := f.countCalls("worktree create"); got != created {
+		t.Fatalf("worktree create calls = %d, want %d: no work is admitted on an unverified ledger", got, created)
+	}
+}
+
+// TestReconcileNeverAdoptsAnUnrecordedAgentForAnInterruptedStep pins the review's
+// first finding: when the binding recorded no session (the interrupted start), the
+// pane's terminal alone must not let a resume adopt whatever agent runs there,
+// because that agent would receive the task's brief.
+func TestReconcileNeverAdoptsAnUnrecordedAgentForAnInterruptedStep(t *testing.T) {
+	ctx := context.Background()
+	f := newCoordFixture(t, fixturePlan{SuppressSession: true})
+	coord := f.shortLeaseCoordinator(t)
+	worker, err := coord.Dispatch(ctx, f.projectKey(), "interrupted", "brief interrupted",
+		[]string{"go test ./... ok"}, nil, nil, f.base)
+	if err == nil {
+		t.Fatalf("dispatch succeeded, want the readiness wait to stop the step")
+	}
+	interrupted := f.taskByID(t, worker.ID)
+	if interrupted.Phase != task.WorktreeCreated || interrupted.OMPSessionID != "" {
+		t.Fatalf("interrupted state = phase %q session %q, want worktree_created with no session",
+			interrupted.Phase, interrupted.OMPSessionID)
+	}
+	// The agent that runs there belongs to a session this binding never recorded.
+	f.rewriteState(func(current *fixtureState) {
+		current.Agents[interrupted.PublicPaneID].Session = "someone-elses-session"
+	})
+	before := len(f.promptsTo(t, interrupted.PublicPaneID))
+
+	f.updatePlan(func(plan *fixturePlan) { plan.SuppressSession = false })
+	time.Sleep(150 * time.Millisecond)
+	if err := coord.Reconcile(ctx); !errors.Is(err, ErrAgentChanged) {
+		t.Fatalf("Reconcile err = %v, want the recorded refusal", err)
+	}
+	after := f.taskByID(t, worker.ID)
+	if after.Phase != task.WorktreeCreated {
+		t.Fatalf("phase = %q, want the recorded %q", after.Phase, task.WorktreeCreated)
+	}
+	if after.Attention == "" {
+		t.Fatalf("an agent the binding never recorded left no attention for a human")
+	}
+	if got := len(f.promptsTo(t, interrupted.PublicPaneID)); got != before {
+		t.Fatalf("the brief was submitted to an agent this binding never recorded (%d -> %d)", before, got)
+	}
+	if after.OMPSessionID != "" {
+		t.Fatalf("a stranger's session was recorded as task %s's worker: %q", after.ID, after.OMPSessionID)
+	}
+}
+
+// TestReconcileStartsTheAgentOfAnInterruptedStepInItsOwnEmptyPane is the safe half
+// of the same rule: an interrupted step whose pane is empty holds nothing to adopt,
+// so a restart starts the agent the task never got.
+func TestReconcileStartsTheAgentOfAnInterruptedStepInItsOwnEmptyPane(t *testing.T) {
+	ctx := context.Background()
+	f := newCoordFixture(t, fixturePlan{AgentStartError: "agent_start_failed"})
+	coord := f.shortLeaseCoordinator(t)
+	worker, err := coord.Dispatch(ctx, f.projectKey(), "interrupted", "brief interrupted",
+		[]string{"go test ./... ok"}, nil, nil, f.base)
+	if err == nil {
+		t.Fatalf("dispatch succeeded, want the refused agent start to stop the step")
+	}
+	interrupted := f.taskByID(t, worker.ID)
+	if interrupted.Phase != task.WorktreeCreated || interrupted.PublicPaneID == "" {
+		t.Fatalf("interrupted state = phase %q pane %q, want worktree_created on a recorded pane",
+			interrupted.Phase, interrupted.PublicPaneID)
+	}
+	if interrupted.OMPSessionID != "" {
+		t.Fatalf("session = %q, want none: the agent never started", interrupted.OMPSessionID)
+	}
+
+	f.updatePlan(func(plan *fixturePlan) { plan.AgentStartError = "" })
+	time.Sleep(150 * time.Millisecond)
+	if err := coord.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	assertStepCompleted(t, f, worker.ID, 1, 2)
 }
 
 func TestReconcileAttentionNamesTheTaskAndKeepsAnExistingBlocker(t *testing.T) {
