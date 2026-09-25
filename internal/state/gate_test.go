@@ -105,10 +105,14 @@ func TestStoreProvisioningSlotClaimIsIdempotentAndReleasable(t *testing.T) {
 	if _, _, err := s.ClaimTask(ctx, gateTask(t, "t2", "repo-a", nil), 1); err != nil {
 		t.Fatalf("ClaimTask(t2): %v", err)
 	}
-	if err := s.ClaimProvisioningSlot(ctx, stored.ID, 1); err != nil {
-		t.Errorf("re-claiming a held slot = %v, want it to be idempotent", err)
+	took, err := s.ClaimProvisioningSlot(ctx, stored.ID, 1)
+	if err != nil {
+		t.Errorf("re-claiming a held slot = %v, want no error", err)
 	}
-	if err := s.ClaimProvisioningSlot(ctx, "t2", 1); !errors.Is(err, state.ErrBudgetExhausted) {
+	if took {
+		t.Error("re-claiming a held slot reported that this call took it: a second caller would provision the same task")
+	}
+	if _, err := s.ClaimProvisioningSlot(ctx, "t2", 1); !errors.Is(err, state.ErrBudgetExhausted) {
 		t.Errorf("ClaimProvisioningSlot(t2) err = %v, want ErrBudgetExhausted", err)
 	}
 
@@ -116,8 +120,8 @@ func TestStoreProvisioningSlotClaimIsIdempotentAndReleasable(t *testing.T) {
 	if err := s.ReleaseProvisioningSlot(ctx, stored.ID); err != nil {
 		t.Fatalf("ReleaseProvisioningSlot: %v", err)
 	}
-	if err := s.ClaimProvisioningSlot(ctx, "t2", 1); err != nil {
-		t.Fatalf("ClaimProvisioningSlot(t2) after the release: %v", err)
+	if took, err := s.ClaimProvisioningSlot(ctx, "t2", 1); err != nil || !took {
+		t.Fatalf("ClaimProvisioningSlot(t2) after the release = (%v, %v), want the free claim", took, err)
 	}
 	if slots, err := s.ProvisioningSlots(ctx, "repo-a"); err != nil || slots != 1 {
 		t.Errorf("ProvisioningSlots = (%d, %v), want (1, nil)", slots, err)

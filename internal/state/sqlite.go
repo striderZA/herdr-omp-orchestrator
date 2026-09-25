@@ -996,51 +996,64 @@ func (s *Store) ClaimTask(ctx context.Context, t task.Task, budget int) (bool, t
 }
 
 // ClaimProvisioningSlot claims a slot for a task that is already recorded, before
-// any side effect touches Herdr. It is idempotent: a task that already holds a
-// slot keeps it. A project that holds every slot its budget allows reports
-// ErrBudgetExhausted and changes nothing.
-func (s *Store) ClaimProvisioningSlot(ctx context.Context, id string, budget int) error {
+// any side effect touches Herdr. It reports whether *this call* took the claim:
+//
+//   - true — the claim was free and this call now holds it, so this caller owns
+//     provisioning that task from here on;
+//   - false — the task already held the claim (another call is provisioning it,
+//     or it is the retry of an attempt that was interrupted), so this caller must
+//     not provision it. A deliberate resume is the one caller that may continue
+//     with a claim it did not take, because the recorded phase is what makes the
+//     retry idempotent.
+//
+// A project that holds every slot its budget allows reports ErrBudgetExhausted
+// and changes nothing.
+func (s *Store) ClaimProvisioningSlot(ctx context.Context, id string, budget int) (bool, error) {
 	if strings.TrimSpace(id) == "" {
-		return fmt.Errorf("%w: task id is required", ErrInvalid)
+		return false, fmt.Errorf("%w: task id is required", ErrInvalid)
 	}
 	if budget < 1 {
-		return fmt.Errorf("%w: a provisioning budget of at least one is required", ErrInvalid)
+		return false, fmt.Errorf("%w: a provisioning budget of at least one is required", ErrInvalid)
 	}
 	tx, err := s.begin(ctx, "claim provisioning slot for "+id)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer tx.rollback()
 
 	t, err := scanTask(tx.QueryRowContext(ctx, `SELECT data FROM tasks WHERE id = ?`, id), "task "+id)
 	if err != nil {
-		return err
+		return false, err
 	}
 	holds, err := taskHoldsSlot(ctx, tx, id)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if holds {
-		return tx.commit("claim provisioning slot for " + id)
+		// Somebody already holds this task's claim: this call must not provision it.
+		return false, tx.commit("claim provisioning slot for " + id)
 	}
 	count, err := claimedSlots(ctx, tx, t.ProjectKey, id)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if count >= budget {
-		return fmt.Errorf("%w: %q already holds %d of %d provisioning slots",
+		return false, fmt.Errorf("%w: %q already holds %d of %d provisioning slots",
 			ErrBudgetExhausted, t.ProjectKey, count, budget)
 	}
 	res, err := tx.ExecContext(ctx,
 		`UPDATE tasks SET slot_claimed_at = ? WHERE id = ? AND slot_claimed_at = 0`,
 		time.Now().UnixMilli(), id)
 	if err != nil {
-		return fmt.Errorf("claim provisioning slot for %s: %w", id, err)
+		return false, fmt.Errorf("claim provisioning slot for %s: %w", id, err)
 	}
 	if err := requireOneRow(res, ErrConflict, "claim provisioning slot for "+id); err != nil {
-		return err
+		return false, err
 	}
-	return tx.commit("claim provisioning slot for " + id)
+	if err := tx.commit("claim provisioning slot for " + id); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // ReleaseProvisioningSlot gives a claimed slot back, for a task whose

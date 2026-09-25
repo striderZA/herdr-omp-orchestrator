@@ -170,7 +170,12 @@ func (c *Coordinator) ResumeDispatch(ctx context.Context, taskID string) (task.T
 	// A resume provisions, so it takes the same durable slot a dispatch takes:
 	// a project that already holds every slot its budget allows leaves the task
 	// queued instead of provisioning past the limit.
-	if err := c.store.ClaimProvisioningSlot(ctx, st.ID, c.opts.Concurrency); err != nil {
+	//
+	// A resume deliberately continues when the claim was already held: that claim
+	// is the record of an attempt this caller was asked to retry, and the recorded
+	// phase is what makes the retry idempotent (an existing checkout and an
+	// existing agent are adopted, a submitted brief is never sent again).
+	if _, err := c.store.ClaimProvisioningSlot(ctx, st.ID, c.opts.Concurrency); err != nil {
 		if errors.Is(err, state.ErrBudgetExhausted) {
 			return st, nil
 		}
@@ -466,10 +471,18 @@ func (c *Coordinator) drainQueued(ctx context.Context, projectKey, excluded stri
 		if ok, _ := c.dispatchable(queued, cand); !ok {
 			return drained
 		}
-		if err := c.store.ClaimProvisioningSlot(ctx, cand.ID, c.opts.Concurrency); err != nil {
+		took, err := c.store.ClaimProvisioningSlot(ctx, cand.ID, c.opts.Concurrency)
+		if err != nil {
 			// No slot is left: every later candidate would be refused for the same
 			// reason, and the ones before it were not eligible.
 			return drained
+		}
+		if !took {
+			// Somebody already holds this task's claim: it is being provisioned right
+			// now, or it is waiting for a deliberate resume. A drain must never
+			// provision a task another caller owns — that would race the same branch,
+			// the same pane and the same brief.
+			continue
 		}
 		if cand.Attention != "" {
 			// Retrying a step retires the retryable reason it failed with: an

@@ -2833,9 +2833,9 @@ func TestResumeReusesTheClaimACrashLeft(t *testing.T) {
 		next.LaunchPaneID, next.PublicPaneID = "", ""
 		next.AgentName, next.OMPSessionID, next.TerminalID = "", "", ""
 	})
-	if err := f.store.ClaimProvisioningSlot(context.Background(), admitted.ID, 3); err != nil {
-		t.Fatalf("claim the slot the dead dispatch held: %v", err)
-	}
+	// The rewind leaves the claim the dead dispatch took: that is exactly the state
+	// a crash between admitting a task and recording a resource leaves behind, and
+	// the retry must reconcile it rather than take a second slot.
 	slots, err := f.store.ProvisioningSlots(context.Background(), f.root)
 	if err != nil || slots != 1 {
 		t.Fatalf("ProvisioningSlots = (%d, %v), want the one claim", slots, err)
@@ -2915,6 +2915,68 @@ func TestDrainRetriesARetryableAttentionAndNeverABlocker(t *testing.T) {
 	}
 	if after.Blocker != "ambiguous, a human decides" || after.Phase != task.Intent {
 		t.Errorf("a blocker was touched by the drain: %+v", after)
+	}
+}
+
+func TestDrainNeverProvisionsATaskAnotherCallerOwns(t *testing.T) {
+	// The reviewed interleaving: process A admitted a task and is inside its
+	// provisioning (claim held, phase still intent, no resource recorded yet), and
+	// process B's drain sees it as an eligible queued candidate. B must not
+	// provision it — that would race the same branch, pane and brief, and B's
+	// failure would then release a claim A is still using.
+	f := newCoordFixture(t, fixturePlan{})
+	sibling := f.sibling()
+	checks := []string{"go test ./... ok"}
+
+	// A admits the task exactly as Dispatch does, then stops before any side effect.
+	request, err := newDispatchRequest("one", "brief one", checks, nil, nil)
+	if err != nil {
+		t.Fatalf("newDispatchRequest: %v", err)
+	}
+	base, err := f.coord.committedSHA(context.Background(), f.root, f.base)
+	if err != nil {
+		t.Fatalf("committedSHA: %v", err)
+	}
+	admitted, claimed, err := f.coord.createTask(context.Background(), f.root, request, base)
+	if err != nil || !claimed {
+		t.Fatalf("admit the task = (%+v, %v, %v), want a claim", admitted, claimed, err)
+	}
+
+	// B drains the project: the claimed task is the queue's only candidate.
+	drained, err := sibling.DrainQueued(context.Background(), f.root)
+	if err != nil {
+		t.Fatalf("sibling DrainQueued: %v", err)
+	}
+	if len(drained) != 0 {
+		t.Fatalf("the sibling drain provisioned %+v, want nothing: the task belongs to another caller", drained)
+	}
+	if created := f.countCalls("worktree create"); created != 0 {
+		t.Errorf("worktree create calls = %d, want 0: the drain raced another caller's provisioning", created)
+	}
+	after, err := f.store.Task(context.Background(), admitted.ID)
+	if err != nil {
+		t.Fatalf("Task: %v", err)
+	}
+	if after.Phase != task.Intent || after.Attention != "" || after.Blocker != "" {
+		t.Errorf("the drain changed a task another caller owns: %+v", after)
+	}
+	if slots, err := f.store.ProvisioningSlots(context.Background(), f.root); err != nil || slots != 1 {
+		t.Errorf("ProvisioningSlots = (%d, %v), want the claim A holds", slots, err)
+	}
+
+	// A finishes its own provisioning, and the claim it held is what counted.
+	finished, err := f.coord.provision(context.Background(), admitted)
+	if err != nil {
+		t.Fatalf("the owner's provisioning failed: %v", err)
+	}
+	if finished.Phase != task.PromptSubmitted {
+		t.Errorf("phase = %q, want %q", finished.Phase, task.PromptSubmitted)
+	}
+	if slots, err := f.store.ProvisioningSlots(context.Background(), f.root); err != nil || slots != 1 {
+		t.Errorf("ProvisioningSlots after the owner finished = (%d, %v), want 1", slots, err)
+	}
+	if created := f.countCalls("worktree create"); created != 1 {
+		t.Errorf("worktree create calls = %d, want exactly 1", created)
 	}
 }
 
