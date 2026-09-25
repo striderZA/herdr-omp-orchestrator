@@ -2293,10 +2293,10 @@ func TestReconcileLeavesAQueuedTaskWhoseGateIsStillClosed(t *testing.T) {
 // recheck: a step that stopped before the brief is continued by the next startup,
 // from the recorded phase, without repeating anything.
 //
-// This coordinator takes a short step lease on purpose: the failed attempt left its
-// durable step claim behind (today only the worktree-create path releases it), and
-// a resumed step may not steal a live claim. Recovery after a crash is therefore
-// gated by that lease, which is what this test waits out.
+// The failed attempt stopped on a readiness timeout, which is an undecided outcome:
+// its durable step claim stays until the lease expires, and a resumed step may not
+// steal a live claim. Recovery is therefore gated by that lease, which is what this
+// test waits out.
 func TestReconcileCompletesAnInterruptedProvisioningStep(t *testing.T) {
 	ctx := context.Background()
 	f := newCoordFixture(t, fixturePlan{SuppressReady: true})
@@ -2327,8 +2327,10 @@ func TestReconcileCompletesAnInterruptedProvisioningStep(t *testing.T) {
 }
 
 // shortLeaseCoordinator builds a second coordinator over the fixture's store and
-// Herdr stand-in with a short step lease, so a test that continues a step a failed
-// attempt left behind does not wait out the default two-minute lease.
+// Herdr stand-in with a short step lease. A step that failed with an undecided
+// outcome keeps its durable step claim (a definite failure gives it back in
+// failTask), so a test that continues such a step does not have to wait out the
+// default two-minute lease.
 func (f *coordFixture) shortLeaseCoordinator(t *testing.T) *Coordinator {
 	t.Helper()
 	coord, err := New(f.store, f.client, Options{
@@ -2548,8 +2550,9 @@ func TestReconcileStartsTheAgentOfAnInterruptedStepInItsOwnEmptyPane(t *testing.
 		t.Fatalf("session = %q, want none: the agent never started", interrupted.OMPSessionID)
 	}
 
+	// A definite refusal released the step claim in failTask, so the resumed step
+	// needs no lease wait here.
 	f.updatePlan(func(plan *fixturePlan) { plan.AgentStartError = "" })
-	time.Sleep(150 * time.Millisecond)
 	if err := coord.Reconcile(ctx); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
