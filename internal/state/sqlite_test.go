@@ -327,11 +327,11 @@ func TestStoreReadyHandshake(t *testing.T) {
 	ctx := context.Background()
 	s := open(t, t.TempDir())
 
-	if err := s.RecordReady(ctx, launchPane, sessionOne, 1); err != nil {
+	if err := s.RecordReady(ctx, launchPane, task.Announcement{ID: sessionOne}, 1); err != nil {
 		t.Fatalf("RecordReady: %v", err)
 	}
 	for _, session := range []string{sessionOne, sessionTwo} {
-		ready, err := s.Ready(ctx, launchPane, session)
+		ready, err := s.Ready(ctx, launchPane, task.Announcement{ID: session})
 		if err != nil {
 			t.Fatalf("Ready(%s): %v", session, err)
 		}
@@ -339,10 +339,10 @@ func TestStoreReadyHandshake(t *testing.T) {
 			t.Errorf("RecordReady alone made %s ready", session)
 		}
 	}
-	if err := s.ConfirmReady(ctx, launchPane, sessionTwo); !errors.Is(err, state.ErrNotFound) {
-		t.Errorf("ConfirmReady with another session err = %v, want ErrNotFound", err)
+	if err := s.ConfirmReady(ctx, launchPane, task.SessionRef{Kind: task.SessionKindID, Value: sessionTwo}); !errors.Is(err, state.ErrMismatch) {
+		t.Errorf("ConfirmReady with another session err = %v, want ErrMismatch", err)
 	}
-	ready, err := s.Ready(ctx, launchPane, sessionOne)
+	ready, err := s.Ready(ctx, launchPane, task.Announcement{ID: sessionOne})
 	if err != nil {
 		t.Fatalf("Ready: %v", err)
 	}
@@ -350,27 +350,27 @@ func TestStoreReadyHandshake(t *testing.T) {
 		t.Error("failed ConfirmReady verified the recorded session")
 	}
 
-	if err := s.ConfirmReady(ctx, launchPane, sessionOne); err != nil {
+	if err := s.ConfirmReady(ctx, launchPane, task.SessionRef{Kind: task.SessionKindID, Value: sessionOne}); err != nil {
 		t.Fatalf("ConfirmReady: %v", err)
 	}
-	if ready, err = s.Ready(ctx, launchPane, sessionOne); err != nil || !ready {
+	if ready, err = s.Ready(ctx, launchPane, task.Announcement{ID: sessionOne}); err != nil || !ready {
 		t.Errorf("Ready(confirmed) = (%v, %v), want (true, nil)", ready, err)
 	}
-	if ready, err = s.Ready(ctx, launchPane, sessionTwo); err != nil || ready {
+	if ready, err = s.Ready(ctx, launchPane, task.Announcement{ID: sessionTwo}); err != nil || ready {
 		t.Errorf("Ready(other session) = (%v, %v), want (false, nil)", ready, err)
 	}
 
 	// A restarted extension announces a new session ID; the old handshake must not pass.
-	if err := s.RecordReady(ctx, launchPane, sessionTwo, 1); err != nil {
+	if err := s.RecordReady(ctx, launchPane, task.Announcement{ID: sessionTwo}, 1); err != nil {
 		t.Fatalf("RecordReady(session two): %v", err)
 	}
-	if ready, err = s.Ready(ctx, launchPane, sessionOne); err != nil || ready {
+	if ready, err = s.Ready(ctx, launchPane, task.Announcement{ID: sessionOne}); err != nil || ready {
 		t.Errorf("stale verified session = (%v, %v), want (false, nil)", ready, err)
 	}
-	if err := s.ConfirmReady(ctx, launchPane, sessionTwo); err != nil {
+	if err := s.ConfirmReady(ctx, launchPane, task.SessionRef{Kind: task.SessionKindID, Value: sessionTwo}); err != nil {
 		t.Fatalf("ConfirmReady(session two): %v", err)
 	}
-	if ready, err = s.Ready(ctx, launchPane, sessionTwo); err != nil || !ready {
+	if ready, err = s.Ready(ctx, launchPane, task.Announcement{ID: sessionTwo}); err != nil || !ready {
 		t.Errorf("Ready(session two) = (%v, %v), want (true, nil)", ready, err)
 	}
 }
@@ -397,21 +397,21 @@ func TestStoreByOMPSessionBindsOneRole(t *testing.T) {
 		t.Fatalf("CreateTask: %v", err)
 	}
 
-	primary, err := s.ByOMPSession(ctx, "omp-primary-1")
+	primary, err := s.ByOMPSession(ctx, task.Announcement{ID: "omp-primary-1"})
 	if err != nil {
 		t.Fatalf("ByOMPSession(primary): %v", err)
 	}
 	if primary.Role != state.RolePrimary || primary.Project.Key != "repo-a" {
 		t.Errorf("primary binding = %+v", primary)
 	}
-	boundWorker, err := s.ByOMPSession(ctx, "omp-worker-1")
+	boundWorker, err := s.ByOMPSession(ctx, task.Announcement{ID: "omp-worker-1"})
 	if err != nil {
 		t.Fatalf("ByOMPSession(worker): %v", err)
 	}
 	if boundWorker.Role != state.RoleWorker || boundWorker.Task.ID != "t1" {
 		t.Errorf("worker binding = %+v", boundWorker)
 	}
-	if _, err := s.ByOMPSession(ctx, "omp-unknown"); !errors.Is(err, state.ErrNotFound) {
+	if _, err := s.ByOMPSession(ctx, task.Announcement{ID: "omp-unknown"}); !errors.Is(err, state.ErrNotFound) {
 		t.Errorf("unknown session err = %v, want ErrNotFound", err)
 	}
 
@@ -421,7 +421,7 @@ func TestStoreByOMPSessionBindsOneRole(t *testing.T) {
 	if err := s.CreateTask(ctx, clash); err != nil {
 		t.Fatalf("CreateTask t2: %v", err)
 	}
-	if _, err := s.ByOMPSession(ctx, "omp-worker-1"); !errors.Is(err, state.ErrAmbiguous) {
+	if _, err := s.ByOMPSession(ctx, task.Announcement{ID: "omp-worker-1"}); !errors.Is(err, state.ErrAmbiguous) {
 		t.Errorf("ambiguous session err = %v, want ErrAmbiguous", err)
 	}
 }

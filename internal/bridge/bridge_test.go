@@ -177,16 +177,32 @@ func (f *bridgeFixture) seedPrimary() task.Project {
 }
 
 // confirm marks a binding's handshake verified the way the coordinator does
-// after comparing the announced session with `agent get`.
+// after comparing the announced session with `agent get`: the extension announced
+// the id, and the coordinator confirmed that id.
 func (f *bridgeFixture) confirm(launchPane, session string) {
 	f.t.Helper()
+	f.confirmRef(launchPane, task.Announcement{ID: session}, task.SessionRef{Kind: task.SessionKindID, Value: session})
+}
+
+// confirmRef records one announced identity and the reference Herdr reported for
+// it, which is what a confirmed handshake is made of.
+func (f *bridgeFixture) confirmRef(launchPane string, announced task.Announcement, ref task.SessionRef) {
+	f.t.Helper()
 	ctx := context.Background()
-	if err := f.store.RecordReady(ctx, launchPane, session, 1); err != nil {
+	if err := f.store.RecordReady(ctx, launchPane, announced, 1); err != nil {
 		f.t.Fatalf("RecordReady: %v", err)
 	}
-	if err := f.store.ConfirmReady(ctx, launchPane, session); err != nil {
+	if err := f.store.ConfirmReady(ctx, launchPane, ref); err != nil {
 		f.t.Fatalf("ConfirmReady: %v", err)
 	}
+}
+
+// announcedID is the announcement a bare session id describes.
+func announcedID(session string) task.Announcement { return task.Announcement{ID: session} }
+
+// refID is the reference form of a bare session id.
+func refID(session string) task.SessionRef {
+	return task.SessionRef{Kind: task.SessionKindID, Value: session}
 }
 
 // paneEnvelope builds the JSON envelope the real Herdr CLI prints for
@@ -298,7 +314,7 @@ func TestBridgeResolveAdoptsAFreshWorkerSession(t *testing.T) {
 		t.Fatalf("recorded session = %q, want the announced one", stored.OMPSessionID)
 	}
 	// Adoption is provisional: it records the session and never the handshake.
-	ready, err := f.store.Ready(context.Background(), workerPane, "omp-fresh-1")
+	ready, err := f.store.Ready(context.Background(), workerPane, announcedID("omp-fresh-1"))
 	if err != nil {
 		t.Fatalf("Ready: %v", err)
 	}
@@ -313,7 +329,7 @@ func TestBridgeResolveAdoptsAFreshWorkerSession(t *testing.T) {
 	if !readyResult.Recorded {
 		t.Fatalf("ready = %+v, want the announcement recorded", readyResult)
 	}
-	ready, err = f.store.Ready(context.Background(), workerPane, "omp-fresh-1")
+	ready, err = f.store.Ready(context.Background(), workerPane, announcedID("omp-fresh-1"))
 	if err != nil || ready {
 		t.Fatalf("Ready after the announcement = (%v, %v), want still unverified", ready, err)
 	}
@@ -360,7 +376,7 @@ func TestBridgeResolveAdoptsAFreshPrimarySession(t *testing.T) {
 	if stored.OMPSessionID != "omp-fresh-primary" {
 		t.Fatalf("recorded session = %q, want the announced one", stored.OMPSessionID)
 	}
-	ready, err := f.store.Ready(context.Background(), primaryPane, "omp-fresh-primary")
+	ready, err := f.store.Ready(context.Background(), primaryPane, announcedID("omp-fresh-primary"))
 	if err != nil || ready {
 		t.Fatalf("Ready after primary adoption = (%v, %v), want unverified", ready, err)
 	}
@@ -626,6 +642,125 @@ func TestBridgeRejectsForeignOrMalformedRequests(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// announced identities
+// ---------------------------------------------------------------------------
+
+const workerSessionFile = `C:\work\omp\sessions\-work-orch\2026-09-25T11-59-03-837Z_omp-worker-1.jsonl`
+
+// callIdentity runs one bridge request with the full identity surface the
+// extension announces (id, session file, materialization state).
+func (f *bridgeFixture) callIdentity(method, id, file string, onDisk bool, params string, ops Ops) bridgeResponse {
+	f.t.Helper()
+	payload, err := json.Marshal(map[string]any{
+		"version":          Protocol,
+		"method":           method,
+		"ompSessionID":     id,
+		"ompSessionFile":   file,
+		"ompSessionOnDisk": onDisk,
+		"params":           json.RawMessage(params),
+	})
+	if err != nil {
+		f.t.Fatalf("encode request: %v", err)
+	}
+	out, err := HandleWith(context.Background(), f.env, strings.NewReader(string(payload)), ops)
+	if err != nil {
+		f.t.Fatalf("Handle(%s): %v", method, err)
+	}
+	return decodeResponse(f.t, out)
+}
+
+func TestBridgeMatchesTheIdentityHerdrReports(t *testing.T) {
+	f := newBridgeFixture(t)
+	// The worker's recorded identity is the session file, exactly as recorded for
+	// a pane where Herdr reported kind "path".
+	f.seedWorker("t1", workerPane, workerPane, workerSessionFile)
+	f.confirmRef(workerPane,
+		task.Announcement{ID: workerSession, File: workerSessionFile, OnDisk: true},
+		task.SessionRef{Kind: task.SessionKindPath, Value: workerSessionFile})
+
+	// The extension announces both identities; the path form is the one Herdr
+	// reported, so it matches.
+	resp := f.callIdentity("resolve", workerSession, workerSessionFile, true, "{}", Ops{})
+	var result ResolveResult
+	resp.decodeResult(t, &result)
+	if !result.Bound || result.TaskID != "t1" {
+		t.Fatalf("resolve = %+v, want the worker bound by its announced file", result)
+	}
+
+	// A different announced file is a different session: refused with attention,
+	// and the recorded identity is never overwritten.
+	other := f.callIdentity("resolve", workerSession, `C:\work\omp\sessions\other.jsonl`, true, "{}", Ops{})
+	var refused ResolveResult
+	other.decodeResult(t, &refused)
+	if refused.Bound {
+		t.Fatalf("resolve with another announced file bound: %+v", refused)
+	}
+	if refused.Reason != ReasonUnverifiedRestore || refused.Attention == "" {
+		t.Errorf("resolve(other file) = %+v, want an attention-carrying refusal", refused)
+	}
+	stored, err := f.store.Task(context.Background(), "t1")
+	if err != nil {
+		t.Fatalf("Task: %v", err)
+	}
+	if stored.OMPSessionID != workerSessionFile {
+		t.Errorf("recorded identity = %q, want the original file untouched", stored.OMPSessionID)
+	}
+}
+
+func TestBridgeReadyRecordsTheWholeAnnouncement(t *testing.T) {
+	f := newBridgeFixture(t)
+	f.seedWorker("t1", workerPane, workerPane, workerSession)
+	f.confirm(workerPane, workerSession)
+
+	// The extension announces the id, the session file and the fact that the
+	// runtime has not materialized it yet.
+	resp := f.callIdentity("ready", workerSession, workerSessionFile, false, "{}", Ops{})
+	var result ReadyResult
+	resp.decodeResult(t, &result)
+	if !result.Recorded {
+		t.Fatalf("ready = %+v, want the announcement recorded", result)
+	}
+	stored, found, err := f.store.AnnouncedSession(context.Background(), workerPane)
+	if err != nil || !found {
+		t.Fatalf("AnnouncedSession = (_, %v, %v), want found", found, err)
+	}
+	if stored.ID != workerSession || stored.File != workerSessionFile || stored.OnDisk {
+		t.Errorf("stored announcement = %+v, want the id, the file and not materialized", stored)
+	}
+	// The confirmation that was already made is kept: the announcement still
+	// describes the session it verified.
+	if ready, err := f.store.Ready(context.Background(), workerPane, announcedID(workerSession)); err != nil || !ready {
+		t.Errorf("announcing a file dropped the confirmed id: (%v, %v)", ready, err)
+	}
+
+	// A request with neither identity is refused before any role work.
+	empty := f.callIdentity("resolve", "", "", true, "{}", Ops{})
+	wantError(t, empty, CodeBadRequest)
+}
+
+func TestBridgeAcceptsAFileOnlyAnnouncement(t *testing.T) {
+	f := newBridgeFixture(t)
+	f.seedWorker("t1", workerPane, workerPane, workerSessionFile)
+
+	// getSessionId() is always present for OMP, but the bridge must not require
+	// both identities: an agent whose runtime exposes only a session file still
+	// binds, and the announced file adopts the fresh pane-recorded task.
+	resp := f.callIdentity("resolve", "", workerSessionFile, false, "{}", Ops{})
+	var result ResolveResult
+	resp.decodeResult(t, &result)
+	if !result.Bound || result.TaskID != "t1" {
+		t.Fatalf("resolve(file only) = %+v, want the worker bound", result)
+	}
+	stored, err := f.store.Task(context.Background(), "t1")
+	if err != nil {
+		t.Fatalf("Task: %v", err)
+	}
+	if stored.OMPSessionID != workerSessionFile {
+		t.Errorf("recorded identity = %q, want the announced file", stored.OMPSessionID)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // role authorization
 // ---------------------------------------------------------------------------
 
@@ -716,7 +851,7 @@ func TestBridgeMutatingMethodsRequireConfirmedReadiness(t *testing.T) {
 
 	// Announced but not yet compared with `agent get`: the extension may have
 	// active tools, but no mutation is authorized.
-	if err := f.store.RecordReady(context.Background(), workerPane, workerSession, 1); err != nil {
+	if err := f.store.RecordReady(context.Background(), workerPane, announcedID(workerSession), 1); err != nil {
 		t.Fatalf("RecordReady: %v", err)
 	}
 	wantError(t, f.callWith("report", workerSession, `{"kind":"result"}`, ops), CodeNotReady)
@@ -1189,17 +1324,17 @@ func TestBridgeReadyRecordsAnUnverifiedHandshake(t *testing.T) {
 		t.Errorf("ready identities = %+v", result)
 	}
 
-	ready, err := f.store.Ready(context.Background(), workerPane, workerSession)
+	ready, err := f.store.Ready(context.Background(), workerPane, announcedID(workerSession))
 	if err != nil {
 		t.Fatalf("Ready: %v", err)
 	}
 	if ready {
 		t.Error("ready must stay unverified until the coordinator confirms it against `agent get`")
 	}
-	if err := f.store.ConfirmReady(context.Background(), workerPane, workerSession); err != nil {
+	if err := f.store.ConfirmReady(context.Background(), workerPane, refID(workerSession)); err != nil {
 		t.Fatalf("ConfirmReady: %v", err)
 	}
-	if ready, err = f.store.Ready(context.Background(), workerPane, workerSession); err != nil || !ready {
+	if ready, err = f.store.Ready(context.Background(), workerPane, announcedID(workerSession)); err != nil || !ready {
 		t.Fatalf("Ready after confirm = (%v, %v)", ready, err)
 	}
 
@@ -1209,7 +1344,7 @@ func TestBridgeReadyRecordsAnUnverifiedHandshake(t *testing.T) {
 	// A session bound to another launch pane records nothing either.
 	f.env["HERDR_PANE_ID"] = "w9:p9"
 	wantError(t, f.call("ready", workerSession, "{}"), CodeLaunchPaneMismatch)
-	if ready, err := f.store.Ready(context.Background(), "w9:p9", workerSession); err != nil || ready {
+	if ready, err := f.store.Ready(context.Background(), "w9:p9", announcedID(workerSession)); err != nil || ready {
 		t.Fatalf("a mismatched pane recorded readiness: (%v, %v)", ready, err)
 	}
 }

@@ -117,7 +117,19 @@ func runBind(env map[string]string, stdout, stderr io.Writer) int {
 	if err != nil {
 		return emit(stdout, stderr, failureBody(coordCode(err), err.Error()))
 	}
-	return emit(stdout, stderr, map[string]any{"ok": true, "project": project})
+	answer := map[string]any{"ok": true, "project": project}
+	// The session hint carries the resume command only when the runtime has
+	// materialized the session: an unmaterialized session is bound but not yet
+	// resumable, and saying so beats advertising a command that cannot work.
+	if hint, hintErr := coordinator.SessionHint(ctx, project.LaunchPaneID); hintErr == nil {
+		answer["session"] = hint
+	} else {
+		answer["session"] = map[string]any{
+			"onDisk":            false,
+			"resumeUnavailable": "the announced session could not be read back: " + hintErr.Error(),
+		}
+	}
+	return emit(stdout, stderr, answer)
 }
 
 // runBridge answers one extension call. The request is read from stdin with a
@@ -232,6 +244,8 @@ func coordCode(err error) string {
 		return "agent_changed"
 	case errors.Is(err, coord.ErrSessionUnavailable):
 		return "session_unavailable"
+	case errors.Is(err, coord.ErrSessionRefUnsupported):
+		return "session_reference_unsupported"
 	case errors.Is(err, coord.ErrReadinessTimeout):
 		return "readiness_timeout"
 	case errors.Is(err, coord.ErrBlocked):

@@ -66,9 +66,15 @@ var (
 	// ErrAgentChanged reports a pane whose OMP session or provenance no longer
 	// matches the recorded worker.
 	ErrAgentChanged = errors.New("coord: the pane's OMP session changed")
-	// ErrSessionUnavailable reports that Herdr published no native OMP session
-	// reference for a pane, so the announced handshake cannot be matched.
-	ErrSessionUnavailable = errors.New("coord: Herdr reported no OMP session for the pane")
+	// ErrSessionUnavailable reports that Herdr published no native session
+	// reference for a pane within the readiness window, so the announced
+	// handshake cannot be matched yet. The integration reports session identity
+	// asynchronously, so this is a retryable condition.
+	ErrSessionUnavailable = errors.New("coord: Herdr reported no session reference for the pane")
+	// ErrSessionRefUnsupported reports a reference Herdr published in a form this
+	// build cannot read. Retrying cannot fix it: the shape is what it is, so a
+	// human decides.
+	ErrSessionRefUnsupported = errors.New("coord: Herdr reported a session reference this build cannot read")
 	// ErrReadinessTimeout reports that the extension did not announce readiness
 	// for the recorded session in time; no brief was submitted.
 	ErrReadinessTimeout = errors.New("coord: the OMP extension did not announce readiness")
@@ -236,13 +242,17 @@ func (c *Coordinator) Bind(ctx context.Context, repo, workspaceID, rootPaneID st
 	if err := c.ensureAgent(ctx, paneID); err != nil {
 		return project, c.settleProject(ctx, root, false, err)
 	}
-	view, err := c.awaitAgentReady(ctx, paneID, root, nil, "", func(view agentView) error {
+	view, err := c.awaitAgentReady(ctx, paneID, root, nil, func(view agentView) error {
 		return c.store.UpdateProject(ctx, root, func(next *task.Project) error {
 			if next.LaunchPaneID != paneID {
 				return fmt.Errorf("%w: the primary binding changed to pane %q while the agent was starting",
 					ErrPrimaryNotLive, next.LaunchPaneID)
 			}
-			next.OMPSessionID = view.SessionID
+			// The first identity Herdr reports is the binding's session identity;
+			// a later confirmation never overwrites it.
+			if strings.TrimSpace(next.OMPSessionID) == "" {
+				next.OMPSessionID = view.Ref.Value
+			}
 			next.TerminalID = view.Agent.TerminalID
 			next.CurrentWorkspaceID = view.Agent.WorkspaceID
 			return nil
@@ -251,7 +261,9 @@ func (c *Coordinator) Bind(ctx context.Context, repo, workspaceID, rootPaneID st
 	if err != nil {
 		return project, c.settleProject(ctx, root, isTerminal(err), err)
 	}
-	project.OMPSessionID = view.SessionID
+	if strings.TrimSpace(project.OMPSessionID) == "" {
+		project.OMPSessionID = view.Ref.Value
+	}
 	project.TerminalID = view.Agent.TerminalID
 	project.CurrentWorkspaceID = view.Agent.WorkspaceID
 	return project, nil
@@ -303,12 +315,14 @@ func (c *Coordinator) reopenPrimary(ctx context.Context, existing task.Project) 
 		return existing, c.settleProject(ctx, existing.Key, isTerminal(err), err)
 	}
 	workspaces := nonEmpty(existing.RepoWorkspaceID, existing.CurrentWorkspaceID)
-	view, err := c.awaitAgentReady(ctx, paneID, existing.Key, workspaces, "", func(view agentView) error {
+	view, err := c.awaitAgentReady(ctx, paneID, existing.Key, workspaces, func(view agentView) error {
 		return c.store.UpdateProject(ctx, existing.Key, func(next *task.Project) error {
 			if next.LaunchPaneID != paneID {
 				return fmt.Errorf("%w: the primary binding changed to pane %q", ErrPrimaryNotLive, next.LaunchPaneID)
 			}
-			next.OMPSessionID = view.SessionID
+			if strings.TrimSpace(next.OMPSessionID) == "" {
+				next.OMPSessionID = view.Ref.Value
+			}
 			next.TerminalID = view.Agent.TerminalID
 			next.CurrentWorkspaceID = view.Agent.WorkspaceID
 			return nil
@@ -317,7 +331,9 @@ func (c *Coordinator) reopenPrimary(ctx context.Context, existing task.Project) 
 	if err != nil {
 		return existing, c.settleProject(ctx, existing.Key, isTerminal(err), err)
 	}
-	existing.OMPSessionID = view.SessionID
+	if strings.TrimSpace(existing.OMPSessionID) == "" {
+		existing.OMPSessionID = view.Ref.Value
+	}
 	existing.TerminalID = view.Agent.TerminalID
 	existing.CurrentWorkspaceID = view.Agent.WorkspaceID
 	return existing, nil
@@ -336,6 +352,54 @@ func (c *Coordinator) settleProject(ctx context.Context, key string, terminal bo
 		return errors.Join(cause, err)
 	}
 	return cause
+}
+
+// SessionHint is what a bound primary reports about its OMP session: the
+// identities the session announced, whether the runtime has materialized the
+// session to durable storage, and — only when resuming can actually work — the
+// Herdr restore command.
+//
+// The rule this type exists to enforce: a session the runtime has not written to
+// disk cannot be resumed. OMP materializes a session lazily (on its first
+// assistant message), so `getSessionFile()` may name a path that leads nowhere and
+// `omp --resume=<id>` would fail. A binding with such a session is still validly
+// bound; it just has no runnable resume hint yet, and saying so beats handing the
+// user a command that cannot work.
+type SessionHint struct {
+	ID                string `json:"id,omitempty"`
+	File              string `json:"file,omitempty"`
+	OnDisk            bool   `json:"onDisk"`
+	Resume            string `json:"resume,omitempty"`
+	ResumeUnavailable string `json:"resumeUnavailable,omitempty"`
+}
+
+// SessionHintOf renders a session hint, omitting the resume command while the
+// session is not on disk.
+func SessionHintOf(announced task.Announcement) SessionHint {
+	hint := SessionHint{ID: announced.ID, File: announced.File, OnDisk: announced.OnDisk}
+	switch {
+	case !announced.OnDisk:
+		hint.ResumeUnavailable = "this session is not materialized on disk yet, so it cannot be resumed; it becomes resumable after its first assistant message"
+	case announced.ID == "":
+		hint.ResumeUnavailable = "this session announced no id, so no resume command can be built for it"
+	default:
+		hint.Resume = "omp --resume=" + announced.ID
+	}
+	return hint
+}
+
+// SessionHint reports what the launch pane announced, for a caller that wants to
+// describe the bound session to a human. It never claims durability: the on-disk
+// flag comes from the runtime.
+func (c *Coordinator) SessionHint(ctx context.Context, launchPaneID string) (SessionHint, error) {
+	announced, found, err := c.store.AnnouncedSession(ctx, launchPaneID)
+	if err != nil {
+		return SessionHint{}, err
+	}
+	if !found {
+		return SessionHint{}, fmt.Errorf("%w: launch pane %q announced no session", ErrSessionUnavailable, launchPaneID)
+	}
+	return SessionHintOf(announced), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -547,7 +611,7 @@ func isTerminal(err error) bool {
 		errors.Is(err, herdr.ErrMalformedResponse),
 		errors.Is(err, herdr.ErrOutputTooLarge),
 		errors.Is(err, ErrAgentChanged),
-		errors.Is(err, ErrSessionUnavailable),
+		errors.Is(err, ErrSessionRefUnsupported),
 		errors.Is(err, ErrHerdrUnavailable):
 		return true
 	default:
@@ -559,23 +623,15 @@ func isTerminal(err error) bool {
 // agent session identity
 // ---------------------------------------------------------------------------
 
-// agentSessionRef is Herdr's AgentSessionInfo, captured from
-// `herdr api schema --json`: {source, agent, kind, value} where kind is "id" or
-// "path".
-type agentSessionRef struct {
-	Source string `json:"source"`
-	Agent  string `json:"agent"`
-	Kind   string `json:"kind"`
-	Value  string `json:"value"`
-}
-
 // agentView is the coordinator's read of one live agent: the typed projection
-// plus the native OMP session reference the bridge's handshake is matched
-// against.
+// plus the native session reference Herdr reports for its pane. A reference Herdr
+// reports in a form this build cannot read is carried as RefErr and treated as a
+// refusal, never as an empty session.
 type agentView struct {
-	Agent     herdr.AgentInfo
-	SessionID string
-	Kind      string
+	Agent  herdr.AgentInfo
+	Ref    task.SessionRef
+	HasRef bool
+	RefErr error
 }
 
 // agentGetResult decodes the raw `agent get` result, including the unmodeled
@@ -584,14 +640,14 @@ type agentGetResult struct {
 	Type  string `json:"type"`
 	Agent struct {
 		herdr.AgentInfo
-		AgentSession *agentSessionRef `json:"agent_session"`
+		AgentSession *herdr.SessionRef `json:"agent_session"`
 	} `json:"agent"`
 }
 
-// agentGet reads the agent behind a live name or pane id and its native OMP
-// session reference. The raw body is decoded because the session reference is
-// not part of the typed projection; everything else is validated as strictly as
-// the typed client does.
+// agentGet reads the agent behind a live name or pane id and its native session
+// reference. The raw body is decoded because the session reference is not part of
+// the typed projection; everything else is validated as strictly as the typed
+// client does, and the reference is decoded by the Herdr boundary as a typed pair.
 func (c *Coordinator) agentGet(ctx context.Context, target string) (agentView, error) {
 	ctx, cancel := c.callContext(ctx)
 	defer cancel()
@@ -619,10 +675,16 @@ func (c *Coordinator) agentGet(ctx context.Context, target string) (agentView, e
 		}
 	}
 	view := agentView{Agent: res.Agent.AgentInfo}
-	if ref := res.Agent.AgentSession; ref != nil {
-		view.Kind = ref.Kind
-		if strings.EqualFold(ref.Kind, "id") {
-			view.SessionID = strings.TrimSpace(ref.Value)
+	if res.Agent.AgentSession != nil {
+		kind, value, err := res.Agent.AgentSession.Identity()
+		switch {
+		case err != nil:
+			// A reference this build cannot read is a refusal: the coordinator
+			// reports it and never records a session it cannot verify.
+			view.RefErr = err
+		default:
+			view.Ref = task.SessionRef{Kind: kind, Value: value}
+			view.HasRef = true
 		}
 	}
 	return view, nil
@@ -663,25 +725,29 @@ func (c *Coordinator) ensureAgent(ctx context.Context, paneID string) error {
 	return fmt.Errorf("start %q on pane %q: %w", c.opts.AgentName, paneID, startErr)
 }
 
-// awaitAgentReady waits until the pane's OMP session is both reported by Herdr
-// and announced by the extension, and it records the session through write
-// before returning so the extension can resolve its role.
+// awaitAgentReady waits until Herdr reports the pane's native session reference
+// *and* the extension has announced a session that the store can confirm against
+// that reference.
 //
-// recorded is the session already stored for this binding; a different session
-// reported by Herdr means the process was restarted and needs a human, so it is
-// reported as ErrAgentChanged instead of being adopted silently. An empty
-// recorded session is learned from Herdr, and nil workspaces means the binding
-// records no workspace to compare against.
+// Herdr reports session identity asynchronously after the agent starts, so the
+// reference may be absent for a while: that is a normal state and is polled with
+// backoff inside the readiness timeout. A reference Herdr reports in a form this
+// build cannot read is a refusal, not an absence. The confirmed reference must be
+// the one Herdr reports *in the confirmed kind's form*: an id compared as an id, a
+// session file compared as a path. A session the extension announced that is not
+// the reference Herdr reports is ErrAgentChanged — a human decides, and no brief is
+// sent. write records a first-seen reference on the binding (it never overwrites).
 func (c *Coordinator) awaitAgentReady(
 	ctx context.Context,
 	paneID, checkout string,
 	workspaces []string,
-	recorded string,
 	write func(agentView) error,
 ) (agentView, error) {
 	deadline := time.Now().Add(c.opts.ReadinessTimeout)
+	interval := c.opts.PollInterval
 	var last agentView
 	var lastErr error
+	sawReference := false
 	for {
 		view, err := c.agentGet(ctx, paneID)
 		switch {
@@ -692,42 +758,35 @@ func (c *Coordinator) awaitAgentReady(
 					ErrAgentChanged, paneID, view.Agent.Agent, c.opts.AgentName)
 			}
 			if strings.TrimSpace(checkout) != "" && !samePath(view.Agent.Cwd, checkout) {
-				return view, fmt.Errorf("%w: pane %q works in %q, not the recorded checkout %q",
+				return view, fmt.Errorf("%w: pane %q works in %s, not the recorded checkout %s",
 					ErrAgentChanged, paneID, view.Agent.Cwd, checkout)
 			}
 			if len(workspaces) > 0 && !containsString(workspaces, view.Agent.WorkspaceID) {
 				return view, fmt.Errorf("%w: pane %q is in workspace %q, not the recorded %s",
 					ErrAgentChanged, paneID, view.Agent.WorkspaceID, strings.Join(workspaces, " or "))
 			}
-			if session := view.SessionID; session != "" {
-				switch {
-				case recorded == "":
+			if view.RefErr != nil {
+				// Failing closed with the reason, rather than polling forever for a
+				// reference this build will never understand.
+				return view, fmt.Errorf("%w: pane %q: %v", ErrSessionRefUnsupported, paneID, view.RefErr)
+			}
+			if view.HasRef {
+				if !sawReference {
+					sawReference = true
 					if write != nil {
 						if err := write(view); err != nil {
 							return view, err
 						}
 					}
-					recorded = session
-				case session != recorded:
-					return view, fmt.Errorf("%w: pane %q now reports OMP session %q, not the recorded %q",
-						ErrAgentChanged, paneID, session, recorded)
 				}
-			}
-			if recorded != "" {
-				confirmErr := c.store.ConfirmReady(ctx, paneID, recorded)
+				stateErr := c.confirmReference(ctx, paneID, view.Ref)
 				switch {
-				case confirmErr == nil:
-					ready, err := c.store.Ready(ctx, paneID, recorded)
-					if err != nil {
-						return view, err
-					}
-					if ready {
-						return view, nil
-					}
-				case errors.Is(confirmErr, state.ErrNotFound):
+				case stateErr == nil:
+					return view, nil
+				case errors.Is(stateErr, state.ErrNotFound):
 					// The extension has not announced this session yet: keep waiting.
 				default:
-					return view, confirmErr
+					return view, fmt.Errorf("%w: pane %q: %v", ErrAgentChanged, paneID, stateErr)
 				}
 			}
 		case isMissingTarget(err):
@@ -738,19 +797,47 @@ func (c *Coordinator) awaitAgentReady(
 
 		if !time.Now().Before(deadline) {
 			if lastErr != nil {
-				return last, fmt.Errorf("%w: pane %q: %v", ErrReadinessTimeout, paneID, lastErr)
+				return last, fmt.Errorf("%w: pane %s: %v", ErrReadinessTimeout, paneID, lastErr)
 			}
-			if recorded == "" {
-				return last, fmt.Errorf("%w: pane %q reported no native session reference, so the extension's handshake cannot be matched",
-					ErrSessionUnavailable, paneID)
+			if !sawReference {
+				return last, fmt.Errorf("%w: pane %q reported no native session reference within %s, so the extension's handshake cannot be matched yet; the integration publishes it asynchronously, so a later resume can still succeed",
+					ErrSessionUnavailable, paneID, c.opts.ReadinessTimeout)
 			}
-			return last, fmt.Errorf("%w: pane %q did not announce its OMP session in time; no brief was sent",
+			return last, fmt.Errorf("%w: pane %q did not announce the session Herdr reports in time; no brief was sent",
 				ErrReadinessTimeout, paneID)
 		}
 		select {
 		case <-ctx.Done():
 			return last, ctx.Err()
-		case <-time.After(c.opts.PollInterval):
+		case <-time.After(interval):
+		}
+		// Back off so a slow integration does not spin, and reset whenever a
+		// reference appeared (the next step needs a fresh observation).
+		if sawReference {
+			interval = c.opts.PollInterval
+		} else if interval < 8*c.opts.PollInterval {
+			interval *= 2
 		}
 	}
+}
+
+// confirmReference records the reference Herdr reported as verified, and reports
+// whether the session the extension announced is that reference. The store owns
+// the comparison: it knows which form was announced.
+func (c *Coordinator) confirmReference(ctx context.Context, paneID string, ref task.SessionRef) error {
+	if err := c.store.ConfirmReady(ctx, paneID, ref); err != nil {
+		return err
+	}
+	announcement, ok := task.AnnouncementOfRef(ref)
+	if !ok {
+		return fmt.Errorf("%w: pane %q reported an unusable session reference", ErrSessionUnavailable, paneID)
+	}
+	ready, err := c.store.Ready(ctx, paneID, announcement)
+	if err != nil {
+		return err
+	}
+	if !ready {
+		return fmt.Errorf("%w: pane %q recorded the reference but it is not the announced session", ErrAgentChanged, paneID)
+	}
+	return nil
 }

@@ -26,6 +26,10 @@ var (
 	ErrNotFound  = errors.New("state: not found")
 	ErrInvalid   = errors.New("state: invalid record")
 	ErrAmbiguous = errors.New("state: ambiguous session binding")
+	// ErrMismatch reports an announced session that is not the identity the
+	// record was confirmed (or announced) with. It is never a reason to replace
+	// the recorded identity: a human decides which process owns the pane.
+	ErrMismatch = errors.New("state: announced session does not match the recorded reference")
 )
 
 // Role identifies whether an OMP session belongs to a primary project or a worker task.
@@ -75,12 +79,67 @@ CREATE TABLE IF NOT EXISTS inbox (
 );
 CREATE TABLE IF NOT EXISTS ready_sessions (
 	launch_pane_id TEXT PRIMARY KEY,
-	omp_session_id TEXT NOT NULL,
+	omp_session_id TEXT NOT NULL DEFAULT '',
+	omp_session_file TEXT NOT NULL DEFAULT '',
+	omp_session_on_disk INTEGER NOT NULL DEFAULT 0,
 	protocol INTEGER NOT NULL,
 	verified INTEGER NOT NULL DEFAULT 0,
+	verified_kind TEXT NOT NULL DEFAULT '',
+	verified_value TEXT NOT NULL DEFAULT '',
 	seen_at INTEGER NOT NULL
 );
 `
+
+// readySessionColumns are the columns a ready record needs beyond its first
+// release shape. A state database written by an older revision is migrated in
+// place, so an existing installation keeps its rows.
+var readySessionColumns = []struct{ name, ddl string }{
+	{"omp_session_file", `ALTER TABLE ready_sessions ADD COLUMN omp_session_file TEXT NOT NULL DEFAULT ''`},
+	{"omp_session_on_disk", `ALTER TABLE ready_sessions ADD COLUMN omp_session_on_disk INTEGER NOT NULL DEFAULT 0`},
+	{"verified_kind", `ALTER TABLE ready_sessions ADD COLUMN verified_kind TEXT NOT NULL DEFAULT ''`},
+	{"verified_value", `ALTER TABLE ready_sessions ADD COLUMN verified_value TEXT NOT NULL DEFAULT ''`},
+}
+
+// migrate adds the columns an older state database is missing. SQLite has no
+// ADD COLUMN IF NOT EXISTS, so the existing columns are read first.
+func migrate(ctx context.Context, db *sql.DB) error {
+	rows, err := db.QueryContext(ctx, `PRAGMA table_info(ready_sessions)`)
+	if err != nil {
+		return fmt.Errorf("inspect ready_sessions: %w", err)
+	}
+	existing := map[string]bool{}
+	for rows.Next() {
+		var (
+			cid        int
+			name       string
+			columnType string
+			notNull    int
+			defaultV   any
+			primaryKey int
+		)
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultV, &primaryKey); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("read ready_sessions columns: %w", err)
+		}
+		existing[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("read ready_sessions columns: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close ready_sessions columns: %w", err)
+	}
+	for _, column := range readySessionColumns {
+		if existing[column.name] {
+			continue
+		}
+		if _, err := db.ExecContext(ctx, column.ddl); err != nil {
+			return fmt.Errorf("add ready_sessions.%s: %w", column.name, err)
+		}
+	}
+	return nil
+}
 
 // Store owns the orchestrator database.
 type Store struct {
@@ -105,6 +164,10 @@ func Open(dir string) (*Store, error) {
 		return nil, fmt.Errorf("open %q: %w", path, err)
 	}
 	if _, err := db.Exec(schema); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate %q: %w", path, err)
+	}
+	if err := migrate(context.Background(), db); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate %q: %w", path, err)
 	}
@@ -292,59 +355,153 @@ func (s *Store) MovePublicPane(ctx context.Context, launchPaneID, oldPublicPaneI
 
 // RecordReady stores the OMP session a launch pane just announced. The
 // handshake stays unverified until ConfirmReady sees the same session.
-func (s *Store) RecordReady(ctx context.Context, launchPaneID, ompSessionID string, protocol int) error {
-	if launchPaneID == "" || ompSessionID == "" {
-		return fmt.Errorf("%w: launch pane and OMP session id are required", ErrInvalid)
+func (s *Store) RecordReady(ctx context.Context, launchPaneID string, announced task.Announcement, protocol int) error {
+	identity, ok := task.NewAnnouncement(announced.ID, announced.File, announced.OnDisk)
+	if !ok {
+		return fmt.Errorf("%w: an announced session carries no identity", ErrInvalid)
 	}
+	if strings.TrimSpace(launchPaneID) == "" {
+		return fmt.Errorf("%w: launch pane is required", ErrInvalid)
+	}
+	// A new announcement invalidates a confirmation that no longer describes it:
+	// a restart announces a different session, and the old confirmation must not
+	// outlive it.
 	if _, err := s.db.ExecContext(ctx, `
-		INSERT INTO ready_sessions (launch_pane_id, omp_session_id, protocol, verified, seen_at)
-		VALUES (?, ?, ?, 0, ?)
+		INSERT INTO ready_sessions (launch_pane_id, omp_session_id, omp_session_file, omp_session_on_disk,
+		                        protocol, verified_kind, verified_value, verified, seen_at)
+		VALUES (?, ?, ?, ?, ?, '', '', 0, ?)
 		ON CONFLICT (launch_pane_id) DO UPDATE SET
 			omp_session_id = excluded.omp_session_id,
+			omp_session_file = excluded.omp_session_file,
+			omp_session_on_disk = excluded.omp_session_on_disk,
 			protocol = excluded.protocol,
+			verified_kind = CASE
+				WHEN ready_sessions.verified_kind = 'id' AND ready_sessions.verified_value = excluded.omp_session_id THEN ready_sessions.verified_kind
+				WHEN ready_sessions.verified_kind = 'path' AND ready_sessions.verified_value = excluded.omp_session_file THEN ready_sessions.verified_kind
+				ELSE ''
+			END,
+			verified_value = CASE
+				WHEN ready_sessions.verified_kind = 'id' AND ready_sessions.verified_value = excluded.omp_session_id THEN ready_sessions.verified_value
+				WHEN ready_sessions.verified_kind = 'path' AND ready_sessions.verified_value = excluded.omp_session_file THEN ready_sessions.verified_value
+				ELSE ''
+			END,
 			verified = CASE
-				WHEN ready_sessions.omp_session_id = excluded.omp_session_id THEN ready_sessions.verified
+				WHEN ready_sessions.verified_kind = 'id' AND ready_sessions.verified_value = excluded.omp_session_id THEN ready_sessions.verified
+				WHEN ready_sessions.verified_kind = 'path' AND ready_sessions.verified_value = excluded.omp_session_file THEN ready_sessions.verified
 				ELSE 0
 			END,
 			seen_at = excluded.seen_at`,
-		launchPaneID, ompSessionID, protocol, time.Now().UnixMilli(),
+		launchPaneID, identity.ID, identity.File, identity.OnDisk, protocol, time.Now().UnixMilli(),
 	); err != nil {
 		return fmt.Errorf("record ready for launch pane %q: %w", launchPaneID, err)
 	}
 	return nil
 }
 
-// ConfirmReady marks a recorded handshake verified, and only for the exact OMP
-// session that was announced.
-func (s *Store) ConfirmReady(ctx context.Context, launchPaneID, ompSessionID string) error {
-	if launchPaneID == "" || ompSessionID == "" {
-		return fmt.Errorf("%w: launch pane and OMP session id are required", ErrInvalid)
+// ConfirmReady records which reference form was verified for a launch pane, and
+// only for a reference the pane actually announced: the recorded confirmation
+// stays the exact identity `agent get` reported. A different form of the same
+// announcement (its id when the file was verified, or the file when the id was)
+// is accepted, because Herdr may report either.
+func (s *Store) ConfirmReady(ctx context.Context, launchPaneID string, ref task.SessionRef) error {
+	normalized, ok := ref.Normalized()
+	if !ok {
+		return fmt.Errorf("%w: session reference %q/%q is not usable", ErrInvalid, ref.Kind, ref.Value)
+	}
+	if strings.TrimSpace(launchPaneID) == "" {
+		return fmt.Errorf("%w: launch pane is required", ErrInvalid)
+	}
+	recorded, found, err := s.readyRecord(ctx, launchPaneID)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return fmt.Errorf("%w: no announced session for launch pane %q", ErrNotFound, launchPaneID)
+	}
+	if !recorded.announcement.Matches(normalized) {
+		return fmt.Errorf("%w: launch pane %q announced %s, not the confirmed %s %q",
+			ErrMismatch, launchPaneID, recorded.announcement.Describe(), normalized.Kind, normalized.Value)
 	}
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE ready_sessions SET verified = 1, seen_at = ? WHERE launch_pane_id = ? AND omp_session_id = ?`,
-		time.Now().UnixMilli(), launchPaneID, ompSessionID)
+		`UPDATE ready_sessions SET verified = 1, verified_kind = ?, verified_value = ?, seen_at = ?
+		 WHERE launch_pane_id = ?`,
+		normalized.Kind, normalized.Value, time.Now().UnixMilli(), launchPaneID)
 	if err != nil {
 		return fmt.Errorf("confirm ready for launch pane %q: %w", launchPaneID, err)
 	}
-	if err := requireOneRow(res, ErrNotFound, fmt.Sprintf("confirm ready for launch pane %q session %q", launchPaneID, ompSessionID)); err != nil {
+	if err := requireOneRow(res, ErrNotFound, fmt.Sprintf("confirm ready for launch pane %q", launchPaneID)); err != nil {
 		return err
 	}
 	return nil
 }
 
-// Ready reports whether exactly this OMP session passed the handshake.
-func (s *Store) Ready(ctx context.Context, launchPaneID, ompSessionID string) (bool, error) {
-	var verified int
-	err := s.db.QueryRowContext(ctx,
-		`SELECT verified FROM ready_sessions WHERE launch_pane_id = ? AND omp_session_id = ?`,
-		launchPaneID, ompSessionID).Scan(&verified)
-	if errors.Is(err, sql.ErrNoRows) {
+// Ready reports whether an announced identity passed the handshake for a launch
+// pane. The recorded confirmation decides which form is compared: an id is
+// trimmed and compared case-insensitively, a path with the platform's path rules.
+// A record that was never confirmed, or a confirmation whose kind this build does
+// not understand, is never ready.
+func (s *Store) Ready(ctx context.Context, launchPaneID string, announced task.Announcement) (bool, error) {
+	identity, ok := task.NewAnnouncement(announced.ID, announced.File, announced.OnDisk)
+	if !ok {
 		return false, nil
 	}
-	if err != nil {
-		return false, fmt.Errorf("read ready for launch pane %q: %w", launchPaneID, err)
+	recorded, found, err := s.readyRecord(ctx, launchPaneID)
+	if err != nil || !found {
+		return false, err
 	}
-	return verified == 1, nil
+	if recorded.verifiedKind == "" || recorded.verifiedValue == "" {
+		return false, nil
+	}
+	value, ok := recorded.announcement.Ref(recorded.verifiedKind)
+	if !ok {
+		return false, nil
+	}
+	announcedValue, ok := identity.Ref(recorded.verifiedKind)
+	if !ok {
+		return false, nil
+	}
+	return task.SameSessionReference(recorded.verifiedKind, value.Value, announcedValue.Value), nil
+}
+
+// AnnouncedSession reads what a launch pane announced, including whether the
+// runtime had materialized that session to disk. It reports whether anything was
+// announced at all.
+//
+// The announced state is what a caller may report to a human; it is never proof
+// of readiness (that stays ConfirmReady) and never proof of durability.
+func (s *Store) AnnouncedSession(ctx context.Context, launchPaneID string) (task.Announcement, bool, error) {
+	if strings.TrimSpace(launchPaneID) == "" {
+		return task.Announcement{}, false, fmt.Errorf("%w: launch pane is required", ErrInvalid)
+	}
+	recorded, found, err := s.readyRecord(ctx, launchPaneID)
+	if err != nil || !found {
+		return task.Announcement{}, false, err
+	}
+	return recorded.announcement, true, nil
+}
+
+// readyRecord is the stored handshake of one launch pane.
+type readyRecord struct {
+	announcement  task.Announcement
+	verifiedKind  string
+	verifiedValue string
+}
+
+func (s *Store) readyRecord(ctx context.Context, launchPaneID string) (readyRecord, bool, error) {
+	var row readyRecord
+	var onDisk int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT omp_session_id, omp_session_file, omp_session_on_disk, verified_kind, verified_value
+		 FROM ready_sessions WHERE launch_pane_id = ?`, launchPaneID).
+		Scan(&row.announcement.ID, &row.announcement.File, &onDisk, &row.verifiedKind, &row.verifiedValue)
+	row.announcement.OnDisk = onDisk == 1
+	if errors.Is(err, sql.ErrNoRows) {
+		return readyRecord{}, false, nil
+	}
+	if err != nil {
+		return readyRecord{}, false, fmt.Errorf("read ready for launch pane %q: %w", launchPaneID, err)
+	}
+	return row, true, nil
 }
 
 // AddInbox stores a note once, reporting whether it was new.
@@ -482,42 +639,74 @@ func (s *Store) UpdateProject(ctx context.Context, key string, mutate func(*task
 	return tx.commit("update project " + key)
 }
 
-// ByOMPSession finds the single project or task that owns an OMP session, and
-// refuses to guess when more than one claims it.
-func (s *Store) ByOMPSession(ctx context.Context, ompSessionID string) (Binding, error) {
-	if ompSessionID == "" {
-		return Binding{}, fmt.Errorf("%w: OMP session id is required", ErrInvalid)
+// ByOMPSession finds the single project or task that owns an announced session
+// and refuses to guess when more than one claims it.
+//
+// An announcement carries both native identities, and a record stores whichever
+// identity the coordinator recorded (Herdr reports an id on some builds and a
+// session file on others), so either announced identity may match: the id is
+// compared case-insensitively, the file with the platform's path rules. Rows
+// whose recorded identity is empty never match.
+func (s *Store) ByOMPSession(ctx context.Context, announced task.Announcement) (Binding, error) {
+	identity, ok := task.NewAnnouncement(announced.ID, announced.File, announced.OnDisk)
+	if !ok {
+		return Binding{}, fmt.Errorf("%w: an announced session carries no identity", ErrInvalid)
 	}
 	// Both lookups run in one read-only transaction so they see a single
 	// database snapshot: concurrent writers must not make a session that had
 	// exactly one owner at every instant look missing or ambiguous.
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
-		return Binding{}, fmt.Errorf("begin read for OMP session %q: %w", ompSessionID, err)
+		return Binding{}, fmt.Errorf("begin read for the announced session: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
 	workers, err := queryFacts[task.Task](ctx, tx,
-		`SELECT data FROM tasks WHERE json_extract(data, '$.OMPSessionID') = ?`, ompSessionID)
+		`SELECT data FROM tasks WHERE json_extract(data, '$.OMPSessionID') IS NOT NULL
+		   AND json_extract(data, '$.OMPSessionID') <> ''`)
 	if err != nil {
-		return Binding{}, fmt.Errorf("read tasks for OMP session %q: %w", ompSessionID, err)
+		return Binding{}, fmt.Errorf("read tasks for the announced session: %w", err)
 	}
 	primaries, err := queryFacts[task.Project](ctx, tx,
-		`SELECT data FROM projects WHERE json_extract(data, '$.OMPSessionID') = ?`, ompSessionID)
+		`SELECT data FROM projects WHERE json_extract(data, '$.OMPSessionID') IS NOT NULL
+		   AND json_extract(data, '$.OMPSessionID') <> ''`)
 	if err != nil {
-		return Binding{}, fmt.Errorf("read projects for OMP session %q: %w", ompSessionID, err)
+		return Binding{}, fmt.Errorf("read projects for the announced session: %w", err)
 	}
-	switch {
-	case len(workers)+len(primaries) == 0:
-		return Binding{}, fmt.Errorf("%w: OMP session %q", ErrNotFound, ompSessionID)
-	case len(workers)+len(primaries) > 1:
-		return Binding{}, fmt.Errorf("%w: OMP session %q matches %d records",
-			ErrAmbiguous, ompSessionID, len(workers)+len(primaries))
-	case len(primaries) == 1:
-		return Binding{Role: RolePrimary, Project: primaries[0]}, nil
+
+	var matches []Binding
+	for _, worker := range workers {
+		if announcedMatchesRecorded(identity, worker.OMPSessionID) {
+			matches = append(matches, Binding{Role: RoleWorker, Task: worker})
+		}
+	}
+	for _, primary := range primaries {
+		if announcedMatchesRecorded(identity, primary.OMPSessionID) {
+			matches = append(matches, Binding{Role: RolePrimary, Project: primary})
+		}
+	}
+	switch len(matches) {
+	case 0:
+		return Binding{}, fmt.Errorf("%w: announced session %s", ErrNotFound, identity.Describe())
+	case 1:
+		return matches[0], nil
 	default:
-		return Binding{Role: RoleWorker, Task: workers[0]}, nil
+		return Binding{}, fmt.Errorf("%w: announced session %s matches %d records",
+			ErrAmbiguous, identity.Describe(), len(matches))
 	}
+}
+
+// announcedMatchesRecorded reports whether a recorded session identity is one of
+// the announced ones, compared in the form the kind implies.
+func announcedMatchesRecorded(announced task.Announcement, recorded string) bool {
+	recorded = strings.TrimSpace(recorded)
+	if recorded == "" {
+		return false
+	}
+	if announced.ID != "" && task.SameSessionReference(task.SessionKindID, announced.ID, recorded) {
+		return true
+	}
+	return announced.File != "" && task.SameSessionReference(task.SessionKindPath, announced.File, recorded)
 }
 
 func scanTask(row interface{ Scan(...any) error }, what string) (task.Task, error) {

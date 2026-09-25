@@ -557,6 +557,57 @@ func (e *OutputLimitError) Is(target error) bool { return target == ErrOutputToo
 // decoded Herdr objects
 // ---------------------------------------------------------------------------
 
+// SessionRef is Herdr's AgentSessionInfo: the native session reference an
+// installed integration reports for a pane. Against Herdr 0.9.1-preview the OMP
+// integration reports kind "PATH" with the OMP session *file* path; other builds
+// report kind "id" with the session id. The reference is a typed pair, so this
+// client decodes it as one: it never parses a session id out of a file name.
+type SessionRef struct {
+	Source string `json:"source"`
+	Agent  string `json:"agent"`
+	Kind   string `json:"kind"`
+	Value  string `json:"value"`
+}
+
+// Identity validates a reference and returns its kind and value. The kinds Herdr
+// defines are accepted case-insensitively (the installed build reports "PATH"
+// against a schema that documents "path"); an unknown kind or an empty value is a
+// typed refusal, never a silently empty session.
+func (r *SessionRef) Identity() (kind, value string, err error) {
+	if r == nil {
+		return "", "", &IdentityError{Op: "agent get", Field: "agent_session",
+			Detail: "the pane reports no native session reference"}
+	}
+	canonical, ok := normalizeSessionKind(r.Kind)
+	if !ok {
+		return "", "", &IdentityError{Op: "agent get", Field: "agent_session.kind",
+			Detail: fmt.Sprintf("unsupported session reference kind %q", r.Kind)}
+	}
+	trimmed := strings.TrimSpace(r.Value)
+	if trimmed == "" {
+		return "", "", &IdentityError{Op: "agent get", Field: "agent_session.value",
+			Detail: fmt.Sprintf("a %s session reference carries no value", canonical)}
+	}
+	return canonical, trimmed, nil
+}
+
+// SessionKindID and SessionKindPath are the reference kinds Herdr documents.
+const (
+	SessionKindID   = "id"
+	SessionKindPath = "path"
+)
+
+func normalizeSessionKind(kind string) (string, bool) {
+	switch {
+	case strings.EqualFold(strings.TrimSpace(kind), SessionKindID):
+		return SessionKindID, true
+	case strings.EqualFold(strings.TrimSpace(kind), SessionKindPath):
+		return SessionKindPath, true
+	default:
+		return "", false
+	}
+}
+
 // PaneInfo is the pane projection this client needs. Ids come from Herdr's
 // response fields, never from labels.
 type PaneInfo struct {

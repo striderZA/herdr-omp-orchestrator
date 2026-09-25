@@ -6,6 +6,13 @@
 // completion from it.
 package task
 
+import (
+	"fmt"
+	"path/filepath"
+	"runtime"
+	"strings"
+)
+
 // Stage is the board column a task occupies.
 type Stage string
 
@@ -77,4 +84,155 @@ func StageOf(x Task) Stage {
 	default:
 		return Queued
 	}
+}
+
+// The two native session identities an installed agent integration reports. Herdr
+// labels the reference with its kind, and the kind decides how the value must be
+// compared: an id is an opaque token, a path is a file the platform resolves.
+const (
+	SessionKindID   = "id"
+	SessionKindPath = "path"
+)
+
+// SessionRef is one native session identity in the form Herdr reports it: a kind
+// and the value that kind names. It is the unit the readiness handshake verifies,
+// so a reference whose kind this build does not understand is refused instead of
+// being compared approximately.
+type SessionRef struct {
+	Kind  string `json:"Kind"`
+	Value string `json:"Value"`
+}
+
+// Announcement is what an agent process tells the bridge about itself: both
+// native identities the runtime exposes, plus whether that session has been
+// materialized to durable storage. At least one identity must be present. Both
+// are recorded, so the coordinator's confirmation can be re-compared in the same
+// form Herdr used rather than in a single preferred form.
+//
+// OnDisk is state, not identity: it never takes part in a comparison, and it
+// exists because an agent runtime may allocate a session path before writing it
+// (OMP materializes a session lazily, on its first assistant message), so a
+// resume command built from an unmaterialized session cannot work.
+type Announcement struct {
+	ID     string `json:"ID"`
+	File   string `json:"File"`
+	OnDisk bool   `json:"OnDisk"`
+}
+
+// NewAnnouncement trims one announced triple. It reports whether either identity
+// is present: an announcement with two empty strings carries nothing to verify.
+func NewAnnouncement(id, file string, onDisk bool) (Announcement, bool) {
+	announced := Announcement{ID: strings.TrimSpace(id), File: strings.TrimSpace(file), OnDisk: onDisk}
+	return announced, announced.ID != "" || announced.File != ""
+}
+
+// Describe renders an announcement for a message a human reads.
+func (a Announcement) Describe() string {
+	state := "not materialized on disk"
+	if a.OnDisk {
+		state = "on disk"
+	}
+	switch {
+	case a.ID != "" && a.File != "":
+		return fmt.Sprintf("id %q / file %q (%s)", a.ID, a.File, state)
+	case a.ID != "":
+		return fmt.Sprintf("id %q (%s)", a.ID, state)
+	case a.File != "":
+		return fmt.Sprintf("file %q (%s)", a.File, state)
+	default:
+		return "no session"
+	}
+}
+
+// AnnouncementOfRef is the single-identity announcement a reference describes. A
+// caller that knows only Herdr's reported reference (the coordinator) uses it to
+// ask whether that identity is the one that was confirmed.
+func AnnouncementOfRef(ref SessionRef) (Announcement, bool) {
+	normalized, ok := ref.Normalized()
+	if !ok {
+		return Announcement{}, false
+	}
+	if normalized.Kind == SessionKindID {
+		return Announcement{ID: normalized.Value}, true
+	}
+	return Announcement{File: normalized.Value}, true
+}
+
+// NormalizeSessionKind validates a Herdr reference kind, comparing case
+// insensitively because the installed build reports "PATH" against a schema that
+// documents "path".
+func NormalizeSessionKind(kind string) (string, bool) {
+	switch {
+	case strings.EqualFold(strings.TrimSpace(kind), SessionKindID):
+		return SessionKindID, true
+	case strings.EqualFold(strings.TrimSpace(kind), SessionKindPath):
+		return SessionKindPath, true
+	default:
+		return "", false
+	}
+}
+
+// Valid reports whether a reference carries a kind this build understands
+// together with a value.
+func (r SessionRef) Valid() bool {
+	_, ok := NormalizeSessionKind(r.Kind)
+	return ok && strings.TrimSpace(r.Value) != ""
+}
+
+// Normalized returns the reference with its kind in the canonical form.
+func (r SessionRef) Normalized() (SessionRef, bool) {
+	kind, ok := NormalizeSessionKind(r.Kind)
+	if !ok || strings.TrimSpace(r.Value) == "" {
+		return SessionRef{}, false
+	}
+	return SessionRef{Kind: kind, Value: strings.TrimSpace(r.Value)}, true
+}
+
+// Ref returns the announced identity for one kind, and whether the announcement
+// carries it.
+func (a Announcement) Ref(kind string) (SessionRef, bool) {
+	switch canonical, ok := NormalizeSessionKind(kind); {
+	case !ok:
+		return SessionRef{}, false
+	case canonical == SessionKindID:
+		return SessionRef{Kind: canonical, Value: a.ID}, a.ID != ""
+	default:
+		return SessionRef{Kind: canonical, Value: a.File}, a.File != ""
+	}
+}
+
+// Matches reports whether a reference is one of the identities the announcement
+// carries, compared in the form the reference's own kind implies.
+func (a Announcement) Matches(ref SessionRef) bool {
+	normalized, ok := ref.Normalized()
+	if !ok {
+		return false
+	}
+	announced, ok := a.Ref(normalized.Kind)
+	if !ok {
+		return false
+	}
+	return SameSessionReference(normalized.Kind, normalized.Value, announced.Value)
+}
+
+// SameSessionReference compares two values in the form their kind implies: an id
+// is trimmed and compared case-insensitively, and a path with the platform's path
+// rules (Windows is case-insensitive and both separators are equivalent).
+func SameSessionReference(kind, a, b string) bool {
+	canonical, ok := NormalizeSessionKind(kind)
+	if !ok {
+		return false
+	}
+	a, b = strings.TrimSpace(a), strings.TrimSpace(b)
+	if a == "" || b == "" {
+		return false
+	}
+	if canonical == SessionKindID {
+		return strings.EqualFold(a, b)
+	}
+	a, b = filepath.Clean(a), filepath.Clean(b)
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(a, b)
+	}
+	return a == b
 }

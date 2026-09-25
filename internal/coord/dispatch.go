@@ -643,7 +643,11 @@ func (c *Coordinator) recordAgentStart(ctx context.Context, st task.Task, paneID
 	write := func(view agentView) error {
 		apply := func(record *task.Task) error {
 			record.AgentName = c.opts.AgentName
-			record.OMPSessionID = view.SessionID
+			// The first identity Herdr reports is the binding's session identity;
+			// whichever form (id or session file) the bridge adopted first is kept.
+			if strings.TrimSpace(record.OMPSessionID) == "" {
+				record.OMPSessionID = view.Ref.Value
+			}
 			record.TerminalID = view.Agent.TerminalID
 			record.CurrentWorkspaceID = view.Agent.WorkspaceID
 			record.Phase = task.AgentStarted
@@ -659,7 +663,7 @@ func (c *Coordinator) recordAgentStart(ctx context.Context, st task.Task, paneID
 		// same binding is the same fact, so re-apply on the stored revision
 		// instead of reporting a conflict a human cannot act on.
 		current, readErr := c.store.Task(ctx, use.ID)
-		if readErr != nil || (current.OMPSessionID != "" && current.OMPSessionID != view.SessionID) {
+		if readErr != nil {
 			return err
 		}
 		next, err = c.record(ctx, current, apply, "record the started agent")
@@ -669,7 +673,7 @@ func (c *Coordinator) recordAgentStart(ctx context.Context, st task.Task, paneID
 		use = next
 		return nil
 	}
-	if _, err := c.awaitAgentReady(ctx, paneID, st.WorktreePath, workspaces, st.OMPSessionID, write); err != nil {
+	if _, err := c.awaitAgentReady(ctx, paneID, st.WorktreePath, workspaces, write); err != nil {
 		return c.failTask(ctx, use, isTerminal(err),
 			fmt.Errorf("task %s: pane %s: %w", st.ID, paneID, err))
 	}

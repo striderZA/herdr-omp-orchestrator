@@ -167,10 +167,25 @@ type Options struct {
 // version can add some without breaking v1 readers; the fields below are
 // required.
 type request struct {
-	Version      int             `json:"version"`
-	Method       string          `json:"method"`
-	OMPSessionID string          `json:"ompSessionID"`
-	Params       json.RawMessage `json:"params"`
+	Version          int             `json:"version"`
+	Method           string          `json:"method"`
+	OMPSessionID     string          `json:"ompSessionID"`
+	OMPSessionFile   string          `json:"ompSessionFile"`
+	OMPSessionOnDisk bool            `json:"ompSessionOnDisk"`
+	Params           json.RawMessage `json:"params"`
+}
+
+// announced is the identity the caller reports. The extension fills all of it in
+// from its own session manager: the id, the session file it allocated, and whether
+// that file has been materialized. Params are never authority for identity, and at
+// least one identity must be present, because a session that announces nothing
+// cannot be verified.
+func (r request) announced() (task.Announcement, error) {
+	announced, ok := task.NewAnnouncement(r.OMPSessionID, r.OMPSessionFile, r.OMPSessionOnDisk)
+	if !ok {
+		return task.Announcement{}, fail(CodeBadRequest, "the request carries no OMP session identity")
+	}
+	return announced, nil
 }
 
 type errorBody struct {
@@ -212,6 +227,11 @@ func run(ctx context.Context, env map[string]string, input io.Reader, opts Optio
 		return nil, err
 	}
 
+	announced, err := req.announced()
+	if err != nil {
+		return nil, err
+	}
+
 	h := &handler{ctx: ctx, env: env, ops: opts.Ops}
 	if err := h.prepare(); err != nil {
 		return nil, err
@@ -220,13 +240,13 @@ func run(ctx context.Context, env map[string]string, input io.Reader, opts Optio
 
 	switch req.Method {
 	case MethodResolve:
-		return h.resolve(req.OMPSessionID)
+		return h.resolve(announced)
 	case MethodReady:
-		return h.ready(req.OMPSessionID)
+		return h.ready(announced)
 	case MethodDispatch:
-		return h.mutate(req, state.RolePrimary, h.ops.Dispatch)
+		return h.mutate(req, state.RolePrimary, announced, h.ops.Dispatch)
 	case MethodReport:
-		return h.mutate(req, state.RoleWorker, h.ops.Report)
+		return h.mutate(req, state.RoleWorker, announced, h.ops.Report)
 	default:
 		return nil, fail(CodeUnsupportedMethod, "unknown bridge method %q", req.Method)
 	}
@@ -292,8 +312,9 @@ func readRequest(input io.Reader, argvMethod string) (request, error) {
 		return request{}, fail(CodeBadRequest, "the request names no method")
 	}
 	req.OMPSessionID = strings.TrimSpace(req.OMPSessionID)
-	if req.OMPSessionID == "" {
-		return request{}, fail(CodeBadRequest, "the request carries no OMP session id")
+	req.OMPSessionFile = strings.TrimSpace(req.OMPSessionFile)
+	if req.OMPSessionID == "" && req.OMPSessionFile == "" {
+		return request{}, fail(CodeBadRequest, "the request carries no OMP session identity")
 	}
 	if len(req.Params) > 0 {
 		trimmed := strings.TrimSpace(string(req.Params))
@@ -373,21 +394,21 @@ type ReadyResult struct {
 // resolve finds the binding that owns this OMP session and proves it belongs to
 // this process. It never trusts params. The only mutation it can perform is the
 // verified launch-pane rebind below.
-func (h *handler) resolve(ompSessionID string) (any, error) {
-	binding, err := h.store.ByOMPSession(h.ctx, ompSessionID)
+func (h *handler) resolve(announced task.Announcement) (any, error) {
+	binding, err := h.store.ByOMPSession(h.ctx, announced)
 	switch {
 	case errors.Is(err, state.ErrNotFound):
 		// A process the coordinator has already keyed to this launch pane but
 		// whose session it could not know yet is exactly a fresh worker or
 		// primary: Herdr starts the agent, the extension announces its session,
 		// and only then can the coordinator read it back from `agent get`.
-		adopted, adoptErr := h.adoptAnnouncedSession(ompSessionID)
+		adopted, adoptErr := h.adoptAnnouncedSession(announced)
 		switch {
 		case errors.Is(adoptErr, state.ErrNotFound):
 			return ResolveResult{Bound: false, Reason: ReasonNotBound, Protocol: Protocol}, nil
 		case errors.Is(adoptErr, errSessionMismatch):
-			attention := fmt.Sprintf("launch pane %q records OMP session %q but this process announces %q; the recorded session is kept and the orchestrator tools stay inactive until a human decides",
-				h.launchPaneID, sessionOfBinding(adopted), ompSessionID)
+			attention := fmt.Sprintf("launch pane %q records %s but this process announces %s; the recorded session is kept and the orchestrator tools stay inactive until a human decides",
+				h.launchPaneID, sessionOfBinding(adopted), announced.Describe())
 			if noteErr := h.recordAttention(adopted, attention); noteErr != nil {
 				return nil, fail(CodeStoreUnavailable, "the session mismatch could not be recorded as attention")
 			}
@@ -406,7 +427,7 @@ func (h *handler) resolve(ompSessionID string) (any, error) {
 		return ResolveResult{
 			Bound:     false,
 			Reason:    ReasonAmbiguousSession,
-			Attention: fmt.Sprintf("OMP session %q matches more than one recorded project or task; a human must resolve which one owns it before its tools can activate", ompSessionID),
+			Attention: fmt.Sprintf("announced session %s matches more than one recorded project or task; a human must resolve which one owns it before its tools can activate", announced.Describe()),
 			Protocol:  Protocol,
 		}, nil
 	case err != nil:
@@ -419,8 +440,8 @@ func (h *handler) resolve(ompSessionID string) (any, error) {
 
 	pane, err := h.verifyRestore(binding)
 	if err != nil {
-		attention := fmt.Sprintf("OMP session %q is recorded on launch pane %q but this process runs in %q, and Herdr could not verify the terminal/checkout provenance: %s. The orchestrator tools stay inactive and this is retried before the next turn",
-			ompSessionID, bindingLaunchPane(binding), h.launchPaneID, err)
+		attention := fmt.Sprintf("session %s is recorded on launch pane %q but this process runs in %q, and Herdr could not verify the terminal/checkout provenance: %s. The orchestrator tools stay inactive and this is retried before the next turn",
+			announced.Describe(), bindingLaunchPane(binding), h.launchPaneID, err)
 		if noteErr := h.recordAttention(binding, attention); noteErr != nil {
 			return nil, fail(CodeStoreUnavailable, "the failed restore could not be recorded as attention")
 		}
@@ -441,7 +462,7 @@ func (h *handler) resolve(ompSessionID string) (any, error) {
 		if !errors.Is(err, state.ErrConflict) {
 			return nil, fail(CodeInternal, "the verified rebind could not be stored")
 		}
-		attention := fmt.Sprintf("OMP session %q changed while its launch pane was being rebound; the binding will be re-verified before the next turn", ompSessionID)
+		attention := fmt.Sprintf("session %s changed while its launch pane was being rebound; the binding will be re-verified before the next turn", announced.Describe())
 		if noteErr := h.recordAttention(binding, attention); noteErr != nil {
 			return nil, fail(CodeStoreUnavailable, "the failed restore could not be recorded as attention")
 		}
@@ -482,11 +503,11 @@ func sessionOfBinding(b state.Binding) string {
 //
 // Unknown pane reports state.ErrNotFound; a record that already holds a
 // different session reports errSessionMismatch and is left untouched.
-func (h *handler) adoptAnnouncedSession(ompSessionID string) (state.Binding, error) {
+func (h *handler) adoptAnnouncedSession(announced task.Announcement) (state.Binding, error) {
 	worker, err := h.store.ByLaunchPane(h.ctx, h.launchPaneID)
 	switch {
 	case err == nil:
-		return h.adoptTaskSession(worker, ompSessionID)
+		return h.adoptTaskSession(worker, announced)
 	case !errors.Is(err, state.ErrNotFound):
 		return state.Binding{}, fail(CodeStoreUnavailable, "the recorded bindings could not be read")
 	}
@@ -494,7 +515,7 @@ func (h *handler) adoptAnnouncedSession(ompSessionID string) (state.Binding, err
 	primary, err := h.store.ProjectByLaunchPane(h.ctx, h.launchPaneID)
 	switch {
 	case err == nil:
-		return h.adoptProjectSession(primary, ompSessionID)
+		return h.adoptProjectSession(primary, announced)
 	case errors.Is(err, state.ErrNotFound):
 		return state.Binding{}, state.ErrNotFound
 	default:
@@ -502,40 +523,65 @@ func (h *handler) adoptAnnouncedSession(ompSessionID string) (state.Binding, err
 	}
 }
 
+// adoptedIdentity is what adoption writes into a record that has no session yet:
+// the announced id when the runtime exposes one, otherwise the announced session
+// file. Either identity is later matched by the same rule the lookup uses, so the
+// choice never makes a session unfindable.
+func adoptedIdentity(announced task.Announcement) string {
+	if announced.ID != "" {
+		return announced.ID
+	}
+	return announced.File
+}
+
+// recordsAnnouncement reports whether a recorded identity is one of the announced
+// ones, compared in the form each kind implies.
+func recordsAnnouncement(recorded string, announced task.Announcement) bool {
+	recorded = strings.TrimSpace(recorded)
+	if recorded == "" {
+		return false
+	}
+	if announced.ID != "" && task.SameSessionReference(task.SessionKindID, announced.ID, recorded) {
+		return true
+	}
+	return announced.File != "" && task.SameSessionReference(task.SessionKindPath, announced.File, recorded)
+}
+
 // adoptTaskSession records an announced session on the worker task bound to this
 // pane, or reports the mismatch without writing.
-func (h *handler) adoptTaskSession(worker task.Task, ompSessionID string) (state.Binding, error) {
+func (h *handler) adoptTaskSession(worker task.Task, announced task.Announcement) (state.Binding, error) {
 	binding := func(t task.Task) state.Binding {
 		return state.Binding{Role: state.RoleWorker, Task: t}
 	}
 	if recorded := strings.TrimSpace(worker.OMPSessionID); recorded != "" {
-		if recorded == ompSessionID {
+		if recordsAnnouncement(recorded, announced) {
 			return binding(worker), nil
 		}
 		return binding(worker), errSessionMismatch
 	}
+	identity := adoptedIdentity(announced)
 	updated, err := h.store.UpdateTask(h.ctx, worker.ID, worker.Revision, func(next *task.Task) error {
 		if recorded := strings.TrimSpace(next.OMPSessionID); recorded != "" {
-			if recorded == ompSessionID {
+			if recordsAnnouncement(recorded, announced) {
 				return nil
 			}
 			return errSessionMismatch
 		}
-		next.OMPSessionID = ompSessionID
+		next.OMPSessionID = identity
 		return nil
 	})
 	if err == nil {
 		return binding(updated), nil
 	}
 	// A compare-and-swap conflict means another call changed the task first.
-	// Re-read and adopt only if the session is still the announced one; a
-	// recorded session is never overwritten.
+	// Re-read and accept only the same announcement; a recorded session is never
+	// overwritten.
 	if errors.Is(err, state.ErrConflict) || errors.Is(err, errSessionMismatch) {
 		current, readErr := h.store.Task(h.ctx, worker.ID)
 		if readErr != nil {
 			return state.Binding{}, fail(CodeStoreUnavailable, "the recorded task could not be read")
 		}
-		if strings.TrimSpace(current.OMPSessionID) == ompSessionID {
+		if recordsAnnouncement(current.OMPSessionID, announced) {
 			return binding(current), nil
 		}
 		return binding(current), errSessionMismatch
@@ -544,31 +590,32 @@ func (h *handler) adoptTaskSession(worker task.Task, ompSessionID string) (state
 }
 
 // adoptProjectSession is adoptTaskSession for a primary project.
-func (h *handler) adoptProjectSession(primary task.Project, ompSessionID string) (state.Binding, error) {
+func (h *handler) adoptProjectSession(primary task.Project, announced task.Announcement) (state.Binding, error) {
 	binding := func(p task.Project) state.Binding {
 		return state.Binding{Role: state.RolePrimary, Project: p}
 	}
 	if recorded := strings.TrimSpace(primary.OMPSessionID); recorded != "" {
-		if recorded == ompSessionID {
+		if recordsAnnouncement(recorded, announced) {
 			return binding(primary), nil
 		}
 		return binding(primary), errSessionMismatch
 	}
+	identity := adoptedIdentity(announced)
 	err := h.store.UpdateProject(h.ctx, primary.Key, func(next *task.Project) error {
 		if next.LaunchPaneID != primary.LaunchPaneID {
 			return errSessionMismatch
 		}
 		if recorded := strings.TrimSpace(next.OMPSessionID); recorded != "" {
-			if recorded == ompSessionID {
+			if recordsAnnouncement(recorded, announced) {
 				return nil
 			}
 			return errSessionMismatch
 		}
-		next.OMPSessionID = ompSessionID
+		next.OMPSessionID = identity
 		return nil
 	})
 	if err == nil {
-		primary.OMPSessionID = ompSessionID
+		primary.OMPSessionID = identity
 		return binding(primary), nil
 	}
 	if errors.Is(err, errSessionMismatch) {
@@ -576,7 +623,7 @@ func (h *handler) adoptProjectSession(primary task.Project, ompSessionID string)
 		if readErr != nil {
 			return state.Binding{}, fail(CodeStoreUnavailable, "the recorded project could not be read")
 		}
-		if strings.TrimSpace(current.OMPSessionID) == ompSessionID {
+		if recordsAnnouncement(current.OMPSessionID, announced) {
 			return binding(current), nil
 		}
 		return binding(current), errSessionMismatch
@@ -716,12 +763,12 @@ func attentionNoteID(taskID, message string) string {
 // ready records the announced OMP session for a binding this process owns. The
 // handshake stays unverified: only the coordinator's comparison with
 // `agent get` may confirm it, and only then does any mutation become legal.
-func (h *handler) ready(ompSessionID string) (any, error) {
-	binding, err := h.authorize(ompSessionID)
+func (h *handler) ready(announced task.Announcement) (any, error) {
+	binding, err := h.authorize(announced)
 	if err != nil {
 		return nil, err
 	}
-	if err := h.store.RecordReady(h.ctx, h.launchPaneID, ompSessionID, Protocol); err != nil {
+	if err := h.store.RecordReady(h.ctx, h.launchPaneID, announced, Protocol); err != nil {
 		return nil, fail(CodeStoreUnavailable, "the readiness handshake could not be recorded")
 	}
 	return ReadyResult{
@@ -741,15 +788,15 @@ func (h *handler) ready(ompSessionID string) (any, error) {
 // operation: the caller's binding must be this process's, the role must be
 // exactly the one the method requires, and the coordinator must already have
 // confirmed this session. Authorization is repeated for every call.
-func (h *handler) mutate(req request, want state.Role, op func(context.Context, Principal, json.RawMessage) (any, error)) (any, error) {
-	binding, err := h.authorize(req.OMPSessionID)
+func (h *handler) mutate(req request, want state.Role, announced task.Announcement, op func(context.Context, Principal, json.RawMessage) (any, error)) (any, error) {
+	binding, err := h.authorize(announced)
 	if err != nil {
 		return nil, err
 	}
 	if binding.Role != want {
 		return nil, fail(CodeForbidden, "%s requires a %s session, and this is a %s session", req.Method, want, binding.Role)
 	}
-	ready, err := h.store.Ready(h.ctx, h.launchPaneID, req.OMPSessionID)
+	ready, err := h.store.Ready(h.ctx, h.launchPaneID, announced)
 	if err != nil {
 		return nil, fail(CodeStoreUnavailable, "the readiness handshake could not be read")
 	}
@@ -778,20 +825,20 @@ func (h *handler) mutate(req request, want state.Role, op func(context.Context, 
 // authorize resolves the session and requires the recorded binding to be this
 // process's own launch pane. It deliberately re-reads the store: a binding that
 // was rebound or replaced since the last call is honored, not cached.
-func (h *handler) authorize(ompSessionID string) (state.Binding, error) {
-	binding, err := h.store.ByOMPSession(h.ctx, ompSessionID)
+func (h *handler) authorize(announced task.Announcement) (state.Binding, error) {
+	binding, err := h.store.ByOMPSession(h.ctx, announced)
 	switch {
 	case errors.Is(err, state.ErrNotFound):
-		return state.Binding{}, fail(CodeNotBound, "no recorded project or task owns OMP session %q", ompSessionID)
+		return state.Binding{}, fail(CodeNotBound, "no recorded project or task owns the announced session %s", announced.Describe())
 	case errors.Is(err, state.ErrAmbiguous):
-		return state.Binding{}, fail(CodeAmbiguousSession, "OMP session %q matches more than one recorded project or task", ompSessionID)
+		return state.Binding{}, fail(CodeAmbiguousSession, "the announced session %s matches more than one recorded project or task", announced.Describe())
 	case err != nil:
 		return state.Binding{}, fail(CodeStoreUnavailable, "the recorded bindings could not be read")
 	}
 	recorded := bindingLaunchPane(binding)
 	if recorded != h.launchPaneID {
 		return state.Binding{}, fail(CodeLaunchPaneMismatch,
-			"OMP session %q is bound to launch pane %q, not this process's launch pane %q", ompSessionID, recorded, h.launchPaneID)
+			"the announced session %s is bound to launch pane %q, not this process's launch pane %q", announced.Describe(), recorded, h.launchPaneID)
 	}
 	return binding, nil
 }

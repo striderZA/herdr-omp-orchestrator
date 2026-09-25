@@ -67,6 +67,24 @@ type fixturePlan struct {
 	// through the bridge (as a real fresh session does) before the coordinator
 	// could record it from `agent get`.
 	AdoptBeforeRecord bool `json:"adopt_before_record"`
+	// SessionRefKind selects the shape Herdr reports for the pane's native
+	// session: "" or "id" (the bare id), "path" (the OMP session file the real
+	// 0.9.1-preview build reports), or any other kind verbatim.
+	SessionRefKind string `json:"session_ref_kind"`
+	// SessionRefValue overrides the reported reference value verbatim.
+	SessionRefValue string `json:"session_ref_value"`
+	// SessionRefAfterGets makes Herdr report no reference at all for the first N
+	// reads of a pane, the way the integration reports session identity
+	// asynchronously after the agent starts.
+	SessionRefAfterGets int `json:"session_ref_after_gets"`
+	// SessionFileEmpty makes the announced session have no file yet, as an
+	// unmaterialized OMP session does.
+	SessionFileEmpty bool `json:"session_file_empty"`
+	// SessionOnDisk makes the announced session claim it is materialized.
+	SessionOnDisk bool `json:"session_on_disk"`
+	// AnnounceSessionMismatch makes the extension announce a different session
+	// than the one Herdr reports for the pane.
+	AnnounceSessionMismatch bool `json:"announce_session_mismatch"`
 	// PromptAmbiguous makes `agent prompt` report Herdr's own timeout code after
 	// recording the submission, the way a real CLI timeout does.
 	PromptAmbiguous bool `json:"prompt_ambiguous"`
@@ -231,27 +249,71 @@ func fixtureAgentGet(dir string, plan fixturePlan, state *fixtureState, argv []s
 		return fixtureError("agent_not_found", "agent target "+pane+" not found")
 	}
 	agent.Gets++
-	session := agent.Session
-	if plan.SuppressSession {
-		session = ""
-	}
+	announced := fixtureAnnouncement(plan, agent.Session)
 	if plan.AdoptBeforeRecord {
-		adoptFixtureSession(pane, agent.Session)
+		adoptFixtureSession(pane, announced.ID)
 	}
-	if plan.RestartBeforeReady && fixtureBound(stateDirOf(), pane, agent.Session, session) {
-		// Herdr restarted the process in this pane: the same pane now reports a
-		// different native session.
-		session = agent.Session + "-restarted"
-	} else if !plan.SuppressReady && session != "" && fixtureBound(stateDirOf(), pane, agent.Session, session) {
+	reported := fixtureReference(plan, announced)
+	if plan.SessionRefAfterGets > 0 && agent.Gets <= plan.SessionRefAfterGets {
+		// The integration has not reported session identity for this pane yet.
+		reported = nil
+	}
+	if plan.RestartBeforeReady && fixtureBound(stateDirOf(), pane, announced) {
+		// The extension announced this session, and Herdr now reports a different
+		// one for the same pane: the process was restarted.
+		recordFixtureReady(pane, announced)
+		restarted := announced
+		restarted.ID += "-restarted"
+		reported = &task.SessionRef{Kind: task.SessionKindID, Value: restarted.ID}
+	} else if !plan.SuppressReady && fixtureBound(stateDirOf(), pane, announced) {
 		// The OMP extension can only announce readiness for a session the bridge
 		// already resolves to its own launch pane.
-		recordFixtureReady(pane, agent.Session)
+		recordFixtureReady(pane, announced)
 	}
 	state.save(dir)
 	return fixtureResult(map[string]any{
 		"type":  "agent_info",
-		"agent": agentInfo(pane, fixtureCwd(plan, *state, pane), agent, session),
+		"agent": agentInfo(pane, fixtureCwd(plan, *state, pane), agent, reported),
 	})
+}
+
+// sessionFileFor is the session file OMP allocates for one session: the runtime
+// names it after the session id, under the agent's sessions directory.
+func sessionFileFor(session string) string {
+	return `C:\work\omp\agent\sessions\-work-orch\2026-09-25T11-59-03-837Z_` + session + `.jsonl`
+}
+
+// fixtureAnnouncement is what this fixture's extension stand-in announces: both
+// identities OMP exposes, plus whether the session is materialized.
+func fixtureAnnouncement(plan fixturePlan, session string) task.Announcement {
+	if session == "" {
+		return task.Announcement{}
+	}
+	file := sessionFileFor(session)
+	if plan.SessionFileEmpty {
+		file = ""
+	}
+	return task.Announcement{ID: session, File: file, OnDisk: plan.SessionOnDisk}
+}
+
+// fixtureReference is Herdr's reported reference for a pane: the kind the plan
+// asks for (the real build reports "PATH"), carrying the matching identity.
+func fixtureReference(plan fixturePlan, announced task.Announcement) *task.SessionRef {
+	if plan.SuppressSession || announced.ID == "" {
+		return nil
+	}
+	kind := plan.SessionRefKind
+	if kind == "" {
+		kind = task.SessionKindID
+	}
+	value := announced.ID
+	if strings.EqualFold(kind, task.SessionKindPath) {
+		value = announced.File
+	}
+	if plan.SessionRefValue != "" {
+		value = plan.SessionRefValue
+	}
+	return &task.SessionRef{Kind: kind, Value: value}
 }
 
 // fixtureCwd is the working directory Herdr reports for an agent's pane: the
@@ -285,7 +347,7 @@ func fixtureAgentStart(dir string, plan fixturePlan, state *fixtureState, argv [
 	state.save(dir)
 	return fixtureResult(map[string]any{
 		"type":  "agent_started",
-		"agent": agentInfo(pane, fixtureCwd(plan, *state, pane), agent, agent.Session),
+		"agent": agentInfo(pane, fixtureCwd(plan, *state, pane), agent, fixtureReference(plan, fixtureAnnouncement(plan, agent.Session))),
 		"argv":  []string{"omp"},
 	})
 }
@@ -307,14 +369,14 @@ func fixtureAgentPrompt(dir string, plan fixturePlan, state *fixtureState, argv 
 	}
 	return fixtureResult(map[string]any{
 		"type":  "agent_prompted",
-		"agent": agentInfo(pane, fixtureCwd(plan, *state, pane), agent, agent.Session),
+		"agent": agentInfo(pane, fixtureCwd(plan, *state, pane), agent, fixtureReference(plan, fixtureAnnouncement(plan, agent.Session))),
 	})
 }
 
-// fixtureBound reports whether the store already binds this pane to a session
-// the extension would announce, the way bridge.authorize decides it.
-func fixtureBound(storeDir, pane, session, reported string) bool {
-	if storeDir == "" || session == "" || reported != session {
+// fixtureBound reports whether the store already binds this pane to the
+// announcement the extension would make, the way bridge.authorize decides it.
+func fixtureBound(storeDir, pane string, announced task.Announcement) bool {
+	if storeDir == "" || announced.ID == "" {
 		return false
 	}
 	store, err := state.Open(storeDir)
@@ -322,8 +384,7 @@ func fixtureBound(storeDir, pane, session, reported string) bool {
 		return false
 	}
 	defer func() { _ = store.Close() }()
-	ctx := context.Background()
-	binding, err := store.ByOMPSession(ctx, session)
+	binding, err := store.ByOMPSession(context.Background(), announced)
 	if err != nil {
 		return false
 	}
@@ -351,6 +412,8 @@ func adoptFixtureSession(pane, session string) {
 	if err != nil || strings.TrimSpace(taskOnPane.OMPSessionID) != "" {
 		return
 	}
+	// The bridge adopts the announced id when the runtime exposes one, which is
+	// what OMP always does.
 	if _, err := store.UpdateTask(ctx, taskOnPane.ID, taskOnPane.Revision, func(next *task.Task) error {
 		next.OMPSessionID = session
 		return nil
@@ -359,8 +422,9 @@ func adoptFixtureSession(pane, session string) {
 	}
 }
 
-// recordFixtureReady stands in for the extension's `ready` call.
-func recordFixtureReady(pane, session string) {
+// recordFixtureReady stands in for the extension's `ready` call: it announces the
+// whole identity surface, still unverified.
+func recordFixtureReady(pane string, announced task.Announcement) {
 	storeDir := stateDirOf()
 	if storeDir == "" {
 		return
@@ -370,7 +434,7 @@ func recordFixtureReady(pane, session string) {
 		return
 	}
 	defer func() { _ = store.Close() }()
-	if err := store.RecordReady(context.Background(), pane, session, 1); err != nil {
+	if err := store.RecordReady(context.Background(), pane, announced, 1); err != nil {
 		fmt.Fprintf(os.Stderr, "fixture: RecordReady: %v\n", err)
 	}
 }
@@ -493,11 +557,7 @@ func sessionSnapshotResult(plan fixturePlan, state fixtureState) map[string]any 
 		if agent == nil {
 			continue
 		}
-		session := agent.Session
-		if plan.SuppressSession {
-			session = ""
-		}
-		agents = append(agents, agentInfo(ws+":p1", cwd, agent, session))
+		agents = append(agents, agentInfo(ws+":p1", cwd, agent, fixtureReference(plan, fixtureAnnouncement(plan, agent.Session))))
 	}
 	return map[string]any{
 		"type": "session_snapshot",
@@ -562,8 +622,9 @@ func paneInfo(pane, ws, cwd, agent string) map[string]any {
 }
 
 // agentInfo renders Herdr's AgentInfo, including the native session reference
-// (AgentSessionInfo) that `herdr api schema --json` documents.
-func agentInfo(pane, cwd string, agent *fixtureAgent, session string) map[string]any {
+// (AgentSessionInfo) that `herdr api schema --json` documents. The reference is
+// optional: the integration reports it asynchronously.
+func agentInfo(pane, cwd string, agent *fixtureAgent, reported *task.SessionRef) map[string]any {
 	ws := workspaceOfPane(pane)
 	info := map[string]any{
 		"name":                    agent.Name,
@@ -583,13 +644,14 @@ func agentInfo(pane, cwd string, agent *fixtureAgent, session string) map[string
 		"terminal_title":          "omp",
 		"terminal_title_stripped": "omp",
 	}
-	if session != "" {
-		// Herdr's AgentSessionInfo, captured from `herdr api schema --json`.
+	if reported != nil {
+		// Herdr's AgentSessionInfo: a typed pair, captured from a real
+		// `herdr agent get` (kind "PATH" carrying the session file).
 		info["agent_session"] = map[string]any{
-			"source": "omp",
+			"source": "herdr:omp",
 			"agent":  "omp",
-			"kind":   "id",
-			"value":  session,
+			"kind":   reported.Kind,
+			"value":  reported.Value,
 		}
 	}
 	return info
@@ -1013,7 +1075,7 @@ func TestBindRecordsTheCanonicalPrimaryAndWaitsForTheExtension(t *testing.T) {
 	if f.countCalls("agent start") != 1 {
 		t.Errorf("agent start calls = %d, want 1", f.countCalls("agent start"))
 	}
-	ready, err := f.store.Ready(context.Background(), "w1:p2", "omp-session-1")
+	ready, err := f.store.Ready(context.Background(), "w1:p2", task.Announcement{ID: "omp-session-1"})
 	if err != nil {
 		t.Fatalf("Ready: %v", err)
 	}
@@ -1596,6 +1658,180 @@ func TestDispatchRecordsTheBriefAsOneArgvElement(t *testing.T) {
 		}
 	}
 	t.Fatal("no agent prompt call was made")
+}
+
+// ---------------------------------------------------------------------------
+// the native session reference Herdr reports
+// ---------------------------------------------------------------------------
+
+func TestDispatchRecordsHerdrsPathFormSessionReference(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{SessionRefKind: "PATH"})
+	st, err := f.dispatch("one", "brief one", []string{"go test ./... ok"}, nil, nil, f.base)
+	if err != nil {
+		t.Fatalf("dispatch with a path-form reference: %v", err)
+	}
+	if st.Phase != task.PromptSubmitted {
+		t.Fatalf("phase = %q, want %q (attention=%q blocker=%q)", st.Phase, task.PromptSubmitted, st.Attention, st.Blocker)
+	}
+	// The recorded identity is the value Herdr reported, and the handshake
+	// matched it in the path form the extension announced.
+	live := f.state().Agents[st.LaunchPaneID]
+	if live == nil {
+		t.Fatalf("no live agent on the recorded pane %q", st.LaunchPaneID)
+	}
+	if !samePath(st.OMPSessionID, sessionFileFor(live.Session)) {
+		t.Errorf("recorded identity = %q, want the session file %q Herdr reported",
+			st.OMPSessionID, sessionFileFor(live.Session))
+	}
+	if got := f.prompts(st.PublicPaneID); len(got) != 1 {
+		t.Errorf("prompts = %v, want one brief", got)
+	}
+}
+
+func TestDispatchRefusesAnUnrecognizedSessionReference(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{SessionRefKind: "pid"})
+	st, err := f.dispatch("one", "brief one", []string{"go test ./... ok"}, nil, nil, f.base)
+	if !errors.Is(err, ErrSessionRefUnsupported) {
+		t.Fatalf("dispatch err = %v, want ErrSessionRefUnsupported", err)
+	}
+	if got := task.StageOf(st); got != task.NeedsInput {
+		t.Errorf("stage = %q, want needs_input", got)
+	}
+	// A shape this build cannot read is not something a retry can fix.
+	if st.Blocker == "" || !strings.Contains(st.Blocker, "pid") {
+		t.Errorf("blocker = %q, want the unsupported kind named", st.Blocker)
+	}
+	if st.Attention != "" {
+		t.Errorf("attention = %q, want nothing retryable about an unreadable shape", st.Attention)
+	}
+	if len(f.prompts(st.PublicPaneID)) != 0 {
+		t.Error("a brief was sent although the session reference could not be read")
+	}
+}
+
+func TestDispatchPollsUntilHerdrReportsTheReference(t *testing.T) {
+	// The integration reports session identity asynchronously: the first reads of
+	// the pane carry no reference at all, and that is not a failure.
+	f := newCoordFixture(t, fixturePlan{SessionRefAfterGets: 2})
+	st, err := f.dispatch("one", "brief one", []string{"go test ./... ok"}, nil, nil, f.base)
+	if err != nil {
+		t.Fatalf("dispatch while the reference was still absent: %v", err)
+	}
+	if st.Phase != task.PromptSubmitted {
+		t.Fatalf("phase = %q, want %q (attention=%q)", st.Phase, task.PromptSubmitted, st.Attention)
+	}
+	if st.OMPSessionID == "" {
+		t.Error("the reported reference was not recorded")
+	}
+	if f.countCalls("agent start") != 1 {
+		t.Errorf("agent start calls = %d, want 1", f.countCalls("agent start"))
+	}
+	if got := f.prompts(st.PublicPaneID); len(got) != 1 {
+		t.Errorf("prompts = %v, want one brief", got)
+	}
+}
+
+func TestDispatchReportsAnActionableErrorWhenNoReferenceArrives(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{SuppressSession: true})
+	st, err := f.dispatch("one", "brief one", []string{"go test ./... ok"}, nil, nil, f.base)
+	if !errors.Is(err, ErrSessionUnavailable) {
+		t.Fatalf("dispatch err = %v, want ErrSessionUnavailable", err)
+	}
+	if got := task.StageOf(st); got != task.NeedsInput {
+		t.Errorf("stage = %q, want needs_input", got)
+	}
+	for _, want := range []string{st.ID, "reference"} {
+		if !strings.Contains(st.Attention, want) {
+			t.Errorf("attention %q does not name %q", st.Attention, want)
+		}
+	}
+	if len(f.prompts(st.PublicPaneID)) != 0 {
+		t.Error("a brief was sent without a session reference")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the session hint bind reports
+// ---------------------------------------------------------------------------
+
+func TestBindReportsNoResumeHintForAnUnmaterializedSession(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{SessionOnDisk: false})
+	project := f.mustBind()
+	hint, err := f.coord.SessionHint(context.Background(), project.LaunchPaneID)
+	if err != nil {
+		t.Fatalf("SessionHint: %v", err)
+	}
+	if !strings.HasPrefix(hint.ID, "omp-session-") {
+		t.Errorf("hint id = %q, want the announced session id", hint.ID)
+	}
+	if hint.OnDisk {
+		t.Error("hint claims the session is materialized")
+	}
+	if hint.Resume != "" {
+		t.Errorf("hint resume = %q, want none for an unmaterialized session", hint.Resume)
+	}
+	if !strings.Contains(hint.ResumeUnavailable, "not materialized") {
+		t.Errorf("hint resumeUnavailable = %q, want the reason", hint.ResumeUnavailable)
+	}
+}
+
+func TestBindReportsAResumeHintForAMaterializedSession(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{SessionOnDisk: true})
+	project := f.mustBind()
+	hint, err := f.coord.SessionHint(context.Background(), project.LaunchPaneID)
+	if err != nil {
+		t.Fatalf("SessionHint: %v", err)
+	}
+	if !hint.OnDisk || hint.ResumeUnavailable != "" {
+		t.Fatalf("hint = %+v, want a materialized session with no caveat", hint)
+	}
+	if want := "omp --resume=" + hint.ID; hint.Resume != want {
+		t.Errorf("hint resume = %q, want %q", hint.Resume, want)
+	}
+}
+
+func TestBindAcceptsAnUndefinedSessionFile(t *testing.T) {
+	// getSessionFile() may be undefined before the runtime materializes a session;
+	// the id alone is then the whole identity surface.
+	f := newCoordFixture(t, fixturePlan{SessionFileEmpty: true, SessionOnDisk: false})
+	project := f.mustBind()
+	hint, err := f.coord.SessionHint(context.Background(), project.LaunchPaneID)
+	if err != nil {
+		t.Fatalf("SessionHint: %v", err)
+	}
+	if hint.File != "" || hint.ID == "" {
+		t.Errorf("hint = %+v, want an id and no file", hint)
+	}
+	if hint.Resume != "" {
+		t.Errorf("hint resume = %q, want none", hint.Resume)
+	}
+	if project.OMPSessionID == "" {
+		t.Error("bind recorded no session identity")
+	}
+}
+
+func TestBindReportsAPathReferenceWithAFullIdentity(t *testing.T) {
+	// The annotated build reports kind=path: the binding records the session file
+	// Herdr reported, and the hint still knows both identities because the
+	// extension announced them.
+	f := newCoordFixture(t, fixturePlan{SessionRefKind: "path", SessionOnDisk: true})
+	project := f.mustBind()
+	hint, err := f.coord.SessionHint(context.Background(), project.LaunchPaneID)
+	if err != nil {
+		t.Fatalf("SessionHint: %v", err)
+	}
+	if !samePath(project.OMPSessionID, hint.File) {
+		t.Errorf("recorded identity = %q, want the announced file %q", project.OMPSessionID, hint.File)
+	}
+	if !strings.HasSuffix(hint.File, ".jsonl") {
+		t.Errorf("hint file = %q, want the session file", hint.File)
+	}
+	if want := "omp --resume=" + hint.ID; hint.Resume != want {
+		t.Errorf("hint resume = %q, want %q", hint.Resume, want)
+	}
+	if hint.ResumeUnavailable != "" {
+		t.Errorf("hint resumeUnavailable = %q, want none for a materialized session", hint.ResumeUnavailable)
+	}
 }
 
 func TestDispatchToleratesTheBridgeAdoptingTheSessionFirst(t *testing.T) {

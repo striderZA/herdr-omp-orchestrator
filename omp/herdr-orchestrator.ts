@@ -81,6 +81,33 @@ function readResolveBinding(value: unknown): ResolveBinding {
   };
 }
 
+// SessionIdentity is what this process tells the bridge about its own session:
+// both native identities OMP exposes, plus whether the session file has actually
+// been written. The bridge records all three and matches Herdr's reported
+// reference by kind, so a path-form reference and an id-form reference describe
+// the same running process without either side parsing a file name.
+interface SessionIdentity {
+  id: string;
+  file: string;
+  onDisk: boolean;
+}
+
+// sessionIdentity reads the identity surface once per call. getSessionFile() may
+// be undefined and isSessionOnDisk() may be false: OMP writes a session lazily,
+// on its first assistant message, so an allocated path is not yet a resumable
+// session.
+function sessionIdentity(sessionManager: {
+  getSessionId(): string;
+  getSessionFile(): string | undefined;
+  isSessionOnDisk(): boolean;
+}): SessionIdentity {
+  return {
+    id: sessionManager.getSessionId(),
+    file: sessionManager.getSessionFile() ?? "",
+    onDisk: sessionManager.isSessionOnDisk(),
+  };
+}
+
 // callBridge runs one versioned bridge command. The Herdr binary path and the
 // plugin state directory are handed to every child explicitly: an ordinary
 // Herdr-managed OMP pane is not guaranteed to inherit plugin-command
@@ -88,13 +115,15 @@ function readResolveBinding(value: unknown): ResolveBinding {
 async function callBridge(
   method: string,
   params: unknown,
-  ompSessionID: string,
+  identity: SessionIdentity,
   signal?: AbortSignal,
 ): Promise<unknown> {
   const request = JSON.stringify({
     version: BRIDGE_PROTOCOL,
     method,
-    ompSessionID,
+    ompSessionID: identity.id,
+    ompSessionFile: identity.file,
+    ompSessionOnDisk: identity.onDisk,
     params: params ?? {},
   });
 
@@ -258,8 +287,8 @@ export default function (pi: ExtensionAPI) {
   // exactly the verified role's tools. It is idempotent: only this plugin's
   // tool names are filtered, so other OMP tools and other extensions' tools are
   // preserved, and nothing is written when the active set already matches.
-  async function activate(sessionID: string): Promise<Role | null> {
-    const binding = readResolveBinding(await callBridge("resolve", {}, sessionID));
+  async function activate(identity: SessionIdentity): Promise<Role | null> {
+    const binding = readResolveBinding(await callBridge("resolve", {}, identity));
     const nextRole = binding.bound ? binding.role : null;
     const target = nextRole === "primary" ? primaryNames : nextRole === "worker" ? workerNames : [];
     const current = pi.getActiveTools();
@@ -268,13 +297,13 @@ export default function (pi: ExtensionAPI) {
     ];
     if (desired.join("\0") !== current.join("\0")) await pi.setActiveTools(desired);
     role = nextRole;
-    if (role) await callBridge("ready", {}, sessionID);
+    if (role) await callBridge("ready", {}, identity);
     return role;
   }
 
   pi.on("session_start", async (_event, ctx) => {
     try {
-      await activate(ctx.sessionManager.getSessionId());
+      await activate(sessionIdentity(ctx.sessionManager));
     } catch (error) {
       ctx.ui.notify(`Orchestrator binding unavailable: ${String(error)}`, "warning");
       throw error;
@@ -286,7 +315,7 @@ export default function (pi: ExtensionAPI) {
   // loaded this extension. Re-resolving before every user turn lets a verified
   // rebind restore the right tools instead of silently disabling them forever.
   pi.on("before_agent_start", async (event, ctx) => {
-    const currentRole = await activate(ctx.sessionManager.getSessionId());
+    const currentRole = await activate(sessionIdentity(ctx.sessionManager));
     if (!currentRole) return;
     return {
       systemPrompt: [
@@ -303,16 +332,21 @@ export default function (pi: ExtensionAPI) {
     label: "Delegate task",
     defaultInactive: true,
     description: "Start a bounded, isolated coding task.",
+    // Schema rule: never pass a mutable value (array or object) to `.default()`
+    // — OMP's builder rejects it at construction time ("A mutable default value
+    // must be specified as a factory"), which makes the whole extension fail to
+    // load. Use a factory, or `.optional()`. omp/load-extension.check.ts runs
+    // this schema through OMP's own builder so the mistake cannot ship.
     parameters: z.object({
       title: z.string().min(1).max(160),
       brief: z.string().min(1).max(16000),
       checks: z.array(z.string().min(1).max(512)).min(1),
-      dependencies: z.array(z.string()).default([]),
-      reservedPaths: z.array(z.string()).default([]),
+      dependencies: z.array(z.string()).default(() => []),
+      reservedPaths: z.array(z.string()).default(() => []),
       baseRevision: z.string().min(7),
     }),
     async execute(_callId, params, signal, _update, ctx) {
-      const result = await callBridge("dispatch", params, ctx.sessionManager.getSessionId(), signal);
+      const result = await callBridge("dispatch", params, sessionIdentity(ctx.sessionManager), signal);
       return { content: [{ type: "text", text: JSON.stringify(result) }], details: result };
     },
   });
@@ -331,7 +365,7 @@ export default function (pi: ExtensionAPI) {
       risk: z.string().max(4000),
     }),
     async execute(_callId, params, signal, _update, ctx) {
-      const result = await callBridge("report", params, ctx.sessionManager.getSessionId(), signal);
+      const result = await callBridge("report", params, sessionIdentity(ctx.sessionManager), signal);
       return { content: [{ type: "text", text: JSON.stringify(result) }], details: result };
     },
   });

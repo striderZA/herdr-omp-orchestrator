@@ -1479,3 +1479,99 @@ func equalStrings(a, b []string) bool {
 	}
 	return true
 }
+
+// ---------------------------------------------------------------------------
+// native session references
+// ---------------------------------------------------------------------------
+
+// TestSessionRefDecodesTheCapturedOMPReference decodes the reference a real
+// `herdr agent get wC:p1` reported for a fresh OMP 18.3.1 pane: kind "PATH"
+// (upper case, against the schema's lower-case enum) whose value is the session
+// *file*, not the session id. Herdr's reference is a typed pair, and this client
+// decodes it as one: no session id is ever parsed out of a file name.
+func TestSessionRefDecodesTheCapturedOMPReference(t *testing.T) {
+	var decoded struct {
+		Result struct {
+			Type  string `json:"type"`
+			Agent struct {
+				Session *SessionRef `json:"agent_session"`
+			} `json:"agent"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(readFixture(t, "agent-session-omp-path.json")), &decoded); err != nil {
+		t.Fatalf("decode captured agent get: %v", err)
+	}
+	if decoded.Result.Type != "agent_info" {
+		t.Fatalf("captured result type = %q, want agent_info", decoded.Result.Type)
+	}
+	ref := decoded.Result.Agent.Session
+	if ref == nil {
+		t.Fatal("captured response carries no agent_session")
+	}
+	if ref.Kind != "PATH" || ref.Source != "herdr:omp" || ref.Agent != "omp" {
+		t.Errorf("captured reference = %+v, want the PATH form from herdr:omp", ref)
+	}
+	kind, value, err := ref.Identity()
+	if err != nil {
+		t.Fatalf("Identity(captured) = %v", err)
+	}
+	if kind != SessionKindPath {
+		t.Errorf("captured kind = %q, want the canonical %q", kind, SessionKindPath)
+	}
+	if !strings.HasSuffix(value, ".jsonl") || !strings.Contains(value, "01a0d86e-ee9c-7000-b9a2-2604f96ae3c6") {
+		t.Errorf("captured value = %q, want the session file verbatim", value)
+	}
+
+	// The id form is the other kind Herdr documents.
+	idRef := &SessionRef{Source: "omp", Agent: "omp", Kind: "id", Value: " 01a0d86e-ee9c-7000-b9a2-2604f96ae3c6 "}
+	kind, value, err = idRef.Identity()
+	if err != nil {
+		t.Fatalf("Identity(kind=id) = %v", err)
+	}
+	if kind != SessionKindID || value != "01a0d86e-ee9c-7000-b9a2-2604f96ae3c6" {
+		t.Errorf("Identity(kind=id) = (%q, %q), want the trimmed id", kind, value)
+	}
+	// The installed build reports the path kind in upper case.
+	upper := &SessionRef{Kind: "PATH", Value: "/home/somebody/.omp/sessions/slug/stamp_x.jsonl"}
+	if kind, _, err := upper.Identity(); err != nil || kind != SessionKindPath {
+		t.Errorf("Identity(kind=PATH) = (%q, %v), want (%q, nil)", kind, err, SessionKindPath)
+	}
+}
+
+func TestSessionRefRefusesUnknownKindsAndEmptyValues(t *testing.T) {
+	cases := []struct {
+		name string
+		ref  *SessionRef
+	}{
+		{name: "missing reference", ref: nil},
+		{name: "unknown kind", ref: &SessionRef{Kind: "pid", Value: "4242"}},
+		{name: "no kind", ref: &SessionRef{Kind: "", Value: "x"}},
+		{name: "empty value", ref: &SessionRef{Kind: "id", Value: ""}},
+		{name: "whitespace value", ref: &SessionRef{Kind: "path", Value: "   "}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			kind, value, err := tc.ref.Identity()
+			if err == nil {
+				t.Fatalf("Identity(%+v) = (%q, %q, nil), want a typed refusal", tc.ref, kind, value)
+			}
+			if !errors.Is(err, ErrIdentity) {
+				t.Fatalf("Identity(%+v) err = %v, want ErrIdentity", tc.ref, err)
+			}
+			var identity *IdentityError
+			if !errors.As(err, &identity) {
+				t.Fatalf("Identity(%+v) err = %T, want *IdentityError", tc.ref, err)
+			}
+			if kind != "" || value != "" {
+				t.Errorf("Identity(%+v) also returned (%q, %q); a refusal must carry neither", tc.ref, kind, value)
+			}
+			// The refusal names the field a human has to look at.
+			if identity.Field != "agent_session" && !strings.HasPrefix(identity.Field, "agent_session.") {
+				t.Errorf("refusal field = %q, want agent_session or a field inside it", identity.Field)
+			}
+			if strings.TrimSpace(identity.Detail) == "" {
+				t.Errorf("refusal %+v carries no detail", identity)
+			}
+		})
+	}
+}
