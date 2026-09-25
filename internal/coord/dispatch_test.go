@@ -331,8 +331,16 @@ func fixtureCwd(plan fixturePlan, state fixtureState, pane string) string {
 
 func fixtureAgentStart(dir string, plan fixturePlan, state *fixtureState, argv []string) int {
 	pane := fixtureFlag(argv, "--pane")
+	name := argv[2]
 	if state.Agents[pane] != nil {
 		return fixtureError("agent_already_running", "the pane already runs an agent")
+	}
+	// Herdr keeps live agent names unique across the whole session, which is what
+	// made one shared name collide with the running primary.
+	for otherPane, agent := range state.Agents {
+		if agent != nil && agent.Name == name {
+			return fixtureError("agent_name_taken", "agent name "+name+" is already used by "+otherPane)
+		}
 	}
 	if plan.AgentStartError != "" {
 		return fixtureError(plan.AgentStartError, "the agent did not start")
@@ -1066,8 +1074,8 @@ func TestBindRecordsTheCanonicalPrimaryAndWaitsForTheExtension(t *testing.T) {
 	if project.OMPSessionID != "omp-session-1" {
 		t.Errorf("OMPSessionID = %q, want omp-session-1 from `agent get`", project.OMPSessionID)
 	}
-	if project.AgentName != "omp" {
-		t.Errorf("AgentName = %q, want omp", project.AgentName)
+	if !strings.HasPrefix(project.AgentName, "orch_p_") {
+		t.Errorf("AgentName = %q, want the derived primary name", project.AgentName)
 	}
 	if f.countCalls("workspace create") != 0 {
 		t.Error("bind created a workspace although the named workspace already represents the root")
@@ -1831,6 +1839,161 @@ func TestBindReportsAPathReferenceWithAFullIdentity(t *testing.T) {
 	}
 	if hint.ResumeUnavailable != "" {
 		t.Errorf("hint resumeUnavailable = %q, want none for a materialized session", hint.ResumeUnavailable)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// agent names
+// ---------------------------------------------------------------------------
+
+func TestAgentNamesAreUniqueAndLegal(t *testing.T) {
+	// A worker's name is its task id: already unique, stable and legal.
+	for _, id := range []string{"orch_08ed0e6352e9", "orch_ffffffffffff"} {
+		name := WorkerAgentName(id)
+		if name != id {
+			t.Errorf("WorkerAgentName(%q) = %q, want the id", id, name)
+		}
+		if !herdr.ValidAgentName(name) {
+			t.Errorf("WorkerAgentName(%q) = %q is not a legal Herdr agent name", id, name)
+		}
+		if len(name) > agentNameLimit {
+			t.Errorf("worker name %q is %d characters, want at most %d", name, len(name), agentNameLimit)
+		}
+	}
+	if name := WorkerAgentName(""); name != "" {
+		t.Errorf("WorkerAgentName(\"\") = %q, want no name", name)
+	}
+	if name := WorkerAgentName("NOT A NAME"); name != "" {
+		t.Errorf("WorkerAgentName(invalid) = %q, want no name", name)
+	}
+
+	// A primary's name is stable per repository, unique across repositories, and
+	// distinct from every worker name.
+	first := PrimaryAgentName(`E:\work\repo-a`)
+	again := PrimaryAgentName(`e:/WORK/repo-a`)
+	other := PrimaryAgentName(`E:\work\repo-b`)
+	if first != again {
+		t.Errorf("PrimaryAgentName is not stable: %q then %q", first, again)
+	}
+	if first == other {
+		t.Errorf("two repositories share the primary name %q", first)
+	}
+	for _, name := range []string{first, other} {
+		if !herdr.ValidAgentName(name) {
+			t.Errorf("primary name %q is not a legal Herdr agent name", name)
+		}
+		if len(name) > agentNameLimit {
+			t.Errorf("primary name %q is %d characters, want at most %d", name, len(name), agentNameLimit)
+		}
+	}
+	if WorkerAgentName("orch_08ed0e6352e9") == first {
+		t.Error("a worker and a primary would share a name")
+	}
+}
+
+func TestConcurrencySecondWorkerStartsWithItsOwnAgentName(t *testing.T) {
+	// The shipped bug: every agent was named "omp", so the second worker's start
+	// collided with the running primary ("agent_name_taken"). The fixture now
+	// enforces Herdr's live-name uniqueness, so this test fails if two agents share
+	// a name.
+	f := newCoordFixture(t, fixturePlan{})
+	first, err := f.dispatch("one", "brief one", []string{"go test ./... ok"}, nil, nil, f.base)
+	if err != nil {
+		t.Fatalf("first dispatch: %v", err)
+	}
+	second, err := f.dispatch("two", "brief two", []string{"go test ./... ok"}, nil, []string{"src/other.txt"}, f.base)
+	if err != nil {
+		t.Fatalf("second dispatch: %v", err)
+	}
+	if first.AgentName == "" || second.AgentName == "" {
+		t.Fatalf("agent names = %q / %q, want both recorded", first.AgentName, second.AgentName)
+	}
+	if first.AgentName == second.AgentName {
+		t.Fatalf("both workers got the name %q, which Herdr rejects", first.AgentName)
+	}
+	if first.AgentName != first.ID || second.AgentName != second.ID {
+		t.Errorf("agent names = %q / %q, want the task ids", first.AgentName, second.AgentName)
+	}
+
+	// The live names really are distinct, and the primary is a third one: every
+	// started agent is recorded under the name Herdr reported.
+	project, err := f.store.Project(context.Background(), f.root)
+	if err != nil {
+		t.Fatalf("Project: %v", err)
+	}
+	live := map[string]string{}
+	for pane, agent := range f.state().Agents {
+		if agent == nil {
+			continue
+		}
+		if other, taken := live[agent.Name]; taken {
+			t.Fatalf("agents on %s and %s share the live name %q", other, pane, agent.Name)
+		}
+		live[agent.Name] = pane
+	}
+	if len(live) != 3 {
+		t.Fatalf("live agents = %v, want the primary and two workers", live)
+	}
+	if _, ok := live[project.AgentName]; !ok {
+		t.Errorf("the primary's recorded name %q is not live: %v", project.AgentName, live)
+	}
+	if project.AgentName == first.AgentName || project.AgentName == second.AgentName {
+		t.Errorf("the primary shares a name with a worker: %q", project.AgentName)
+	}
+	if !herdr.ValidAgentName(project.AgentName) {
+		t.Errorf("primary name %q is not a legal Herdr agent name", project.AgentName)
+	}
+}
+
+func TestTakenAgentNameStaysActionable(t *testing.T) {
+	// A genuine collision stays a definite failure: attention naming the pane, the
+	// attempted command and Herdr's code, and no brief is sent.
+	f := newCoordFixture(t, fixturePlan{AgentStartError: "agent_name_taken"})
+	st, err := f.dispatch("one", "brief one", []string{"go test ./... ok"}, nil, nil, f.base)
+	if !errors.Is(err, herdr.ErrCLI) {
+		t.Fatalf("dispatch err = %v, want a Herdr CLI failure", err)
+	}
+	if st.Phase != task.WorktreeCreated {
+		t.Fatalf("phase = %q, want %q", st.Phase, task.WorktreeCreated)
+	}
+	if task.StageOf(st) != task.NeedsInput {
+		t.Errorf("stage = %q, want needs_input", task.StageOf(st))
+	}
+	for _, want := range []string{st.ID, st.LaunchPaneID, WorkerAgentName(st.ID), "agent_name_taken"} {
+		if !strings.Contains(st.Attention, want) {
+			t.Errorf("attention %q does not name %q", st.Attention, want)
+		}
+	}
+	if st.Blocker != "" {
+		t.Errorf("a definite start failure was recorded as terminal: %q", st.Blocker)
+	}
+	if len(f.prompts(st.PublicPaneID)) != 0 {
+		t.Error("a brief was sent although the agent never started")
+	}
+}
+
+func TestBindAdoptsTheRecordedPrimaryAgentOnARebind(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	project := f.mustBind()
+	if project.AgentName == "" {
+		t.Fatal("bind recorded no agent name")
+	}
+	before := f.countCalls("agent start")
+
+	// Re-binding the same repository adopts the live agent that is already running
+	// under the derived name instead of starting a second one.
+	again, err := f.bind("", "")
+	if err != nil {
+		t.Fatalf("rebind: %v", err)
+	}
+	if again.AgentName != project.AgentName {
+		t.Errorf("rebind recorded agent name %q, want the live %q", again.AgentName, project.AgentName)
+	}
+	if after := f.countCalls("agent start"); after != before {
+		t.Errorf("rebind called agent start %d more times, want none", after-before)
+	}
+	if got := f.state().Agents[project.LaunchPaneID]; got == nil || got.Name != project.AgentName {
+		t.Errorf("the live agent on %s = %+v, want the recorded name %q", project.LaunchPaneID, got, project.AgentName)
 	}
 }
 

@@ -112,6 +112,12 @@ var (
 
 var agentNamePattern = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,31}$`)
 
+// ValidAgentName reports whether name is a legal Herdr agent name: it must start
+// with a lower-case letter, continue with lower-case letters, digits, '_' or '-',
+// and be at most 32 characters. Herdr keeps live agent names unique, so a caller
+// that starts several agents in one session must derive distinct names.
+func ValidAgentName(name string) bool { return agentNamePattern.MatchString(name) }
+
 var validReadSources = map[string]bool{
 	"visible":          true,
 	"recent":           true,

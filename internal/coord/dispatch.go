@@ -622,12 +622,24 @@ func (c *Coordinator) startWorker(ctx context.Context, st task.Task) (task.Task,
 		paneID = resolved
 	}
 
-	if err := c.ensureAgent(ctx, paneID); err != nil {
+	name, err := c.ensureAgent(ctx, paneID, WorkerAgentName(st.ID))
+	if err != nil {
 		return c.failTask(ctx, st, isTerminal(err),
 			fmt.Errorf("task %s: pane %s: %w", st.ID, paneID, err))
 	}
+	if name == "" {
+		// Herdr reported no name (older response shape): keep the derived one.
+		name = WorkerAgentName(st.ID)
+	}
+	st, err = c.record(ctx, st, func(record *task.Task) error {
+		record.AgentName = name
+		return nil
+	}, "record the worker agent name")
+	if err != nil {
+		return c.failTask(ctx, st, true, err)
+	}
 
-	st, err := c.recordAgentStart(ctx, st, paneID)
+	st, err = c.recordAgentStart(ctx, st, paneID)
 	if err != nil {
 		return st, err
 	}
@@ -642,7 +654,6 @@ func (c *Coordinator) recordAgentStart(ctx context.Context, st task.Task, paneID
 	use := st
 	write := func(view agentView) error {
 		apply := func(record *task.Task) error {
-			record.AgentName = c.opts.AgentName
 			// The first identity Herdr reports is the binding's session identity;
 			// whichever form (id or session file) the bridge adopted first is kept.
 			if strings.TrimSpace(record.OMPSessionID) == "" {

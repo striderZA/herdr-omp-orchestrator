@@ -29,6 +29,8 @@ package coord
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -96,8 +98,12 @@ const (
 	defaultReadinessTimeout = 20 * time.Second
 	// defaultPollInterval is how often the readiness wait re-reads Herdr.
 	defaultPollInterval = 200 * time.Millisecond
-	// defaultAgentName is the Herdr agent name the coordinator starts.
-	defaultAgentName = "omp"
+	// defaultAgentKind is the Herdr agent kind the coordinator requires.
+	defaultAgentKind = "omp"
+	// primaryAgentPrefix and workerAgentPrefix keep the two roles' names disjoint:
+	// a worker's name is its task id, a primary's is derived from the project.
+	primaryAgentPrefix = "orch_p_"
+	agentNameLimit     = 32
 )
 
 // Task identities the coordinator generates. Herdr labels are never used as
@@ -126,8 +132,11 @@ type Options struct {
 	PollInterval time.Duration
 	// Git is the git executable. It defaults to "git".
 	Git string
-	// AgentName is the Herdr agent name to start. It defaults to "omp".
-	AgentName string
+	// AgentKind is the Herdr agent kind the coordinator requires and starts. It
+	// defaults to "omp". The name is derived per agent (PrimaryAgentName /
+	// WorkerAgentName): Herdr keeps live agent names unique, so one name for
+	// every agent would collide with the primary that is already running.
+	AgentKind string
 }
 
 // Coordinator is the only writer of dispatch facts. It owns no private state:
@@ -163,8 +172,8 @@ func New(store *state.Store, client *herdr.Client, opts Options) (*Coordinator, 
 	if strings.TrimSpace(opts.Git) == "" {
 		opts.Git = "git"
 	}
-	if strings.TrimSpace(opts.AgentName) == "" {
-		opts.AgentName = defaultAgentName
+	if strings.TrimSpace(opts.AgentKind) == "" {
+		opts.AgentKind = defaultAgentKind
 	}
 	return &Coordinator{store: store, herdr: client, opts: opts, random: fillRandom}, nil
 }
@@ -234,13 +243,23 @@ func (c *Coordinator) Bind(ctx context.Context, repo, workspaceID, rootPaneID st
 		CurrentWorkspaceID: workspace,
 		LaunchPaneID:       paneID,
 		PublicPaneID:       paneID,
-		AgentName:          c.opts.AgentName,
+		AgentName:          PrimaryAgentName(root),
 	}
 	if err := c.store.CreateProject(ctx, project); err != nil {
 		return task.Project{}, fmt.Errorf("record the primary for %s: %w", root, err)
 	}
-	if err := c.ensureAgent(ctx, paneID); err != nil {
-		return project, c.settleProject(ctx, root, false, err)
+	name, err := c.ensureAgent(ctx, paneID, PrimaryAgentName(root))
+	if err != nil {
+		return project, c.settleProject(ctx, root, isTerminal(err), err)
+	}
+	if name != "" {
+		project.AgentName = name
+		if err := c.store.UpdateProject(ctx, root, func(next *task.Project) error {
+			next.AgentName = name
+			return nil
+		}); err != nil {
+			return project, c.settleProject(ctx, root, true, err)
+		}
 	}
 	view, err := c.awaitAgentReady(ctx, paneID, root, nil, func(view agentView) error {
 		return c.store.UpdateProject(ctx, root, func(next *task.Project) error {
@@ -293,7 +312,7 @@ func (c *Coordinator) reopenPrimary(ctx context.Context, existing task.Project) 
 		return existing, c.settleProject(ctx, existing.Key, true,
 			fmt.Errorf("%w: the recorded primary pane %s works in %s, not the bound repository %s",
 				ErrPrimaryNotLive, paneID, pane.Cwd, existing.Key))
-	case paneHostsAgent(pane) && !strings.EqualFold(pane.Agent, c.opts.AgentName):
+	case paneHostsAgent(pane) && !strings.EqualFold(pane.Agent, c.opts.AgentKind):
 		return existing, c.settleProject(ctx, existing.Key, true,
 			fmt.Errorf("%w: the recorded primary pane %s now runs %q", ErrPrimaryNotLive, paneID, pane.Agent))
 	}
@@ -311,8 +330,18 @@ func (c *Coordinator) reopenPrimary(ctx context.Context, existing task.Project) 
 		existing.PublicPaneID = pane.PaneID
 		existing.CurrentWorkspaceID = pane.WorkspaceID
 	}
-	if err := c.ensureAgent(ctx, paneID); err != nil {
+	name, err := c.ensureAgent(ctx, paneID, PrimaryAgentName(existing.Key))
+	if err != nil {
 		return existing, c.settleProject(ctx, existing.Key, isTerminal(err), err)
+	}
+	if name != "" && name != existing.AgentName {
+		if err := c.store.UpdateProject(ctx, existing.Key, func(next *task.Project) error {
+			next.AgentName = name
+			return nil
+		}); err != nil {
+			return existing, c.settleProject(ctx, existing.Key, true, err)
+		}
+		existing.AgentName = name
 	}
 	workspaces := nonEmpty(existing.RepoWorkspaceID, existing.CurrentWorkspaceID)
 	view, err := c.awaitAgentReady(ctx, paneID, existing.Key, workspaces, func(view agentView) error {
@@ -352,6 +381,33 @@ func (c *Coordinator) settleProject(ctx context.Context, key string, terminal bo
 		return errors.Join(cause, err)
 	}
 	return cause
+}
+
+// PrimaryAgentName is the stable Herdr agent name of one repository's primary.
+//
+// It is derived from the canonical project key, so re-binding the same repository
+// adopts the same agent instead of starting a second one, and two projects never
+// share a name. The result is a legal Herdr name (see herdr.ValidAgentName).
+func PrimaryAgentName(projectKey string) string {
+	sum := sha256.Sum256([]byte(normalizedKey(projectKey)))
+	return primaryAgentPrefix + hex.EncodeToString(sum[:4])
+}
+
+// WorkerAgentName is the Herdr agent name of one worker. The task id is already
+// unique and stable, so using it as the name cannot collide with another worker,
+// and Herdr's live agent name identifies the task it belongs to.
+func WorkerAgentName(taskID string) string {
+	name := strings.ToLower(strings.TrimSpace(taskID))
+	if name == "" || !herdr.ValidAgentName(name) {
+		return ""
+	}
+	return name
+}
+
+// normalizedKey is the project key in the one spelling the name derivation uses,
+// so a differently cased path names the same primary.
+func normalizedKey(projectKey string) string {
+	return strings.ToLower(filepath.ToSlash(filepath.Clean(strings.TrimSpace(projectKey))))
 }
 
 // SessionHint is what a bound primary reports about its OMP session: the
@@ -690,39 +746,57 @@ func (c *Coordinator) agentGet(ctx context.Context, target string) (agentView, e
 	return view, nil
 }
 
-// ensureAgent makes sure exactly one OMP agent runs in pane. It adopts a live
-// agent instead of starting a second one, and it only starts an agent when
-// Herdr authoritatively reports that the pane has none.
-func (c *Coordinator) ensureAgent(ctx context.Context, paneID string) error {
+// ensureAgent makes sure exactly one agent of the required kind runs in pane, and
+// returns the name Herdr reports for it.
+//
+// It adopts a live agent instead of starting a second one — including a
+// re-bind, where the recorded agent is already running under the name this
+// derivation produces — and records the name Herdr reports rather than assuming
+// the one that was asked for. A name Herdr has already given to another live
+// agent stays a definite failure: the collision is real and a human has to
+// resolve it, so it is never retried blindly.
+func (c *Coordinator) ensureAgent(ctx context.Context, paneID, name string) (string, error) {
 	view, err := c.agentGet(ctx, paneID)
 	switch {
 	case err == nil:
-		if !strings.EqualFold(view.Agent.Agent, c.opts.AgentName) {
-			return fmt.Errorf("%w: pane %q already runs %q, not %q",
-				ErrAgentChanged, paneID, view.Agent.Agent, c.opts.AgentName)
+		if !strings.EqualFold(view.Agent.Agent, c.opts.AgentKind) {
+			return "", fmt.Errorf("%w: pane %q already runs %q, not %q",
+				ErrAgentChanged, paneID, view.Agent.Agent, c.opts.AgentKind)
 		}
-		return nil
+		return liveAgentName(view), nil
 	case isMissingTarget(err):
 		// No agent in this pane: starting one is the next step.
 	default:
-		return fmt.Errorf("the pane's agent could not be read before starting one: %w", err)
+		return "", fmt.Errorf("the pane's agent could not be read before starting one: %w", err)
 	}
 
+	if !herdr.ValidAgentName(name) {
+		return "", fmt.Errorf("%w: %q is not a legal Herdr agent name", ErrInvalidRequest, name)
+	}
 	callCtx, cancel := c.callContext(ctx)
-	_, startErr := c.herdr.AgentStart(callCtx, c.opts.AgentName, paneID)
+	started, startErr := c.herdr.AgentStart(callCtx, name, paneID)
 	cancel()
 	if startErr == nil {
 		// The client already validated that the started agent sits on this pane.
-		return nil
+		return liveAgentName(agentView{Agent: started.Agent}), nil
 	}
 	if !errors.Is(startErr, herdr.ErrAmbiguous) {
-		return fmt.Errorf("start %q on pane %q: %w", c.opts.AgentName, paneID, startErr)
+		return "", fmt.Errorf("start %q on pane %q: %w", name, paneID, startErr)
 	}
 	// The start may have taken effect. Adopt a live agent instead of repeating.
-	if view, readErr := c.agentGet(ctx, paneID); readErr == nil && strings.EqualFold(view.Agent.Agent, c.opts.AgentName) {
-		return nil
+	if view, readErr := c.agentGet(ctx, paneID); readErr == nil && strings.EqualFold(view.Agent.Agent, c.opts.AgentKind) {
+		return liveAgentName(view), nil
 	}
-	return fmt.Errorf("start %q on pane %q: %w", c.opts.AgentName, paneID, startErr)
+	return "", fmt.Errorf("start %q on pane %q: %w", name, paneID, startErr)
+}
+
+// liveAgentName is the name Herdr reports for a live agent, falling back to the
+// recorded role name when the response carries none.
+func liveAgentName(view agentView) string {
+	if name := strings.TrimSpace(view.Agent.Name); name != "" {
+		return name
+	}
+	return ""
 }
 
 // awaitAgentReady waits until Herdr reports the pane's native session reference
@@ -753,9 +827,9 @@ func (c *Coordinator) awaitAgentReady(
 		switch {
 		case err == nil:
 			last, lastErr = view, nil
-			if !strings.EqualFold(view.Agent.Agent, c.opts.AgentName) {
+			if !strings.EqualFold(view.Agent.Agent, c.opts.AgentKind) {
 				return view, fmt.Errorf("%w: pane %q runs %q, not %q",
-					ErrAgentChanged, paneID, view.Agent.Agent, c.opts.AgentName)
+					ErrAgentChanged, paneID, view.Agent.Agent, c.opts.AgentKind)
 			}
 			if strings.TrimSpace(checkout) != "" && !samePath(view.Agent.Cwd, checkout) {
 				return view, fmt.Errorf("%w: pane %q works in %s, not the recorded checkout %s",
