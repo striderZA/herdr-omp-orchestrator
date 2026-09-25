@@ -89,6 +89,9 @@ type fixturePlan struct {
 	// AnnounceSessionMismatch makes the extension announce a different session
 	// than the one Herdr reports for the pane.
 	AnnounceSessionMismatch bool `json:"announce_session_mismatch"`
+	// AgentReadText is what `agent read` prints for a pane: the terminal text the
+	// primary would show a user. An empty value prints a stable placeholder.
+	AgentReadText string `json:"agent_read_text"`
 	// AdoptDuringStart makes the extension (through the bridge) adopt its
 	// announced session while `agent start` is still answering, which is what
 	// bumps the task's revision between the coordinator's read and its write.
@@ -206,6 +209,15 @@ func runFixture() int {
 		return fixtureAgentStart(dir, plan, &state, argv)
 	case "agent prompt":
 		return fixtureAgentPrompt(dir, plan, &state, argv)
+	case "agent read":
+		text := plan.AgentReadText
+		if text == "" {
+			text = "worker terminal\n> waiting for instructions"
+		}
+		if _, err := os.Stdout.WriteString(text); err != nil {
+			return 30
+		}
+		return 0
 	default:
 		return fixtureUnexpected(argv, "unsupported command")
 	}
@@ -2977,6 +2989,214 @@ func TestDrainNeverProvisionsATaskAnotherCallerOwns(t *testing.T) {
 	}
 	if created := f.countCalls("worktree create"); created != 1 {
 		t.Errorf("worktree create calls = %d, want exactly 1", created)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// adjudicating an ambiguous brief submission
+// ---------------------------------------------------------------------------
+
+// ambiguousBrief produces the stuck state a real ambiguous submission leaves: an
+// AgentStarted task whose blocker is that submission, with a live worker.
+func (f *coordFixture) ambiguousBrief(title string) task.Task {
+	f.t.Helper()
+	f.updatePlan(func(p *fixturePlan) { p.PromptAmbiguous = true })
+	st, err := f.dispatchSpec(f.coord, spec{title: title, checks: []string{"go test ./... ok"}})
+	if !errors.Is(err, herdr.ErrAmbiguous) {
+		f.t.Fatalf("dispatch err = %v, want an ambiguous submission", err)
+	}
+	if !f.isAdjudicable(st) {
+		f.t.Fatalf("task %s is not in the ambiguous state: phase=%q blocker=%q", st.ID, st.Phase, st.Blocker)
+	}
+	f.updatePlan(func(p *fixturePlan) { p.PromptAmbiguous = false })
+	return f.block(st, func(next *task.Task) {
+		next.Attention = "task 5's question marker stays untouched"
+	})
+}
+
+// isAdjudicable asks the coordinator whether the task carries the ambiguous brief
+// blocker, through the same predicate the adjudication uses.
+func (f *coordFixture) isAdjudicable(st task.Task) bool {
+	f.t.Helper()
+	return IsAmbiguousBriefTask(st)
+}
+
+func TestAdjudicateBriefDeliveredRecordsTheSubmissionWithoutPrompting(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	st := f.ambiguousBrief("one")
+	before := f.countCalls("agent prompt")
+
+	evidence, text, err := f.coord.BriefInspection(context.Background(), st.ID)
+	if err != nil {
+		t.Fatalf("BriefInspection: %v", err)
+	}
+	if text == "" || evidence.PaneID != st.PublicPaneID || evidence.Digest == "" {
+		t.Fatalf("inspection = (%+v, %q), want the pane and the text", evidence, text)
+	}
+
+	decided, err := f.coord.AdjudicateBrief(context.Background(), st.ID, st.Revision, BriefDelivered, evidence)
+	if err != nil {
+		t.Fatalf("AdjudicateBrief(delivered): %v", err)
+	}
+	// The submission is recorded as delivered and nothing was sent again.
+	if decided.Phase != task.PromptSubmitted {
+		t.Errorf("phase = %q, want %q", decided.Phase, task.PromptSubmitted)
+	}
+	if decided.Blocker != "" {
+		t.Errorf("the ambiguity blocker survived the adjudication: %q", decided.Blocker)
+	}
+	if decided.Attention != "task 5's question marker stays untouched" {
+		t.Errorf("attention = %q, want the worker's own question untouched", decided.Attention)
+	}
+	if got := f.countCalls("agent prompt"); got != before {
+		t.Errorf("agent prompt calls = %d, want %d: a delivered brief was submitted again", got, before)
+	}
+	// The worker's question still awaits the user, so the stage stays Needs input
+	// until Task 5's answer machinery resolves it; the adjudication only recorded
+	// the submission, it did not answer anything.
+	if got := task.StageOf(decided); got != task.NeedsInput {
+		t.Errorf("stage = %q, want needs_input while the worker's question stands", got)
+	}
+	answered := f.block(decided, func(next *task.Task) {
+		next.Attention = ""
+	})
+	if got := task.StageOf(answered); got != task.Running {
+		t.Errorf("stage after the question is answered = %q, want running", got)
+	}
+	// The decision is durable and auditable.
+	notes, err := f.store.PendingInbox(context.Background(), f.root)
+	if err != nil {
+		t.Fatalf("PendingInbox: %v", err)
+	}
+	found := false
+	for _, note := range notes {
+		if note.TaskID == st.ID && strings.Contains(note.Summary, "delivered") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("no durable note records the adjudication: %+v", notes)
+	}
+	// A second decision has nothing to adjudicate.
+	if _, err := f.coord.AdjudicateBrief(context.Background(), st.ID, decided.Revision, BriefDelivered, evidence); !errors.Is(err, ErrNotAdjudicable) {
+		t.Errorf("second adjudication err = %v, want ErrNotAdjudicable", err)
+	}
+}
+
+func TestAdjudicateBriefNotDeliveredResumesExactlyOnce(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	st := f.ambiguousBrief("one")
+	before := f.countCalls("agent prompt")
+
+	evidence, _, err := f.coord.BriefInspection(context.Background(), st.ID)
+	if err != nil {
+		t.Fatalf("BriefInspection: %v", err)
+	}
+	decided, err := f.coord.AdjudicateBrief(context.Background(), st.ID, st.Revision, BriefNotDelivered, evidence)
+	if err != nil {
+		t.Fatalf("AdjudicateBrief(not_delivered): %v", err)
+	}
+	if decided.Phase != task.PromptSubmitted {
+		t.Fatalf("phase = %q, want %q", decided.Phase, task.PromptSubmitted)
+	}
+	if decided.Blocker != "" {
+		t.Errorf("the ambiguity blocker survived the adjudication: %q", decided.Blocker)
+	}
+	if decided.Attention == "" {
+		t.Error("the adjudication cleared an attention it does not own")
+	}
+	if got := f.countCalls("agent prompt"); got != before+1 {
+		t.Errorf("agent prompt calls = %d, want %d: the resume submitted the brief once", got, before+1)
+	}
+	// Once: another decision finds nothing to adjudicate and sends nothing.
+	if _, err := f.coord.AdjudicateBrief(context.Background(), st.ID, decided.Revision, BriefNotDelivered, evidence); !errors.Is(err, ErrNotAdjudicable) {
+		t.Fatalf("second adjudication err = %v, want ErrNotAdjudicable", err)
+	}
+	if got := f.countCalls("agent prompt"); got != before+1 {
+		t.Errorf("agent prompt calls = %d, want no further submission", got)
+	}
+}
+
+func TestAdjudicateBriefRefusesChangedOrForeignEvidence(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	st := f.ambiguousBrief("one")
+	ctx := context.Background()
+	evidence, _, err := f.coord.BriefInspection(ctx, st.ID)
+	if err != nil {
+		t.Fatalf("BriefInspection: %v", err)
+	}
+
+	// Another pane: the decision must be about the worker the user inspected.
+	foreign := evidence
+	foreign.PaneID = "w9:p9"
+	if _, err := f.coord.AdjudicateBrief(ctx, st.ID, st.Revision, BriefDelivered, foreign); !errors.Is(err, ErrEvidenceChanged) {
+		t.Errorf("foreign pane err = %v, want ErrEvidenceChanged", err)
+	}
+	// A stale revision: something changed the task between the inspection and the
+	// decision, so the decision may no longer describe it.
+	f.block(st, func(next *task.Task) { next.Activity = "moved on" })
+	if _, err := f.coord.AdjudicateBrief(ctx, st.ID, st.Revision, BriefDelivered, evidence); !errors.Is(err, state.ErrConflict) {
+		t.Errorf("stale revision err = %v, want state.ErrConflict", err)
+	}
+	current, err := f.store.Task(ctx, st.ID)
+	if err != nil {
+		t.Fatalf("Task: %v", err)
+	}
+	// The terminal moved on since the inspection: re-reading yields a different
+	// digest, so the decision is refused.
+	f.updatePlan(func(p *fixturePlan) { p.AgentReadText = "the worker is now asking a question" })
+	if _, err := f.coord.AdjudicateBrief(ctx, st.ID, current.Revision, BriefDelivered, evidence); !errors.Is(err, ErrEvidenceChanged) {
+		t.Errorf("moved-on terminal err = %v, want ErrEvidenceChanged", err)
+	}
+	// A decision that names no decision is a caller error.
+	if _, err := f.coord.AdjudicateBrief(ctx, st.ID, current.Revision, "maybe", evidence); !errors.Is(err, ErrInvalidRequest) {
+		t.Errorf("unknown decision err = %v, want ErrInvalidRequest", err)
+	}
+
+	// Nothing was applied by any of those refusals.
+	after, err := f.store.Task(ctx, st.ID)
+	if err != nil {
+		t.Fatalf("Task: %v", err)
+	}
+	if after.Phase != task.AgentStarted || after.Blocker != st.Blocker {
+		t.Errorf("a refused adjudication changed the task: %+v", after)
+	}
+}
+
+func TestAdjudicateBriefRefusesEveryOtherBlockerAndPhase(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	ctx := context.Background()
+	checks := []string{"go test ./... ok"}
+
+	// A running task with no blocker is not adjudicable.
+	running, err := f.dispatchSpec(f.coord, spec{title: "running", checks: checks})
+	if err != nil {
+		t.Fatalf("dispatch running: %v", err)
+	}
+	if _, err := f.coord.AdjudicateBrief(ctx, running.ID, running.Revision, BriefDelivered, BriefEvidence{PaneID: running.PublicPaneID, Digest: "x"}); !errors.Is(err, ErrNotAdjudicable) {
+		t.Errorf("running task err = %v, want ErrNotAdjudicable", err)
+	}
+	// Neither is Task 5's input-attempt marker: a different feature owns it.
+	asked := f.block(running, func(next *task.Task) {
+		next.Blocker = "input attempt: answer abc123 - 1790366337785"
+		next.Phase = task.AgentStarted
+	})
+	evidence := BriefEvidence{PaneID: asked.PublicPaneID, Digest: "x"}
+	if _, err := f.coord.AdjudicateBrief(ctx, asked.ID, asked.Revision, BriefDelivered, evidence); !errors.Is(err, ErrNotAdjudicable) {
+		t.Errorf("input-attempt marker err = %v, want ErrNotAdjudicable", err)
+	}
+	// And an ambiguity from another step is not the brief's: the predicate is
+	// exact, so only this task's own submission failure is accepted.
+	other := f.block(asked, func(next *task.Task) {
+		next.Blocker = "task " + next.ID + " could not create the worktree: coord: the step's outcome could not be identified"
+	})
+	evidence = BriefEvidence{PaneID: other.PublicPaneID, Digest: "x"}
+	if _, err := f.coord.AdjudicateBrief(ctx, other.ID, other.Revision, BriefDelivered, evidence); !errors.Is(err, ErrNotAdjudicable) {
+		t.Errorf("other step's ambiguity err = %v, want ErrNotAdjudicable", err)
+	}
+	// The inspection itself refuses outside the ambiguous state.
+	if _, _, err := f.coord.BriefInspection(ctx, running.ID); !errors.Is(err, ErrNotAdjudicable) {
+		t.Errorf("BriefInspection(running) err = %v, want ErrNotAdjudicable", err)
 	}
 }
 

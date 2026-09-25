@@ -848,6 +848,230 @@ func isNonDelivery(err error) bool {
 }
 
 // ---------------------------------------------------------------------------
+// adjudicating an ambiguous brief submission
+// ---------------------------------------------------------------------------
+
+// Errors specific to the brief adjudication. They live here rather than with the
+// other sentinels because this surface owns them.
+var (
+	// ErrNotAdjudicable reports a task that carries no ambiguous brief submission
+	// to decide, so nothing may be recorded for it.
+	ErrNotAdjudicable = errors.New("coord: the task has no ambiguous brief submission")
+	// ErrEvidenceChanged reports that what a user inspected is not what the task
+	// records now, so the decision cannot be applied to it.
+	ErrEvidenceChanged = errors.New("coord: the inspected evidence no longer matches")
+)
+
+// BriefDecision is a user's adjudication of an ambiguous brief submission: the
+// one state an ambiguous submission leaves which nothing else can resolve.
+type BriefDecision string
+
+const (
+	// BriefDelivered records that the brief did reach the worker. The task moves to
+	// prompt_submitted without another submission.
+	BriefDelivered BriefDecision = "delivered"
+	// BriefNotDelivered records that the brief never reached the worker. The
+	// ambiguity blocker is cleared and the recorded phase resumes once, which
+	// submits the brief again.
+	BriefNotDelivered BriefDecision = "not_delivered"
+)
+
+// BriefEvidence is what a user was shown and answered about: the worker's pane and
+// the digest of the terminal text the primary displayed for that pane. The
+// coordinator re-reads the same pane and requires the same digest, so a decision
+// can never be applied to a terminal that has moved on.
+type BriefEvidence struct {
+	PaneID string `json:"paneId"`
+	Digest string `json:"digest"`
+}
+
+// IsAmbiguousBriefTask reports whether a task carries exactly the blocker an
+// ambiguous brief submission leaves: the task is at AgentStarted, the blocker is
+// this task's own submission failure, and it is the ambiguity kind.
+//
+// It is deliberately exact. Another step's ambiguity, Task 5's `input attempt:`
+// marker, a question's attention and an empty blocker all report false, so an
+// adjudication can never clear a fact it does not own.
+func IsAmbiguousBriefTask(st task.Task) bool {
+	if st.Phase != task.AgentStarted || strings.TrimSpace(st.Blocker) == "" {
+		return false
+	}
+	prefix := fmt.Sprintf("task %s could not submit the brief: ", st.ID)
+	return strings.HasPrefix(st.Blocker, prefix) && strings.Contains(st.Blocker, ErrAmbiguousStep.Error())
+}
+
+// BriefInspection reads the evidence a user has to see before deciding: the
+// text of the task's current worker pane, exactly as the primary will show it,
+// together with the handle the decision must be made with. It is read-only, and it
+// refuses anything that is not an ambiguous brief submission.
+func (c *Coordinator) BriefInspection(ctx context.Context, taskID string) (BriefEvidence, string, error) {
+	st, err := c.store.Task(ctx, taskID)
+	if err != nil {
+		return BriefEvidence{}, "", err
+	}
+	if !IsAmbiguousBriefTask(st) {
+		return BriefEvidence{}, "", fmt.Errorf("%w: task %s is at phase %s with no ambiguous brief submission",
+			ErrNotAdjudicable, st.ID, st.Phase)
+	}
+	paneID := strings.TrimSpace(st.PublicPaneID)
+	if paneID == "" {
+		paneID = strings.TrimSpace(st.LaunchPaneID)
+	}
+	if paneID == "" {
+		return BriefEvidence{}, "", fmt.Errorf("%w: task %s records no pane to inspect", ErrEvidenceChanged, st.ID)
+	}
+	text, err := c.readAgentText(ctx, paneID)
+	if err != nil {
+		return BriefEvidence{}, "", fmt.Errorf("%w: the worker's terminal could not be read: %v", ErrEvidenceChanged, err)
+	}
+	return BriefEvidence{PaneID: paneID, Digest: digestDialog(text)}, text, nil
+}
+
+// AdjudicateBrief records a user's decision about an ambiguous brief submission.
+//
+// It is the only way out of that state, so it is narrow on purpose:
+//
+//   - the task must still be at AgentStarted with the specific ambiguous
+//     submission blocker, at exactly the revision the user inspected (a compare
+//     and swap, so a task that changed under the decision is refused);
+//   - the recorded pane must still run the worker this task recorded (its name and
+//     its native session identity), so a pane now held by somebody else refuses;
+//   - the caller must present the pane and the digest it showed the user, and the
+//     coordinator re-reads that pane and requires the same digest — a terminal that
+//     moved on refuses;
+//   - `BriefDelivered` records the submission (Phase = prompt_submitted) and sends
+//     nothing; `BriefNotDelivered` clears only the ambiguity blocker and resumes the
+//     recorded phase once.
+//
+// It never touches the task's Attention (another feature owns that) and it is never
+// called automatically or from a hook: only a user's answer reaches it.
+func (c *Coordinator) AdjudicateBrief(
+	ctx context.Context,
+	taskID string,
+	expectedRevision int64,
+	decision BriefDecision,
+	observed BriefEvidence,
+) (task.Task, error) {
+	switch decision {
+	case BriefDelivered, BriefNotDelivered:
+	default:
+		return task.Task{}, fmt.Errorf("%w: %q is not a brief decision", ErrInvalidRequest, decision)
+	}
+	st, err := c.store.Task(ctx, taskID)
+	if err != nil {
+		return task.Task{}, err
+	}
+	if !IsAmbiguousBriefTask(st) {
+		return task.Task{}, fmt.Errorf("%w: task %s is at phase %s with no ambiguous brief submission",
+			ErrNotAdjudicable, st.ID, st.Phase)
+	}
+
+	// Provenance: the pane the user looked at must be this task's worker, and the
+	// worker must still be the process the task recorded.
+	paneID := strings.TrimSpace(st.PublicPaneID)
+	if paneID == "" {
+		paneID = strings.TrimSpace(st.LaunchPaneID)
+	}
+	if paneID == "" || observed.PaneID != paneID {
+		return st, fmt.Errorf("%w: task %s records pane %q, not the inspected %q",
+			ErrEvidenceChanged, st.ID, paneID, observed.PaneID)
+	}
+	if err := c.confirmWorkerIdentity(ctx, st, paneID); err != nil {
+		return st, err
+	}
+	text, err := c.readAgentText(ctx, paneID)
+	if err != nil {
+		return st, fmt.Errorf("%w: the worker's terminal could not be re-read: %v", ErrEvidenceChanged, err)
+	}
+	if digest := digestDialog(text); observed.Digest == "" || digest != observed.Digest {
+		return st, fmt.Errorf("%w: pane %s shows something other than what was inspected (digest %s, inspected %s)",
+			ErrEvidenceChanged, paneID, digest, observed.Digest)
+	}
+
+	// Apply on the inspected revision, re-checking the state inside the compare and
+	// swap so a task that changed under the decision is refused rather than adjusted.
+	decided, err := c.store.UpdateTask(ctx, st.ID, expectedRevision, func(next *task.Task) error {
+		if !IsAmbiguousBriefTask(*next) {
+			return fmt.Errorf("%w: task %s changed while it was being adjudicated", ErrNotAdjudicable, next.ID)
+		}
+		next.Blocker = ""
+		if decision == BriefDelivered {
+			next.Phase = task.PromptSubmitted
+		}
+		return nil
+	})
+	if err != nil {
+		return st, err
+	}
+	summary := fmt.Sprintf("the user decided the brief for task %s was %s after inspecting pane %s",
+		decided.ID, decision, paneID)
+	if err := c.notify(ctx, decided.ProjectKey, decided.ID, "adjudication",
+		summary, "recorded by the user"); err != nil {
+		return decided, err
+	}
+	if decision == BriefDelivered {
+		return decided, nil
+	}
+	// Not delivered: resume the recorded phase exactly once. The phase owns the
+	// task's provisioning slot, so nothing has to be claimed again.
+	provisioned, err := c.provision(ctx, decided)
+	if err != nil {
+		return provisioned, err
+	}
+	return provisioned, nil
+}
+
+// confirmWorkerIdentity requires the pane to still run the worker this task
+// recorded: the recorded agent name (when there is one) and the recorded native
+// session identity, compared in either form (an id or a session file path).
+func (c *Coordinator) confirmWorkerIdentity(ctx context.Context, st task.Task, paneID string) error {
+	view, err := c.agentGet(ctx, paneID)
+	if err != nil {
+		return fmt.Errorf("%w: the worker on pane %s could not be read: %v", ErrEvidenceChanged, paneID, err)
+	}
+	if view.RefErr != nil {
+		return fmt.Errorf("%w: pane %s reports a session this build cannot read: %v", ErrEvidenceChanged, paneID, view.RefErr)
+	}
+	if name := strings.TrimSpace(st.AgentName); name != "" && !strings.EqualFold(strings.TrimSpace(view.Agent.Name), name) {
+		return fmt.Errorf("%w: pane %s now runs %q, not the recorded worker %q",
+			ErrEvidenceChanged, paneID, view.Agent.Name, name)
+	}
+	if recorded := strings.TrimSpace(st.OMPSessionID); recorded != "" {
+		if !view.HasRef || !sameSessionIdentity(recorded, view.Ref.Value) {
+			return fmt.Errorf("%w: pane %s now reports session %q, not the recorded %q",
+				ErrEvidenceChanged, paneID, view.Ref.Value, recorded)
+		}
+	}
+	return nil
+}
+
+// sameSessionIdentity compares a recorded session identity with one Herdr reports:
+// the same token, or the same file when either side names a path. Both values come
+// from Herdr, so an exact match is the normal case and the path form only tolerates
+// separator and case differences a move or a restore can introduce.
+func sameSessionIdentity(recorded, reported string) bool {
+	recorded, reported = strings.TrimSpace(recorded), strings.TrimSpace(reported)
+	if recorded == "" || reported == "" {
+		return false
+	}
+	if strings.EqualFold(recorded, reported) {
+		return true
+	}
+	if strings.ContainsAny(recorded, `/\`) || strings.ContainsAny(reported, `/\`) {
+		return samePath(recorded, reported)
+	}
+	return false
+}
+
+// readAgentText reads the worker's visible terminal, the same way the primary's
+// approval surface does: a passive read that works for a blocked full-screen agent.
+func (c *Coordinator) readAgentText(ctx context.Context, paneID string) (string, error) {
+	callCtx, cancel := c.callContext(ctx)
+	defer cancel()
+	return c.herdr.AgentRead(callCtx, paneID, herdr.AgentReadOptions{Source: "visible"})
+}
+
+// ---------------------------------------------------------------------------
 // durable outcomes
 // ---------------------------------------------------------------------------
 
