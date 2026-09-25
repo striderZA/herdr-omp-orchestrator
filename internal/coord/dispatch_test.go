@@ -2867,6 +2867,57 @@ func TestResumeReusesTheClaimACrashLeft(t *testing.T) {
 	}
 }
 
+func TestDrainRetriesARetryableAttentionAndNeverABlocker(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{WorktreeCreateError: "not_git_worktree"})
+	checks := []string{"go test ./... ok"}
+	failed, err := f.dispatchSpec(f.coord, spec{title: "one", checks: checks})
+	if !errors.Is(err, herdr.ErrCLI) {
+		t.Fatalf("dispatch err = %v, want a Herdr CLI failure", err)
+	}
+	if failed.Attention == "" || failed.Blocker != "" || failed.Phase != task.Intent {
+		t.Fatalf("failed task = %+v, want a retryable attention at intent", failed)
+	}
+	// A failed step that recorded nothing gives its slot back, so the queue can
+	// still make progress while this task waits for its cause to be fixed.
+	if slots, err := f.store.ProvisioningSlots(context.Background(), f.root); err != nil || slots != 0 {
+		t.Fatalf("ProvisioningSlots = (%d, %v), want the slot released", slots, err)
+	}
+
+	// The cause is fixed and nothing resumes the task explicitly: the drain does,
+	// and the retryable reason must not outlive the retry that mended it.
+	f.updatePlan(func(p *fixturePlan) { p.WorktreeCreateError = "" })
+	drained, err := f.coord.DrainQueued(context.Background(), f.root)
+	if err != nil {
+		t.Fatalf("DrainQueued: %v", err)
+	}
+	if len(drained) != 1 || drained[0].ID != failed.ID {
+		t.Fatalf("DrainQueued = %+v, want the failed task %s", drained, failed.ID)
+	}
+	if drained[0].Attention != "" {
+		t.Errorf("attention survived the successful retry: %q", drained[0].Attention)
+	}
+	if got := task.StageOf(drained[0]); got != task.Running {
+		t.Errorf("stage = %q, want running", got)
+	}
+
+	// A blocker is never retried by a drain: it is a decision only a human makes.
+	blocked := f.mustDispatch("two", "brief two")
+	blocked = f.block(blocked, func(next *task.Task) {
+		next.Phase = task.Intent
+		next.Blocker = "ambiguous, a human decides"
+	})
+	if drained, err := f.coord.DrainQueued(context.Background(), f.root); err != nil || len(drained) != 0 {
+		t.Fatalf("DrainQueued with a blocked task = (%v, %v), want no progress", drained, err)
+	}
+	after, err := f.store.Task(context.Background(), blocked.ID)
+	if err != nil {
+		t.Fatalf("Task: %v", err)
+	}
+	if after.Blocker != "ambiguous, a human decides" || after.Phase != task.Intent {
+		t.Errorf("a blocker was touched by the drain: %+v", after)
+	}
+}
+
 func TestDispatchToleratesTheBridgeAdoptingTheSessionFirst(t *testing.T) {
 	f := newCoordFixture(t, fixturePlan{AdoptBeforeRecord: true})
 	st, err := f.dispatch("one", "brief one", []string{"go test ./... ok"}, nil, nil, f.base)

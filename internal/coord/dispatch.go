@@ -471,6 +471,19 @@ func (c *Coordinator) drainQueued(ctx context.Context, projectKey, excluded stri
 			// reason, and the ones before it were not eligible.
 			return drained
 		}
+		if cand.Attention != "" {
+			// Retrying a step retires the retryable reason it failed with: an
+			// attention that outlived its retry would leave a running task looking
+			// like it still needs a human. A blocker is never touched.
+			cleared, err := c.record(ctx, cand, func(next *task.Task) error {
+				next.Attention = ""
+				return nil
+			}, "clear the retryable attention")
+			if err != nil {
+				continue
+			}
+			cand = cleared
+		}
 		provisioned, err := c.provision(ctx, cand)
 		if err != nil {
 			// The task recorded its own attention or blocker; the next candidate can
