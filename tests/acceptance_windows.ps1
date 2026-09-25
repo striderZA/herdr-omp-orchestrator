@@ -415,6 +415,9 @@ function Add-Assertion {
         at       = (Get-Date).ToUniversalTime().ToString('o')
     }
     [void]$script:Assertions.Add($record)
+    try {
+        Add-Content -LiteralPath $script:ReportText -Value ("{0,-7} {1,-6} {2} {3}" -f $record.status, $record.id, $record.task, $record.what) -ErrorAction SilentlyContinue
+    } catch { }
     switch ($Status) {
         'PASS' { $script:Passed++; Write-Host ("[PASS] {0} {1}" -f $Id, $What) -ForegroundColor Green }
         'INFO' { Write-Host ("[INFO] {0} {1}" -f $Id, $What) -ForegroundColor Cyan }
@@ -551,6 +554,11 @@ function Write-Step {
     param([string]$Text)
     Write-Host ''
     Write-Host ("=== {0}" -f $Text) -ForegroundColor White
+    # The journal survives a hard host exit (which skips finally), so a failed
+    # run still shows the last step it reached.
+    try {
+        Add-Content -LiteralPath $script:ReportText -Value ("--- step: {0} {1}" -f (Get-Date).ToUniversalTime().ToString('o'), $Text) -ErrorAction SilentlyContinue
+    } catch { }
 }
 
 function Wait-Until {
@@ -1354,23 +1362,26 @@ function Invoke-Link {
 # ---------------------------------------------------------------------------
 
 function Start-RunServer {
+    <#
+        Starts the isolated session's headless server as a child of this script.
+        The child inherits this console on purpose: no OutputDataReceived /
+        ErrorDataReceived handlers are attached, because those run on
+        thread-pool threads where an exception is not covered by this script's
+        try/finally and terminates the whole Windows PowerShell process without
+        running any cleanup (leaving the session server and the temp repository
+        behind). The server's own lines therefore appear inline in this console;
+        nothing in the run depends on capturing them.
+    #>
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $script:HerdrExe
     $psi.Arguments = (@('--session', $script:SessionName, 'server') | ForEach-Object { ConvertTo-ArgumentLiteral $_ }) -join ' '
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError = $true
     $psi.WorkingDirectory = $script:RepoRoot
     $psi.EnvironmentVariables['HERDR_CONFIG_PATH'] = $script:ConfigPath
     $proc = New-Object System.Diagnostics.Process
     $proc.StartInfo = $psi
     [void]$proc.Start()
-    # Drain both streams continuously so the child never blocks on a full pipe.
-    $proc.add_OutputDataReceived({ param($s, $e) if ($e.Data) { Add-Content -LiteralPath $script:ServerLog -Value $e.Data } })
-    $proc.add_ErrorDataReceived({ param($s, $e) if ($e.Data) { Add-Content -LiteralPath $script:ServerErr -Value $e.Data } })
-    $proc.BeginOutputReadLine()
-    $proc.BeginErrorReadLine()
     $script:ServerProcess = $proc
     $script:ServerStartedByScript = $true
     return $proc
