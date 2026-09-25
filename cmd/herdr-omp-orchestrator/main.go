@@ -250,6 +250,10 @@ func coordCode(err error) string {
 		return "readiness_timeout"
 	case errors.Is(err, coord.ErrBlocked):
 		return "blocked"
+	case errors.Is(err, coord.ErrAmbiguousStep):
+		return "ambiguous_step"
+	case errors.Is(err, coord.ErrPersistence):
+		return "state_write_failed"
 	case errors.Is(err, coord.ErrHerdrUnavailable), errors.Is(err, herdr.ErrCLI),
 		errors.Is(err, herdr.ErrTimeout), errors.Is(err, herdr.ErrAmbiguous):
 		return "herdr_unavailable"

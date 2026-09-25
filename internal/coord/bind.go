@@ -83,6 +83,13 @@ var (
 	// ErrBlocked reports a task that needs a human decision before it can be
 	// resumed; resuming it would risk repeating an ambiguous side effect.
 	ErrBlocked = errors.New("coord: task needs input")
+	// ErrPersistence reports that a task's facts could not be written: the
+	// coordinator could not leave the durable failure it must always leave.
+	ErrPersistence = errors.New("coord: the task's facts could not be recorded")
+	// ErrAmbiguousStep reports a provisioning step whose outcome could not be
+	// identified from Herdr's state. A human inspects it; it is never repeated
+	// blindly.
+	ErrAmbiguousStep = errors.New("coord: the step's outcome could not be identified")
 	// ErrHerdrUnavailable reports that the Herdr CLI could not be used at all.
 	ErrHerdrUnavailable = errors.New("coord: Herdr is unavailable")
 )
@@ -113,6 +120,10 @@ const (
 	taskBranchBase = "orch/"
 	taskIDBytes    = 6 // 12 hexadecimal characters
 	idAttempts     = 5
+	// recordAttempts bounds how often one step re-reads and re-applies its write
+	// when another writer lands first: the bridge adopting an announced session
+	// for a pane, or a concurrent coordinator call for the same task.
+	recordAttempts = 4
 )
 
 // gitOutputLimit bounds one git invocation's diagnostics.
@@ -668,6 +679,7 @@ func isTerminal(err error) bool {
 		errors.Is(err, herdr.ErrOutputTooLarge),
 		errors.Is(err, ErrAgentChanged),
 		errors.Is(err, ErrSessionRefUnsupported),
+		errors.Is(err, ErrAmbiguousStep),
 		errors.Is(err, ErrHerdrUnavailable):
 		return true
 	default:

@@ -85,6 +85,10 @@ type fixturePlan struct {
 	// AnnounceSessionMismatch makes the extension announce a different session
 	// than the one Herdr reports for the pane.
 	AnnounceSessionMismatch bool `json:"announce_session_mismatch"`
+	// AdoptDuringStart makes the extension (through the bridge) adopt its
+	// announced session while `agent start` is still answering, which is what
+	// bumps the task's revision between the coordinator's read and its write.
+	AdoptDuringStart bool `json:"adopt_during_start"`
 	// PromptAmbiguous makes `agent prompt` report Herdr's own timeout code after
 	// recording the submission, the way a real CLI timeout does.
 	PromptAmbiguous bool `json:"prompt_ambiguous"`
@@ -353,6 +357,11 @@ func fixtureAgentStart(dir string, plan fixturePlan, state *fixtureState, argv [
 	}
 	state.Agents[pane] = agent
 	state.save(dir)
+	if plan.AdoptDuringStart {
+		// The extension is already running in this pane: it resolves and adopts
+		// its announced session while the start call is still answering.
+		adoptFixtureSession(pane, agent.Session)
+	}
 	return fixtureResult(map[string]any{
 		"type":  "agent_started",
 		"agent": agentInfo(pane, fixtureCwd(plan, *state, pane), agent, fixtureReference(plan, fixtureAnnouncement(plan, agent.Session))),
@@ -1994,6 +2003,127 @@ func TestBindAdoptsTheRecordedPrimaryAgentOnARebind(t *testing.T) {
 	}
 	if got := f.state().Agents[project.LaunchPaneID]; got == nil || got.Name != project.AgentName {
 		t.Errorf("the live agent on %s = %+v, want the recorded name %q", project.LaunchPaneID, got, project.AgentName)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// writes, failures and their durability
+// ---------------------------------------------------------------------------
+
+func TestDispatchWritesEachStepOnTheCurrentRevision(t *testing.T) {
+	// The shipped bug: another writer (the extension adopting its session through
+	// the bridge) landed between the coordinator's read of the task and its write
+	// of the agent name, so the write failed with a stale revision and the whole
+	// dispatch stopped with nothing recorded.
+	f := newCoordFixture(t, fixturePlan{AdoptDuringStart: true})
+	st, err := f.dispatch("one", "brief one", []string{"go test ./... ok"}, nil, nil, f.base)
+	if err != nil {
+		t.Fatalf("dispatch with a concurrent writer: %v", err)
+	}
+	if st.Phase != task.PromptSubmitted {
+		t.Fatalf("phase = %q, want %q (attention=%q blocker=%q)", st.Phase, task.PromptSubmitted, st.Attention, st.Blocker)
+	}
+	if st.Attention != "" || st.Blocker != "" {
+		t.Errorf("a concurrent write was reported as a problem: attention=%q blocker=%q", st.Attention, st.Blocker)
+	}
+	if st.AgentName == "" {
+		t.Error("the agent name was not recorded")
+	}
+	if st.OMPSessionID == "" {
+		t.Error("the adopted session was not recorded")
+	}
+	if got := f.prompts(st.PublicPaneID); len(got) != 1 {
+		t.Errorf("prompts = %v, want one brief", got)
+	}
+}
+
+func TestDispatchFailureIsDurableAndActionable(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{AgentStartError: "agent_name_taken"})
+	st, err := f.dispatch("one", "brief one", []string{"go test ./... ok"}, nil, nil, f.base)
+	if err == nil {
+		t.Fatal("dispatch succeeded although the agent could not start")
+	}
+	// The durable record names the task, the phase it reached, the resources it
+	// holds and the cause.
+	if task.StageOf(st) != task.NeedsInput {
+		t.Fatalf("stage = %q, want needs_input", task.StageOf(st))
+	}
+	if st.Attention == "" {
+		t.Fatal("the failure was not persisted as attention")
+	}
+	for _, want := range []string{
+		st.ID, "start the worker agent", "phase worktree_created", st.WorktreePath, st.LaunchPaneID, "agent_name_taken",
+	} {
+		if !strings.Contains(st.Attention, want) {
+			t.Errorf("attention %q does not name %q", st.Attention, want)
+		}
+	}
+
+	// The returned error is actionable: it names the step, the recorded state and
+	// the way out, and it is not the bare "internal" the primary used to see.
+	message := err.Error()
+	for _, want := range []string{st.ID, "could not start the worker agent", "phase worktree_created", "agent_name_taken", "resumable"} {
+		if !strings.Contains(message, want) {
+			t.Errorf("error %q does not name %q", message, want)
+		}
+	}
+	if strings.HasPrefix(message, "internal:") {
+		t.Errorf("error is still unclassified: %q", message)
+	}
+	// Classification is still reachable through the wrapper, and the failure is
+	// not claimed to be an unavailable Herdr: it answered.
+	if !errors.Is(err, herdr.ErrCLI) {
+		t.Errorf("error %v does not classify as a Herdr CLI failure", err)
+	}
+	if errors.Is(err, ErrHerdrUnavailable) {
+		t.Errorf("error %v is misclassified as an unavailable Herdr", err)
+	}
+	var step *StepError
+	if !errors.As(err, &step) {
+		t.Fatalf("error %v is not a *StepError", err)
+	}
+	if step.TaskID != st.ID || step.Step != "start the worker agent" || step.Phase != task.WorktreeCreated {
+		t.Errorf("step error = %+v, want the recorded task, step and phase", step)
+	}
+
+	// The task is resumable: fixing the cause lets the recorded phase continue.
+	f.updatePlan(func(p *fixturePlan) { p.AgentStartError = "" })
+	resumed, err := f.resume(st.ID)
+	if err != nil {
+		t.Fatalf("resume after fixing the cause: %v", err)
+	}
+	if resumed.Phase != task.PromptSubmitted {
+		t.Errorf("resumed phase = %q, want %q", resumed.Phase, task.PromptSubmitted)
+	}
+	if f.countCalls("agent start") != 2 || f.countCalls("worktree create") != 1 {
+		t.Errorf("resume did not build on the recorded phase: %v", f.calls())
+	}
+}
+
+func TestFailureThatCannotBeRecordedIsReportedNotDropped(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	f.projectKey()
+	// A task that does not exist cannot be updated: the attempt and its retry both
+	// fail, and the caller has to learn that the durable failure is missing.
+	ghost := task.Task{ID: "orch_000000000000", ProjectKey: f.root, Phase: task.WorktreeCreated, Revision: 7}
+	updated, err := f.coord.failTask(context.Background(), ghost, "start the worker agent", false,
+		fmt.Errorf("%w: the agent could not start", herdr.ErrCLI))
+	if err == nil {
+		t.Fatal("failTask reported success although it could not write")
+	}
+	if !errors.Is(err, ErrPersistence) {
+		t.Errorf("err = %v, want ErrPersistence", err)
+	}
+	if !errors.Is(err, herdr.ErrCLI) {
+		t.Errorf("err = %v, want the cause reachable through it", err)
+	}
+	for _, want := range []string{"orch_000000000000", "worktree_created", "could not be recorded"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err %q does not name %q", err, want)
+		}
+	}
+	if updated.Attention != "" || updated.Blocker != "" {
+		t.Errorf("a ghost task was reported as updated: %+v", updated)
 	}
 }
 

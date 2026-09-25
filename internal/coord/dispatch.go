@@ -487,8 +487,8 @@ func (c *Coordinator) provision(ctx context.Context, st task.Task) (task.Task, e
 // second checkout.
 func (c *Coordinator) createWorktree(ctx context.Context, st task.Task) (task.Task, error) {
 	if listed, err := c.findWorktree(ctx, st.ProjectKey, st.Branch); err != nil {
-		return c.failTask(ctx, st, isTerminal(err),
-			fmt.Errorf("task %s: the repository's worktrees could not be read before creating %q: %w", st.ID, st.Branch, err))
+		return c.failTask(ctx, st, "read the repository's worktrees", isTerminal(err),
+			fmt.Errorf("the repository's worktrees could not be read before creating %q: %w", st.Branch, err))
 	} else if listed != nil {
 		return c.adoptWorktree(ctx, st, listed)
 	}
@@ -502,9 +502,9 @@ func (c *Coordinator) createWorktree(ctx context.Context, st task.Task) (task.Ta
 			branch = st.Branch
 		}
 		if !sameBranch(branch, st.Branch) {
-			return c.failTask(ctx, st, true,
-				fmt.Errorf("%w: task %s asked for branch %q but `worktree create` answered with %q",
-					ErrAgentChanged, st.ID, st.Branch, created.Branch))
+			return c.failTask(ctx, st, "create the worktree", true,
+				fmt.Errorf("%w: asked for branch %q but `worktree create` answered with %q",
+					ErrAgentChanged, st.Branch, created.Branch))
 		}
 		next, recordErr := c.record(ctx, st, func(record *task.Task) error {
 			record.Branch = branch
@@ -519,31 +519,31 @@ func (c *Coordinator) createWorktree(ctx context.Context, st task.Task) (task.Ta
 		if recordErr != nil {
 			// The checkout exists but is not recorded: a human must decide,
 			// because a retry from this phase cannot tell it apart later.
-			return c.failTask(ctx, st, true, recordErr)
+			return c.failTask(ctx, st, "record the created worktree", true, recordErr)
 		}
 		return next, nil
 	}
 
 	if !errors.Is(err, herdr.ErrAmbiguous) {
-		return c.failTask(ctx, st, false,
-			fmt.Errorf("task %s: worktree create for root %s branch %q base %s failed: %w",
-				st.ID, st.ProjectKey, st.Branch, st.BaseRevision, err))
+		return c.failTask(ctx, st, "create the worktree", false,
+			fmt.Errorf("worktree create for root %s branch %q base %s failed: %w",
+				st.ProjectKey, st.Branch, st.BaseRevision, err))
 	}
 	// The create may have taken effect. Inspect the repository before deciding.
 	listed, listErr := c.findWorktree(ctx, st.ProjectKey, st.Branch)
 	if listErr != nil {
-		return c.failTask(ctx, st, true,
-			fmt.Errorf("task %s: worktree create for root %s branch %q base %s is ambiguous and the worktree listing failed: %v: %w",
-				st.ID, st.ProjectKey, st.Branch, st.BaseRevision, listErr, err))
+		return c.failTask(ctx, st, "create the worktree", true,
+			fmt.Errorf("%w: worktree create for root %s branch %q base %s is ambiguous and the worktree listing failed: %v",
+				ErrAmbiguousStep, st.ProjectKey, st.Branch, st.BaseRevision, listErr))
 	}
 	if listed == nil {
-		return c.failTask(ctx, st, true,
-			fmt.Errorf("task %s: worktree create for root %s branch %q base %s is ambiguous and `worktree list` does not list that branch: %w",
-				st.ID, st.ProjectKey, st.Branch, st.BaseRevision, err))
+		return c.failTask(ctx, st, "create the worktree", true,
+			fmt.Errorf("%w: worktree create for root %s branch %q base %s is ambiguous and `worktree list` does not list that branch",
+				ErrAmbiguousStep, st.ProjectKey, st.Branch, st.BaseRevision))
 	}
 	next, adoptErr := c.adoptWorktree(ctx, st, listed)
 	if adoptErr != nil {
-		return c.failTask(ctx, st, true, adoptErr)
+		return c.failTask(ctx, st, "adopt the existing worktree", true, adoptErr)
 	}
 	return next, nil
 }
@@ -608,7 +608,7 @@ func (c *Coordinator) startWorker(ctx context.Context, st task.Task) (task.Task,
 	if strings.TrimSpace(paneID) == "" {
 		resolved, err := c.paneForTask(ctx, st)
 		if err != nil {
-			return c.failTask(ctx, st, true, fmt.Errorf("task %s: %w", st.ID, err))
+			return c.failTask(ctx, st, "resolve the worker pane", true, err)
 		}
 		next, err := c.record(ctx, st, func(record *task.Task) error {
 			record.LaunchPaneID = resolved
@@ -616,7 +616,7 @@ func (c *Coordinator) startWorker(ctx context.Context, st task.Task) (task.Task,
 			return nil
 		}, "record the worker pane")
 		if err != nil {
-			return c.failTask(ctx, st, true, err)
+			return c.failTask(ctx, st, "record the worker pane", true, err)
 		}
 		st = next
 		paneID = resolved
@@ -624,8 +624,7 @@ func (c *Coordinator) startWorker(ctx context.Context, st task.Task) (task.Task,
 
 	name, err := c.ensureAgent(ctx, paneID, WorkerAgentName(st.ID))
 	if err != nil {
-		return c.failTask(ctx, st, isTerminal(err),
-			fmt.Errorf("task %s: pane %s: %w", st.ID, paneID, err))
+		return c.failTask(ctx, st, "start the worker agent", isTerminal(err), err)
 	}
 	if name == "" {
 		// Herdr reported no name (older response shape): keep the derived one.
@@ -636,7 +635,7 @@ func (c *Coordinator) startWorker(ctx context.Context, st task.Task) (task.Task,
 		return nil
 	}, "record the worker agent name")
 	if err != nil {
-		return c.failTask(ctx, st, true, err)
+		return c.failTask(ctx, st, "record the worker agent name", true, err)
 	}
 
 	st, err = c.recordAgentStart(ctx, st, paneID)
@@ -685,8 +684,7 @@ func (c *Coordinator) recordAgentStart(ctx context.Context, st task.Task, paneID
 		return nil
 	}
 	if _, err := c.awaitAgentReady(ctx, paneID, st.WorktreePath, workspaces, write); err != nil {
-		return c.failTask(ctx, use, isTerminal(err),
-			fmt.Errorf("task %s: pane %s: %w", st.ID, paneID, err))
+		return c.failTask(ctx, use, "confirm the worker's OMP session", isTerminal(err), err)
 	}
 	return use, nil
 }
@@ -729,8 +727,8 @@ func (c *Coordinator) submitBrief(ctx context.Context, st task.Task) (task.Task,
 		paneID = st.LaunchPaneID
 	}
 	if strings.TrimSpace(paneID) == "" {
-		return c.failTask(ctx, st, true,
-			fmt.Errorf("task %s: no pane is recorded for the worker, so the brief cannot be addressed", st.ID))
+		return c.failTask(ctx, st, "submit the brief", true,
+			fmt.Errorf("no pane is recorded for the worker, so the brief cannot be addressed"))
 	}
 	callCtx, cancel := c.callContext(ctx)
 	_, err := c.herdr.AgentPrompt(callCtx, paneID, st.Brief)
@@ -742,16 +740,16 @@ func (c *Coordinator) submitBrief(ctx context.Context, st task.Task) (task.Task,
 		}, "record the submitted brief")
 	}
 	if errors.Is(err, herdr.ErrAmbiguous) {
-		return c.failTask(ctx, st, true,
-			fmt.Errorf("task %s: agent prompt on pane %s is ambiguous, so the brief may already have been delivered; inspect `agent read %s` before deciding: %w",
-				st.ID, paneID, paneID, err))
+		return c.failTask(ctx, st, "submit the brief", true,
+			fmt.Errorf("%w: the brief on pane %s may already have been delivered; inspect `agent read %s` before deciding: %w",
+				ErrAmbiguousStep, paneID, paneID, err))
 	}
 	if isNonDelivery(err) {
-		return c.failTask(ctx, st, false,
-			fmt.Errorf("task %s: agent prompt on pane %s was refused before any input was written: %w", st.ID, paneID, err))
+		return c.failTask(ctx, st, "submit the brief", false,
+			fmt.Errorf("agent prompt on pane %s was refused before any input was written: %w", paneID, err))
 	}
-	return c.failTask(ctx, st, true,
-		fmt.Errorf("task %s: agent prompt on pane %s failed without proof that nothing was delivered: %w", st.ID, paneID, err))
+	return c.failTask(ctx, st, "submit the brief", true,
+		fmt.Errorf("agent prompt on pane %s failed without proof that nothing was delivered: %w", paneID, err))
 }
 
 // isNonDelivery reports a Herdr refusal that provably wrote no input: a blocked
@@ -773,33 +771,114 @@ func isNonDelivery(err error) bool {
 // durable outcomes
 // ---------------------------------------------------------------------------
 
-// record applies one compare-and-swap update and reports a failure to persist
-// an acknowledged side effect.
+// record applies one update to a task's facts on the revision the store holds at
+// the moment of the write.
+//
+// A step must build on the current revision, never on one captured before an
+// intervening write: another coordinator call and the bridge (which adopts an
+// announced session for a pane) both write the same task, so a write that carried
+// a stale revision would fail even though nothing is wrong. The retry re-reads and
+// re-applies, which is safe because every mutation here is a plain field
+// assignment or a fill-if-empty.
 func (c *Coordinator) record(ctx context.Context, st task.Task, mutate func(*task.Task) error, what string) (task.Task, error) {
-	updated, err := c.store.UpdateTask(ctx, st.ID, st.Revision, mutate)
-	if err != nil {
-		return st, fmt.Errorf("task %s: %s: %w", st.ID, what, err)
+	var lastErr error
+	for range recordAttempts {
+		current, err := c.store.Task(ctx, st.ID)
+		if err != nil {
+			return st, fmt.Errorf("task %s: %s: %w", st.ID, what, err)
+		}
+		updated, err := c.store.UpdateTask(ctx, st.ID, current.Revision, mutate)
+		if err == nil {
+			return updated, nil
+		}
+		if !errors.Is(err, state.ErrConflict) {
+			return st, fmt.Errorf("task %s: %s: %w", st.ID, what, err)
+		}
+		lastErr = err
 	}
-	return updated, nil
+	return st, fmt.Errorf("task %s: %s: %w", st.ID, what, lastErr)
 }
 
-// failTask records why provisioning stopped. Attention marks a failure that a
-// retry repeats safely; a blocker marks an outcome a human must decide, and
-// ResumeDispatch refuses to touch it.
-func (c *Coordinator) failTask(ctx context.Context, st task.Task, terminal bool, cause error) (task.Task, error) {
-	message := cause.Error()
+// StepError reports a dispatch step that failed, with the facts a human needs in
+// order to act: the task, the step and phase it stopped at, the resources it
+// already recorded, and the cause. The coordinator returns it for every
+// provisioning failure, so a caller never has to read this package or the state
+// database to find out what happened, and it always says that the task is
+// resumable rather than something to retry blindly.
+type StepError struct {
+	TaskID  string
+	Step    string
+	Phase   task.Phase
+	Facts   task.Task
+	Cause   error
+	Stalled bool
+}
+
+// Error renders one line naming the step, the cause and the recorded resources.
+func (e *StepError) Error() string {
+	var recorded []string
+	for _, fact := range []struct{ name, value string }{
+		{"branch", e.Facts.Branch},
+		{"worktree", e.Facts.WorktreePath},
+		{"workspace", e.Facts.WorktreeWorkspaceID},
+		{"pane", e.Facts.PublicPaneID},
+		{"agent", e.Facts.AgentName},
+		{"session", e.Facts.OMPSessionID},
+	} {
+		if strings.TrimSpace(fact.value) != "" {
+			recorded = append(recorded, fact.name+" "+fact.value)
+		}
+	}
+	detail := "phase " + string(e.Phase)
+	if len(recorded) > 0 {
+		detail += ", " + strings.Join(recorded, ", ")
+	}
+	advice := "the task is resumable: fix the cause and resume it from the recorded phase instead of dispatching the same work again"
+	if !e.Stalled {
+		advice = "the task is resumable: this step is retried from the recorded phase, and nothing was repeated"
+	}
+	return fmt.Sprintf("task %s could not %s: %v (task %s; %s)", e.TaskID, e.Step, e.Cause, detail, advice)
+}
+
+// Unwrap keeps the cause reachable, so a caller still classifies with errors.Is
+// and never matches this wrapper by accident.
+func (e *StepError) Unwrap() error { return e.Cause }
+
+// stepError wraps a provisioning failure with the task's recorded facts.
+func stepError(st task.Task, step string, terminal bool, cause error) *StepError {
+	return &StepError{
+		TaskID:  st.ID,
+		Step:    step,
+		Phase:   st.Phase,
+		Facts:   st,
+		Cause:   cause,
+		Stalled: terminal,
+	}
+}
+
+// failTask records why provisioning stopped and returns the actionable error.
+// Attention marks a failure that a retry repeats safely; a blocker marks an
+// outcome a human must decide, and ResumeDispatch refuses to touch it.
+//
+// The write is retried on the freshly read revision: a step that failed must
+// still leave durable attention naming the task, the phase, the recorded
+// resources and the cause. If even that fails, the persistence failure is part of
+// the returned error instead of being dropped.
+func (c *Coordinator) failTask(ctx context.Context, st task.Task, step string, terminal bool, cause error) (task.Task, error) {
+	failure := stepError(st, step, terminal, cause)
 	updated, err := c.record(ctx, st, func(next *task.Task) error {
 		if terminal {
-			next.Blocker = message
+			next.Blocker = failure.Error()
 			return nil
 		}
-		next.Attention = message
+		next.Attention = failure.Error()
 		return nil
 	}, "record the dispatch failure")
 	if err != nil {
-		return st, errors.Join(cause, err)
+		return st, fmt.Errorf("%w: task %s stopped at phase %s with %w, and that failure could not be recorded: %v",
+			ErrPersistence, st.ID, st.Phase, cause, err)
 	}
-	return updated, cause
+	return updated, failure
 }
 
 // notify records one deduplicated inbox note for the project, so a failure that
