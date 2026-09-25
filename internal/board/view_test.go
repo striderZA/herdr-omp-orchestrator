@@ -138,6 +138,10 @@ func TestBoardWrapKeepsMultibyteWordsWhole(t *testing.T) {
 		strings.Repeat("🎉", 12),
 		"a日本b語c日d本e語",
 		"日本語🎉日本語🎉日本語",
+		// A combining mark takes no column of its own, so a byte offset that
+		// assumes one rune per column steps off the boundary entirely.
+		strings.Repeat("e\u0301", 8),
+		"नमस्तेनमस्तेनमस्ते",
 	}
 	for _, word := range words {
 		for _, width := range []int{1, 2, 3, 4, 5, 7, 11, 16, 24} {
@@ -216,6 +220,32 @@ func wrappedField(t *testing.T, lines []string, label, next string) string {
 		t.Fatalf("no line after %q begins with %q:\n%s", label, next, strings.Join(lines, "\n"))
 	}
 	return strings.TrimPrefix(strings.Join(lines[start:end], ""), label)
+}
+
+// TestBoardWideRunesSurviveAWholeCardLine pins the title path too: at a width
+// that can hold the whole card, the card line carries every rune of the wide
+// title, unclipped and unreplaced.
+func TestBoardWideRunesSurviveAWholeCardLine(t *testing.T) {
+	title := strings.Repeat("日本語", 4)
+	card := sampleTask("orch_mb", func(x *task.Task) { x.Title = title })
+	board := NewBoard([]Card{{Task: card, Stage: task.NeedsInput}})
+	const width = 40
+	out := Render(board, Detail{SelectedID: card.ID}, width, Theme{Profile: termenv.Ascii})
+	if !utf8.ValidString(out) {
+		t.Fatalf("the board rendered invalid UTF-8:\n%q", out)
+	}
+	if strings.ContainsRune(out, utf8.RuneError) {
+		t.Errorf("the board rendered a replacement rune:\n%s", out)
+	}
+	cardLine := lineContaining(t, strings.Split(out, "\n"), "["+card.ID+"]")
+	if !strings.Contains(cardLine, title) {
+		t.Errorf("the card line %q does not carry the whole title %q", cardLine, title)
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if got := runeWidth(line); got > width && utf8.RuneCountInString(line) > 1 {
+			t.Errorf("line %q is %d columns wide, want at most %d", line, got, width)
+		}
+	}
 }
 
 // TestBoardWideRunesAndNewlinesStayOnOneBoundedLine keeps the bound true for the
