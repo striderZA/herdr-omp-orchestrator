@@ -1,0 +1,13 @@
+id = "user.omp-orchestrator"
+name = "OMP Orchestrator"
+version = "0.1.0"
+min_herdr_version = "0.9.1"
+platforms = ["windows"]
+
+[[build]]
+command = ["go", "build", "-o", "herdr-omp-orchestrator.exe", "./cmd/herdr-omp-orchestrator"]
+
+[[actions]]
+id = "setup"
+title = "Setup OMP orchestrator extension"
+command = ["./herdr-omp-orchestrator.exe", "setup"]
