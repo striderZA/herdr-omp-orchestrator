@@ -698,6 +698,106 @@ func TestBridgeResolveAcceptsEquivalentCheckoutPaths(t *testing.T) {
 	}
 }
 
+// TestBridgeResolveAcceptsAMovedWorkerWorkspace proves the workspace check
+// accepts either workspace a worker is recorded in. Moving a public pane
+// records the workspace it was moved to while keeping the worktree workspace as
+// provenance, so a worker whose OMP process restarts in the moved workspace is
+// still verified instead of staying unbound forever.
+func TestBridgeResolveAcceptsAMovedWorkerWorkspace(t *testing.T) {
+	f := newBridgeFixture(t)
+	ctx := context.Background()
+	f.seedWorker("t1", workerPane, workerPane, workerSession)
+
+	const movedPublicPane = "w9:p4"
+	if err := f.store.MovePublicPane(ctx, workerPane, workerPane, movedPublicPane); err != nil {
+		t.Fatalf("MovePublicPane: %v", err)
+	}
+	moved, err := f.store.Task(ctx, "t1")
+	if err != nil {
+		t.Fatalf("read moved task: %v", err)
+	}
+	if moved.CurrentWorkspaceID == moved.WorktreeWorkspaceID {
+		t.Fatalf("the move recorded no new workspace: %+v", moved)
+	}
+	if moved.WorktreeWorkspaceID != workerWorktree {
+		t.Fatalf("the move dropped the worktree provenance: %+v", moved)
+	}
+
+	// The worker's OMP process restarted in a new pane that sits in the
+	// workspace its pane was moved to.
+	const restoredPane = "w7:p3"
+	f.useHerdrFixture(paneEnvelope(t, restoredPane, "term-moved", moved.CurrentWorkspaceID, f.worktree, "omp"))
+	f.env["HERDR_PANE_ID"] = restoredPane
+
+	var result ResolveResult
+	f.call("resolve", workerSession, "{}").decodeResult(t, &result)
+	if !result.Bound || !result.Rebound {
+		t.Fatalf("resolve in the moved workspace = %+v, want a verified rebind", result)
+	}
+	if result.Role != string(state.RoleWorker) || result.TaskID != "t1" || result.ProjectKey != f.repoRoot {
+		t.Errorf("rebound role/binding = %+v", result)
+	}
+	if result.LaunchPaneID != restoredPane || result.PublicPaneID != restoredPane || result.TerminalID != "term-moved" {
+		t.Errorf("rebound identities = %+v", result)
+	}
+	if result.WorktreeID != moved.WorktreeWorkspaceID {
+		t.Errorf("rebind changed the worktree provenance: %+v", result)
+	}
+
+	after, err := f.store.Task(ctx, "t1")
+	if err != nil {
+		t.Fatalf("re-read task: %v", err)
+	}
+	if after.LaunchPaneID != restoredPane || after.PublicPaneID != restoredPane {
+		t.Errorf("stored panes = %q/%q, want %q", after.LaunchPaneID, after.PublicPaneID, restoredPane)
+	}
+	if after.CurrentWorkspaceID != moved.CurrentWorkspaceID || after.WorktreeWorkspaceID != moved.WorktreeWorkspaceID {
+		t.Errorf("rebind rewrote the recorded workspaces: %+v", after)
+	}
+}
+
+// TestBridgeResolveRefusesAWorkerInAThirdWorkspace proves the widened check is
+// still a refusal: a pane in a workspace the task was never recorded in cannot
+// promote itself, and the attention text names both the workspace found and the
+// ones that would have been accepted.
+func TestBridgeResolveRefusesAWorkerInAThirdWorkspace(t *testing.T) {
+	f := newBridgeFixture(t)
+	ctx := context.Background()
+	f.seedWorker("t1", workerPane, workerPane, workerSession)
+
+	if err := f.store.MovePublicPane(ctx, workerPane, workerPane, "w9:p4"); err != nil {
+		t.Fatalf("MovePublicPane: %v", err)
+	}
+	moved, err := f.store.Task(ctx, "t1")
+	if err != nil {
+		t.Fatalf("read moved task: %v", err)
+	}
+
+	const restoredPane = "w7:p3"
+	const unrelated = "ws-unrelated-9"
+	if unrelated == moved.CurrentWorkspaceID || unrelated == moved.WorktreeWorkspaceID {
+		t.Fatalf("the fixture reuses a recorded workspace: %+v", moved)
+	}
+	f.useHerdrFixture(paneEnvelope(t, restoredPane, "term-elsewhere", unrelated, f.worktree, "omp"))
+	f.env["HERDR_PANE_ID"] = restoredPane
+
+	var result ResolveResult
+	f.call("resolve", workerSession, "{}").decodeResult(t, &result)
+	if result.Bound {
+		t.Fatalf("resolve bound a pane in an unrelated workspace: %+v", result)
+	}
+	if result.Reason != ReasonUnverifiedRestore {
+		t.Errorf("reason = %q, want %q", result.Reason, ReasonUnverifiedRestore)
+	}
+	if !strings.Contains(result.Attention, unrelated) {
+		t.Errorf("attention does not name the workspace the pane was found in: %q", result.Attention)
+	}
+	if !strings.Contains(result.Attention, moved.WorktreeWorkspaceID) || !strings.Contains(result.Attention, moved.CurrentWorkspaceID) {
+		t.Errorf("attention does not name the recorded workspaces: %q", result.Attention)
+	}
+	f.assertAttentionRecorded(t, moved)
+}
+
 func TestBridgeResolveRefusesUnverifiedRestore(t *testing.T) {
 	t.Run("different checkout", func(t *testing.T) {
 		f := newBridgeFixture(t)

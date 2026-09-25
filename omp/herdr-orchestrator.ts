@@ -119,6 +119,11 @@ async function callBridge(
       },
     });
 
+    // Decode each stream once rather than per chunk: a multi-byte character
+    // split across two pipe reads must not be replaced by U+FFFD.
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+
     const out: string[] = [];
     const err: string[] = [];
     let outBytes = 0;
@@ -141,21 +146,21 @@ async function callBridge(
       finish(() => reject(new BridgeError({ code: "aborted", message: `${method}: cancelled` })));
     };
 
-    child.stdout.on("data", (chunk: Uint8Array) => {
-      outBytes += chunk.length;
+    child.stdout.on("data", (chunk: string) => {
+      outBytes += Buffer.byteLength(chunk, "utf8");
       if (outBytes > MAX_OUTPUT_BYTES) {
         overflow("stdout", outBytes);
         return;
       }
-      out.push(String(chunk));
+      out.push(chunk);
     });
-    child.stderr.on("data", (chunk: Uint8Array) => {
-      errBytes += chunk.length;
+    child.stderr.on("data", (chunk: string) => {
+      errBytes += Buffer.byteLength(chunk, "utf8");
       if (errBytes > MAX_OUTPUT_BYTES) {
         overflow("stderr", errBytes);
         return;
       }
-      err.push(String(chunk));
+      err.push(chunk);
     });
     child.on("error", (error: unknown) => {
       finish(() =>

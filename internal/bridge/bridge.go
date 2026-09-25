@@ -42,6 +42,7 @@ import (
 	"io"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"time"
 
@@ -460,8 +461,9 @@ func (h *handler) verifyRestore(binding state.Binding) (*herdr.PaneInfo, error) 
 	if checkout := bindingCheckout(binding); !samePath(pane.Cwd, checkout) {
 		return nil, fmt.Errorf("pane %q works in %q, not the recorded checkout %q", h.launchPaneID, pane.Cwd, checkout)
 	}
-	if workspace := bindingWorkspace(binding); workspace != "" && pane.WorkspaceID != workspace {
-		return nil, fmt.Errorf("pane %q is in workspace %q, not the recorded %q", h.launchPaneID, pane.WorkspaceID, workspace)
+	if expected := bindingWorkspaces(binding); len(expected) > 0 && !slices.Contains(expected, pane.WorkspaceID) {
+		return nil, fmt.Errorf("pane %q is in workspace %q, not the recorded workspace %s",
+			h.launchPaneID, pane.WorkspaceID, quotedAlternatives(expected))
 	}
 	return pane, nil
 }
@@ -676,14 +678,39 @@ func bindingCheckout(b state.Binding) string {
 	return b.Task.WorktreePath
 }
 
-// bindingWorkspace is the workspace the recorded process is expected to be in.
-// A moved worker keeps its worktree workspace as provenance, so the current
-// workspace is accepted too.
-func bindingWorkspace(b state.Binding) string {
+// bindingWorkspaces is the set of workspaces the recorded process may
+// legitimately be in. A primary has only the workspace it currently runs in. A
+// moved worker keeps its worktree workspace as provenance while its current
+// workspace records where it was moved to, so a restore in either one is still
+// the same worker; a restore anywhere else is refused.
+func bindingWorkspaces(b state.Binding) []string {
 	if b.Role == state.RolePrimary {
-		return b.Project.CurrentWorkspaceID
+		return nonEmptyIDs(b.Project.CurrentWorkspaceID)
 	}
-	return b.Task.WorktreeWorkspaceID
+	return nonEmptyIDs(b.Task.WorktreeWorkspaceID, b.Task.CurrentWorkspaceID)
+}
+
+// nonEmptyIDs drops empty ids — an unrecorded workspace means "unknown", not a
+// workspace the pane must be in — and duplicates of one already accepted.
+func nonEmptyIDs(ids ...string) []string {
+	var out []string
+	for _, id := range ids {
+		if id == "" || slices.Contains(out, id) {
+			continue
+		}
+		out = append(out, id)
+	}
+	return out
+}
+
+// quotedAlternatives renders accepted ids for a message that has to name
+// everything that would have been accepted.
+func quotedAlternatives(ids []string) string {
+	quoted := make([]string, 0, len(ids))
+	for _, id := range ids {
+		quoted = append(quoted, fmt.Sprintf("%q", id))
+	}
+	return strings.Join(quoted, " or ")
 }
 
 func boundResult(b state.Binding, rebound bool) ResolveResult {
