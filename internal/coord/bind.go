@@ -29,6 +29,7 @@ package coord
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -107,6 +108,11 @@ const (
 	defaultPollInterval = 200 * time.Millisecond
 	// defaultAgentKind is the Herdr agent kind the coordinator requires.
 	defaultAgentKind = "omp"
+	// defaultStepLease bounds how long one provisioning step may hold its durable
+	// step claim. It has to outlast the longest step (an agent start plus the
+	// readiness wait) so a live caller is never overtaken, and stay short enough
+	// that a crashed one is recoverable by the next resume.
+	defaultStepLease = 2 * time.Minute
 	// primaryAgentPrefix and workerAgentPrefix keep the two roles' names disjoint:
 	// a worker's name is its task id, a primary's is derived from the project.
 	primaryAgentPrefix = "orch_p_"
@@ -148,6 +154,9 @@ type Options struct {
 	// WorkerAgentName): Herdr keeps live agent names unique, so one name for
 	// every agent would collide with the primary that is already running.
 	AgentKind string
+	// StepLease bounds how long one provisioning step holds its durable step
+	// claim. It defaults to two minutes.
+	StepLease time.Duration
 }
 
 // Coordinator is the only writer of dispatch facts. It owns no private state:
@@ -158,6 +167,9 @@ type Coordinator struct {
 	herdr  *herdr.Client
 	opts   Options
 	random func([]byte) error
+	// owner identifies this coordinator in the durable step claim, so the claim it
+	// takes can be released by it and by nobody else.
+	owner string
 }
 
 // New returns a coordinator over an open store and a Herdr client.
@@ -186,7 +198,20 @@ func New(store *state.Store, client *herdr.Client, opts Options) (*Coordinator, 
 	if strings.TrimSpace(opts.AgentKind) == "" {
 		opts.AgentKind = defaultAgentKind
 	}
-	return &Coordinator{store: store, herdr: client, opts: opts, random: fillRandom}, nil
+	if opts.StepLease <= 0 {
+		opts.StepLease = defaultStepLease
+	}
+	owner := make([]byte, 8)
+	if _, err := rand.Read(owner); err != nil {
+		return nil, fmt.Errorf("generate a coordinator identity: %w", err)
+	}
+	return &Coordinator{
+		store:  store,
+		herdr:  client,
+		opts:   opts,
+		random: fillRandom,
+		owner:  hex.EncodeToString(owner),
+	}, nil
 }
 
 // Bind records the primary OMP session for one canonical repository.

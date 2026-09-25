@@ -528,31 +528,101 @@ func fillRandom(buf []byte) error {
 // the persisted step machine
 // ---------------------------------------------------------------------------
 
-// provision advances a task as far as its recorded phase allows. Each step is
-// idempotent on its own: it inspects the recorded facts and authoritative Herdr
-// state before acting.
+// provision advances a task as far as its recorded phase allows, one step at a
+// time. Each step is idempotent on its own (it inspects the recorded facts and
+// authoritative Herdr state before acting) and each step is taken exclusively
+// through the durable step claim, so two callers resuming the same task — a
+// startup pass and a user's adjudication, or two startup passes — cannot both
+// issue the same side effect. A caller that does not get the claim stops and
+// reports ErrStepInFlight; the recorded phase is what the other caller continues
+// from, and a claim left by a crashed caller can be taken over once its lease
+// expires, so crash recovery is not weakened.
 func (c *Coordinator) provision(ctx context.Context, st task.Task) (task.Task, error) {
-	if st.Phase == task.PromptSubmitted {
-		return st, nil
-	}
-	if st.Phase == task.Intent {
-		next, err := c.createWorktree(ctx, st)
+	for {
+		if st.Phase == task.PromptSubmitted {
+			return st, nil
+		}
+		took, err := c.store.ClaimStep(ctx, st.ID, st.Phase, c.owner, c.opts.StepLease)
+		if err != nil {
+			return st, err
+		}
+		if !took {
+			// Either another caller is running this exact step, or it finished it
+			// and moved the task on. Re-read the task to tell the two apart: a
+			// phase that advanced is ours to continue from, an unchanged phase is
+			// somebody else's step.
+			current, readErr := c.store.Task(ctx, st.ID)
+			if readErr != nil {
+				return st, readErr
+			}
+			if current.Phase == st.Phase {
+				return current, fmt.Errorf("%w: task %s is already running its %s step elsewhere",
+					ErrStepInFlight, st.ID, phaseStep(st.Phase))
+			}
+			st = current
+			continue
+		}
+		next, err := c.provisionPhase(ctx, st)
 		if err != nil {
 			return next, err
 		}
 		st = next
 	}
-	if st.Phase == task.WorktreeCreated {
-		next, err := c.startWorker(ctx, st)
-		if err != nil {
-			return next, err
-		}
-		st = next
-	}
-	if st.Phase == task.AgentStarted {
+}
+
+// provisionPhase runs the one step the task's recorded phase asks for.
+func (c *Coordinator) provisionPhase(ctx context.Context, st task.Task) (task.Task, error) {
+	switch st.Phase {
+	case task.Intent:
+		return c.createWorktree(ctx, st)
+	case task.WorktreeCreated:
+		return c.startWorker(ctx, st)
+	case task.AgentStarted:
 		return c.submitBrief(ctx, st)
+	default:
+		return st, fmt.Errorf("%w: task %s is at unknown phase %q", ErrInvalidRequest, st.ID, st.Phase)
 	}
-	return st, fmt.Errorf("%w: task %s is at unknown phase %q", ErrInvalidRequest, st.ID, st.Phase)
+}
+
+// phaseStep names the work one phase asks for, for a message a human reads.
+func phaseStep(phase task.Phase) string {
+	switch phase {
+	case task.Intent:
+		return "create the worktree"
+	case task.WorktreeCreated:
+		return "start the worker"
+	case task.AgentStarted:
+		return "submit the brief"
+	default:
+		return string(phase)
+	}
+}
+
+// releaseStep gives up this coordinator's step claim after a step that failed
+// without advancing the phase, so a retry does not have to wait out the lease.
+func (c *Coordinator) releaseStep(ctx context.Context, st task.Task) {
+	_ = c.store.ReleaseStep(ctx, st.ID, c.owner)
+}
+
+// definiteFailure reports whether a failed step provably wrote nothing, which is
+// what lets its step claim go back immediately. Every undecided outcome — a
+// timeout, Herdr's own ambiguity, an uninterpretable response, an identity this
+// build cannot read — keeps the claim instead, so the next attempt waits for the
+// lease or for a human, and never races a side effect that may have happened.
+func definiteFailure(cause error) bool {
+	switch {
+	case errors.Is(cause, herdr.ErrTimeout),
+		errors.Is(cause, herdr.ErrAmbiguous),
+		errors.Is(cause, herdr.ErrMalformedResponse),
+		errors.Is(cause, herdr.ErrIdentity),
+		errors.Is(cause, herdr.ErrOutputTooLarge),
+		errors.Is(cause, ErrAmbiguousStep),
+		errors.Is(cause, ErrEvidenceChanged),
+		errors.Is(cause, ErrSessionRefUnsupported):
+		return false
+	default:
+		return true
+	}
 }
 
 // createWorktree creates the isolated checkout for a task and records the exact
@@ -564,6 +634,7 @@ func (c *Coordinator) provision(ctx context.Context, st task.Task) (task.Task, e
 // second checkout.
 func (c *Coordinator) createWorktree(ctx context.Context, st task.Task) (task.Task, error) {
 	if listed, err := c.findWorktree(ctx, st.ProjectKey, st.Branch); err != nil {
+		c.releaseStep(ctx, st)
 		return c.failTask(ctx, st, "read the repository's worktrees", isTerminal(err),
 			fmt.Errorf("the repository's worktrees could not be read before creating %q: %w", st.Branch, err))
 	} else if listed != nil {
@@ -603,8 +674,10 @@ func (c *Coordinator) createWorktree(ctx context.Context, st task.Task) (task.Ta
 
 	if !errors.Is(err, herdr.ErrAmbiguous) {
 		// A definite failure created nothing, so the claimed slot goes back and
-		// another queued task can use it.
+		// another queued task can use it — and so does the step claim, so a retry
+		// does not have to wait out its lease.
 		c.releaseSlot(ctx, st)
+		c.releaseStep(ctx, st)
 		return c.failTask(ctx, st, "create the worktree", false,
 			fmt.Errorf("worktree create for root %s branch %q base %s failed: %w",
 				st.ProjectKey, st.Branch, st.BaseRevision, err))
@@ -860,6 +933,9 @@ var (
 	// ErrEvidenceChanged reports that what a user inspected is not what the task
 	// records now, so the decision cannot be applied to it.
 	ErrEvidenceChanged = errors.New("coord: the inspected evidence no longer matches")
+	// ErrStepInFlight reports that another caller holds the durable claim for the
+	// task's step, so this caller issued no side effect at all.
+	ErrStepInFlight = errors.New("coord: another caller is running this task's step")
 )
 
 // BriefDecision is a user's adjudication of an ambiguous brief submission: the
@@ -883,6 +959,111 @@ const (
 type BriefEvidence struct {
 	PaneID string `json:"paneId"`
 	Digest string `json:"digest"`
+}
+
+// BriefInspectionParams is the brief_inspection request body: the task to inspect.
+type BriefInspectionParams struct {
+	TaskID string `json:"taskId"`
+}
+
+// AdjudicateBriefParams is the adjudicate_brief request body: the task, the
+// revision the user inspected, the outcome they confirmed and the evidence handle
+// the inspection returned. All four are required: the decision is made about that
+// exact revision and that exact text.
+type AdjudicateBriefParams struct {
+	TaskID           string `json:"taskId"`
+	ExpectedRevision int64  `json:"expectedRevision"`
+	Decision         string `json:"decision"`
+	PaneID           string `json:"paneId"`
+	Digest           string `json:"digest"`
+}
+
+// BriefInspectionResult is the evidence a primary shows a user before deciding
+// about an ambiguous brief submission. It is an additive wire result: the task,
+// the pane it read, the revision the decision must be tied to, the digest of the
+// text shown, the text itself, and the two outcomes the coordinator accepts.
+type BriefInspectionResult struct {
+	TaskID     string   `json:"taskId"`
+	ProjectKey string   `json:"projectKey"`
+	Title      string   `json:"title"`
+	Phase      string   `json:"phase"`
+	Blocker    string   `json:"blocker"`
+	PaneID     string   `json:"paneId"`
+	Revision   int64    `json:"revision"`
+	Digest     string   `json:"digest"`
+	Terminal   string   `json:"terminal"`
+	Decisions  []string `json:"decisions"`
+}
+
+// BriefAdjudication is the additive result of a recorded adjudication: which
+// outcome the user chose and the task as it now stands.
+type BriefAdjudication struct {
+	Decision string         `json:"decision"`
+	Task     DispatchResult `json:"task"`
+}
+
+// BriefInspectionFor is BriefInspection for an already authorized primary, and it
+// requires the task to belong to that primary's project: a primary adjudicates
+// the workers it dispatched, never another project's.
+func (c *Coordinator) BriefInspectionFor(ctx context.Context, projectKey, taskID string) (BriefInspectionResult, error) {
+	st, err := c.adjudicableTask(ctx, projectKey, taskID)
+	if err != nil {
+		return BriefInspectionResult{}, err
+	}
+	evidence, text, err := c.inspectAmbiguousBrief(ctx, st)
+	if err != nil {
+		return BriefInspectionResult{}, err
+	}
+	return BriefInspectionResult{
+		TaskID:     st.ID,
+		ProjectKey: st.ProjectKey,
+		Title:      st.Title,
+		Phase:      string(st.Phase),
+		Blocker:    st.Blocker,
+		PaneID:     evidence.PaneID,
+		Revision:   st.Revision,
+		Digest:     evidence.Digest,
+		Terminal:   text,
+		Decisions:  []string{string(BriefDelivered), string(BriefNotDelivered)},
+	}, nil
+}
+
+// AdjudicateBriefFor is AdjudicateBrief for an already authorized primary: the
+// task must belong to that primary's project.
+func (c *Coordinator) AdjudicateBriefFor(
+	ctx context.Context,
+	projectKey, taskID string,
+	expectedRevision int64,
+	decision BriefDecision,
+	observed BriefEvidence,
+) (BriefAdjudication, error) {
+	st, err := c.adjudicableTask(ctx, projectKey, taskID)
+	if err != nil {
+		return BriefAdjudication{}, err
+	}
+	decided, err := c.adjudicate(ctx, st, expectedRevision, decision, observed)
+	if err != nil {
+		return BriefAdjudication{}, err
+	}
+	return BriefAdjudication{Decision: string(decision), Task: resultOf(decided)}, nil
+}
+
+// adjudicableTask reads one task and requires it to belong to the given project
+// and to carry the ambiguous brief blocker.
+func (c *Coordinator) adjudicableTask(ctx context.Context, projectKey, taskID string) (task.Task, error) {
+	st, err := c.store.Task(ctx, strings.TrimSpace(taskID))
+	if err != nil {
+		return task.Task{}, err
+	}
+	if key := strings.TrimSpace(projectKey); key != "" && st.ProjectKey != key {
+		return task.Task{}, fmt.Errorf("%w: task %s belongs to %q, not to this primary's project %q",
+			ErrNotAdjudicable, st.ID, st.ProjectKey, key)
+	}
+	if !IsAmbiguousBriefTask(st) {
+		return task.Task{}, fmt.Errorf("%w: task %s is at phase %s with no ambiguous brief submission",
+			ErrNotAdjudicable, st.ID, st.Phase)
+	}
+	return st, nil
 }
 
 // IsAmbiguousBriefTask reports whether a task carries exactly the blocker an
@@ -913,6 +1094,12 @@ func (c *Coordinator) BriefInspection(ctx context.Context, taskID string) (Brief
 		return BriefEvidence{}, "", fmt.Errorf("%w: task %s is at phase %s with no ambiguous brief submission",
 			ErrNotAdjudicable, st.ID, st.Phase)
 	}
+	return c.inspectAmbiguousBrief(ctx, st)
+}
+
+// inspectAmbiguousBrief reads the evidence for a task already known to carry the
+// ambiguous brief blocker.
+func (c *Coordinator) inspectAmbiguousBrief(ctx context.Context, st task.Task) (BriefEvidence, string, error) {
 	paneID := strings.TrimSpace(st.PublicPaneID)
 	if paneID == "" {
 		paneID = strings.TrimSpace(st.LaunchPaneID)
@@ -952,11 +1139,6 @@ func (c *Coordinator) AdjudicateBrief(
 	decision BriefDecision,
 	observed BriefEvidence,
 ) (task.Task, error) {
-	switch decision {
-	case BriefDelivered, BriefNotDelivered:
-	default:
-		return task.Task{}, fmt.Errorf("%w: %q is not a brief decision", ErrInvalidRequest, decision)
-	}
 	st, err := c.store.Task(ctx, taskID)
 	if err != nil {
 		return task.Task{}, err
@@ -964,6 +1146,23 @@ func (c *Coordinator) AdjudicateBrief(
 	if !IsAmbiguousBriefTask(st) {
 		return task.Task{}, fmt.Errorf("%w: task %s is at phase %s with no ambiguous brief submission",
 			ErrNotAdjudicable, st.ID, st.Phase)
+	}
+	return c.adjudicate(ctx, st, expectedRevision, decision, observed)
+}
+
+// adjudicate applies one decision to a task already known to carry the ambiguous
+// brief blocker.
+func (c *Coordinator) adjudicate(
+	ctx context.Context,
+	st task.Task,
+	expectedRevision int64,
+	decision BriefDecision,
+	observed BriefEvidence,
+) (task.Task, error) {
+	switch decision {
+	case BriefDelivered, BriefNotDelivered:
+	default:
+		return task.Task{}, fmt.Errorf("%w: %q is not a brief decision", ErrInvalidRequest, decision)
 	}
 
 	// Provenance: the pane the user looked at must be this task's worker, and the
@@ -1012,8 +1211,12 @@ func (c *Coordinator) AdjudicateBrief(
 	if decision == BriefDelivered {
 		return decided, nil
 	}
-	// Not delivered: resume the recorded phase exactly once. The phase owns the
-	// task's provisioning slot, so nothing has to be claimed again.
+	// Not delivered: resume the recorded phase exactly once. The user's inspection
+	// is the proof that the uncertain step is not running, so its claim may go; the
+	// phase owns the task's provisioning slot, so nothing has to be claimed again.
+	if err := c.store.ClearStepClaim(ctx, decided.ID); err != nil {
+		return decided, err
+	}
 	provisioned, err := c.provision(ctx, decided)
 	if err != nil {
 		return provisioned, err
@@ -1223,6 +1426,14 @@ func (e *PersistenceError) Is(target error) bool { return target == ErrPersisten
 // resources and the cause. If even that fails, the persistence failure is part of
 // the returned error instead of being dropped.
 func (c *Coordinator) failTask(ctx context.Context, st task.Task, step string, terminal bool, cause error) (task.Task, error) {
+	// A definite failure provably wrote nothing, so its step claim goes back at
+	// once and a resume may run now. A timeout, Herdr's ambiguity, and a response
+	// this build cannot interpret all leave the outcome undecided: their claim is
+	// kept until its lease expires, so a retry waits for live inspection instead of
+	// racing a side effect that may already have happened.
+	if definiteFailure(cause) {
+		c.releaseStep(ctx, st)
+	}
 	failure := stepError(st, step, terminal, cause)
 	updated, err := c.record(ctx, st, func(next *task.Task) error {
 		if terminal {

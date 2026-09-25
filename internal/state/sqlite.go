@@ -72,6 +72,9 @@ CREATE TABLE IF NOT EXISTS tasks (
 	public_pane_id TEXT NOT NULL DEFAULT '',
 	revision INTEGER NOT NULL,
 	slot_claimed_at INTEGER NOT NULL DEFAULT 0,
+	step_claim_owner TEXT NOT NULL DEFAULT '',
+	step_claim_phase TEXT NOT NULL DEFAULT '',
+	step_claim_until INTEGER NOT NULL DEFAULT 0,
 	data JSON NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS tasks_launch_pane_id
@@ -124,6 +127,9 @@ var inboxColumns = []struct{ name, ddl string }{
 // recorded, which the gate reads as well.
 var taskColumns = []struct{ name, ddl string }{
 	{"slot_claimed_at", `ALTER TABLE tasks ADD COLUMN slot_claimed_at INTEGER NOT NULL DEFAULT 0`},
+	{"step_claim_owner", `ALTER TABLE tasks ADD COLUMN step_claim_owner TEXT NOT NULL DEFAULT ''`},
+	{"step_claim_phase", `ALTER TABLE tasks ADD COLUMN step_claim_phase TEXT NOT NULL DEFAULT ''`},
+	{"step_claim_until", `ALTER TABLE tasks ADD COLUMN step_claim_until INTEGER NOT NULL DEFAULT 0`},
 }
 
 // migratedColumns are the additive columns of every table, in the order they are
@@ -1138,6 +1144,126 @@ func pathsOverlap(a, b string) (string, bool) {
 // rowQueryer is the read surface shared by *sql.DB and one write transaction.
 type rowQueryer interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// ---------------------------------------------------------------------------
+// the durable step claim
+// ---------------------------------------------------------------------------
+
+// ClaimStep takes the exclusive right to run the provisioning step of one task at
+// one phase, for owner, and reports whether *this call* got it.
+//
+// A slot claim says a task may hold worker capacity; it does not say who is
+// running the task's next step. Two callers can both be inside a resume of the
+// same task (a startup pass and a user's adjudication, or two startup passes), and
+// the phase alone cannot tell them apart, so this claim makes the step exclusive
+// durably:
+//
+//   - a claim is keyed by the phase it was taken for, so a step that advanced does
+//     not block the next step;
+//   - a claim that is older than lease can be taken over, which is what keeps a
+//     crash recoverable: the process that died left the claim, and the retry —
+//     minutes later, or from another process — is allowed to continue from the
+//     recorded phase;
+//   - a live claim for the same phase is never stolen, so only one caller runs the
+//     step and only one side effect (a worktree create, an agent start, a brief) is
+//     ever issued per step.
+func (s *Store) ClaimStep(ctx context.Context, taskID string, phase task.Phase, owner string, lease time.Duration) (bool, error) {
+	if strings.TrimSpace(taskID) == "" || strings.TrimSpace(owner) == "" {
+		return false, fmt.Errorf("%w: task id and owner are required", ErrInvalid)
+	}
+	if strings.TrimSpace(string(phase)) == "" || lease <= 0 {
+		return false, fmt.Errorf("%w: a phase and a positive lease are required", ErrInvalid)
+	}
+	tx, err := s.begin(ctx, "claim step of "+taskID)
+	if err != nil {
+		return false, err
+	}
+	defer tx.rollback()
+
+	var holder, heldPhase string
+	var heldUntil int64
+	// The step is eligible only while the task still records this phase, so a
+	// caller holding a stale read can never re-run a step the task has moved past
+	// (the loser of a concurrent resume, for example).
+	current, err := scanTask(tx.QueryRowContext(ctx, `SELECT data FROM tasks WHERE id = ?`, taskID), "task "+taskID)
+	if err != nil {
+		return false, err
+	}
+	if current.Phase != phase {
+		return false, tx.commit("claim step of " + taskID)
+	}
+	err = tx.QueryRowContext(ctx,
+		`SELECT step_claim_owner, step_claim_phase, step_claim_until FROM tasks WHERE id = ?`, taskID).
+		Scan(&holder, &heldPhase, &heldUntil)
+	if err != nil {
+		return false, fmt.Errorf("read the step claim of %s: %w", taskID, err)
+	}
+	now := time.Now().UnixMilli()
+	live := holder != "" && heldPhase == string(phase) && now < heldUntil
+	if live {
+		// Another caller is running this very step. Commit without changing anything
+		// so the read did not hold a write lock longer than it had to.
+		return false, tx.commit("claim step of " + taskID)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE tasks SET step_claim_owner = ?, step_claim_phase = ?, step_claim_until = ? WHERE id = ?`,
+		owner, string(phase), now+lease.Milliseconds(), taskID); err != nil {
+		return false, fmt.Errorf("claim step of %s: %w", taskID, err)
+	}
+	if err := tx.commit("claim step of " + taskID); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// ClearStepClaim drops any owner's step claim for one task.
+//
+// It exists for exactly one caller: a user who has inspected a task and decided
+// what happened to a step whose outcome was undecided. That inspection is the
+// proof that no live caller is running the step, so the claim may go — and no
+// automatic caller may do this, or a live step could be raced.
+func (s *Store) ClearStepClaim(ctx context.Context, taskID string) error {
+	if strings.TrimSpace(taskID) == "" {
+		return fmt.Errorf("%w: task id is required", ErrInvalid)
+	}
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE tasks SET step_claim_owner = '', step_claim_phase = '', step_claim_until = 0 WHERE id = ?`, taskID)
+	if err != nil {
+		return fmt.Errorf("clear the step claim of %s: %w", taskID, err)
+	}
+	if err := requireOneRow(res, ErrNotFound, "clear the step claim of "+taskID); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ReleaseStep gives up this owner's step claim, for a step that failed without
+// changing the task's phase: a retry must not have to wait out the lease. A claim
+// another owner holds is left alone.
+func (s *Store) ReleaseStep(ctx context.Context, taskID, owner string) error {
+	if strings.TrimSpace(taskID) == "" || strings.TrimSpace(owner) == "" {
+		return fmt.Errorf("%w: task id and owner are required", ErrInvalid)
+	}
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE tasks SET step_claim_owner = '', step_claim_phase = '', step_claim_until = 0
+		  WHERE id = ? AND step_claim_owner = ?`, taskID, owner)
+	if err != nil {
+		return fmt.Errorf("release the step claim of %s: %w", taskID, err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("release the step claim of %s: %w", taskID, err)
+	}
+	if rows == 0 {
+		// Either the task is gone or another owner holds the claim: both are
+		// reported, because neither is this caller's step to release.
+		if _, err := s.Task(ctx, taskID); err != nil {
+			return err
+		}
+		return fmt.Errorf("%w: task %s holds a step claim this owner did not take", ErrConflict, taskID)
+	}
+	return nil
 }
 
 // CreateProject records a new primary project.

@@ -171,6 +171,24 @@ interface CleanupPreview {
   detail: string;
 }
 
+// BriefInspection is the evidence a primary shows before deciding an ambiguous
+// brief submission: the task and its phase and blocker, the pane that was read, the
+// revision the decision must be tied to, and the digest of the terminal text shown.
+interface BriefInspection {
+  taskId: string;
+  title: string;
+  phase: string;
+  blocker: string;
+  paneId: string;
+  revision: number;
+  digest: string;
+  terminal: string;
+}
+
+// EVIDENCE_LIMIT bounds how much of a worker's terminal a confirmation shows: the
+// digest covers the whole read, and the user is asked to check the pane itself.
+const EVIDENCE_LIMIT = 1200;
+
 type ConfirmPlan = { ok: true; request: ConfirmRequest } | { ok: false; reason: string };
 type GateOutcome<T> = { ok: true; value: T } | { ok: false; reason: string };
 
@@ -178,6 +196,12 @@ function previewText(value: unknown, key: string): string {
   if (typeof value !== "object" || value === null || !(key in value)) return "";
   const field = value[key];
   return typeof field === "string" ? field : "";
+}
+
+function previewNumber(value: unknown, key: string): number {
+  if (typeof value !== "object" || value === null || !(key in value)) return 0;
+  const field = value[key];
+  return typeof field === "number" && Number.isFinite(field) ? field : 0;
 }
 
 function previewFlag(value: unknown, key: string): boolean {
@@ -298,6 +322,59 @@ export function settleConfirmRequest(taskId: string, decision: string): ConfirmP
         `Task ${taskId}: confirm that the input sent to this worker earlier ${observed}. ` +
         "Inspect the worker's pane first: this decides whether anything else may be sent to it.",
     },
+  };
+}
+
+// adjudicateConfirmRequest is the confirmation an ambiguous brief submission needs:
+// the model proposes one of the two outcomes, and the user sees the exact evidence
+// the inspection read — the task, its pane, the revision and the terminal text —
+// before anything is recorded. The text is what the digest was taken over, so the
+// coordinator can refuse a decision made on a screen that has since changed.
+export function adjudicateConfirmRequest(inspection: BriefInspection, decision: string): ConfirmPlan {
+  if (inspection.taskId.length === 0) {
+    return { ok: false, reason: "the inspection named no task" };
+  }
+  if (decision !== "delivered" && decision !== "not_delivered") {
+    return {
+      ok: false,
+      reason: `"${decision}" is not a decision; the user reports that the brief either "delivered" or "not_delivered"`,
+    };
+  }
+  if (inspection.paneId.length === 0 || inspection.digest.length === 0) {
+    return { ok: false, reason: "the inspection carries no pane and digest, so nothing can be decided" };
+  }
+  const outcome =
+    decision === "delivered"
+      ? "the brief DID reach the worker (it will be recorded as submitted and never sent again)"
+      : "the brief did NOT reach the worker (only this blocker is cleared and the brief is sent once)";
+  const shown = inspection.terminal.length > EVIDENCE_LIMIT
+    ? `${inspection.terminal.slice(0, EVIDENCE_LIMIT)}\n… (truncated)`
+    : inspection.terminal;
+  return {
+    ok: true,
+    request: {
+      title: "Decide an uncertain dispatch",
+      message:
+        `Task ${inspection.taskId} (phase ${inspection.phase}) on pane ${inspection.paneId}, revision ` +
+        `${String(inspection.revision)}, digest ${inspection.digest}: confirm that ${outcome}.\n\n` +
+        `What the worker's pane shows now:\n${shown}\n\n` +
+        "Read the pane yourself before answering: an answer of \"delivered\" records a submission you did not see.",
+    },
+  };
+}
+
+// readBriefInspection shapes the whole brief_inspection answer, and reports whether
+// it is usable at all: a decision is never taken on a partial reading.
+function readBriefInspection(value: unknown): BriefInspection {
+  return {
+    taskId: previewText(value, "taskId"),
+    title: previewText(value, "title"),
+    phase: previewText(value, "phase"),
+    blocker: previewText(value, "blocker"),
+    paneId: previewText(value, "paneId"),
+    revision: previewNumber(value, "revision"),
+    digest: previewText(value, "digest"),
+    terminal: previewText(value, "terminal"),
   };
 }
 
@@ -612,6 +689,7 @@ export default function (pi: ExtensionAPI) {
     "orch_approve_dialog",
     "orch_review",
     "orch_settle_input",
+    "orch_adjudicate_dispatch",
     "orch_cleanup",
   ];
   const workerNames = ["orch_progress", "orch_question", "orch_report"];
@@ -845,6 +923,42 @@ export default function (pi: ExtensionAPI) {
       if (!plan.ok) return toolRefusal(plan.reason);
       const gated = await confirmThen(uiGate(ctx), plan.request, () =>
         callBridge("settle_input", { taskId: params.taskId, decision: params.decision }, identity, signal),
+      );
+      if (!gated.ok) return toolRefusal(gated.reason);
+      return toolResult(gated.value);
+    },
+  });
+
+  pi.registerTool({
+    name: "orch_adjudicate_dispatch",
+    label: "Decide an uncertain dispatch",
+    defaultInactive: true,
+    description:
+      "Decide what happened to a brief whose submission was left uncertain, after the user inspects the worker's pane: whether it arrived. \"delivered\" records the submission without sending it again; \"not_delivered\" clears that blocker and sends it once more. Nothing else can clear that blocker.",
+    parameters: z.object({
+      taskId: z.string().min(1),
+      decision: z.enum(["delivered", "not_delivered"]),
+    }),
+    async execute(_callId, params, signal, _update, ctx) {
+      const identity = sessionIdentity(ctx.sessionManager);
+      const inspection = readBriefInspection(
+        await callBridge("brief_inspection", { taskId: params.taskId }, identity, signal),
+      );
+      const plan = adjudicateConfirmRequest(inspection, params.decision);
+      if (!plan.ok) return toolRefusal(plan.reason);
+      const gated = await confirmThen(uiGate(ctx), plan.request, () =>
+        callBridge(
+          "adjudicate_brief",
+          {
+            taskId: inspection.taskId,
+            expectedRevision: inspection.revision,
+            decision: params.decision,
+            paneId: inspection.paneId,
+            digest: inspection.digest,
+          },
+          identity,
+          signal,
+        ),
       );
       if (!gated.ok) return toolRefusal(gated.reason);
       return toolResult(gated.value);

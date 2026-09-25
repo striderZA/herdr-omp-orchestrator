@@ -19,6 +19,7 @@
 //   NODE_PATH=%USERPROFILE%\node_modules bun omp/load-extension.check.ts
 // or point OMP_TYPED_BUILDER straight at the zod module file.
 import extension, {
+  adjudicateConfirmRequest,
   afterTurnRefresh,
   cleanupConfirmRequest,
   confirmThen,
@@ -144,6 +145,7 @@ try {
 
 const names = tools.map((tool) => tool.name).sort();
 const wantNames = [
+  "orch_adjudicate_dispatch",
   "orch_answer",
   "orch_approve_dialog",
   "orch_cleanup",
@@ -546,6 +548,54 @@ async function checkGates(): Promise<void> {
   }
   check(!settleConfirmRequest("orch_abc", "maybe").ok, "the settlement accepted a decision the user cannot make");
   check(!settleConfirmRequest("", "delivered").ok, "the settlement accepted no task");
+
+  // A brief adjudication is decided on evidence, so the confirmation must show the
+  // pane, the revision, the digest and the terminal text the digest covers, and it
+  // must refuse a decision the coordinator would not accept.
+  const inspection = {
+    taskId: "orch_abc",
+    title: "one",
+    phase: "agent_started",
+    blocker: "task orch_abc could not submit the brief: coord: the step's outcome could not be identified",
+    paneId: "w2:p1",
+    revision: 7,
+    digest: "a1b2c3d4",
+    terminal: "worker terminal\n> waiting for instructions",
+  };
+  const adjudicated = adjudicateConfirmRequest(inspection, "delivered");
+  if (!adjudicated.ok) {
+    failures.push(`the delivered adjudication was refused: ${adjudicated.reason}`);
+  } else {
+    check(
+      adjudicated.request.title === "Decide an uncertain dispatch",
+      `the adjudication confirmation is titled ${JSON.stringify(adjudicated.request.title)}`,
+    );
+    for (const shown of ["orch_abc", "w2:p1", "revision 7", "a1b2c3d4", "waiting for instructions", "DID reach"]) {
+      check(
+        adjudicated.request.message.includes(shown),
+        `the adjudication confirmation does not show ${JSON.stringify(shown)}: ${JSON.stringify(adjudicated.request.message)}`,
+      );
+    }
+  }
+  const withheld = adjudicateConfirmRequest(inspection, "not_delivered");
+  if (!withheld.ok) {
+    failures.push(`the not-delivered adjudication was refused: ${withheld.reason}`);
+  } else {
+    check(
+      withheld.request.message.includes("did NOT reach"),
+      `the not-delivered adjudication reads ${JSON.stringify(withheld.request.message)}`,
+    );
+  }
+  check(!adjudicateConfirmRequest(inspection, "maybe").ok, "the adjudication accepted a decision the coordinator refuses");
+  check(
+    !adjudicateConfirmRequest({ ...inspection, digest: "" }, "delivered").ok,
+    "the adjudication accepted evidence with no digest",
+  );
+  check(
+    !adjudicateConfirmRequest({ ...inspection, paneId: "" }, "delivered").ok,
+    "the adjudication accepted evidence with no pane",
+  );
+  check(!adjudicateConfirmRequest({ ...inspection, taskId: "" }, "delivered").ok, "the adjudication accepted no task");
 
   // The adapter reads the context it was given, never a guess.
   check(uiGate({ hasUI: false, ui: { confirm: async () => true } }).hasUI === false, "uiGate invented a UI");

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -115,6 +116,9 @@ type fixturePlan struct {
 	WorktreeCreateTimeout bool `json:"worktree_create_timeout"`
 	// AgentStartError makes `agent start` fail with that Herdr code.
 	AgentStartError string `json:"agent_start_error"`
+	// AgentStartTimeout makes `agent start` start the agent and then answer with
+	// Herdr's own timeout code, the way a CLI timeout arrives after the effect.
+	AgentStartTimeout bool `json:"agent_start_timeout"`
 	// SkipGitWorktree keeps the checkout off disk (an already-broken create).
 	SkipGitWorktree bool `json:"skip_git_worktree"`
 }
@@ -438,6 +442,11 @@ func fixtureAgentStart(dir string, plan fixturePlan, state *fixtureState, argv [
 		Terminal: "term-" + strings.ReplaceAll(pane, ":", "-"),
 		Session:  fmt.Sprintf("omp-session-%d", state.NextSession),
 		Status:   "idle",
+	}
+	if plan.AgentStartTimeout {
+		// The answer never arrived and nothing was recorded: the outcome is unknown
+		// in both directions, so the coordinator cannot reconcile it.
+		return fixtureError("timeout", "the command timed out before the agent was seen")
 	}
 	state.Agents[pane] = agent
 	state.save(dir)
@@ -3197,6 +3206,287 @@ func TestAdjudicateBriefRefusesEveryOtherBlockerAndPhase(t *testing.T) {
 	// The inspection itself refuses outside the ambiguous state.
 	if _, _, err := f.coord.BriefInspection(ctx, running.ID); !errors.Is(err, ErrNotAdjudicable) {
 		t.Errorf("BriefInspection(running) err = %v, want ErrNotAdjudicable", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the durable step claim
+// ---------------------------------------------------------------------------
+
+func TestConcurrentResumesIssueOneCommandPerStep(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	checks := []string{"go test ./... ok"}
+
+	// The brief step is the one Herdr cannot protect: two callers resuming the same
+	// AgentStarted task would each submit it, and nothing on the other side would
+	// notice. Only the durable step claim stops that.
+	submitted, err := f.dispatchSpec(f.coord, spec{title: "one", checks: checks})
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	atBrief := f.block(submitted, func(next *task.Task) {
+		next.Phase = task.AgentStarted
+	})
+	f.coord.releaseStep(context.Background(), atBrief)
+	before := f.countCalls("agent prompt")
+	sibling := f.sibling()
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	start := make(chan struct{})
+	for _, c := range []*Coordinator{f.coord, sibling} {
+		wg.Add(1)
+		go func(c *Coordinator) {
+			defer wg.Done()
+			<-start
+			_, err := c.ResumeDispatch(context.Background(), atBrief.ID)
+			errs <- err
+		}(c)
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+
+	inFlight := 0
+	for err := range errs {
+		switch {
+		case err == nil:
+		case errors.Is(err, ErrStepInFlight):
+			inFlight++
+		default:
+			t.Errorf("concurrent resume err = %v", err)
+		}
+	}
+	if inFlight != 1 {
+		t.Errorf("callers told the step was in flight = %d, want exactly 1", inFlight)
+	}
+	if got := f.countCalls("agent prompt"); got != before+1 {
+		t.Fatalf("agent prompt calls = %d, want %d: the brief was submitted twice", got, before+1)
+	}
+	final, err := f.store.Task(context.Background(), atBrief.ID)
+	if err != nil {
+		t.Fatalf("Task: %v", err)
+	}
+	if final.Phase != task.PromptSubmitted || final.Attention != "" || final.Blocker != "" {
+		t.Errorf("the resumed task = phase %q attention %q, want a clean submitted task", final.Phase, final.Attention)
+	}
+	if got := f.prompts(final.PublicPaneID); len(got) != before+1 {
+		t.Errorf("prompts = %v, want %d: one brief from the dispatch and one from the winner", got, before+1)
+	}
+
+	// The same for the worker-start step: without the claim both callers would run
+	// it, and the loser would record a failure on a task the winner is finishing.
+	atStart := f.block(final, func(next *task.Task) {
+		next.Phase = task.WorktreeCreated
+		next.LaunchPaneID, next.PublicPaneID = "", ""
+		next.AgentName, next.OMPSessionID, next.TerminalID = "", "", ""
+	})
+	f.coord.releaseStep(context.Background(), atStart)
+	beforeStart := f.countCalls("agent start")
+	beforePrompts := f.countCalls("agent prompt")
+	other := f.sibling()
+	errs = make(chan error, 2)
+	start = make(chan struct{})
+	for _, c := range []*Coordinator{f.coord, other} {
+		wg.Add(1)
+		go func(c *Coordinator) {
+			defer wg.Done()
+			<-start
+			_, err := c.ResumeDispatch(context.Background(), atStart.ID)
+			errs <- err
+		}(c)
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	inFlight = 0
+	for err := range errs {
+		switch {
+		case err == nil:
+		case errors.Is(err, ErrStepInFlight):
+			inFlight++
+		default:
+			t.Errorf("concurrent start err = %v", err)
+		}
+	}
+	if inFlight != 1 {
+		t.Errorf("callers told the step was in flight = %d, want exactly 1", inFlight)
+	}
+	// One caller ran the step: it adopted the agent that was already live on the
+	// pane, so no start was issued at all, and the brief went out once.
+	if got := f.countCalls("agent start"); got != beforeStart {
+		t.Errorf("agent start calls = %d, want %d: two callers ran the start step", got, beforeStart)
+	}
+	if got := f.countCalls("agent prompt"); got != beforePrompts+1 {
+		t.Errorf("agent prompt calls = %d, want %d", got, beforePrompts+1)
+	}
+	started, err := f.store.Task(context.Background(), atStart.ID)
+	if err != nil {
+		t.Fatalf("Task: %v", err)
+	}
+	if started.Attention != "" || started.Blocker != "" {
+		t.Errorf("a losing caller recorded a failure on a running task: attention=%q blocker=%q",
+			started.Attention, started.Blocker)
+	}
+	if started.Phase != task.PromptSubmitted {
+		t.Errorf("phase = %q, want %q", started.Phase, task.PromptSubmitted)
+	}
+}
+
+func TestDefiniteAgentStartRefusalReleasesTheClaimForAnImmediateResume(t *testing.T) {
+	// A definite refusal provably wrote nothing, so the claim goes back at once and
+	// a resume may run immediately instead of waiting out the two-minute lease.
+	f := newCoordFixture(t, fixturePlan{AgentStartError: "agent_start_failed"})
+	ctx := context.Background()
+	failed, err := f.dispatchSpec(f.coord, spec{title: "one", checks: []string{"go test ./... ok"}})
+	if !errors.Is(err, herdr.ErrCLI) {
+		t.Fatalf("dispatch err = %v, want a Herdr CLI failure", err)
+	}
+	if failed.Phase != task.WorktreeCreated || failed.Attention == "" {
+		t.Fatalf("failed task = phase %q attention %q, want a retryable failure at worktree_created",
+			failed.Phase, failed.Attention)
+	}
+	// No lease wait: the claim the failed step held is already gone.
+	if took, err := f.store.ClaimStep(ctx, failed.ID, task.WorktreeCreated, "probe", time.Minute); err != nil || !took {
+		t.Fatalf("ClaimStep after a definite refusal = (%v, %v), want the claim released", took, err)
+	}
+	if err := f.store.ReleaseStep(ctx, failed.ID, "probe"); err != nil {
+		t.Fatalf("ReleaseStep: %v", err)
+	}
+
+	f.updatePlan(func(p *fixturePlan) { p.AgentStartError = "" })
+	beforeStart := f.countCalls("agent start")
+	resumed, err := f.resume(failed.ID)
+	if err != nil {
+		t.Fatalf("immediate resume after a definite refusal: %v", err)
+	}
+	if resumed.Phase != task.PromptSubmitted {
+		t.Fatalf("phase = %q, want %q", resumed.Phase, task.PromptSubmitted)
+	}
+	if got := f.countCalls("agent start"); got != beforeStart+1 {
+		t.Errorf("agent start calls = %d, want %d", got, beforeStart+1)
+	}
+	if resumed.Attention != "" {
+		t.Errorf("attention survived the successful retry: %q", resumed.Attention)
+	}
+}
+
+func TestAmbiguousAgentStartKeepsItsBlockerAndClaimUntilInspected(t *testing.T) {
+	// An ambiguous start may have taken effect, so nothing is released and nothing
+	// retries automatically: the task is blocked for a human, and the claim stays
+	// until its lease expires or a user decides.
+	f := newCoordFixture(t, fixturePlan{AgentStartTimeout: true})
+	ctx := context.Background()
+	st, err := f.dispatchSpec(f.coord, spec{title: "one", checks: []string{"go test ./... ok"}})
+	if !errors.Is(err, herdr.ErrAmbiguous) {
+		t.Fatalf("dispatch err = %v, want an ambiguous outcome", err)
+	}
+	if st.Blocker == "" || st.Attention != "" {
+		t.Fatalf("task = blocker %q attention %q, want a blocker only", st.Blocker, st.Attention)
+	}
+	if got := task.StageOf(st); got != task.NeedsInput {
+		t.Errorf("stage = %q, want needs_input", got)
+	}
+	// The claim is still held: another owner cannot take that step.
+	phase := st.Phase
+	if took, err := f.store.ClaimStep(ctx, st.ID, phase, "probe", time.Minute); err != nil || took {
+		t.Fatalf("ClaimStep after an ambiguous start = (%v, %v), want the claim kept", took, err)
+	}
+	// And nothing resumes it automatically, even with the cause "fixed".
+	f.updatePlan(func(p *fixturePlan) { p.AgentStartTimeout = false })
+	if _, err := f.resume(st.ID); !errors.Is(err, ErrBlocked) {
+		t.Fatalf("resume of a blocked task err = %v, want ErrBlocked", err)
+	}
+	// Nothing was recorded on the pane either: the outcome is genuinely unknown, so
+	// no caller may proceed on its own.
+	if live := f.state().Agents[st.LaunchPaneID]; live != nil {
+		t.Errorf("pane %q reports an agent, so this was not an unknown outcome", st.LaunchPaneID)
+	}
+	if got := f.prompts(st.PublicPaneID); len(got) != 0 {
+		t.Errorf("prompts = %v, want none before a human decides", got)
+	}
+}
+
+func TestStepClaimLeaseKeepsCrashRecovery(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	ctx := context.Background()
+	st, err := f.dispatchSpec(f.coord, spec{title: "one", checks: []string{"go test ./... ok"}})
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	atBrief := f.block(st, func(next *task.Task) {
+		next.Phase = task.AgentStarted
+	})
+	f.coord.releaseStep(ctx, atBrief)
+	before := f.countCalls("agent prompt")
+
+	// A live claim for this very step stops another caller: that is the
+	// no-duplicate half.
+	if took, err := f.store.ClaimStep(ctx, atBrief.ID, task.AgentStarted, "another-caller", time.Minute); err != nil || !took {
+		t.Fatalf("ClaimStep = (%v, %v), want the claim", took, err)
+	}
+	if _, err := f.resume(atBrief.ID); !errors.Is(err, ErrStepInFlight) {
+		t.Fatalf("resume with a live claim err = %v, want ErrStepInFlight", err)
+	}
+	if got := f.countCalls("agent prompt"); got != before {
+		t.Fatalf("agent prompt calls = %d, want %d", got, before)
+	}
+	// The claim is released by the caller that failed before any side effect, so a
+	// retry does not have to wait for the lease.
+	if err := f.coord.store.ReleaseStep(ctx, atBrief.ID, "another-caller"); err != nil {
+		t.Fatalf("ReleaseStep: %v", err)
+	}
+	// A crashed caller's claim expires, and the next resume continues from the
+	// recorded phase: crash recovery is not weakened by the exclusivity.
+	if took, err := f.store.ClaimStep(ctx, atBrief.ID, task.AgentStarted, "dead-caller", 20*time.Millisecond); err != nil || !took {
+		t.Fatalf("ClaimStep(dead) = (%v, %v), want the claim", took, err)
+	}
+	time.Sleep(40 * time.Millisecond)
+	resumed, err := f.resume(atBrief.ID)
+	if err != nil {
+		t.Fatalf("resume after the lease expired: %v", err)
+	}
+	if resumed.Phase != task.PromptSubmitted {
+		t.Errorf("phase = %q, want %q", resumed.Phase, task.PromptSubmitted)
+	}
+	if got := f.countCalls("agent prompt"); got != before+1 {
+		t.Errorf("agent prompt calls = %d, want %d", got, before+1)
+	}
+}
+
+func TestBriefInspectionForStaysInsideThePrimariesProject(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	st := f.ambiguousBrief("one")
+	ctx := context.Background()
+
+	// The primary's own project may inspect and decide.
+	result, err := f.coord.BriefInspectionFor(ctx, f.root, st.ID)
+	if err != nil {
+		t.Fatalf("BriefInspectionFor: %v", err)
+	}
+	if result.TaskID != st.ID || result.Revision != st.Revision || result.PaneID != st.PublicPaneID {
+		t.Fatalf("inspection = %+v, want the task, its revision and its pane", result)
+	}
+	if len(result.Decisions) != 2 || result.Terminal == "" {
+		t.Errorf("inspection = %+v, want both decisions and the terminal text", result)
+	}
+	// Another project may not, even with the right task id.
+	if _, err := f.coord.BriefInspectionFor(ctx, "E:/somewhere/else", st.ID); !errors.Is(err, ErrNotAdjudicable) {
+		t.Errorf("foreign project inspection err = %v, want ErrNotAdjudicable", err)
+	}
+	if _, err := f.coord.AdjudicateBriefFor(ctx, "E:/somewhere/else", st.ID, st.Revision, BriefDelivered,
+		BriefEvidence{PaneID: result.PaneID, Digest: result.Digest}); !errors.Is(err, ErrNotAdjudicable) {
+		t.Errorf("foreign project adjudication err = %v, want ErrNotAdjudicable", err)
+	}
+	// The primary's own decision is recorded and answers with the outcome and the
+	// task's new facts.
+	decided, err := f.coord.AdjudicateBriefFor(ctx, f.root, st.ID, result.Revision, BriefDelivered,
+		BriefEvidence{PaneID: result.PaneID, Digest: result.Digest})
+	if err != nil {
+		t.Fatalf("AdjudicateBriefFor: %v", err)
+	}
+	if decided.Decision != string(BriefDelivered) || decided.Task.TaskID != st.ID || decided.Task.Phase != string(task.PromptSubmitted) {
+		t.Errorf("adjudication = %+v, want the delivered outcome and the submitted task", decided)
 	}
 }
 

@@ -75,13 +75,21 @@ const (
 	MethodQuestion = "question"
 	// The primary's decisions, and the two read-only previews they are shown
 	// before deciding.
-	MethodAnswer         = "answer"
-	MethodDialogPreview  = "dialog_preview"
-	MethodApproveDialog  = "approve_dialog"
-	MethodReview         = "review"
-	MethodSettleInput    = "settle_input"
-	MethodCleanupPreview = "cleanup_preview"
-	MethodCleanup        = "cleanup"
+	MethodAnswer        = "answer"
+	MethodDialogPreview = "dialog_preview"
+	MethodApproveDialog = "approve_dialog"
+	MethodReview        = "review"
+	MethodSettleInput   = "settle_input"
+	// MethodBriefInspection reads the evidence a user decides an ambiguous brief
+	// submission on. The op itself mutates nothing, but it is authorized like any
+	// other primary call: a session that has not confirmed its handshake may not
+	// read another task's terminal.
+	MethodBriefInspection = "brief_inspection"
+	// MethodAdjudicateBrief records the user's decision about an ambiguous brief
+	// submission.
+	MethodAdjudicateBrief = "adjudicate_brief"
+	MethodCleanupPreview  = "cleanup_preview"
+	MethodCleanup         = "cleanup"
 )
 
 // Reasons a resolve result is not bound. The extension only needs `bound`; the
@@ -167,9 +175,14 @@ type Principal struct {
 type Ops struct {
 	Dispatch func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
 	// Worker role.
-	Report   func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
-	Progress func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
-	Question func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
+	Report func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
+	// BriefInspection and AdjudicateBrief are Task 4's brief-adjudication surface:
+	// the primary shows the evidence the inspection returns, the user decides, and
+	// the decision is recorded against that exact evidence.
+	BriefInspection func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
+	AdjudicateBrief func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
+	Progress        func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
+	Question        func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
 	// Primary role. The two previews are read-only; the bridge authorizes them
 	// exactly like a mutation and their operation performs none.
 	Answer         func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
@@ -258,6 +271,23 @@ func CoordinatorOps(c *coord.Coordinator) Ops {
 			result, err := c.ApproveDialog(ctx, p.LaunchPaneID, request.TaskID, request.ObservedDigest, request.Keys)
 			return result, coordError(err)
 		},
+		BriefInspection: func(ctx context.Context, p Principal, params json.RawMessage) (any, error) {
+			var request coord.BriefInspectionParams
+			if err := decodeParams(params, &request); err != nil {
+				return nil, err
+			}
+			result, err := c.BriefInspectionFor(ctx, p.ProjectKey, request.TaskID)
+			return result, coordError(err)
+		},
+		AdjudicateBrief: func(ctx context.Context, p Principal, params json.RawMessage) (any, error) {
+			var request coord.AdjudicateBriefParams
+			if err := decodeParams(params, &request); err != nil {
+				return nil, err
+			}
+			result, err := c.AdjudicateBriefFor(ctx, p.ProjectKey, request.TaskID, request.ExpectedRevision,
+				coord.BriefDecision(request.Decision), coord.BriefEvidence{PaneID: request.PaneID, Digest: request.Digest})
+			return result, coordError(err)
+		},
 		Review: func(ctx context.Context, p Principal, params json.RawMessage) (any, error) {
 			var request coord.ReviewParams
 			if err := decodeParams(params, &request); err != nil {
@@ -304,17 +334,19 @@ func UnavailableOps(cause error) Ops {
 		return nil, &Error{Code: CodeHerdrUnavailable, Message: "the coordinator is unavailable: " + cause.Error()}
 	}
 	return Ops{
-		Dispatch:       unavailable,
-		Report:         unavailable,
-		Progress:       unavailable,
-		Question:       unavailable,
-		Answer:         unavailable,
-		DialogPreview:  unavailable,
-		ApproveDialog:  unavailable,
-		Review:         unavailable,
-		CleanupPreview: unavailable,
-		SettleInput:    unavailable,
-		Cleanup:        unavailable,
+		Dispatch:        unavailable,
+		Report:          unavailable,
+		Progress:        unavailable,
+		Question:        unavailable,
+		Answer:          unavailable,
+		DialogPreview:   unavailable,
+		ApproveDialog:   unavailable,
+		BriefInspection: unavailable,
+		AdjudicateBrief: unavailable,
+		Review:          unavailable,
+		CleanupPreview:  unavailable,
+		SettleInput:     unavailable,
+		Cleanup:         unavailable,
 	}
 }
 
@@ -364,6 +396,12 @@ func coordErrorCode(err error) string {
 		return "input_pending"
 	case errors.Is(err, coord.ErrBlocked):
 		return "blocked"
+	case errors.Is(err, coord.ErrNotAdjudicable):
+		return "not_adjudicable"
+	case errors.Is(err, coord.ErrEvidenceChanged):
+		return "evidence_changed"
+	case errors.Is(err, coord.ErrStepInFlight):
+		return "step_in_flight"
 	case errors.Is(err, coord.ErrAgentChanged):
 		return "agent_changed"
 	case errors.Is(err, coord.ErrProjectUnknown):
@@ -494,6 +532,10 @@ func run(ctx context.Context, env map[string]string, input io.Reader, opts Optio
 		return h.mutate(req, state.RolePrimary, announced, h.ops.Review)
 	case MethodCleanupPreview:
 		return h.mutate(req, state.RolePrimary, announced, h.ops.CleanupPreview)
+	case MethodBriefInspection:
+		return h.mutate(req, state.RolePrimary, announced, h.ops.BriefInspection)
+	case MethodAdjudicateBrief:
+		return h.mutate(req, state.RolePrimary, announced, h.ops.AdjudicateBrief)
 	case MethodSettleInput:
 		return h.mutate(req, state.RolePrimary, announced, h.ops.SettleInput)
 	case MethodCleanup:

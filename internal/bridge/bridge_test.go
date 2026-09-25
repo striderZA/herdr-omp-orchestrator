@@ -783,6 +783,105 @@ func TestBridgeAcceptsAFileOnlyAnnouncement(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// the brief adjudication methods
+// ---------------------------------------------------------------------------
+
+func TestBridgeBriefAdjudicationIsPrimaryOnlyAndWired(t *testing.T) {
+	f := newBridgeFixture(t)
+	f.seedPrimary()
+	f.seedWorker("t1", workerPane, workerPane, workerSession)
+	f.confirm(workerPane, workerSession)
+	f.confirm(primaryPane, primarySession)
+
+	type seen struct {
+		principal Principal
+		params    json.RawMessage
+	}
+	var inspected, adjudicated seen
+	ops := Ops{
+		BriefInspection: func(_ context.Context, p Principal, params json.RawMessage) (any, error) {
+			inspected = seen{p, params}
+			return map[string]any{"taskId": "t1", "paneId": workerPane, "revision": 7}, nil
+		},
+		AdjudicateBrief: func(_ context.Context, p Principal, params json.RawMessage) (any, error) {
+			adjudicated = seen{p, params}
+			return map[string]any{"decision": "delivered"}, nil
+		},
+	}
+
+	// The worker may use neither method, and neither op runs when it tries.
+	f.env["HERDR_PANE_ID"] = workerPane
+	wantError(t, f.callWith("brief_inspection", workerSession, `{"taskId":"t1"}`, ops), CodeForbidden)
+	wantError(t, f.callWith("adjudicate_brief", workerSession,
+		`{"taskId":"t1","expectedRevision":7,"decision":"delivered","paneId":"w1:p2","digest":"d"}`, ops), CodeForbidden)
+	if inspected.principal.Role != "" || adjudicated.principal.Role != "" {
+		t.Fatalf("an adjudication op ran for a worker: %+v / %+v", inspected, adjudicated)
+	}
+
+	// The primary may, and each op sees the verified principal and its own body.
+	f.env["HERDR_PANE_ID"] = primaryPane
+	resp := f.callWith("brief_inspection", primarySession, `{"taskId":"t1"}`, ops)
+	if !resp.OK {
+		t.Fatalf("brief_inspection failed: %+v", resp.Error)
+	}
+	if inspected.principal.Role != state.RolePrimary || inspected.principal.ProjectKey != f.repoRoot {
+		t.Errorf("inspection principal = %+v, want the primary project", inspected.principal)
+	}
+	var body coord.BriefInspectionParams
+	if err := json.Unmarshal(inspected.params, &body); err != nil || body.TaskID != "t1" {
+		t.Errorf("inspection params = %s, want the task id", inspected.params)
+	}
+	decided := f.callWith("adjudicate_brief", primarySession,
+		`{"taskId":"t1","expectedRevision":7,"decision":"delivered","paneId":"w1:p2","digest":"d"}`, ops)
+	if !decided.OK {
+		t.Fatalf("adjudicate_brief failed: %+v", decided.Error)
+	}
+	var report coord.AdjudicateBriefParams
+	if err := json.Unmarshal(adjudicated.params, &report); err != nil {
+		t.Fatalf("adjudication params = %s", adjudicated.params)
+	}
+	if report.TaskID != "t1" || report.ExpectedRevision != 7 || report.Decision != "delivered" ||
+		report.PaneID != "w1:p2" || report.Digest != "d" {
+		t.Errorf("adjudication params = %+v, want the inspected evidence verbatim", report)
+	}
+
+	// A primary whose handshake was never confirmed mutates nothing.
+	f2 := newBridgeFixture(t)
+	f2.seedPrimary()
+	if err := f2.store.RecordReady(context.Background(), primaryPane, announcedID(primarySession), 1); err != nil {
+		t.Fatalf("RecordReady: %v", err)
+	}
+	f2.env["HERDR_PANE_ID"] = primaryPane
+	wantError(t, f2.callWith("adjudicate_brief", primarySession,
+		`{"taskId":"t1","expectedRevision":7,"decision":"delivered","paneId":"w1:p2","digest":"d"}`, ops), CodeNotReady)
+
+	// Unwired operations answer not_implemented only after authorization.
+	unauthorized := f.callWith("brief_inspection", primarySession, `{"taskId":"t1"}`, Ops{})
+	wantError(t, unauthorized, CodeNotImplemented)
+}
+
+func TestBridgeAdjudicationRefusalsAreCoded(t *testing.T) {
+	// The adjudication's own refusals map to stable codes, so a primary can act on
+	// them without reading a message.
+	for _, tc := range []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"not adjudicable", coord.ErrNotAdjudicable, "not_adjudicable"},
+		{"evidence changed", coord.ErrEvidenceChanged, "evidence_changed"},
+		{"step in flight", coord.ErrStepInFlight, "step_in_flight"},
+		{"invalid request", coord.ErrInvalidRequest, "bad_request"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := coordErrorCode(fmt.Errorf("wrapped: %w", tc.err)); got != tc.want {
+				t.Fatalf("coordErrorCode(%v) = %q, want %q", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
 // role authorization
 // ---------------------------------------------------------------------------
 

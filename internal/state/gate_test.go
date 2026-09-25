@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"herdr-omp-orchestrator/internal/state"
 	"herdr-omp-orchestrator/internal/task"
@@ -211,4 +212,56 @@ func taskIDFor(i, j int) string {
 
 func contains(haystack, needle string) bool {
 	return len(needle) > 0 && len(haystack) >= len(needle) && strings.Contains(haystack, needle)
+}
+
+func TestStoreClaimStepIsExclusivePerPhase(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	first := open(t, dir)
+	second := open(t, dir)
+
+	if _, _, err := first.ClaimTask(ctx, gateTask(t, "t1", "repo-a", nil), 3); err != nil {
+		t.Fatalf("ClaimTask: %v", err)
+	}
+	// Two connections claiming the same step of the same task: exactly one wins.
+	took, err := first.ClaimStep(ctx, "t1", task.Intent, "owner-a", time.Minute)
+	if err != nil || !took {
+		t.Fatalf("first ClaimStep = (%v, %v), want the claim", took, err)
+	}
+	if took, err := second.ClaimStep(ctx, "t1", task.Intent, "owner-b", time.Minute); err != nil || took {
+		t.Fatalf("second ClaimStep = (%v, %v), want it refused", took, err)
+	}
+	// The phase a task has moved past cannot be claimed again, even by another
+	// owner: a caller with a stale read must not re-run a finished step.
+	if _, err := first.UpdateTask(ctx, "t1", 1, func(next *task.Task) error {
+		next.Phase = task.WorktreeCreated
+		return nil
+	}); err != nil {
+		t.Fatalf("advance: %v", err)
+	}
+	if took, err := second.ClaimStep(ctx, "t1", task.Intent, "owner-b", time.Minute); err != nil || took {
+		t.Errorf("ClaimStep on a phase the task left = (%v, %v), want it refused", took, err)
+	}
+	// The next phase is claimable, and the old owner's claim does not block it.
+	if took, err := second.ClaimStep(ctx, "t1", task.WorktreeCreated, "owner-b", time.Minute); err != nil || !took {
+		t.Fatalf("ClaimStep for the new phase = (%v, %v), want the claim", took, err)
+	}
+	// A claim whose lease expired can be taken over: that is crash recovery.
+	if err := second.ReleaseStep(ctx, "t1", "owner-b"); err != nil {
+		t.Fatalf("ReleaseStep: %v", err)
+	}
+	if took, err := second.ClaimStep(ctx, "t1", task.WorktreeCreated, "owner-dead", 20*time.Millisecond); err != nil || !took {
+		t.Fatalf("ClaimStep(dead) = (%v, %v), want the claim", took, err)
+	}
+	time.Sleep(40 * time.Millisecond)
+	if took, err := first.ClaimStep(ctx, "t1", task.WorktreeCreated, "owner-live", time.Minute); err != nil || !took {
+		t.Fatalf("ClaimStep after the lease expired = (%v, %v), want the claim", took, err)
+	}
+	// Releasing someone else's claim is refused, never silent.
+	if err := first.ReleaseStep(ctx, "t1", "owner-dead"); !errors.Is(err, state.ErrConflict) {
+		t.Errorf("ReleaseStep(other owner) err = %v, want ErrConflict", err)
+	}
+	if err := first.ReleaseStep(ctx, "t1", "owner-live"); err != nil {
+		t.Errorf("ReleaseStep(own claim) err = %v", err)
+	}
 }
