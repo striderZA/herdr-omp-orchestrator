@@ -1697,7 +1697,7 @@ func TestReconcileTreatsAMissingSessionReferenceAsUnproven(t *testing.T) {
 	if err != nil {
 		t.Fatalf("identityOf: %v", err)
 	}
-	probe, err := f.coord.probePane(ctx, worker.PublicPaneID, identity, worker.TerminalID, worker.WorktreePath)
+	probe, err := f.coord.probePane(ctx, worker.PublicPaneID, identity, worker.TerminalID, worker.WorktreePath, false)
 	if err != nil {
 		t.Fatalf("probePane: %v", err)
 	}
@@ -1731,7 +1731,7 @@ func TestReconcileTreatsAMissingSessionReferenceAsUnproven(t *testing.T) {
 	if err != nil {
 		t.Fatalf("identityOf after the reference returned: %v", err)
 	}
-	proven, err := f.coord.probePane(ctx, worker.PublicPaneID, restored, worker.TerminalID, worker.WorktreePath)
+	proven, err := f.coord.probePane(ctx, worker.PublicPaneID, restored, worker.TerminalID, worker.WorktreePath, false)
 	if err != nil {
 		t.Fatalf("probePane after the reference returned: %v", err)
 	}
@@ -2206,6 +2206,231 @@ func TestAWorkerNoteReachesAnIdlePrimaryAcrossSessionForms(t *testing.T) {
 	f.mustHandle(t, EventAgentStatus, statusEventPayload(t, primary, "idle"))
 	if prompts := f.promptsTo(t, primary); len(prompts) != 1 {
 		t.Fatalf("prompts after the next idle observation = %d, want 1", len(prompts))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// startup recheck of queued work and interrupted steps
+// ---------------------------------------------------------------------------
+
+// TestReconcileProvisionsAQueuedTaskWhoseGateOpened pins the startup caller the
+// spec's recheck contract needs: a task queued behind an unreviewed prerequisite
+// becomes reachable at the moment the prerequisite is recorded, without another
+// dispatch.
+func TestReconcileProvisionsAQueuedTaskWhoseGateOpened(t *testing.T) {
+	ctx := context.Background()
+	f := newCoordFixture(t, fixturePlan{})
+	checks := []string{"go test ./... ok"}
+	first, err := f.dispatchSpec(f.coord, spec{title: "first", checks: checks, reserved: []string{"src/first.txt"}})
+	if err != nil {
+		t.Fatalf("dispatch first: %v", err)
+	}
+	queued, err := f.dispatchSpec(f.coord, spec{
+		title: "second", checks: checks, deps: []string{first.ID}, reserved: []string{"src/second.txt"},
+	})
+	if err != nil {
+		t.Fatalf("dispatch second: %v", err)
+	}
+	if queued.Phase != task.Intent {
+		t.Fatalf("phase = %q, want %q: an unreviewed prerequisite must queue the task", queued.Phase, task.Intent)
+	}
+	created := f.countCalls("worktree create")
+
+	// The prerequisite is reported, which opens the gate. Nothing dispatches again.
+	f.satisfyReview(first)
+	if err := f.coord.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	after := f.taskByID(t, queued.ID)
+	if after.Phase != task.PromptSubmitted {
+		t.Fatalf("phase = %q, want %q: a queued task must be reachable after a restart", after.Phase, task.PromptSubmitted)
+	}
+	if after.WorktreePath == "" || after.PublicPaneID == "" || after.AgentName == "" {
+		t.Fatalf("the drained task records no resources: %+v", after)
+	}
+	if got := f.countCalls("worktree create"); got != created+1 {
+		t.Fatalf("worktree create calls = %d, want %d (one for the drained task)", got, created+1)
+	}
+	if prompts := f.prompts(after.PublicPaneID); len(prompts) != 1 {
+		t.Fatalf("briefs = %v, want exactly one", prompts)
+	}
+}
+
+// TestReconcileLeavesAQueuedTaskWhoseGateIsStillClosed is the guard on that
+// caller: a queued task whose prerequisite is not reviewed yet, or whose budget
+// is full, is not admitted by a restart.
+func TestReconcileLeavesAQueuedTaskWhoseGateIsStillClosed(t *testing.T) {
+	ctx := context.Background()
+	f := newCoordFixture(t, fixturePlan{})
+	checks := []string{"go test ./... ok"}
+	first, err := f.dispatchSpec(f.coord, spec{title: "first", checks: checks, reserved: []string{"src/first.txt"}})
+	if err != nil {
+		t.Fatalf("dispatch first: %v", err)
+	}
+	queued, err := f.dispatchSpec(f.coord, spec{
+		title: "second", checks: checks, deps: []string{first.ID}, reserved: []string{"src/second.txt"},
+	})
+	if err != nil {
+		t.Fatalf("dispatch second: %v", err)
+	}
+	created := f.countCalls("worktree create")
+
+	if err := f.coord.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	after := f.taskByID(t, queued.ID)
+	if after.Phase != task.Intent || after.WorktreePath != "" || after.PublicPaneID != "" {
+		t.Fatalf("a still-gated task was provisioned: %+v", after)
+	}
+	if got := f.countCalls("worktree create"); got != created {
+		t.Fatalf("worktree create calls = %d, want %d", got, created)
+	}
+}
+
+// TestReconcileCompletesAnInterruptedProvisioningStep pins the other half of the
+// recheck: a step that stopped before recording its phase is continued by the
+// next startup, from the recorded phase, without repeating anything.
+func TestReconcileCompletesAnInterruptedProvisioningStep(t *testing.T) {
+	t.Run("the step stopped before it recorded any session", func(t *testing.T) {
+		// The agent started but Herdr never published its session, so nothing of the
+		// handshake was recorded and the task is still at worktree_created.
+		f := newCoordFixture(t, fixturePlan{SuppressSession: true})
+		worker, err := f.dispatchSpec(f.coord, spec{title: "interrupted", checks: []string{"go test ./... ok"}})
+		if err == nil {
+			t.Fatalf("dispatch succeeded, want the readiness wait to stop the step")
+		}
+		interrupted := f.taskByID(t, worker.ID)
+		if interrupted.Phase != task.WorktreeCreated {
+			t.Fatalf("phase = %q, want %q", interrupted.Phase, task.WorktreeCreated)
+		}
+		if interrupted.Attention == "" {
+			t.Fatalf("an interrupted step left no reason on the task")
+		}
+
+		// The cause is fixed, and a restart finishes the recorded step.
+		f.updatePlan(func(plan *fixturePlan) { plan.SuppressSession = false })
+		if err := f.coord.Reconcile(context.Background()); err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+		assertStepCompleted(t, f, worker.ID, 1)
+	})
+
+	t.Run("the step stopped before the brief", func(t *testing.T) {
+		// The pane's session was recorded, but the extension never confirmed the
+		// handshake, so the brief the phase still owes was never submitted.
+		f := newCoordFixture(t, fixturePlan{SuppressReady: true})
+		worker, err := f.dispatchSpec(f.coord, spec{title: "interrupted", checks: []string{"go test ./... ok"}})
+		if err == nil {
+			t.Fatalf("dispatch succeeded, want the readiness wait to stop the step")
+		}
+		interrupted := f.taskByID(t, worker.ID)
+		if interrupted.Phase != task.AgentStarted {
+			t.Fatalf("phase = %q, want %q", interrupted.Phase, task.AgentStarted)
+		}
+		if prompts := f.prompts(interrupted.PublicPaneID); len(prompts) != 0 {
+			t.Fatalf("briefs = %v, want none before the interrupted step is continued", prompts)
+		}
+
+		f.updatePlan(func(plan *fixturePlan) { plan.SuppressReady = false })
+		if err := f.coord.Reconcile(context.Background()); err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+		assertStepCompleted(t, f, worker.ID, 1)
+	})
+}
+
+// assertStepCompleted checks the durable outcome of continuing an interrupted
+// step: the recorded phase reached its end, exactly one brief was submitted, and
+// no step was repeated.
+func assertStepCompleted(t *testing.T, f *coordFixture, taskID string, briefs int) {
+	t.Helper()
+	after := f.taskByID(t, taskID)
+	if after.Phase != task.PromptSubmitted {
+		t.Fatalf("phase = %q, want %q: the recorded step must be continued", after.Phase, task.PromptSubmitted)
+	}
+	if after.Attention != "" || after.Blocker != "" {
+		t.Fatalf("attention = %q blocker = %q, want a completed step", after.Attention, after.Blocker)
+	}
+	if after.OMPSessionID == "" {
+		t.Fatalf("the completed step recorded no session")
+	}
+	if prompts := f.prompts(after.PublicPaneID); len(prompts) != briefs {
+		t.Fatalf("briefs = %v, want exactly %d", prompts, briefs)
+	}
+	if starts := f.countCalls("agent start"); starts != 1 {
+		t.Fatalf("agent start calls = %d, want 1: the recorded step never starts a second agent", starts)
+	}
+}
+
+// TestReconcileLeavesAnUnprovenInterruptedStepAlone pins the gate on continuing a
+// step: only a pane this pass proved may be touched, so a stranger's OMP session
+// is never adopted - and the brief the recorded phase still owes is not sent to it.
+func TestReconcileLeavesAnUnprovenInterruptedStepAlone(t *testing.T) {
+	ctx := context.Background()
+	f := newCoordFixture(t, fixturePlan{})
+	worker := f.boundWorker(t)
+	pane := worker.PublicPaneID
+	// The recorded phase says the brief was never submitted; a different session
+	// now holds the pane.
+	f.block(worker, func(next *task.Task) { next.Phase = task.AgentStarted })
+	f.rewriteState(func(current *fixtureState) {
+		current.Agents[pane].Session = "someone-elses-session"
+	})
+	before := len(f.promptsTo(t, pane))
+
+	if err := f.coord.Reconcile(ctx); !errors.Is(err, ErrAgentChanged) {
+		t.Fatalf("Reconcile err = %v, want the recorded refusal", err)
+	}
+	after := f.taskByID(t, worker.ID)
+	if after.Phase != task.AgentStarted {
+		t.Fatalf("phase = %q, want the recorded %q", after.Phase, task.AgentStarted)
+	}
+	if after.Attention == "" {
+		t.Fatalf("an unprovable step left no attention for a human")
+	}
+	if got := len(f.promptsTo(t, pane)); got != before {
+		t.Fatalf("the owed brief was submitted to a pane this pass could not prove (%d -> %d)", before, got)
+	}
+	if starts := f.countCalls("agent start"); starts != 1 {
+		t.Fatalf("agent start calls = %d, want only the dispatch's own", starts)
+	}
+}
+
+// TestReconcileLeavesAnInterruptedStepWithNoSessionOnAStrangeTerminalAlone pins
+// the terminal rule a resume must not lean on: when the binding recorded no
+// session at all, only the recorded terminal proves the pane, so an agent on a
+// different terminal is never adopted.
+func TestReconcileLeavesAnInterruptedStepWithNoSessionOnAStrangeTerminalAlone(t *testing.T) {
+	ctx := context.Background()
+	f := newCoordFixture(t, fixturePlan{})
+	worker := f.boundWorker(t)
+	f.block(worker, func(next *task.Task) {
+		next.Phase = task.AgentStarted
+		next.OMPSessionID = ""
+	})
+	f.rewriteState(func(current *fixtureState) {
+		agent := current.Agents[worker.PublicPaneID]
+		delete(current.Agents, worker.PublicPaneID)
+		delete(current.Workspaces, workspaceOfPane(worker.PublicPaneID))
+		agent.Terminal = "term-somewhere-else"
+		current.Workspaces["w9"] = worker.WorktreePath
+		current.Agents["w9:p1"] = agent
+	})
+	before := len(f.promptsTo(t, worker.PublicPaneID))
+
+	if err := f.coord.Reconcile(ctx); !errors.Is(err, ErrAgentChanged) {
+		t.Fatalf("Reconcile err = %v, want the recorded refusal", err)
+	}
+	after := f.taskByID(t, worker.ID)
+	if after.Phase != task.AgentStarted {
+		t.Fatalf("phase = %q, want the recorded %q", after.Phase, task.AgentStarted)
+	}
+	if after.PublicPaneID != worker.PublicPaneID {
+		t.Fatalf("a pane with no recorded session was re-keyed to %q", after.PublicPaneID)
+	}
+	if got := len(f.promptsTo(t, worker.PublicPaneID)); got != before {
+		t.Fatalf("a brief was submitted to an unprovable pane (%d -> %d)", before, got)
 	}
 }
 

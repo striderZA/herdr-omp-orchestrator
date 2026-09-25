@@ -331,7 +331,7 @@ func (c *Coordinator) observeWorkerStatus(ctx context.Context, st task.Task, sta
 	if err != nil {
 		return fmt.Errorf("read the confirmed session of task %s: %w", st.ID, err)
 	}
-	probe, err := c.probePane(ctx, st.PublicPaneID, identity, st.TerminalID, st.WorktreePath)
+	probe, err := c.probePane(ctx, st.PublicPaneID, identity, st.TerminalID, st.WorktreePath, false)
 	if err != nil {
 		return err
 	}
@@ -505,7 +505,7 @@ func (c *Coordinator) applyTaskMove(ctx context.Context, st task.Task, previous 
 	// The payload describes what Herdr moved; Herdr's live state decides whether
 	// the pane it moved to is still this task's worker. Without that proof a
 	// public rebind could hand the task to a different OMP session.
-	reason, err := c.proveMovedPane(ctx, pane, identity, st.TerminalID, st.WorktreePath)
+	reason, err := c.proveMovedPane(ctx, pane, identity, st.TerminalID, st.WorktreePath, resumableStep(st))
 	if err != nil {
 		return err
 	}
@@ -534,15 +534,11 @@ func (c *Coordinator) applyTaskMove(ctx context.Context, st task.Task, previous 
 // whose session this plugin never recorded cannot be proven either. It returns
 // the reason a pane is not the binding's own, or the error of a probe that could
 // not be read at all.
-func (c *Coordinator) proveMovedPane(ctx context.Context, pane MovedPaneInfo, identity recordedIdentity, terminal, checkout string) (string, error) {
+func (c *Coordinator) proveMovedPane(ctx context.Context, pane MovedPaneInfo, identity recordedIdentity, terminal, checkout string, allowUnconfirmed bool) (string, error) {
 	if strings.TrimSpace(identity.Session) == "" {
 		return "the binding records no OMP session, so the moved pane cannot be proven to be its own", nil
 	}
-	if !identity.Proven {
-		return fmt.Sprintf("the confirmed session of launch pane %s cannot relate the recorded %q to the form Herdr reports, so the moved pane cannot be proven",
-			identity.LaunchPaneID, identity.Session), nil
-	}
-	probe, err := c.probePane(ctx, pane.PaneID, identity, terminal, checkout)
+	probe, err := c.probePane(ctx, pane.PaneID, identity, terminal, checkout, allowUnconfirmed)
 	if err != nil {
 		return "", err
 	}
@@ -586,7 +582,7 @@ func (c *Coordinator) applyProjectMove(ctx context.Context, project task.Project
 	if reason := movedIdentityProblem(project.TerminalID, identity, project.Key, pane); reason != "" {
 		return c.projectAttention(ctx, project, fmt.Sprintf("the moved primary pane %s no longer matches project %s: %s", pane.PaneID, project.Key, reason))
 	}
-	reason, err := c.proveMovedPane(ctx, pane, identity, project.TerminalID, project.Key)
+	reason, err := c.proveMovedPane(ctx, pane, identity, project.TerminalID, project.Key, false)
 	if err != nil {
 		return err
 	}
@@ -958,7 +954,7 @@ func (c *Coordinator) probePrimary(ctx context.Context, project task.Project) (p
 	if err != nil {
 		return paneProbe{}, fmt.Errorf("read the confirmed session of project %s: %w", project.Key, err)
 	}
-	probe, err := c.probePane(ctx, paneID, identity, project.TerminalID, project.Key)
+	probe, err := c.probePane(ctx, paneID, identity, project.TerminalID, project.Key, false)
 	if err != nil {
 		return paneProbe{}, err
 	}
@@ -1032,20 +1028,90 @@ func (c *Coordinator) reconcileProject(ctx context.Context, project task.Project
 			unfinished = append(unfinished, st)
 		}
 	}
-	if len(unfinished) == 0 {
-		return errors.Join(failures...)
-	}
-	// The checkout listing is corroborating evidence, not a prerequisite: if it
-	// cannot be read the pane evidence still decides, and the failure is
-	// reported instead of being hidden.
-	listed, listErr := c.worktreeList(ctx, project.Key)
-	if listErr != nil {
-		failures = append(failures, listErr)
-	}
-	for _, st := range unfinished {
-		if err := c.reconcileTask(ctx, project, st, snapshot, listed); err != nil {
-			failures = append(failures, err)
+	proved := map[string]bool{}
+	if len(unfinished) > 0 {
+		// The checkout listing is corroborating evidence, not a prerequisite: if it
+		// cannot be read the pane evidence still decides, and the failure is
+		// reported instead of being hidden.
+		listed, listErr := c.worktreeList(ctx, project.Key)
+		if listErr != nil {
+			failures = append(failures, listErr)
 		}
+		for _, st := range unfinished {
+			verified, err := c.reconcileTask(ctx, project, st, snapshot, listed)
+			if verified {
+				proved[st.ID] = true
+			}
+			if err != nil {
+				failures = append(failures, err)
+			}
+		}
+	}
+	// The identities of this project are repaired and proved, so the work a
+	// restart interrupted may continue, and the queue may be walked. Both go
+	// through the durable gate the dispatcher uses, so neither can provision past
+	// the budget, repeat a recorded step, or touch a pane this pass did not stand
+	// behind.
+	if err := c.resumeProvedSteps(ctx, unfinished, proved); err != nil {
+		failures = append(failures, err)
+	}
+	if _, err := c.DrainQueued(ctx, project.Key); err != nil {
+		failures = append(failures, err)
+	}
+	return errors.Join(failures...)
+}
+
+// resumableStep reports whether a provisioning step a restart interrupted is one
+// this pass may continue: the checkout exists but the worker is neither confirmed
+// briefed nor waiting on a human. A task whose disposition is recorded is closed
+// history, and a blocker is a decision only a human makes (ResumeDispatch refuses
+// it by itself, and so does this gate).
+func resumableStep(st task.Task) bool {
+	if strings.TrimSpace(st.Disposition) != "" || strings.TrimSpace(st.Blocker) != "" {
+		return false
+	}
+	switch st.Phase {
+	case task.WorktreeCreated, task.AgentStarted:
+		return true
+	default:
+		return false
+	}
+}
+
+// resumeProvedSteps continues the provisioning of the tasks whose recorded step a
+// restart interrupted, oldest first, and only for the tasks whose pane this pass
+// proved.
+//
+// The proof is the gate: continuing a step starts an agent or submits a brief in
+// the pane, so a pane holding a session the binding cannot prove is never touched
+// - the attention this pass recorded for it stands, and a human decides. A
+// queued (intent) task is deliberately not resumed here: the queue is the drain's,
+// and resuming one directly could take a slot ahead of a task that has been
+// waiting longer.
+//
+// A step's own failure is recorded on the task by the step machine, exactly as
+// DrainQueued leaves a candidate's failure, so it is not this pass's error; only
+// a task the pass could not read is reported.
+func (c *Coordinator) resumeProvedSteps(ctx context.Context, unfinished []task.Task, proved map[string]bool) error {
+	var failures []error
+	for _, st := range unfinished {
+		if !resumableStep(st) || !proved[st.ID] {
+			continue
+		}
+		// Re-read: the identity pass may have recorded attention on the task for a
+		// reason this iteration's snapshot predates.
+		current, err := c.store.Task(ctx, st.ID)
+		if err != nil {
+			failures = append(failures, fmt.Errorf("read task %s before continuing its recorded step: %w", st.ID, err))
+			continue
+		}
+		if !resumableStep(current) {
+			continue
+		}
+		// ResumeDispatch re-gates the task, clears a retryable attention and runs
+		// the recorded step; a step that fails again records its own attention or
+		// blocker on the task.
+		_, _ = c.ResumeDispatch(ctx, current.ID)
 	}
 	return errors.Join(failures...)
 }
@@ -1075,7 +1141,7 @@ func (c *Coordinator) reconcilePrimary(ctx context.Context, project task.Project
 	if err != nil {
 		return fmt.Errorf("read the confirmed session of project %s: %w", project.Key, err)
 	}
-	probes, err := c.probeCandidates(ctx, snapshot, []string{project.LaunchPaneID, project.PublicPaneID}, identity, project.TerminalID, project.Key)
+	probes, err := c.probeCandidates(ctx, snapshot, []string{project.LaunchPaneID, project.PublicPaneID}, identity, project.TerminalID, project.Key, false)
 	if err != nil {
 		return err
 	}
@@ -1095,27 +1161,31 @@ func (c *Coordinator) reconcilePrimary(ctx context.Context, project task.Project
 	return nil
 }
 
-// reconcileTask re-derives one unfinished worker's pane from the snapshot.
-func (c *Coordinator) reconcileTask(ctx context.Context, project task.Project, st task.Task, snapshot *snapshotView, listed *herdr.WorktreeList) error {
+// reconcileTask re-derives one unfinished worker's pane from the snapshot. It
+// reports whether this pass proved the pane, which is what lets the caller
+// continue a recorded step: a pane it could not prove is never resumed.
+func (c *Coordinator) reconcileTask(ctx context.Context, project task.Project, st task.Task, snapshot *snapshotView, listed *herdr.WorktreeList) (bool, error) {
 	identity, err := c.identityOf(ctx, st.LaunchPaneID, st.OMPSessionID)
 	if err != nil {
-		return fmt.Errorf("read the confirmed session of task %s: %w", st.ID, err)
+		return false, fmt.Errorf("read the confirmed session of task %s: %w", st.ID, err)
 	}
-	probes, err := c.probeCandidates(ctx, snapshot, []string{st.LaunchPaneID, st.PublicPaneID}, identity, st.TerminalID, st.WorktreePath)
+	// An interrupted provisioning step is allowed the same-form fallback: its
+	// handshake is exactly what it never completed.
+	probes, err := c.probeCandidates(ctx, snapshot, []string{st.LaunchPaneID, st.PublicPaneID}, identity, st.TerminalID, st.WorktreePath, resumableStep(st))
 	if err != nil {
-		return err
+		return false, err
 	}
 	ours := oursOnly(probes)
 	switch {
 	case len(ours) == 1:
 		if !checkoutListed(listed, st.WorktreePath) {
-			return c.taskAttention(ctx, st, fmt.Sprintf(
+			return false, c.taskAttention(ctx, st, fmt.Sprintf(
 				"the checkout %s of task %s is no longer listed by `worktree list`; its pane binding was left as recorded",
 				st.WorktreePath, st.ID))
 		}
-		return c.applyTaskPane(ctx, st, ours[0])
+		return true, c.applyTaskPane(ctx, st, ours[0])
 	case len(ours) > 1:
-		return c.taskAttention(ctx, st, fmt.Sprintf(
+		return false, c.taskAttention(ctx, st, fmt.Sprintf(
 			"%d panes report the worker session of task %s (%s); the binding was not re-keyed",
 			len(ours), st.ID, strings.Join(paneIDs(ours), ", ")))
 	}
@@ -1124,21 +1194,21 @@ func (c *Coordinator) reconcileTask(ctx context.Context, project task.Project, s
 	// started in its place. A pane that cannot be judged either way is the same
 	// answer - an identity this pass may not guess at.
 	if refuted := refutedOnly(probes); len(refuted) > 0 {
-		return c.taskAttention(ctx, st, fmt.Sprintf(
+		return false, c.taskAttention(ctx, st, fmt.Sprintf(
 			"pane %s is not the worker of task %s and no agent was started in its place: %s",
 			refuted[0].Pane.PaneID, st.ID, refuted[0].Refusal))
 	}
 	if unproven := unprovenOnly(probes); len(unproven) > 0 {
-		return c.taskAttention(ctx, st, fmt.Sprintf(
+		return false, c.taskAttention(ctx, st, fmt.Sprintf(
 			"pane %s could not be proven to be the worker of task %s, so its binding was left as recorded: %s",
 			unproven[0].Pane.PaneID, st.ID, unproven[0].Refusal))
 	}
 	if !checkoutListed(listed, st.WorktreePath) {
-		return c.taskAttention(ctx, st, fmt.Sprintf(
+		return false, c.taskAttention(ctx, st, fmt.Sprintf(
 			"the checkout %s of task %s is no longer listed by `worktree list`; its pane binding was left as recorded",
 			st.WorktreePath, st.ID))
 	}
-	return c.reconcileExit(ctx, project, st)
+	return false, c.reconcileExit(ctx, project, st)
 }
 
 // reconcileExit queues one deduplicated note for a worker that is no longer
@@ -1149,6 +1219,12 @@ func (c *Coordinator) reconcileTask(ctx context.Context, project task.Project, s
 // vanished pane, and a worker whose final report is already recorded is not news.
 func (c *Coordinator) reconcileExit(ctx context.Context, project task.Project, st task.Task) error {
 	if isReviewed(st) {
+		return nil
+	}
+	if st.Phase == task.WorktreeCreated && strings.TrimSpace(st.OMPSessionID) == "" {
+		// No worker was ever confirmed for this task, so nothing has exited: the
+		// recorded provisioning step is what a restart has to recheck, and this
+		// pass has already given it its chance.
 		return nil
 	}
 	summary := fmt.Sprintf(
@@ -1428,11 +1504,11 @@ type paneProbe struct {
 }
 
 // probeCandidates probes every snapshot pane a binding could be.
-func (c *Coordinator) probeCandidates(ctx context.Context, snapshot *snapshotView, ids []string, identity recordedIdentity, terminal, checkout string) ([]paneProbe, error) {
+func (c *Coordinator) probeCandidates(ctx context.Context, snapshot *snapshotView, ids []string, identity recordedIdentity, terminal, checkout string, allowUnconfirmed bool) ([]paneProbe, error) {
 	candidates := snapshotCandidates(snapshot.Panes, ids, terminal, checkout)
 	var probes []paneProbe
 	for _, pane := range candidates {
-		probe, err := c.probePane(ctx, pane.PaneID, identity, terminal, checkout)
+		probe, err := c.probePane(ctx, pane.PaneID, identity, terminal, checkout, allowUnconfirmed)
 		if err != nil {
 			return nil, err
 		}
@@ -1443,7 +1519,7 @@ func (c *Coordinator) probeCandidates(ctx context.Context, snapshot *snapshotVie
 
 // probePane verifies one pane against a recorded identity, using Herdr's live
 // agent projection rather than the payload that raised the question.
-func (c *Coordinator) probePane(ctx context.Context, paneID string, identity recordedIdentity, terminal, checkout string) (paneProbe, error) {
+func (c *Coordinator) probePane(ctx context.Context, paneID string, identity recordedIdentity, terminal, checkout string, allowUnconfirmed bool) (paneProbe, error) {
 	probe := paneProbe{}
 	if strings.TrimSpace(paneID) == "" {
 		probe.Refusal = "no pane is recorded"
@@ -1479,6 +1555,16 @@ func (c *Coordinator) probePane(ctx context.Context, paneID string, identity rec
 	probe.CheckoutProven = recordedCheckout != "" && cwd != "" && samePath(cwd, recordedCheckout)
 	recordedSession := strings.TrimSpace(identity.Session)
 	matched := recordedSession != "" && view.HasRef && identity.proves(view.Ref)
+	if !matched && allowUnconfirmed && recordedSession != "" && view.HasRef {
+		// A provisioning step that never completed its handshake has no confirmed
+		// announcement, so the two native forms cannot be bridged - but the value
+		// Herdr reports now can still be compared in its own form: the same id as
+		// an id, the same path as a path. That is one process observed twice, and
+		// it is the only proof an interrupted step has. Callers that decide a live
+		// binding (a status event, a move, the primary before a flush) do not pass
+		// this: they require the confirmed handshake that bridges the forms.
+		matched = task.SameSessionReference(view.Ref.Kind, recordedSession, view.Ref.Value)
+	}
 	switch {
 	case !strings.EqualFold(strings.TrimSpace(view.Agent.Agent), c.opts.AgentKind):
 		probe.Refutes = true
@@ -1497,8 +1583,10 @@ func (c *Coordinator) probePane(ctx context.Context, paneID string, identity rec
 		probe.Refusal = "the pane reports no session reference, so the recorded session cannot be proven"
 	case !probe.SameCheckout:
 		probe.Refusal = fmt.Sprintf("the pane works in %s, not the recorded checkout %s", cwd, checkout)
-	case recordedSession == "" && !view.HasRef && !probe.SameTerminal:
-		probe.Refusal = "the pane reports no session reference and is not the terminal the binding recorded"
+	case recordedSession == "" && !probe.SameTerminal:
+		// Nothing but the terminal can prove a binding that recorded no session, so
+		// an agent elsewhere is a different process however it identifies itself.
+		probe.Refusal = "the binding records no session, and this pane is not the terminal it was dispatched with"
 	default:
 		probe.Ours = true
 		probe.SessionOK = matched
