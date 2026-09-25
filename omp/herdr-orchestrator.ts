@@ -358,6 +358,45 @@ export async function refreshReady(
   }
 }
 
+// afterTurnRefresh performs one post-turn refresh: wait (bounded) while the runtime
+// says the session is not on disk yet, then announce the identity it reports now —
+// once, and only when that identity differs from the handshake already recorded.
+//
+// It reports a failure through warn and returns null instead of throwing, so the
+// agent_end hook wired to it can never fail an otherwise completed turn. It is
+// exported, and it is the function that hook calls, so the load check can drive the
+// failure path with a rejecting send.
+export async function afterTurnRefresh(
+  identity: () => SessionIdentity,
+  announced: SessionIdentity | null,
+  send: (identity: SessionIdentity, signal: AbortSignal) => Promise<void>,
+  warn: (message: string) => void,
+): Promise<SessionIdentity | null> {
+  let current = identity();
+  for (let attempt = 0; !current.onDisk && attempt < MATERIALIZE_TRIES; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, MATERIALIZE_WAIT_MS));
+    current = identity();
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REFRESH_TIMEOUT_MS);
+  try {
+    return await refreshReady(current, announced, (next) => send(next, controller.signal), warn);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// warnOnce reports at most one warning per process: a refresh that keeps failing
+// stays visible without repeating on every turn.
+export function warnOnce(warn: (message: string) => void): (message: string) => void {
+  let warned = false;
+  return (message: string) => {
+    if (warned) return;
+    warned = true;
+    warn(message);
+  };
+}
+
 // toolResult and toolRefusal are the two shapes these tools answer with: the
 // bridge's value, or the reason an action was not taken.
 function toolResult(value: unknown) {
@@ -579,7 +618,7 @@ export default function (pi: ExtensionAPI) {
   // rebind restore the right tools instead of silently disabling them forever.
   // The handshake the coordinator holds, as this process last announced it.
   let announced: SessionIdentity | null = null;
-  let refreshWarned = false;
+  let warnRefresh: ((message: string) => void) | null = null;
 
   // announce records the identity surface for the bound role and remembers what
   // was announced, so the post-turn refresh can tell whether anything changed.
@@ -594,31 +633,20 @@ export default function (pi: ExtensionAPI) {
   // once and leaves the recorded handshake, and with it the no-resume state, alone.
   pi.on("agent_end", async (_event, ctx) => {
     if (role === null) return;
+    // One warning per process, whichever turn first shows the failure.
+    const warn = (warnRefresh ??= warnOnce((message: string): void => ctx.ui.notify(message, "warning")));
     try {
-      let identity = sessionIdentity(ctx.sessionManager);
-      for (let attempt = 0; !identity.onDisk && attempt < MATERIALIZE_TRIES; attempt++) {
-        await new Promise((resolve) => setTimeout(resolve, MATERIALIZE_WAIT_MS));
-        identity = sessionIdentity(ctx.sessionManager);
-      }
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), REFRESH_TIMEOUT_MS);
-      try {
-        const refreshed = await refreshReady(identity, announced, (next) => callBridge("ready", {}, next, controller.signal), (message) => {
-          if (refreshWarned) return;
-          refreshWarned = true;
-          ctx.ui.notify(message, "warning");
-        });
-        if (refreshed !== null) announced = refreshed;
-      } finally {
-        clearTimeout(timer);
-      }
+      const refreshed = await afterTurnRefresh(
+        () => sessionIdentity(ctx.sessionManager),
+        announced,
+        (next, signal) => callBridge("ready", {}, next, signal),
+        warn,
+      );
+      if (refreshed !== null) announced = refreshed;
     } catch (error) {
       // The hook is the last thing between a completed turn and the user: only an
       // unexpected failure reaches here, and it must not escape.
-      if (!refreshWarned) {
-        refreshWarned = true;
-        ctx.ui.notify(`Orchestrator session refresh failed: ${String(error)}`, "warning");
-      }
+      warn(`Orchestrator session refresh failed: ${String(error)}`);
     }
   });
 

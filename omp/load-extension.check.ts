@@ -19,12 +19,14 @@
 //   NODE_PATH=%USERPROFILE%\node_modules bun omp/load-extension.check.ts
 // or point OMP_TYPED_BUILDER straight at the zod module file.
 import extension, {
+  afterTurnRefresh,
   cleanupConfirmRequest,
   confirmThen,
   dialogConfirmRequest,
   refreshIdentity,
   refreshReady,
   uiGate,
+  warnOnce,
 } from "./herdr-orchestrator.ts";
 
 // OMP's builder returns a *callable* schema (ArkType-compatible validation from
@@ -574,6 +576,66 @@ async function checkSessionRefresh(): Promise<void> {
     warned[0]?.includes("refresh failed"),
     `the warning does not say what failed: ${JSON.stringify(warned[0])}`,
   );
+
+  // The whole post-turn path, driven the way the hook drives it, with a bridge
+  // that refuses: the failure must not throw, must announce nothing, and must warn
+  // at most once per process — the residual gap the independent review named.
+  const failureWarnings: string[] = [];
+  const warnFailure = warnOnce((message: string) => failureWarnings.push(message));
+  const failedTurn = await afterTurnRefresh(
+    () => materialized,
+    loaded,
+    async () => {
+      throw new Error("the bridge is unavailable");
+    },
+    warnFailure,
+  );
+  check(failedTurn === null, "a failed turn reported an identity as announced");
+  check(failureWarnings.length === 1, `a failed turn warned ${failureWarnings.length} times, want once`);
+  check(
+    failureWarnings[0]?.includes("refresh failed"),
+    `the post-turn warning does not say what failed: ${JSON.stringify(failureWarnings[0])}`,
+  );
+  // A second failing turn stays quiet: the user heard about it once.
+  await afterTurnRefresh(
+    () => materialized,
+    loaded,
+    async () => {
+      throw new Error("still unavailable");
+    },
+    warnFailure,
+  );
+  check(failureWarnings.length === 1, "the once-per-process warning repeated on a later turn");
+
+  // The same function on the happy path: exactly one send, carrying the refreshed
+  // identity, and no warning.
+  const refreshedSends: SessionIdentity[] = [];
+  const refreshedTurn = await afterTurnRefresh(
+    () => materialized,
+    loaded,
+    async (next) => {
+      refreshedSends.push(next);
+    },
+    warnFailure,
+  );
+  check(
+    refreshedSends.length === 1 && refreshedTurn?.onDisk === true,
+    `the post-turn refresh sent ${refreshedSends.length} calls for ${JSON.stringify(refreshedTurn)}`,
+  );
+  check(failureWarnings.length === 1, "a successful refresh warned");
+
+  // A session the runtime has not materialized yet is still announced once, so a
+  // build that keeps reporting onDisk false cannot spam the bridge either.
+  const unmaterializedSends: SessionIdentity[] = [];
+  await afterTurnRefresh(
+    () => loaded,
+    loaded,
+    async (next) => {
+      unmaterializedSends.push(next);
+    },
+    warnFailure,
+  );
+  check(unmaterializedSends.length === 0, "an unchanged identity was re-announced");
 
   // The hook itself, invoked as OMP invokes it, must be safe: this process is not
   // bound in the check (the bridge cannot run), so it does nothing at all rather
