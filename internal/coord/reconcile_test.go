@@ -61,8 +61,22 @@ func loadSchemaExcerpt(t *testing.T) schemaExcerpt {
 }
 
 // eventFixture reads one sanitized event payload, substituting the recorded
-// ids for the fixture's placeholders.
+// ids for the fixture's placeholders. The replacements are raw text, so a caller
+// may substitute either a value or a whole JSON fragment.
 func eventFixture(t *testing.T, name string, subs ...string) []byte {
+	t.Helper()
+	return substituteFixture(t, name, false, subs...)
+}
+
+// eventFixtureJSON is eventFixture with the replacements JSON-encoded, which is
+// what a captured fixture needs: a Windows checkout path or a session file is a
+// value that must be escaped to stay valid JSON.
+func eventFixtureJSON(t *testing.T, name string, subs ...string) []byte {
+	t.Helper()
+	return substituteFixture(t, name, true, subs...)
+}
+
+func substituteFixture(t *testing.T, name string, encode bool, subs ...string) []byte {
 	t.Helper()
 	if len(subs)%2 != 0 {
 		t.Fatalf("eventFixture(%s): substitutions must be pairs", name)
@@ -73,7 +87,15 @@ func eventFixture(t *testing.T, name string, subs ...string) []byte {
 	}
 	text := string(data)
 	for i := 0; i < len(subs); i += 2 {
-		text = strings.ReplaceAll(text, subs[i], subs[i+1])
+		value := subs[i+1]
+		if encode {
+			encoded, err := json.Marshal(value)
+			if err != nil {
+				t.Fatalf("encode %q: %v", value, err)
+			}
+			value = string(encoded[1 : len(encoded)-1])
+		}
+		text = strings.ReplaceAll(text, subs[i], value)
 	}
 	if !json.Valid([]byte(text)) {
 		t.Fatalf("the %s fixture is not JSON after substitution", name)
@@ -478,6 +500,60 @@ func TestEventFixturesMatchTheRecordedSchemaShapes(t *testing.T) {
 		if !containsString(excerpt.EventKinds, kind) {
 			t.Fatalf("the adapter names the event kind %q, which the installed schema does not define", kind)
 		}
+	}
+}
+
+// TestCapturedHookPayloadsDriveTheHandlers feeds the sanitized payloads a real
+// Herdr session delivered to this plugin's hooks - captured during Task 6's
+// integration gate (see testdata/events/captured_*.json) - through the handlers,
+// so the adapter is proven against what Herdr actually sends: an envelope that
+// names the event and a data object that names its own type, ids in
+// "workspace:pane" form, a session reference of kind "path" carrying the OMP
+// session file, and the closed source workspace a cross-workspace move reports.
+func TestCapturedHookPayloadsDriveTheHandlers(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	worker := f.boundWorker(t)
+	workspace := workspaceOfPane(worker.PublicPaneID)
+
+	// The status payload Herdr delivered for a real idle -> working transition.
+	f.setAgentStatus(t, worker.PublicPaneID, "working")
+	status := eventFixtureJSON(t, "captured_pane_agent_status_changed.json",
+		"{{pane}}", worker.PublicPaneID,
+		"{{workspace}}", workspace)
+	f.mustHandle(t, EventAgentStatus, status)
+	observed := f.taskByID(t, worker.ID)
+	if observed.Activity != "working" {
+		t.Fatalf("activity = %q, want working", observed.Activity)
+	}
+	if notes := f.notesOfKind(t, noteKindActivity); len(notes) != 1 {
+		t.Fatalf("activity notes = %d, want 1", len(notes))
+	}
+
+	// The move payload Herdr delivered for a real cross-workspace move whose
+	// source workspace it closed.
+	move := eventFixtureJSON(t, "captured_pane_moved.json",
+		"{{prev_pane}}", observed.PublicPaneID,
+		"{{prev_workspace}}", observed.CurrentWorkspaceID,
+		"{{pane}}", "w7:p1",
+		"{{workspace}}", "w7",
+		"{{terminal}}", observed.TerminalID,
+		"{{checkout}}", observed.WorktreePath,
+		"{{session_file}}", observed.OMPSessionID)
+	f.mustHandle(t, EventPaneMoved, move)
+	after := f.taskByID(t, worker.ID)
+	switch {
+	case after.PublicPaneID != "w7:p1":
+		t.Fatalf("public pane = %q, want w7:p1", after.PublicPaneID)
+	case after.CurrentWorkspaceID != "w7":
+		t.Fatalf("current workspace = %q, want w7", after.CurrentWorkspaceID)
+	case after.LaunchPaneID != observed.LaunchPaneID:
+		t.Fatalf("launch pane = %q, want the recorded %q", after.LaunchPaneID, observed.LaunchPaneID)
+	case after.WorktreeWorkspaceID != observed.WorktreeWorkspaceID:
+		t.Fatalf("worktree workspace = %q, want the original %q", after.WorktreeWorkspaceID, observed.WorktreeWorkspaceID)
+	case after.TerminalID != observed.TerminalID:
+		t.Fatalf("terminal = %q, want the recorded %q", after.TerminalID, observed.TerminalID)
+	case after.Attention != "" || after.Blocker != "":
+		t.Fatalf("the captured closed source workspace raised attention=%q blocker=%q", after.Attention, after.Blocker)
 	}
 }
 

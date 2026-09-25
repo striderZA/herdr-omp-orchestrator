@@ -79,7 +79,6 @@ CREATE TABLE IF NOT EXISTS inbox (
 	delivery_state TEXT NOT NULL DEFAULT 'pending',
 	delivery_detail TEXT NOT NULL DEFAULT ''
 );
-CREATE INDEX IF NOT EXISTS inbox_pending ON inbox (project_key, delivery_state);
 CREATE TABLE IF NOT EXISTS ready_sessions (
 	launch_pane_id TEXT PRIMARY KEY,
 	omp_session_id TEXT NOT NULL DEFAULT '',
@@ -121,6 +120,14 @@ var migratedColumns = []struct {
 	{"ready_sessions", readySessionColumns},
 	{"inbox", inboxColumns},
 }
+
+// postMigrateIndexes creates the indexes that name a column an older state
+// database only gets from the additive migration above. Creating them with the
+// tables would make an existing installation fail to open: SQLite rejects an
+// index on a column the table does not have yet.
+const postMigrateIndexes = `
+CREATE INDEX IF NOT EXISTS inbox_pending ON inbox (project_key, delivery_state);
+`
 
 // migrate adds the columns an older state database is missing.
 func migrate(ctx context.Context, db *sql.DB) error {
@@ -202,6 +209,12 @@ func Open(dir string) (*Store, error) {
 	if err := migrate(context.Background(), db); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate %q: %w", path, err)
+	}
+	// The indexes that depend on migrated columns come after the migration, not
+	// with the tables: an existing installation has the old table shape.
+	if _, err := db.Exec(postMigrateIndexes); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("index %q: %w", path, err)
 	}
 	return &Store{db: db}, nil
 }

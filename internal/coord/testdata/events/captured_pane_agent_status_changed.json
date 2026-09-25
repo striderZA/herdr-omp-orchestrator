@@ -1,0 +1,10 @@
+{
+  "event": "pane_agent_status_changed",
+  "data": {
+    "type": "pane_agent_status_changed",
+    "pane_id": "{{pane}}",
+    "workspace_id": "{{workspace}}",
+    "agent_status": "working",
+    "agent": "omp"
+  }
+}

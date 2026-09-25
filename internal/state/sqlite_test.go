@@ -323,6 +323,55 @@ func TestStoreInboxDeduplicates(t *testing.T) {
 	}
 }
 
+// TestOpenMigratesAnInboxWrittenByAnEarlierRevision pins the upgrade path a
+// shipped installation takes. The inbox of an earlier revision has no delivery
+// state, so the index on that column cannot be created with the tables: doing so
+// makes every later open fail with "no such column", which is exactly what the
+// first real hook run of Task 6 hit.
+func TestOpenMigratesAnInboxWrittenByAnEarlierRevision(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	raw := rawState(t, dir)
+	if _, err := raw.Exec(`
+		CREATE TABLE inbox (
+			id TEXT PRIMARY KEY,
+			project_key TEXT NOT NULL,
+			task_id TEXT NOT NULL DEFAULT '',
+			kind TEXT NOT NULL,
+			summary TEXT NOT NULL,
+			delivery TEXT NOT NULL
+		)`); err != nil {
+		t.Fatalf("seed the earlier revision: %v", err)
+	}
+	if _, err := raw.Exec(
+		`INSERT INTO inbox (id, project_key, task_id, kind, summary, delivery)
+		 VALUES ('i1', 'repo-a', 't1', 'result', 'done', 'worker result')`); err != nil {
+		t.Fatalf("seed the earlier note: %v", err)
+	}
+
+	s := open(t, dir)
+	note, err := s.Inbox(ctx, "i1")
+	if err != nil {
+		t.Fatalf("Inbox: %v", err)
+	}
+	if note.State() != task.DeliveryPending {
+		t.Errorf("migrated note state = %q, want %q", note.State(), task.DeliveryPending)
+	}
+	if note.Delivery != "worker result" {
+		t.Errorf("migrated note delivery label = %q, want the recorded label", note.Delivery)
+	}
+	claimed, err := s.ClaimInbox(ctx, []string{"i1"})
+	if err != nil {
+		t.Fatalf("ClaimInbox on a migrated note: %v", err)
+	}
+	if len(claimed) != 1 {
+		t.Fatalf("ClaimInbox took %d notes, want 1", len(claimed))
+	}
+	if _, err := s.SettleInbox(ctx, []string{"i1"}, task.DeliveryDelivered, "prompted"); err != nil {
+		t.Fatalf("SettleInbox on a migrated note: %v", err)
+	}
+}
+
 // rawState opens the state database the way a migration or an operator tool
 // would: a second handle on the same file, which is what lets a test make one
 // table refuse a write while everything else stays usable.

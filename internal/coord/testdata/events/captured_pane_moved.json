@@ -1,0 +1,54 @@
+{
+  "event": "pane_moved",
+  "data": {
+    "type": "pane_moved",
+    "previous_pane_id": "{{prev_pane}}",
+    "previous_workspace_id": "{{prev_workspace}}",
+    "previous_tab_id": "{{prev_workspace}}:t1",
+    "pane": {
+      "pane_id": "{{pane}}",
+      "terminal_id": "{{terminal}}",
+      "workspace_id": "{{workspace}}",
+      "tab_id": "{{workspace}}:t1",
+      "focused": false,
+      "cwd": "{{checkout}}",
+      "agent": "omp",
+      "terminal_title": "p > repo",
+      "terminal_title_stripped": "p > repo",
+      "agent_status": "idle",
+      "agent_session": {
+        "source": "herdr:omp",
+        "agent": "omp",
+        "kind": "path",
+        "value": "{{session_file}}"
+      },
+      "scroll": {
+        "offset_from_bottom": 0,
+        "max_offset_from_bottom": 0,
+        "viewport_rows": 69
+      },
+      "revision": 4
+    },
+    "created_workspace": {
+      "workspace_id": "{{workspace}}",
+      "number": 2,
+      "label": "repo",
+      "focused": false,
+      "pane_count": 1,
+      "tab_count": 1,
+      "active_tab_id": "{{workspace}}:t1",
+      "agent_status": "idle"
+    },
+    "created_tab": {
+      "tab_id": "{{workspace}}:t1",
+      "workspace_id": "{{workspace}}",
+      "number": 1,
+      "label": "1",
+      "focused": false,
+      "pane_count": 1,
+      "agent_status": "idle"
+    },
+    "closed_workspace_id": "{{prev_workspace}}",
+    "closed_tab_id": "{{prev_workspace}}:t1"
+  }
+}
