@@ -1204,6 +1204,18 @@ function Test-JsonBool {
     return [bool]$prop.Value
 }
 
+function Test-ResumeHintAvailability {
+    <#
+        Whether a bind hint says exactly one thing: either a resume command, or
+        why no resume command can be built. It must never say both and never
+        neither.
+    #>
+    param($Hint)
+    $resume = [string](Get-Field $Hint 'resume')
+    $unavailable = [string](Get-Field $Hint 'resumeUnavailable')
+    return (($resume -ne '') -xor ($unavailable -ne ''))
+}
+
 function Test-ResumeHintImplication {
     <#
         The materialization gate as an implication that a malformed flag cannot
@@ -1897,10 +1909,10 @@ function Invoke-Bind {
     $unavailable = [string](Get-Field $hint 'resumeUnavailable')
     # Read strictly: a malformed value takes the stricter branch (no resume offered).
     $onDiskHint = ((Test-JsonBool -Object $hint -Name 'onDisk') -eq $true)
-    Assert-True -Id 'N6.2' -What 'the hint either offers a resume command or states why it cannot' `
-        -Condition (($resume -ne '') -xor ($unavailable -eq '')) -Evidence "resume=[$resume] unavailable=[$unavailable]"
-    Assert-True -Id 'N6.3' -What 'a resume hint is only offered for a session that is on disk (materialization gate)' `
-        -Condition ((-not $onDiskHint) -or ($resume -ne '')) -Evidence "onDisk=$onDiskHint resume=[$resume]"
+    Assert-True -Id 'N6.2' -What 'the hint either offers a resume command or states why it cannot, never both and never neither' `
+        -Condition (Test-ResumeHintAvailability -Hint $hint) -Evidence "resume=[$resume] unavailable=[$unavailable]"
+    Assert-True -Id 'N6.3' -What 'a resume hint is offered exactly when the session is on disk, and a malformed onDisk flag cannot satisfy this' `
+        -Condition (Test-ResumeHintImplication -Hint $hint) -Evidence (Protect-Text (Get-Json $hint) 400)
     if ($onDiskHint) {
         Add-Assertion -Id 'N6.4' -What 'the session was already materialized at bind time, so the unmaterialized branch is not observable here' -Status 'INFO' -Evidence "resume=[$resume]"
     } else {

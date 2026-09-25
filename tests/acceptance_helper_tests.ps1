@@ -374,6 +374,14 @@ Check 'hint: absent flag fails' ((Test-ResumeHintImplication -Hint ([pscustomobj
     Set-Location -LiteralPath $previousLocation
 }
 
+
+# --- resume availability (N6.2): exactly one of resume/resumeUnavailable -----
+Check 'availability: materialized (resume set, no reason) passes' ((Test-ResumeHintAvailability -Hint ([pscustomobject]@{ resume = 'omp --resume=x'; resumeUnavailable = '' })) -eq $true) 'materialized'
+Check 'availability: unmaterialized (no resume, reason set) passes' ((Test-ResumeHintAvailability -Hint ([pscustomobject]@{ resume = ''; resumeUnavailable = 'not materialized yet' })) -eq $true) 'unmaterialized'
+Check 'availability: both present fails' ((Test-ResumeHintAvailability -Hint ([pscustomobject]@{ resume = 'omp --resume=x'; resumeUnavailable = 'y' })) -eq $false) 'both'
+Check 'availability: neither present fails' ((Test-ResumeHintAvailability -Hint ([pscustomobject]@{ resume = ''; resumeUnavailable = '' })) -eq $false) 'neither'
+Check 'N6 rule: a string onDisk cannot pass even with a resume offered' ((Test-ResumeHintImplication -Hint ([pscustomobject]@{ onDisk = 'true'; resume = 'omp --resume=x'; resumeUnavailable = '' })) -eq $false) 'string flag + resume'
+Check 'N6 rule: a missing onDisk cannot pass even with a resume offered' ((Test-ResumeHintImplication -Hint ([pscustomobject]@{ resume = 'omp --resume=x'; resumeUnavailable = '' })) -eq $false) 'absent flag + resume'
 $exitCode = $fails + $projectionFails
 Write-Host ''
 Write-Host "helper check failures: $exitCode of $checks checks"
