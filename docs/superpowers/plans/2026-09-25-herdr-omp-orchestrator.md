@@ -18,7 +18,7 @@
 - Plugin actions/hooks/board use one Go executable; the OMP extension uses its host runtime only. `exec.CommandContext`/`spawn` argv arrays, bounded stdin/stdout/stderr, explicit timeouts; never interpolate prompts into shell commands.
 - CLI timeouts after a submission are **ambiguous**. Inspect authoritative Herdr state and recorded step before retrying; never blindly resubmit prompts or force-delete dirty worktrees.
 - Use `CGO_ENABLED=0` and pure-Go SQLite so the shipped Windows executable does not depend on a C toolchain. Pin module versions and commit `go.mod`/`go.sum`.
-- Development prerequisites: Go is **not** currently on PATH and Herdr's OMP integration is **not** installed on this machine. Install Go from https://go.dev/dl/ before running Go steps; do not install or alter user-wide Herdr/OMP integration without the user's explicit setup action. The release archive contains a prebuilt `.exe`; GitHub `herdr plugin install` from source requires Go because Herdr runs the manifest build command. A local/prebuilt release uses `herdr plugin link` (which skips builds).
+- Development prerequisites: Go is **not** currently on PATH and Herdr's OMP integration is **not** installed on this machine. A user-scoped Go 1.27.1 toolchain has been installed at `C:\Users\Jaco\AppData\Local\tools\go` (verified: `go version go1.27.1 windows/amd64`). The shell cannot resolve a bare `go`; every Go command in this plan runs as `MSYS_NO_PATHCONV=1 cmd.exe /c "set PATH=C:\Users\Jaco\AppData\Local\tools\go\bin;%PATH%&&go <args>"` — verified working for `go env`, `go test ./...` and `CGO_ENABLED=0` builds. Set `CGO_ENABLED=0` inside that command for builds. Do not install or alter user-wide Herdr/OMP integration without the user's explicit setup action. The release archive contains a prebuilt `.exe`; GitHub `herdr plugin install` from source requires Go because Herdr runs the manifest build command. A local/prebuilt release uses `herdr plugin link` (which skips builds).
 - Run only newly created/modified tests at each task; use a disposable Git repository for Herdr integration and never the AO reference checkout. Stop at a failed gate, record exact output, and repair the contract rather than weakening the test.
 
 ## Compatibility gates (before implementing lifecycle code)
@@ -100,6 +100,7 @@ type Inbox struct { ID, ProjectKey, TaskID, Kind, Summary, Delivery string }
 
 ```go
 func TestStageSeparatesActivityFromCompletion(t *testing.T) {
+    if StageOf(Task{Phase: Intent}) != Queued { t.Fatal("unprovisioned intent is queued, not running") }
     x := Task{Phase: PromptSubmitted, Activity: "done"}
     if StageOf(x) != Running { t.Fatalf("Herdr done is not task done: %s", StageOf(x)) }
     x.Blocker = "need an answer"
@@ -124,7 +125,7 @@ func StageOf(x Task) Stage {
     case x.Disposition != "": return Done
     case x.Blocker != "" || x.Attention != "": return NeedsInput
     case x.Report != nil && x.Report.Kind == "result": return ReadyForReview
-    case x.Phase != "": return Running
+    case x.Phase == WorktreeCreated || x.Phase == AgentStarted || x.Phase == PromptSubmitted: return Running
     default: return Queued
     }
 }
