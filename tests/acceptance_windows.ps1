@@ -2455,17 +2455,45 @@ function Invoke-CleanupRefusals {
     $cleanup3 = Invoke-BridgeAs -LaunchPaneId $primaryLaunch -Method 'cleanup' -Params @{ taskId = $idB }
     Add-Assertion -Id 'C7.1' -What 'the plugin’s removal path never asks Herdr to force a removal' -Status 'INFO' `
         -Evidence 'internal/coord/report.go (removeCheckout) calls herdr WorktreeRemove(...,false); internal/herdr/client.go builds `worktree remove --workspace <id>` with no --force; a forced removal is refused by verifyRemoval'
-    Assert-True -Id 'C7.2' -What 'the branch survives whatever the removal did' -Condition ((Invoke-Git -Arguments @('branch', '--format=%(refname:short)') -Directory $script:RepoPath).Stdout -match [regex]::Escape($branch)) -TaskId $idB
+
+    # Required: cleanup of the moved, now-clean, worker-free checkout must succeed.
+    # A refusal here (in particular `not_linked_worktree`) is an acceptance failure,
+    # not an observation: the task's worktree provenance must still be enough to
+    # remove its own checkout after a move closed the linked source workspace.
+    $cleanupCode = [string](Get-Field $cleanup3.Error 'code')
+    Assert-True -Id 'C7.2' -What 'cleanup of the moved, now-clean checkout succeeds through its recorded provenance' `
+        -Condition $cleanup3.Ok -TaskId $idB `
+        -Command "herdr-omp-orchestrator.exe bridge cleanup (taskId=$idB)" `
+        -Evidence $(if ($cleanup3.Ok) { Protect-Text (Get-Json $cleanup3.Result) 400 } else { "code=[$cleanupCode] " + (Protect-Text (Get-Json $cleanup3.Error) 500) })
+    if (-not $cleanup3.Ok) {
+        Assert-Equal -Id 'C7.2b' -What 'the removal of a moved checkout is not refused for a workspace-linking reason' `
+            -Expected 'ok' -Actual $cleanupCode -TaskId $idB `
+            -Evidence ("the checkout is [$(Get-Field $script:TaskB 'WorktreePath')] on branch [$branch], the worker is closed and the checkout is clean; a refusal means the plugin could not resolve its own recorded provenance")
+    }
+
+    Assert-True -Id 'C7.3' -What 'the branch survives the removal (the plugin never deletes it)' `
+        -Condition ((Invoke-Git -Arguments @('branch', '--format=%(refname:short)') -Directory $script:RepoPath).Stdout -match [regex]::Escape($branch)) -TaskId $idB
+    Assert-True -Id 'C7.4' -What 'the removal reports the exact recorded checkout as removed, unforced' `
+        -Condition ($cleanup3.Ok -and (Get-Flag $cleanup3.Result 'removed') -and (Test-SamePath -A (Get-Field $cleanup3.Result 'path') -B $path)) -TaskId $idB `
+        -Evidence (Protect-Text (Get-Json $cleanup3.Result) 400)
+    Assert-True -Id 'C7.5' -What 'the removed checkout is gone from disk' `
+        -Condition ($cleanup3.Ok -and (-not (Test-Path -LiteralPath $path))) -TaskId $idB
     if ($cleanup3.Ok) {
-        Assert-True -Id 'C7.3' -What 'the removal reports the recorded checkout as removed' -Condition ((Get-Flag $cleanup3.Result 'removed') -and (Test-SamePath -A (Get-Field $cleanup3.Result 'path') -B $path)) -TaskId $idB -Evidence (Protect-Text (Get-Json $cleanup3.Result) 400)
-        Assert-True -Id 'C7.4' -What 'the removed checkout is gone from disk' -Condition (-not (Test-Path -LiteralPath $path)) -TaskId $idB
         $after = Get-Field (Get-TaskById -Id $idB) 'fact'
-        Assert-True -Id 'C7.5' -What 'the task keeps its branch and path as provenance after removal' -Condition (([string](Get-Field $after 'Branch') -eq $branch) -and ([string](Get-Field $after 'WorktreePath') -eq $path)) -TaskId $idB
+        Assert-True -Id 'C7.6' -What 'the task keeps its branch and path as provenance after removal' -Condition (([string](Get-Field $after 'Branch') -eq $branch) -and (Test-SamePath -A ([string](Get-Field $after 'WorktreePath')) -B $path)) -TaskId $idB
+        Assert-True -Id 'C7.7' -What 'the removed task keeps its report and disposition (removal never rewrites the review)' `
+            -Condition (($null -ne (Get-Field $after 'Report' $null)) -and ([string](Get-Field $after 'Disposition') -ne '')) -TaskId $idB
+        $listingAfter = Get-WorktreeList
+        $stillListed = @((Get-Field $listingAfter 'worktrees' @()) | Where-Object { Test-SamePath -A (Get-Field $_ 'path') -B $path })
+        Assert-Equal -Id 'C7.8' -What 'Herdr no longer lists the removed checkout' -Expected 0 -Actual $stillListed.Count -TaskId $idB
+        Assert-True -Id 'C7.9' -What 'the cleared task records no live identities after the removal' `
+            -Condition (([string](Get-Field $after 'PublicPaneID') -eq '') -and ([string](Get-Field $after 'LaunchPaneID') -eq '') -and ([string](Get-Field $after 'WorktreeWorkspaceID') -eq '')) -TaskId $idB `
+            -Evidence (Protect-Text (Get-Json $after) 400)
     } else {
-        Add-Assertion -Id 'C7.3' -What 'cleanup after a cross-workspace move was refused by Herdr' -Status 'INFO' `
-            -Evidence (Protect-Text (Get-Json $cleanup3.Error) 500)
         $script:MovedCleanupRefused = $cleanup3.Error
-        Assert-True -Id 'C7.4' -What 'the refusal left the checkout in place (nothing was removed)' -Condition (Test-Path -LiteralPath $path) -TaskId $idB
+        Assert-True -Id 'C7.6b' -What 'a refused removal left the checkout in place untouched' -Condition (Test-Path -LiteralPath $path) -TaskId $idB
+        Assert-True -Id 'C7.7b' -What 'a refused removal left the branch in place' `
+            -Condition ((Invoke-Git -Arguments @('branch', '--format=%(refname:short)') -Directory $script:RepoPath).Stdout -match [regex]::Escape($branch)) -TaskId $idB
     }
 }
 
