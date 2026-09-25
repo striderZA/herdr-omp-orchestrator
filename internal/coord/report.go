@@ -296,6 +296,12 @@ func (c *Coordinator) Progress(ctx context.Context, launchPaneID, summary string
 // Question records one durable question and puts the task in Needs input so the
 // primary relays it to the user. It writes no task resource and never steals
 // focus: a question is a fact about the task, not a terminal operation.
+//
+// The Needs-input marker and the note that tells the primary about it are one
+// fact, so they are written in a single store transaction: a task can never be
+// left waiting for an answer nobody was asked. Asking the same question again is
+// the same fact — the marker already matches, so only the deduplicated note is
+// (re)confirmed and the revision the primary is watching does not move.
 func (c *Coordinator) Question(ctx context.Context, launchPaneID, text string) (QuestionResult, error) {
 	st, err := c.workerTask(ctx, launchPaneID)
 	if err != nil {
@@ -306,20 +312,23 @@ func (c *Coordinator) Question(ctx context.Context, launchPaneID, text string) (
 		return QuestionResult{}, err
 	}
 
+	attention := questionAttention(question)
 	asked := st
-	if attention := questionAttention(question); st.Attention != attention {
-		updated, err := c.record(ctx, st, func(next *task.Task) error {
+	inserted := false
+	if st.Attention != attention {
+		updated, insertedNote, err := c.recordWithNote(ctx, st, func(next *task.Task) error {
 			next.Attention = attention
 			return nil
-		}, "record the worker question")
+		}, c.noteFor(st, "question", question, "worker question"), "record the worker question")
 		if err != nil {
 			return QuestionResult{}, err
 		}
-		asked = updated
-	}
-	inserted, err := c.note(ctx, asked, "question", question, "worker question")
-	if err != nil {
-		return QuestionResult{}, err
+		asked, inserted = updated, insertedNote
+	} else {
+		inserted, err = c.note(ctx, asked, "question", question, "worker question")
+		if err != nil {
+			return QuestionResult{}, err
+		}
 	}
 	return QuestionResult{TaskID: asked.ID, Stage: task.StageOf(asked), Duplicate: !inserted}, nil
 }

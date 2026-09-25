@@ -260,6 +260,87 @@ func TestQuestionIsDurableDeduplicatedAndNeedsInput(t *testing.T) {
 	}
 }
 
+// TestQuestionIsDurableOnlyTogetherWithItsNote is the same transaction property the
+// final report has: the Needs-input marker a question sets and the note that tells
+// the primary about it are one fact. A question whose note cannot be written must
+// leave the task exactly as it was — no marker, no revision bump, no note — instead
+// of leaving it waiting for an answer nobody was asked.
+func TestQuestionIsDurableOnlyTogetherWithItsNote(t *testing.T) {
+	f := newReportFixture(t)
+	_, worker := f.seed()
+	ctx := context.Background()
+
+	f.poisonInbox(t)
+	before := f.reload(worker.ID)
+	if _, err := f.coord.Question(ctx, worker.LaunchPaneID, "Which branch should I target?"); err == nil {
+		t.Fatal("Question succeeded although its note could not be written")
+	}
+	after := f.reload(worker.ID)
+	if after.Attention != before.Attention {
+		t.Errorf("a question that could not be announced still left the task waiting: attention %q -> %q", before.Attention, after.Attention)
+	}
+	if after.Revision != before.Revision {
+		t.Errorf("a question that could not be announced wrote revision %d (was %d)", after.Revision, before.Revision)
+	}
+	if stage := task.StageOf(after); stage != task.Running {
+		t.Errorf("stage after a question that could not be announced = %q, want %q", stage, task.Running)
+	}
+	if got := len(f.notes("question")); got != 0 {
+		t.Errorf("a failed question left %d question notes", got)
+	}
+
+	// With the inbox writable again the same question lands, marker and note
+	// together, and one note is exactly what the primary gets.
+	f.healInbox(t)
+	result, err := f.coord.Question(ctx, worker.LaunchPaneID, "Which branch should I target?")
+	if err != nil {
+		t.Fatalf("Question after the inbox recovered: %v", err)
+	}
+	if result.Duplicate {
+		t.Error("the question was reported as a duplicate although it never landed")
+	}
+	asked := f.reload(worker.ID)
+	if !strings.Contains(asked.Attention, "Which branch should I target?") {
+		t.Errorf("attention %q does not carry the recovered question", asked.Attention)
+	}
+	if stage := task.StageOf(asked); stage != task.NeedsInput {
+		t.Errorf("stage after the recovered question = %q, want %q", stage, task.NeedsInput)
+	}
+	if got := len(f.notes("question")); got != 1 {
+		t.Errorf("question notes after the recovered question = %d, want 1", got)
+	}
+
+	// Asking it again is the same fact: the note is deduplicated and the task is
+	// not rewritten, so a repeated question cannot bump the revision the primary is
+	// watching.
+	revision := asked.Revision
+	again, err := f.coord.Question(ctx, worker.LaunchPaneID, "Which branch should I target?")
+	if err != nil {
+		t.Fatalf("Question (repeat): %v", err)
+	}
+	if !again.Duplicate {
+		t.Error("a repeated question was not reported as a duplicate")
+	}
+	if got := f.reload(worker.ID).Revision; got != revision {
+		t.Errorf("a repeated question wrote revision %d (was %d)", got, revision)
+	}
+	if got := len(f.notes("question")); got != 1 {
+		t.Errorf("question notes after a repeated question = %d, want 1", got)
+	}
+
+	// A durable question whose note is already recorded survives an unwritable
+	// inbox: the fact is unchanged, and the failure is reported rather than
+	// silently swallowed.
+	f.poisonInbox(t)
+	if _, err := f.coord.Question(ctx, worker.LaunchPaneID, "Which branch should I target?"); err == nil {
+		t.Error("a repeated question reported success although the inbox could not be written")
+	}
+	unchanged := f.reload(worker.ID)
+	if unchanged.Attention != asked.Attention || unchanged.Revision != revision {
+		t.Errorf("a repeated question changed the task while its note failed: %+v", unchanged)
+	}
+}
+
 func TestQuestionAndProgressNeverCompleteATask(t *testing.T) {
 	f := newReportFixture(t)
 	_, worker := f.seed()
