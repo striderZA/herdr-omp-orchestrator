@@ -45,22 +45,29 @@ if (-not (Test-Path -LiteralPath (Join-Path $script:PluginRoot 'herdr-plugin.tom
 $previousLocation = (Get-Location).Path
 Set-Location -LiteralPath $script:PluginRoot
 
-$script:HelperCopy = Join-Path $env:TEMP ("orch-acc-helpers-" + ([guid]::NewGuid().ToString('N')).Substring(0, 6) + ".ps1")
+# Everything this harness writes lives under one uniquely named directory it owns,
+# so a run can never collide with or delete a file it did not create, and cleanup
+# is one removal.
+$script:HarnessRoot = Join-Path $env:TEMP ("orch-acc-helpertest-" + ([guid]::NewGuid().ToString('N')).Substring(0, 6))
+New-Item -ItemType Directory -Path $script:HarnessRoot -Force | Out-Null
+
+$script:HelperCopy = Join-Path $script:HarnessRoot 'helpers.ps1'
 $lines = Get-Content -LiteralPath $script:AcceptanceScript
 $driver = @($lines | Select-String -Pattern '^\$script:StartedAt = \(Get-Date\)')
 if ($driver.Count -eq 0) { throw "the driver block was not found in $($script:AcceptanceScript)" }
 Set-Content -LiteralPath $script:HelperCopy -Value $lines[0..($driver[-1].LineNumber - 2)] -Encoding UTF8
 . $script:HelperCopy
 
-# The helper half writes assertion journal lines; keep them inside this run's temp dir.
-$script:WorkRoot = Join-Path $env:TEMP ("orch-acc-helpertest-" + ([guid]::NewGuid().ToString('N')).Substring(0, 6))
-New-Item -ItemType Directory -Path $script:WorkRoot -Force | Out-Null
-$script:ReportText = Join-Path $script:WorkRoot 'report.txt'
+# The helper half writes assertion journal lines; keep them inside this owned dir.
+$script:WorkRoot = $script:HarnessRoot
+$script:ReportText = Join-Path $script:HarnessRoot 'report.txt'
 Set-Content -LiteralPath $script:ReportText -Value 'helper tests' -Encoding UTF8
 
 $fails = 0
+$checks = 0
 function Check {
     param([string]$Name, [bool]$Ok, [string]$Detail = '')
+    $script:checks++
     if ($Ok) { Write-Host "ok   $Name" } else { Write-Host "FAIL $Name :: $Detail" -ForegroundColor Red; $script:fails++ }
 }
 
@@ -146,8 +153,7 @@ if (Test-Path -LiteralPath $ext) {
 }
 
 # --- state helper against a synthetic store with the real schema ------------
-$work = Join-Path $env:TEMP ('orch-acc-statecheck-' + [guid]::NewGuid().ToString('N').Substring(0, 6))
-New-Item -ItemType Directory -Path $work -Force | Out-Null
+$work = $script:HarnessRoot
 $script:WorkRoot = $work
 $script:StateHelper = Join-Path $work 'state_query.py'
 $db = Join-Path $work 'orchestrator.sqlite'
@@ -173,6 +179,7 @@ CREATE TABLE IF NOT EXISTS ready_sessions (launch_pane_id TEXT PRIMARY KEY, omp_
   omp_session_file TEXT NOT NULL DEFAULT '', omp_session_on_disk INTEGER NOT NULL DEFAULT 0, protocol INTEGER NOT NULL,
   verified INTEGER NOT NULL DEFAULT 0, verified_kind TEXT NOT NULL DEFAULT '', verified_value TEXT NOT NULL DEFAULT '',
   seen_at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS inbox_pending ON inbox (project_key, delivery_state);
 """)
 key = "C:\\temp\\run\\repo"
 cur.execute("INSERT INTO projects VALUES (?,?)", (key, json.dumps({"Key": key, "AgentName": "orch_p_x", "OMPSessionID": "sess-1"})))
@@ -238,8 +245,6 @@ Check 'foreign reference injected' ($injected.Stdout -match 'injected') $injecte
 $blocked = Invoke-Native -File $script:Python -Arguments @($script:StateHelper, $db2, 'delete-scoped', 'C:\temp\run\repo', 'w1:p1,w2:p1') -TimeoutSeconds 60
 Check 'delete refuses when a foreign row references our identity' (($blocked.ExitCode -eq 3) -and ($blocked.Stdout -match 'foreign')) "exit=$($blocked.ExitCode) out=$($blocked.Stdout)"
 
-Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
-
 # --- added checks: task projection and handshake materialization -------------
 $projectionFails = 0
 $fact = [pscustomobject]@{
@@ -260,10 +265,10 @@ $reported.Report = [pscustomobject]@{ Kind = 'result'; Summary = 's' }
 Check 'projection (stage form) notices a report' ((Get-TaskProjection -Fact $fact) -cne (Get-TaskProjection -Fact $reported)) 'report'
 Check 'projection (move form) ignores a report' ((Get-TaskProjection -Fact $fact -MoveSensitive) -ceq (Get-TaskProjection -Fact $reported -MoveSensitive)) 'report/move'
 
-$pathHandshake = [pscustomobject]@{ omp_session_file = (Join-Path $env:TEMP 'orch-acc-materialized-probe.txt'); omp_session_on_disk = 1 }
+$pathHandshake = [pscustomobject]@{ omp_session_file = (Join-Path $script:HarnessRoot 'materialized-probe.txt'); omp_session_on_disk = 1 }
 Set-Content -LiteralPath $pathHandshake.omp_session_file -Value 'x'
 Check 'handshake materialized: existing path' ((Test-HandshakeMaterialized -Handshake $pathHandshake) -eq $true) 'path exists'
-$pathHandshake.omp_session_file = (Join-Path $env:TEMP 'orch-acc-missing-probe-xyz.jsonl')
+$pathHandshake.omp_session_file = (Join-Path $script:HarnessRoot 'missing-probe.jsonl')
 Check 'handshake materialized: missing path' ((Test-HandshakeMaterialized -Handshake $pathHandshake) -eq $false) 'path missing'
 $idHandshake = [pscustomobject]@{ omp_session_id = '01a0-abc'; omp_session_file = ''; omp_session_on_disk = 1 }
 Check 'handshake materialized: id-only is uncheckable' ($null -eq (Test-HandshakeMaterialized -Handshake $idHandshake)) 'id-only'
@@ -294,7 +299,7 @@ $rendered = Get-ExpectedExtensionContent -Executable 'C:\x\herdr-omp-orchestrato
 Check 'renderer output is a string, not an array' ($rendered -is [string]) $rendered.GetType().Name
 Check 'renderer left no placeholder behind' (-not ($rendered -match '@@OMP_ORCH_')) ($rendered -match '@@OMP_ORCH_[A-Z_]+@@')
 Check 'renderer output starts with the managed marker' ($rendered.StartsWith('// herdr-omp-orchestrator managed OMP extension')) $rendered.Substring(0, 60)
-$renderFile = Join-Path $env:TEMP 'orch-acc-render-probe.ts'
+$renderFile = Join-Path $script:HarnessRoot 'render-probe.ts'
 Set-Content -LiteralPath $renderFile -Value $rendered -Encoding UTF8 -NoNewline
 $parsed = Get-ExtensionConstants -Path $renderFile
 Check 'rendered executable round-trips' ([string]$parsed['PLUGIN_EXECUTABLE'] -eq 'C:\x\herdr-omp-orchestrator.exe') ([string]$parsed['PLUGIN_EXECUTABLE'])
@@ -358,9 +363,11 @@ Check 'hint: materialized with no resume fails' ((Test-ResumeHintImplication -Hi
 Check 'hint: string flag fails' ((Test-ResumeHintImplication -Hint ([pscustomobject]@{ onDisk = 'false'; resume = '' })) -eq $false) 'string'
 Check 'hint: absent flag fails' ((Test-ResumeHintImplication -Hint ([pscustomobject]@{ resume = '' })) -eq $false) 'absent'
 
-Remove-Item -LiteralPath $script:HelperCopy -Force -ErrorAction SilentlyContinue
-Remove-Item -LiteralPath $script:WorkRoot -Recurse -Force -ErrorAction SilentlyContinue
+$exitCode = $fails + $projectionFails
+# One owned directory holds every path this run created, so cleanup is one removal
+# and cannot touch anything the harness did not create.
+Remove-Item -LiteralPath $script:HarnessRoot -Recurse -Force -ErrorAction SilentlyContinue
 Set-Location -LiteralPath $previousLocation
 Write-Host ''
-Write-Host "helper check failures: $fails (extra: $projectionFails)"
-exit ($fails + $projectionFails)
+Write-Host "helper check failures: $exitCode of $checks checks"
+exit $exitCode
