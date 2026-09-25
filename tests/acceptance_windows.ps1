@@ -968,7 +968,10 @@ function Invoke-PluginAction {
         return $null
     }
     $answer = $null
-    try { $answer = ($invocation.Stdout | ConvertFrom-Json).result } catch {
+    try {
+        $parsed = $invocation.Stdout | ConvertFrom-Json
+        $answer = Get-Field $parsed 'result' $null
+    } catch {
         Report-CommandFailure -AssertId "action/$ActionId" -Arguments $argv -Result $invocation
         return $null
     }
@@ -979,7 +982,7 @@ function Get-PluginLogEntry {
     param([Parameter(Mandatory)][string]$LogId, [double]$TimeoutSeconds = 60, [switch]$NoSessionScope)
     $wait = Wait-Until -TimeoutSeconds $TimeoutSeconds -IntervalSeconds 1 -What "plugin log $LogId" -Probe {
         $json = Get-HerdrJson -Arguments @('plugin', 'log', 'list', '--plugin', $script:PluginId, '--limit', '40') -NoSessionScope:$NoSessionScope
-        $entry = @($json.Result.logs | Where-Object { $_.log_id -eq $LogId })
+        $entry = @((Get-JsonField $json 'logs' @()) | Where-Object { (Get-Field $_ 'log_id') -eq $LogId })
         if ($entry.Count -eq 0) { return $null }
         if ($entry[0].status -eq 'running') { return $null }
         return $entry[0]
@@ -1080,7 +1083,10 @@ function Get-LiveAgent {
         try { $code = (($result.Stderr | ConvertFrom-Json).error.code) } catch { $code = '' }
         return [pscustomobject]@{ Found = $false; Code = $code; Agent = $null; Raw = $result }
     }
-    try { return [pscustomobject]@{ Found = $true; Code = ''; Agent = ($result.Stdout | ConvertFrom-Json).result.agent; Raw = $result } } catch {
+    try {
+        $parsed = $result.Stdout | ConvertFrom-Json
+        return [pscustomobject]@{ Found = $true; Code = ''; Agent = (Get-Field (Get-Field $parsed 'result' $null) 'agent' $null); Raw = $result }
+    } catch {
         return [pscustomobject]@{ Found = $false; Code = 'unparsable'; Agent = $null; Raw = $result }
     }
 }
@@ -1092,7 +1098,7 @@ function Get-WorktreeList {
 
 function Get-Snapshot {
     $json = Get-HerdrJson -Arguments @('api', 'snapshot')
-    return $json.Result.snapshot
+    return (Get-JsonField $json 'snapshot')
 }
 
 function Get-FocusProjection {
@@ -1147,6 +1153,13 @@ function Get-Field {
 function Get-Flag {
     param($Object, [string]$Name)
     return ([bool](Get-Field -Object $Object -Name $Name -Default $false))
+}
+
+function Get-JsonField {
+    # One field of a parsed Herdr envelope (Get-HerdrJson returns {Result,Raw,
+    # Invocation}); never raises when the field is absent under Set-StrictMode.
+    param($Json, [string]$Name, $Default = $null)
+    return (Get-Field (Get-Field $Json 'Result' $null) $Name $Default)
 }
 
 function Get-Json {
@@ -1270,7 +1283,7 @@ function Invoke-Preflight {
         -Evidence (Protect-Text $ompLine 200)
 
     $pluginList = Get-HerdrJson -Arguments @('plugin', 'list', '--json', '--plugin', $script:PluginId) -NoSessionScope
-    $plugin = @($pluginList.Result.plugins | Where-Object { (Get-Field $_ 'plugin_id') -eq $script:PluginId })
+    $plugin = @((Get-JsonField $pluginList 'plugins' @()) | Where-Object { (Get-Field $_ 'plugin_id') -eq $script:PluginId })
     Assert-Equal -Id 'P1.7' -What 'the plugin is registered before the run' -Expected 1 -Actual $plugin.Count
     if ($plugin.Count -eq 0) { throw 'the plugin is not linked; run this acceptance after `herdr plugin link` (the run never links a plugin it did not find)' }
     $script:PluginRegistrationBefore = [pscustomobject]@{
@@ -1319,7 +1332,7 @@ function Invoke-Preflight {
     }
 
     $defaultSession = Get-HerdrJson -Arguments @('api', 'snapshot') -NoSessionScope
-    $script:DefaultSessionBefore = Get-FocusProjection -Snapshot $defaultSession.Result.snapshot
+    $script:DefaultSessionBefore = Get-FocusProjection -Snapshot (Get-JsonField $defaultSession 'snapshot')
     Add-Assertion -Id 'P1.15' -What 'default session projection captured (isolation context)' -Status 'INFO' -Evidence (Protect-Text $script:DefaultSessionBefore 600)
     $defaultRecord = @(Get-Sessions | Where-Object { (Get-Field $_ 'name') -eq 'default' })
     Assert-Equal -Id 'P1.15b' -What "the user's default session was found before the run" -Expected 1 -Actual $defaultRecord.Count
@@ -1381,7 +1394,7 @@ function Invoke-Link {
     if ($link.ExitCode -ne 0) { Report-CommandFailure -AssertId 'L1.1' -Arguments @('plugin', 'link') -Result $link }
 
     $json = Get-HerdrJson -Arguments @('plugin', 'list', '--json', '--plugin', $script:PluginId) -NoSessionScope
-    $plugin = @($json.Result.plugins | Where-Object { (Get-Field $_ 'plugin_id') -eq $script:PluginId })
+    $plugin = @((Get-JsonField $json 'plugins' @()) | Where-Object { (Get-Field $_ 'plugin_id') -eq $script:PluginId })
     Assert-Equal -Id 'L1.2' -What 'the plugin is registered after linking' -Expected 1 -Actual $plugin.Count
     if ($plugin.Count -gt 0) {
         Assert-SamePath -Id 'L1.3' -What 'plugin_root is unchanged' -Expected $script:PluginRegistrationBefore.Root -Actual (Get-Field $plugin[0] 'plugin_root')
@@ -1398,10 +1411,10 @@ function Invoke-Link {
 
     $actions = Get-HerdrJson -Arguments @('plugin', 'action', 'list', '--plugin', $script:PluginId) -NoSessionScope
     foreach ($id in @('setup', 'bind', 'board')) {
-        $found = @($actions.Result.actions | Where-Object { (Get-Field $_ 'action_id') -eq $id })
+        $found = @((Get-JsonField $actions 'actions' @()) | Where-Object { (Get-Field $_ 'action_id') -eq $id })
         Assert-Equal -Id "L2.$id" -What "action '$id' is registered" -Expected 1 -Actual $found.Count
     }
-    $bindAction = @($actions.Result.actions | Where-Object { (Get-Field $_ 'action_id') -eq 'bind' })
+    $bindAction = @((Get-JsonField $actions 'actions' @()) | Where-Object { (Get-Field $_ 'action_id') -eq 'bind' })
     if ($bindAction.Count -gt 0) {
         $contexts = @(Get-Field $bindAction[0] 'contexts' @())
         Assert-Equal -Id 'L2.bind-contexts' -What 'bind declares pane and workspace contexts' -Expected 2 -Actual $contexts.Count -Evidence ($contexts -join ',')
@@ -1477,7 +1490,7 @@ directory = "$($script:WorktreesRoot.Replace('\', '/'))"
         -Condition ($default.Count -gt 0 -and (Get-Flag $default[0] 'running')) -Evidence (Protect-Text (Get-Json $default) 400)
 
     $workspaces = Get-HerdrJson -Arguments @('workspace', 'list')
-    $script:InitialWorkspaceCount = @($workspaces.Result.workspaces).Count
+    $script:InitialWorkspaceCount = @((Get-JsonField $workspaces 'workspaces' @())).Count
     Assert-Equal -Id 'S1.6' -What 'the isolated session starts empty (it is not the user session)' -Expected 0 -Actual $script:InitialWorkspaceCount
 }
 
@@ -2293,7 +2306,8 @@ function Invoke-PaneMove {
     $move = Invoke-Herdr -Arguments @('pane', 'move', $pane, '--new-workspace', '--label', "accept-moved-$($script:RunId)", '--no-focus') -TimeoutSeconds 120
     Assert-Equal -Id 'M1.1' -What 'pane move exits 0' -Expected 0 -Actual $move.ExitCode -Command $move.CommandLine -Evidence (Protect-Text $move.Stderr 400)
     if ($move.ExitCode -ne 0) { Block-Item -Id 'M1.2' -What 'cross-workspace move' -Evidence (Protect-Text $move.Stderr 400); return }
-    $moved = (($move.Stdout | ConvertFrom-Json).result).move_result
+    $moveParsed = $move.Stdout | ConvertFrom-Json
+    $moved = Get-Field (Get-Field $moveParsed 'result' $null) 'move_result' $null
     $newPane = [string](Get-Field (Get-Field $moved 'pane') 'pane_id')
     $newWorkspace = [string](Get-Field (Get-Field $moved 'pane') 'workspace_id')
     [void]$script:CreatedPanes.Add($newPane)
@@ -2309,7 +2323,7 @@ function Invoke-PaneMove {
     $gone = Invoke-Herdr -Arguments @('workspace', 'get', $sourceWorkspace)
     Assert-True -Id 'M3.1' -What 'the closed source workspace can no longer be read' -Condition ($gone.ExitCode -ne 0) -Evidence (Protect-Text $gone.Stderr 300)
     $list = Get-HerdrJson -Arguments @('workspace', 'list')
-    $stillThere = @($list.Result.workspaces | Where-Object { (Get-Field $_ 'workspace_id') -eq $sourceWorkspace })
+    $stillThere = @((Get-JsonField $list 'workspaces' @()) | Where-Object { (Get-Field $_ 'workspace_id') -eq $sourceWorkspace })
     Assert-Equal -Id 'M3.2' -What 'the source workspace is absent from the live list' -Expected 0 -Actual $stillThere.Count
     [void]$script:CreatedWorkspaces.Remove($sourceWorkspace)
 
@@ -2468,7 +2482,7 @@ function Invoke-Board {
     if (-not $boardPane) {
         # Fall back to the only pane that appeared in the project workspace while
         # the action ran, so a wrapped answer shape cannot hide a real pane.
-        $live = @((Get-HerdrJson -Arguments @('pane', 'list', '--workspace', $script:PrimaryWorkspace)).Result.panes |
+        $live = @((Get-JsonField (Get-HerdrJson -Arguments @('pane', 'list', '--workspace', $script:PrimaryWorkspace)) 'panes' @()) |
             Where-Object { (Get-Field $_ 'pane_id') -ne $script:PrimaryPane })
         if ($live.Count -eq 1) { $boardPane = [string](Get-Field $live[0] 'pane_id') }
     }
@@ -2674,7 +2688,8 @@ function Invoke-CleanupRefusals {
 
     # The removal must report the force flag Herdr actually used. A result that
     # does not carry it cannot prove anything, so its absence is a failure.
-    $forcedProperty = $cleanup3.Result.PSObject.Properties['forced']
+    $forcedProperty = $null
+    if ($cleanup3.Result) { $forcedProperty = $cleanup3.Result.PSObject.Properties['forced'] }
     Assert-True -Id 'C7.2c' -What 'the cleanup result reports the force flag Herdr actually used' `
         -Condition ($cleanup3.Ok -and ($null -ne $forcedProperty)) -TaskId $idB `
         -Evidence (Protect-Text (Get-Json $cleanup3.Result) 400)
@@ -2855,7 +2870,7 @@ function Invoke-Restart {
 
     $startup = Wait-Until -TimeoutSeconds 120 -IntervalSeconds 5 -What 'startup hook' -Probe {
         $json = Get-HerdrJson -Arguments @('plugin', 'log', 'list', '--plugin', $script:PluginId, '--limit', '50')
-        $entries = @($json.Result.logs | Where-Object { (Get-Field $_ 'event') -eq 'startup' })
+        $entries = @((Get-JsonField $json 'logs' @()) | Where-Object { (Get-Field $_ 'event') -eq 'startup' })
         if ($entries.Count -lt 2) { return $null }
         $newest = $entries | Sort-Object { [int64](Get-Field $_ 'started_unix_ms') } | Select-Object -Last 1
         if ((Get-Field $newest 'status') -eq 'running') { return $null }
@@ -3017,7 +3032,7 @@ function Invoke-Cleanup {
     if ($script:SessionCreated) {
         try {
             $list = Get-HerdrJson -Arguments @('workspace', 'list') -TimeoutSeconds 60
-            $live = @($list.Result.workspaces | ForEach-Object { [string](Get-Field $_ 'workspace_id') })
+            $live = @((Get-JsonField $list 'workspaces' @()) | ForEach-Object { [string](Get-Field $_ 'workspace_id') })
             $ours = @($script:CreatedWorkspaces | Where-Object { $live -contains $_ } | Select-Object -Unique)
             if ($ours.Count -gt 0) {
                 $focus = Invoke-Herdr -Arguments @('workspace', 'focus', $ours[0]) -TimeoutSeconds 60
@@ -3041,8 +3056,8 @@ function Invoke-Cleanup {
         }
         $script:CreatedWorkspaces.Clear()
         $remaining = Get-HerdrJson -Arguments @('workspace', 'list') -TimeoutSeconds 60
-        Assert-Equal -Id 'Z2.1' -What 'every workspace this run created is closed again' -Expected 0 -Actual @($remaining.Result.workspaces).Count `
-            -Evidence (Protect-Text (Get-Json $remaining.Result.workspaces) 400)
+        Assert-Equal -Id 'Z2.1' -What 'every workspace this run created is closed again' -Expected 0 -Actual @((Get-JsonField $remaining 'workspaces' @())).Count `
+            -Evidence (Protect-Text (Get-Json (Get-JsonField $remaining 'workspaces' @())) 400)
         $finalSnapshot = Get-Snapshot
         Assert-Equal -Id 'Z2.2' -What 'the isolated session is back to the empty focus state it had before this run created anything' `
             -Expected $script:InitialWorkspaceCount -Actual @($finalSnapshot.workspaces).Count `
@@ -3125,7 +3140,7 @@ function Invoke-Cleanup {
 
     # 6. Prove nothing of the user's was changed.
     $default = Get-HerdrJson -Arguments @('api', 'snapshot') -NoSessionScope
-    $defaultProjection = Get-FocusProjection -Snapshot $default.Result.snapshot
+    $defaultProjection = Get-FocusProjection -Snapshot (Get-JsonField $default 'snapshot')
     $defaultRecord = @(Get-Sessions | Where-Object { (Get-Field $_ 'name') -eq 'default' })
     Assert-Equal -Id 'Z6.1' -What "the user's default session still has its own server, directory and socket (this run never stopped, restarted or replaced it)" `
         -Expected 1 -Actual $defaultRecord.Count
@@ -3147,7 +3162,7 @@ function Invoke-Cleanup {
         -Evidence "run=$(Protect-Text $script:SessionSocket 200) default=$(Protect-Text $script:DefaultSessionRecord.Socket 200)"
 
     $pluginList = Get-HerdrJson -Arguments @('plugin', 'list', '--json', '--plugin', $script:PluginId) -NoSessionScope
-    $plugin = @($pluginList.Result.plugins | Where-Object { (Get-Field $_ 'plugin_id') -eq $script:PluginId })
+    $plugin = @((Get-JsonField $pluginList 'plugins' @()) | Where-Object { (Get-Field $_ 'plugin_id') -eq $script:PluginId })
     Assert-Equal -Id 'Z6.2' -What 'the plugin is still linked exactly once (this run never unlinked it)' -Expected 1 -Actual $plugin.Count
     if ($plugin.Count -gt 0) {
         Assert-SamePath -Id 'Z6.3' -What 'the plugin root is unchanged' -Expected $script:PluginRegistrationBefore.Root -Actual ([string](Get-Field $plugin[0] 'plugin_root'))
