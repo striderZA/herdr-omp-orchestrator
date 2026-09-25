@@ -841,8 +841,13 @@ function Get-TaskProjection {
         move-insensitive one (only the fields a cross-workspace move and the
         worker's own activity are allowed to leave alone).
     #>
-    param($Fact, [switch]$MoveSensitive)
-    $fields = if ($MoveSensitive) {
+    param($Fact, [switch]$MoveSensitive, [switch]$CleanupInvariant)
+    $fields = if ($CleanupInvariant) {
+        # Exactly what a removal must leave untouched, and nothing a lifecycle
+        # hook may independently refresh (Activity/ActivitySeenAt/Revision).
+        @('Branch', 'WorktreePath', 'Report', 'Disposition', 'LaunchPaneID', 'PublicPaneID',
+          'TerminalID', 'CurrentWorkspaceID', 'WorktreeWorkspaceID', 'AgentName', 'OMPSessionID')
+    } elseif ($MoveSensitive) {
         @('ID', 'ProjectKey', 'Title', 'Brief', 'BaseRevision', 'Branch', 'Checks', 'Dependencies',
           'ReservedPaths', 'WorktreePath', 'WorktreeWorkspaceID', 'TerminalID', 'LaunchPaneID',
           'AgentName', 'OMPSessionID', 'CreatedAt')
@@ -2452,12 +2457,19 @@ function Invoke-CleanupRefusals {
     }
     Assert-True -Id 'C6.2' -What 'no agent is left on the closed pane' -Condition $dead.Ok -TaskId $idB
 
-    # Everything the removal must preserve is captured before it runs, so the
-    # post-removal comparison is exact rather than "still non-empty".
-    $reportBefore = Get-Json (Get-Field $script:TaskB 'Report' $null)
-    $dispositionBefore = [string](Get-Field $script:TaskB 'Disposition')
-    $pathBefore = [string](Get-Field $script:TaskB 'WorktreePath')
-    $branchBefore = [string](Get-Field $script:TaskB 'Branch')
+    # Everything the removal must preserve is captured from a FRESH store read
+    # taken here, after the worker pane was closed and observed gone, so both the
+    # success and the refusal comparison are exact rather than "still non-empty".
+    $preCleanupRow = Get-TaskById -Id $idB
+    Assert-True -Id 'C7.0' -What 'the task fact was re-read immediately before the final cleanup call' `
+        -Condition ($null -ne $preCleanupRow) -TaskId $idB -Evidence (Protect-Text (Get-Json $preCleanupRow) 500)
+    if (-not $preCleanupRow) { Block-Item -Id 'C7.0b' -What 'the moved task could not be re-read before cleanup' -Evidence $idB; return }
+    $preCleanup = Get-Field $preCleanupRow 'fact'
+    $reportBefore = Get-Json (Get-Field $preCleanup 'Report' $null)
+    $dispositionBefore = [string](Get-Field $preCleanup 'Disposition')
+    $pathBefore = [string](Get-Field $preCleanup 'WorktreePath')
+    $branchBefore = [string](Get-Field $preCleanup 'Branch')
+    $cleanupInvariantBefore = Get-TaskProjection -Fact $preCleanup -CleanupInvariant
 
     $cleanup3 = Invoke-BridgeAs -LaunchPaneId $primaryLaunch -Method 'cleanup' -Params @{ taskId = $idB }
     Add-Assertion -Id 'C7.1' -What 'the plugin’s removal path never asks Herdr to force a removal' -Status 'INFO' `
@@ -2529,11 +2541,19 @@ function Invoke-CleanupRefusals {
         Assert-True -Id 'C7.6b' -What 'a refused removal left the checkout in place untouched' -Condition (Test-Path -LiteralPath $path) -TaskId $idB
         Assert-True -Id 'C7.7b' -What 'a refused removal left the branch in place' `
             -Condition ((Invoke-Git -Arguments @('branch', '--format=%(refname:short)') -Directory $script:RepoPath).Stdout -match [regex]::Escape($branch)) -TaskId $idB
-        $unchanged = Get-Field (Get-TaskById -Id $idB) 'fact'
+        # A refusal must leave every cleanup-relevant fact exactly as it was: the
+        # eleven fields a removal touches, compared against the fresh pre-call read
+        # (never Activity/ActivitySeenAt/Revision, which a lifecycle hook may
+        # independently refresh when the pane closes).
+        $afterRefusal = Get-Field (Get-TaskById -Id $idB) 'fact'
+        $cleanupInvariantAfter = Get-TaskProjection -Fact $afterRefusal -CleanupInvariant
+        Assert-Equal -Id 'C7.13' -What 'a refused removal left Branch, WorktreePath, Report, Disposition and all seven live identities byte-identical' `
+            -Expected $cleanupInvariantBefore -Actual $cleanupInvariantAfter -TaskId $idB `
+            -Evidence ("code=[$cleanupCode] before=[" + (Protect-Text $cleanupInvariantBefore 600) + "] after=[" + (Protect-Text $cleanupInvariantAfter 600) + "]")
         Assert-Equal -Id 'C7.7c' -What 'a refused removal left the report and disposition untouched' `
-            -Expected $reportBefore -Actual (Get-Json (Get-Field $unchanged 'Report' $null)) -TaskId $idB
+            -Expected $reportBefore -Actual (Get-Json (Get-Field $afterRefusal 'Report' $null)) -TaskId $idB
         Assert-Equal -Id 'C7.7d' -What 'a refused removal left the disposition untouched' `
-            -Expected $dispositionBefore -Actual ([string](Get-Field $unchanged 'Disposition')) -TaskId $idB
+            -Expected $dispositionBefore -Actual ([string](Get-Field $afterRefusal 'Disposition')) -TaskId $idB
     }
 }
 
