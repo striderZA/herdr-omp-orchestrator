@@ -739,6 +739,52 @@ func TestReviewDrainsTheTasksItsDispositionUnblocks(t *testing.T) {
 	}
 }
 
+// TestDrainNeverProvisionsATaskAnotherCallerClaimed pins the property that keeps two
+// concurrent drain callers (a review's disposition and another dispatch, say) from
+// provisioning the same task twice: the durable claim is exclusive per task, and a drain
+// that did not win it leaves that task alone rather than racing the same worktree, the
+// same pane and the same brief.
+func TestDrainNeverProvisionsATaskAnotherCallerClaimed(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	ctx := context.Background()
+
+	prereq := f.mustDispatch("prereq", "Prereq brief.")
+	dependent, err := f.dispatch("dependent", "Dependent brief.", []string{"go test ./... ok"}, []string{prereq.ID}, nil, f.base)
+	if err != nil {
+		t.Fatalf("dispatch the dependent task: %v", err)
+	}
+	f.satisfyReview(prereq) // the dependent task is now eligible to be drained
+
+	// Another caller claims it first, and the claim is exclusive: the same task cannot be
+	// claimed twice, so only one caller can ever provision it.
+	claimed, err := f.store.ClaimProvisioningSlot(ctx, dependent.ID, 3)
+	if err != nil || !claimed {
+		t.Fatalf("the first claim = (%v, %v), want the task claimed", claimed, err)
+	}
+	again, err := f.store.ClaimProvisioningSlot(ctx, dependent.ID, 3)
+	if err != nil {
+		t.Fatalf("the second claim: %v", err)
+	}
+	if again {
+		t.Fatal("two callers hold one task's provisioning claim")
+	}
+
+	// So a drain skips it instead of provisioning it a second time.
+	if _, err := f.coord.DrainQueued(ctx, f.projectKey()); err != nil {
+		t.Fatalf("DrainQueued: %v", err)
+	}
+	after, err := f.store.Task(ctx, dependent.ID)
+	if err != nil {
+		t.Fatalf("read the dependent task: %v", err)
+	}
+	if after.Phase != task.Intent {
+		t.Errorf("the drain provisioned a task another caller had claimed: %+v", after)
+	}
+	if got := f.prompts(after.PublicPaneID); len(got) != 0 {
+		t.Errorf("the drain submitted a brief for a claimed task: %v", got)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // ownership rechecks
 // ---------------------------------------------------------------------------
