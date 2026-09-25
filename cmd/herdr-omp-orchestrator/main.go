@@ -182,13 +182,17 @@ func runEvent(env map[string]string, stdout, stderr io.Writer) int {
 	if eventName == "" {
 		return emit(stdout, stderr, failureBody("event_unavailable", envPluginEvent+" is not set"))
 	}
-	payload := strings.TrimSpace(env[envPluginEventJSON])
-	if payload == "" {
-		return emit(stdout, stderr, failureBody("event_payload_unavailable", envPluginEventJSON+" is not set"))
-	}
-	if len(payload) > coord.MaxEventPayloadBytes {
+	// The bound applies to the bytes Herdr delivered, before any trimming, so a
+	// payload padded with whitespace around a small event is refused whole
+	// instead of being accepted as a smaller one.
+	rawPayload := env[envPluginEventJSON]
+	if len(rawPayload) > coord.MaxEventPayloadBytes {
 		return emit(stdout, stderr, failureBody("event_payload_too_large",
-			fmt.Sprintf("the %s payload exceeds the %d byte bound", eventName, coord.MaxEventPayloadBytes)))
+			fmt.Sprintf("the %s payload is %d bytes, larger than the %d byte bound",
+				eventName, len(rawPayload), coord.MaxEventPayloadBytes)))
+	}
+	if strings.TrimSpace(rawPayload) == "" {
+		return emit(stdout, stderr, failureBody("event_payload_unavailable", envPluginEventJSON+" is not set"))
 	}
 
 	coordinator, closeCoordinator, err := openCoordinator(env)
@@ -199,7 +203,7 @@ func runEvent(env map[string]string, stdout, stderr io.Writer) int {
 
 	ctx, cancel := context.WithTimeout(context.Background(), eventTimeout)
 	defer cancel()
-	if err := coordinator.HandleEvent(ctx, eventName, []byte(payload)); err != nil {
+	if err := coordinator.HandleEvent(ctx, eventName, []byte(rawPayload)); err != nil {
 		return emit(stdout, stderr, failureBody(coordCode(err), err.Error()))
 	}
 	return emit(stdout, stderr, map[string]any{"ok": true, "event": eventName})

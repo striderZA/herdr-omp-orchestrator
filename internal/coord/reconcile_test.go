@@ -18,6 +18,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -530,7 +531,10 @@ func TestCapturedHookPayloadsDriveTheHandlers(t *testing.T) {
 	}
 
 	// The move payload Herdr delivered for a real cross-workspace move whose
-	// source workspace it closed.
+	// source workspace it closed. The stand-in's own state is moved the same way
+	// first: the plugin re-proves the pane against Herdr, so a payload alone is
+	// not enough.
+	f.movedWorkerState(t, observed, "w7:p1", "w7", observed.OMPSessionID)
 	move := eventFixtureJSON(t, "captured_pane_moved.json",
 		"{{prev_pane}}", observed.PublicPaneID,
 		"{{prev_workspace}}", observed.CurrentWorkspaceID,
@@ -1406,7 +1410,339 @@ func TestInboxPromptIsBoundedAndNamesEveryTask(t *testing.T) {
 // ---------------------------------------------------------------------------
 // projections the coordinator exposes to the board
 // ---------------------------------------------------------------------------
+// follow-up regressions (Task 6 review)
+// ---------------------------------------------------------------------------
 
+// movedWorkerState moves the stand-in's worker pane into a new workspace and
+// keeps the checkout, the way a real `pane move` does. The terminal is the same
+// process; session and pane id are what the caller says they are.
+func (f *coordFixture) movedWorkerState(t *testing.T, st task.Task, pane, workspace, session string) {
+	t.Helper()
+	f.rewriteState(func(current *fixtureState) {
+		agent := current.Agents[st.PublicPaneID]
+		if agent == nil {
+			t.Fatalf("no agent is running in pane %q", st.PublicPaneID)
+		}
+		delete(current.Agents, st.PublicPaneID)
+		delete(current.Workspaces, workspaceOfPane(st.PublicPaneID))
+		agent.Session = session
+		current.Workspaces[workspace] = st.WorktreePath
+		current.Agents[pane] = agent
+	})
+}
+
+// TestFlushInboxDeliversEveryClaimedNoteAndLeavesTheRestPending pins the batch a
+// flush is allowed to claim: a note is either named whole in the prompt that
+// carries it, or left pending for a later batch. Truncating the prompt while
+// settling every claimed note would silently lose notes.
+func TestFlushInboxDeliversEveryClaimedNoteAndLeavesTheRestPending(t *testing.T) {
+	ctx := context.Background()
+	f := newCoordFixture(t, fixturePlan{})
+	worker := f.boundWorker(t)
+	primary := f.boundProject(t).PublicPaneID
+	const notes = 25
+	for i := 1; i <= notes; i++ {
+		if _, err := f.coord.Progress(ctx, worker.LaunchPaneID, fmt.Sprintf("step %02d", i)); err != nil {
+			t.Fatalf("Progress %d: %v", i, err)
+		}
+	}
+	pending, err := f.store.PendingInbox(ctx, f.projectKey())
+	if err != nil {
+		t.Fatalf("PendingInbox: %v", err)
+	}
+	if len(pending) != notes {
+		t.Fatalf("pending notes = %d, want %d", len(pending), notes)
+	}
+
+	if err := f.coord.FlushInbox(ctx, f.projectKey()); err != nil {
+		t.Fatalf("FlushInbox: %v", err)
+	}
+	prompts := f.promptsTo(t, primary)
+	if len(prompts) != 1 {
+		t.Fatalf("prompts = %d, want 1", len(prompts))
+	}
+	text := prompts[0].Text
+	delivered, remaining := f.notesByState(t, task.DeliveryDelivered), f.notesByState(t, task.DeliveryPending)
+	if len(delivered) != inboxPromptNoteLimit {
+		t.Fatalf("delivered notes = %d, want the %d note batch", len(delivered), inboxPromptNoteLimit)
+	}
+	if len(remaining) != notes-len(delivered) {
+		t.Fatalf("pending notes after the flush = %d, want %d", len(remaining), notes-len(delivered))
+	}
+	for _, note := range delivered {
+		if !strings.Contains(text, note.Summary) {
+			t.Fatalf("the prompt dropped the delivered note %q: %s", note.Summary, text)
+		}
+	}
+	for _, note := range remaining {
+		if strings.Contains(text, note.Summary) {
+			t.Fatalf("the prompt named %q but its note was left pending", note.Summary)
+		}
+	}
+
+	// The next flush carries the rest, and no note is ever delivered twice.
+	f.setAgentStatus(t, primary, "idle")
+	if err := f.coord.FlushInbox(ctx, f.projectKey()); err != nil {
+		t.Fatalf("second FlushInbox: %v", err)
+	}
+	if got := len(f.notesByState(t, task.DeliveryPending)); got != 0 {
+		t.Fatalf("pending notes after the second flush = %d, want 0", got)
+	}
+	seen := 0
+	for _, prompt := range f.promptsTo(t, primary) {
+		for i := 1; i <= notes; i++ {
+			if strings.Contains(prompt.Text, fmt.Sprintf("step %02d", i)) {
+				seen++
+			}
+		}
+	}
+	if seen != notes {
+		t.Fatalf("the prompts named %d of %d notes, want every note exactly once", seen, notes)
+	}
+}
+
+// TestFlushInboxBatchesBySizeAndLeavesTheRestPending is the byte-bound half of
+// the same rule: the batch is chosen so the whole prompt fits, not truncated
+// after the notes were already claimed.
+func TestFlushInboxBatchesBySizeAndLeavesTheRestPending(t *testing.T) {
+	ctx := context.Background()
+	f := newCoordFixture(t, fixturePlan{})
+	worker := f.boundWorker(t)
+	primary := f.boundProject(t).PublicPaneID
+	const notes = 12
+	summary := strings.Repeat("x", 400)
+	for i := range notes {
+		if _, err := f.coord.Progress(ctx, worker.LaunchPaneID, fmt.Sprintf("%02d %s", i, summary)); err != nil {
+			t.Fatalf("Progress %d: %v", i, err)
+		}
+	}
+	if err := f.coord.FlushInbox(ctx, f.projectKey()); err != nil {
+		t.Fatalf("FlushInbox: %v", err)
+	}
+	prompts := f.promptsTo(t, primary)
+	if len(prompts) != 1 {
+		t.Fatalf("prompts = %d, want 1", len(prompts))
+	}
+	first := len(f.notesByState(t, task.DeliveryDelivered))
+	if first == 0 || first >= notes {
+		t.Fatalf("first batch delivered %d of %d notes, want a partial batch", first, notes)
+	}
+	if len(prompts[0].Text) > inboxPromptLimit {
+		t.Fatalf("prompt is %d bytes, larger than the %d byte bound", len(prompts[0].Text), inboxPromptLimit)
+	}
+	// Draining the queue needs more batches, and every note is named once.
+	for i := 0; i < notes && len(f.notesByState(t, task.DeliveryPending)) > 0; i++ {
+		f.setAgentStatus(t, primary, "idle")
+		if err := f.coord.FlushInbox(ctx, f.projectKey()); err != nil {
+			t.Fatalf("FlushInbox %d: %v", i, err)
+		}
+	}
+	if got := len(f.notesByState(t, task.DeliveryPending)); got != 0 {
+		t.Fatalf("pending notes after draining = %d, want 0", got)
+	}
+	named := 0
+	for i := range notes {
+		marker := fmt.Sprintf("%02d x", i)
+		appearances := 0
+		for _, prompt := range f.promptsTo(t, primary) {
+			if strings.Contains(prompt.Text, marker) {
+				appearances++
+			}
+		}
+		if appearances != 1 {
+			t.Fatalf("note %d was named in %d prompts, want exactly 1", i, appearances)
+		}
+		named++
+	}
+	if named != notes {
+		t.Fatalf("named %d of %d notes", named, notes)
+	}
+}
+
+// TestMoveRequiresALiveProofOfTheRecordedSession pins that a public pane rebind
+// is committed only for a pane Herdr itself proves is the recorded worker.
+// Trusting the move payload alone would accept a pane the event describes as
+// ours even when the live pane holds a different session.
+func TestMoveRequiresALiveProofOfTheRecordedSession(t *testing.T) {
+	t.Run("the payload carries no session but the live pane proves it", func(t *testing.T) {
+		f := newCoordFixture(t, fixturePlan{})
+		worker := f.boundWorker(t)
+		f.movedWorkerState(t, worker, "w9:p1", "w9", worker.OMPSessionID)
+
+		payload := movePayload(t, worker, "w9:p1", "w9")
+		delete(payload["pane"].(map[string]any), "agent_session")
+		f.mustHandle(t, EventPaneMoved, encodeEvent(t, payload))
+
+		after := f.taskByID(t, worker.ID)
+		if after.PublicPaneID != "w9:p1" || after.CurrentWorkspaceID != "w9" {
+			t.Fatalf("a live-proven move was not recorded: pane %q workspace %q", after.PublicPaneID, after.CurrentWorkspaceID)
+		}
+		if after.LaunchPaneID != worker.LaunchPaneID || after.TerminalID != worker.TerminalID {
+			t.Fatalf("the move re-keyed launch %q terminal %q", after.LaunchPaneID, after.TerminalID)
+		}
+	})
+
+	t.Run("the payload carries no session and the live pane differs", func(t *testing.T) {
+		f := newCoordFixture(t, fixturePlan{})
+		worker := f.boundWorker(t)
+		f.movedWorkerState(t, worker, "w9:p1", "w9", "someone-elses-session")
+
+		payload := movePayload(t, worker, "w9:p1", "w9")
+		delete(payload["pane"].(map[string]any), "agent_session")
+		err := f.coord.HandleEvent(context.Background(), EventPaneMoved, encodeEvent(t, payload))
+		if !errors.Is(err, ErrAgentChanged) {
+			t.Fatalf("err = %v, want ErrAgentChanged", err)
+		}
+		assertMoveRefused(t, f, worker)
+	})
+
+	t.Run("the payload claims the recorded session but the live pane differs", func(t *testing.T) {
+		f := newCoordFixture(t, fixturePlan{})
+		worker := f.boundWorker(t)
+		f.movedWorkerState(t, worker, "w9:p1", "w9", "someone-elses-session")
+
+		payload := movePayload(t, worker, "w9:p1", "w9")
+		err := f.coord.HandleEvent(context.Background(), EventPaneMoved, encodeEvent(t, payload))
+		if !errors.Is(err, ErrAgentChanged) {
+			t.Fatalf("err = %v, want ErrAgentChanged", err)
+		}
+		assertMoveRefused(t, f, worker)
+	})
+}
+
+// assertMoveRefused checks the durable outcome of a refused move: the binding is
+// untouched, a human is told, and nothing was started in the pane.
+func assertMoveRefused(t *testing.T, f *coordFixture, worker task.Task) {
+	t.Helper()
+	after := f.taskByID(t, worker.ID)
+	if after.PublicPaneID != worker.PublicPaneID || after.CurrentWorkspaceID != worker.CurrentWorkspaceID {
+		t.Fatalf("a refused move re-keyed the task: pane %q workspace %q", after.PublicPaneID, after.CurrentWorkspaceID)
+	}
+	if after.Attention == "" {
+		t.Fatalf("a refused move left no attention for a human")
+	}
+	if stage := task.StageOf(after); stage != task.NeedsInput {
+		t.Fatalf("stage = %q, want %q", stage, task.NeedsInput)
+	}
+	if starts := f.countCalls("agent start"); starts != 1 {
+		t.Fatalf("agent start calls = %d, want only the dispatch's own (%v)", starts, tasksStarted(f))
+	}
+}
+
+// TestReconcileTreatsAMissingSessionReferenceAsUnproven pins the probe rule: a
+// recorded session that Herdr does not report back cannot be proven, even on the
+// terminal the task was dispatched with. Adopting such a pane would let an
+// unrelated OMP session inherit a worker's task.
+func TestReconcileTreatsAMissingSessionReferenceAsUnproven(t *testing.T) {
+	ctx := context.Background()
+	f := newCoordFixture(t, fixturePlan{})
+	worker := f.boundWorker(t)
+	f.updatePlan(func(plan *fixturePlan) { plan.SuppressSessionFor = worker.PublicPaneID })
+
+	probe, err := f.coord.probePane(ctx, worker.PublicPaneID, worker.OMPSessionID, worker.TerminalID, worker.WorktreePath)
+	if err != nil {
+		t.Fatalf("probePane: %v", err)
+	}
+	switch {
+	case probe.Ours:
+		t.Fatalf("a pane reporting no session reference was accepted as the worker")
+	case probe.Refutes:
+		t.Fatalf("an unpublished reference is not a contradiction, it is unproven")
+	case probe.Vacant:
+		t.Fatalf("the pane holds an agent, so it is not vacant")
+	}
+
+	if err := f.coord.Reconcile(ctx); !errors.Is(err, ErrAgentChanged) {
+		t.Fatalf("Reconcile err = %v, want the recorded refusal", err)
+	}
+	after := f.taskByID(t, worker.ID)
+	if after.Attention == "" {
+		t.Fatalf("an unprovable worker left no attention for a human")
+	}
+	if after.PublicPaneID != worker.PublicPaneID || after.LaunchPaneID != worker.LaunchPaneID {
+		t.Fatalf("an unprovable worker was re-keyed: launch %q public %q", after.LaunchPaneID, after.PublicPaneID)
+	}
+	if starts := f.countCalls("agent start"); starts != 1 {
+		t.Fatalf("agent start calls = %d, want only the dispatch's own", starts)
+	}
+
+	// The acceptance case is unchanged: once Herdr reports the recorded session,
+	// the same pane is proven and reconciles silently.
+	f.updatePlan(func(plan *fixturePlan) { plan.SuppressSessionFor = "" })
+	proven, err := f.coord.probePane(ctx, worker.PublicPaneID, worker.OMPSessionID, worker.TerminalID, worker.WorktreePath)
+	if err != nil {
+		t.Fatalf("probePane after the reference returned: %v", err)
+	}
+	if !proven.Ours || !proven.SessionOK {
+		t.Fatalf("the recorded session was not accepted: ours=%v sessionOK=%v refusal=%q", proven.Ours, proven.SessionOK, proven.Refusal)
+	}
+}
+
+// TestEventPayloadSizeIsCheckedBeforeTrimming pins that the bound applies to the
+// bytes Herdr delivered, not to what is left after whitespace was stripped: a
+// payload of mostly legal JSON whitespace with a small valid object inside must
+// be refused whole.
+func TestEventPayloadSizeIsCheckedBeforeTrimming(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	worker := f.boundWorker(t)
+	inner := `{"type":"pane_agent_status_changed","pane_id":"` + worker.PublicPaneID +
+		`","workspace_id":"` + workspaceOfPane(worker.PublicPaneID) + `","agent_status":"idle"}`
+
+	oversized := inner + strings.Repeat(" ", MaxEventPayloadBytes)
+	err := f.coord.HandleEvent(context.Background(), EventAgentStatus, []byte(oversized))
+	if !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("oversized payload err = %v, want ErrInvalidRequest", err)
+	}
+	if !strings.Contains(err.Error(), "larger than") {
+		t.Fatalf("oversized payload error = %q, want the size refusal", err)
+	}
+
+	whitespace := strings.Repeat(" ", 64)
+	err = f.coord.HandleEvent(context.Background(), EventAgentStatus, []byte(whitespace))
+	if !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("whitespace-only payload err = %v, want ErrInvalidRequest", err)
+	}
+	if !strings.Contains(err.Error(), "no payload") {
+		t.Fatalf("whitespace-only payload error = %q, want the empty-payload refusal", err)
+	}
+
+	// A payload at the bound passes the size gate and is applied: the padding is
+	// legal JSON whitespace around a real event.
+	atBound := inner + strings.Repeat(" ", MaxEventPayloadBytes-len(inner))
+	if err := f.coord.HandleEvent(context.Background(), EventAgentStatus, []byte(atBound)); err != nil {
+		t.Fatalf("payload at the %d byte bound err = %v", MaxEventPayloadBytes, err)
+	}
+	if after := f.taskByID(t, worker.ID); after.Activity != "idle" {
+		t.Fatalf("activity = %q, want the padded payload to have been applied", after.Activity)
+	}
+}
+
+// notesByState lists the project's notes in one delivery state.
+func (f *coordFixture) notesByState(t *testing.T, state string) []task.Inbox {
+	t.Helper()
+	var out []task.Inbox
+	for _, note := range f.inboxRows(t) {
+		if note.State() == state {
+			out = append(out, note)
+		}
+	}
+	return out
+}
+
+// tasksStarted names the `agent start` argv the stand-in recorded.
+func tasksStarted(f *coordFixture) []string {
+	var out []string
+	for _, call := range f.calls() {
+		if len(call.Argv) >= 2 && call.Argv[0]+" "+call.Argv[1] == "agent start" {
+			out = append(out, strings.Join(call.Argv, " "))
+		}
+	}
+	return out
+}
+
+// TestReconcileAttentionNamesTheTaskAndKeepsAnExistingBlocker pins that a
+// reconciliation finding never replaces a blocker a dispatch step already
+// recorded.
 func TestReconcileAttentionNamesTheTaskAndKeepsAnExistingBlocker(t *testing.T) {
 	f := newCoordFixture(t, fixturePlan{})
 	worker := f.boundWorker(t)

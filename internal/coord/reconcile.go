@@ -194,6 +194,10 @@ func (c *Coordinator) HandleEvent(ctx context.Context, eventName string, payload
 // envelope `{"event": ..., "data": {...}}` and the standalone event object that
 // carries `type` itself. The hook name decides which event this is; an envelope
 // that names a different event is a contradiction, not a reinterpretation.
+//
+// The size bound applies to the bytes Herdr delivered, before any trimming: a
+// payload of mostly legal JSON whitespace around a small object is still a
+// payload this plugin must not parse.
 func decodeHookPayload(eventName string, payload []byte) (json.RawMessage, error) {
 	name := strings.TrimSpace(eventName)
 	switch name {
@@ -201,13 +205,14 @@ func decodeHookPayload(eventName string, payload []byte) (json.RawMessage, error
 	default:
 		return nil, fmt.Errorf("%w: %q is not an event this plugin subscribes to", ErrInvalidRequest, eventName)
 	}
+	if len(payload) > MaxEventPayloadBytes {
+		return nil, fmt.Errorf("%w: the %s payload is %d bytes, larger than the %d byte bound",
+			ErrInvalidRequest, name, len(payload), MaxEventPayloadBytes)
+	}
 	raw := bytes.TrimSpace(payload)
 	switch {
 	case len(raw) == 0:
 		return nil, fmt.Errorf("%w: the %s event carries no payload", ErrInvalidRequest, name)
-	case len(raw) > MaxEventPayloadBytes:
-		return nil, fmt.Errorf("%w: the %s payload is %d bytes, larger than the %d byte bound",
-			ErrInvalidRequest, name, len(raw), MaxEventPayloadBytes)
 	case !json.Valid(raw):
 		return nil, fmt.Errorf("%w: the %s payload is not JSON", ErrInvalidRequest, name)
 	}
@@ -489,6 +494,16 @@ func (c *Coordinator) applyTaskMove(ctx context.Context, st task.Task, previous 
 	if reason := movedIdentityProblem(st.TerminalID, st.OMPSessionID, st.WorktreePath, pane); reason != "" {
 		return c.taskAttention(ctx, st, fmt.Sprintf("the moved pane %s no longer matches task %s: %s", pane.PaneID, st.ID, reason))
 	}
+	// The payload describes what Herdr moved; Herdr's live state decides whether
+	// the pane it moved to is still this task's worker. Without that proof a
+	// public rebind could hand the task to a different OMP session.
+	reason, err := c.proveMovedPane(ctx, pane, st.OMPSessionID, st.TerminalID, st.WorktreePath)
+	if err != nil {
+		return err
+	}
+	if reason != "" {
+		return c.taskAttention(ctx, st, fmt.Sprintf("the moved pane %s is not the worker of task %s: %s", pane.PaneID, st.ID, reason))
+	}
 	if err := c.store.MovePublicPane(ctx, st.LaunchPaneID, previous, pane.PaneID); err != nil {
 		if errors.Is(err, state.ErrConflict) {
 			// Another hook or the startup pass recorded the same move first.
@@ -497,6 +512,29 @@ func (c *Coordinator) applyTaskMove(ctx context.Context, st task.Task, previous 
 		return fmt.Errorf("record the moved public pane of task %s: %w", st.ID, err)
 	}
 	return nil
+}
+
+// proveMovedPane verifies a moved pane against Herdr's live state before a
+// public identity is re-bound to it.
+//
+// The move payload says what Herdr moved; only a live probe proves the pane it
+// moved to still runs the recorded OMP session on the recorded terminal, in the
+// recorded checkout. A binding whose session this plugin never recorded cannot
+// be proven either, so it is refused rather than re-keyed. It returns the reason
+// a pane is not the binding's own, or the error of a probe that could not be
+// read at all.
+func (c *Coordinator) proveMovedPane(ctx context.Context, pane MovedPaneInfo, session, terminal, checkout string) (string, error) {
+	if strings.TrimSpace(session) == "" {
+		return "the binding records no OMP session, so the moved pane cannot be proven to be its own", nil
+	}
+	probe, err := c.probePane(ctx, pane.PaneID, session, terminal, checkout)
+	if err != nil {
+		return "", err
+	}
+	if probe.Ours {
+		return "", nil
+	}
+	return fmt.Sprintf("Herdr's live state does not prove it: %s", probe.Refusal), nil
 }
 
 // applyProjectMove records a primary's new public identity. The project key, its
@@ -521,7 +559,14 @@ func (c *Coordinator) applyProjectMove(ctx context.Context, project task.Project
 	if reason := movedIdentityProblem(project.TerminalID, project.OMPSessionID, project.Key, pane); reason != "" {
 		return c.projectAttention(ctx, project, fmt.Sprintf("the moved primary pane %s no longer matches project %s: %s", pane.PaneID, project.Key, reason))
 	}
-	err := c.store.UpdateProject(ctx, project.Key, func(next *task.Project) error {
+	reason, err := c.proveMovedPane(ctx, pane, project.OMPSessionID, project.TerminalID, project.Key)
+	if err != nil {
+		return err
+	}
+	if reason != "" {
+		return c.projectAttention(ctx, project, fmt.Sprintf("the moved pane %s is not the primary of project %s: %s", pane.PaneID, project.Key, reason))
+	}
+	err = c.store.UpdateProject(ctx, project.Key, func(next *task.Project) error {
 		if next.LaunchPaneID != project.LaunchPaneID {
 			return errSuperseded
 		}
@@ -676,7 +721,14 @@ func (c *Coordinator) FlushInbox(ctx context.Context, projectKey string) error {
 	if !probe.Ours || !probe.Idle {
 		return nil
 	}
-	claimed, err := c.store.ClaimInbox(ctx, inboxIDs(pending))
+	// The batch is chosen before anything is claimed: a note is claimed only when
+	// this prompt really names it, so a backlog larger than one prompt is
+	// delivered in successive batches instead of being settled unseen.
+	batch := inboxBatch(pending)
+	if len(batch) == 0 {
+		return nil
+	}
+	claimed, err := c.store.ClaimInbox(ctx, inboxIDs(batch))
 	if err != nil {
 		return err
 	}
@@ -687,11 +739,28 @@ func (c *Coordinator) FlushInbox(ctx context.Context, projectKey string) error {
 	return c.deliverInbox(ctx, probe.Pane.PaneID, claimed)
 }
 
+// inboxBatch selects the longest prefix of notes that one prompt carries whole:
+// at most inboxPromptNoteLimit notes and at most inboxPromptLimit bytes of
+// rendered text. Every other note stays pending for the next batch.
+func inboxBatch(notes []task.Inbox) []task.Inbox {
+	limit := inboxPromptNoteLimit
+	if len(notes) < limit {
+		limit = len(notes)
+	}
+	for n := limit; n > 0; n-- {
+		if len(inboxPrompt(notes[:n])) <= inboxPromptLimit {
+			return notes[:n]
+		}
+	}
+	return nil
+}
+
 // deliverInbox submits one claimed batch as a single prompt and settles it.
 //
-// The prompt text names the note's task ids and summaries and is bounded, so a
-// backlog cannot become an unbounded turn. Only one attempt per claim exists in
-// this process: whatever the answer was, the notes are settled before returning.
+// The batch was chosen to fit before it was claimed, so every note in it is named
+// in the prompt; the total truncation in inboxPrompt is only a net for a caller
+// that bypassed inboxBatch. Only one attempt per claim exists in this process:
+// whatever the answer was, the notes are settled before returning.
 func (c *Coordinator) deliverInbox(ctx context.Context, paneID string, notes []task.Inbox) error {
 	ids := inboxIDs(notes)
 	text := inboxPrompt(notes)
@@ -730,15 +799,12 @@ func (c *Coordinator) deliverInbox(ctx context.Context, paneID string, notes []t
 }
 
 // inboxPrompt renders the one turn a flush submits: the task each note belongs
-// to, its kind and its summary, bounded per line and in total.
+// to, its kind and its summary. Callers pass a batch inboxBatch selected, so the
+// only truncation here is the whole-text net and the per-line bound on a summary.
 func inboxPrompt(notes []task.Inbox) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "orchestrator: %d pending worker note(s)\n", len(notes))
-	for i, note := range notes {
-		if i >= inboxPromptNoteLimit {
-			fmt.Fprintf(&b, "- … %d more note(s) are queued\n", len(notes)-i)
-			break
-		}
+	fmt.Fprintf(&b, "orchestrator: %d worker note(s)\n", len(notes))
+	for _, note := range notes {
 		b.WriteString("- " + truncateRunes(inboxPromptLine(note), inboxPromptLineLimit) + "\n")
 	}
 	return truncateRunes(b.String(), inboxPromptLimit)
@@ -1276,6 +1342,7 @@ func (c *Coordinator) probePane(ctx context.Context, paneID, session, terminal, 
 	cwd := strings.TrimSpace(view.Agent.Cwd)
 	probe.SameCheckout = strings.TrimSpace(checkout) == "" || cwd == "" || samePath(cwd, checkout)
 	recordedSession := strings.TrimSpace(session)
+	matched := recordedSession != "" && view.HasRef && sessionMatchesRef(recordedSession, view.Ref)
 	switch {
 	case !strings.EqualFold(strings.TrimSpace(view.Agent.Agent), c.opts.AgentKind):
 		probe.Refutes = true
@@ -1283,16 +1350,21 @@ func (c *Coordinator) probePane(ctx context.Context, paneID, session, terminal, 
 	case view.RefErr != nil:
 		probe.Refutes = true
 		probe.Refusal = fmt.Sprintf("the pane reports a session reference this build cannot read (%v)", view.RefErr)
-	case recordedSession != "" && view.HasRef && !sessionMatchesRef(recordedSession, view.Ref):
+	case recordedSession != "" && view.HasRef && !matched:
 		probe.Refutes = true
 		probe.Refusal = fmt.Sprintf("the pane reports %s session %q, not the recorded %q", view.Ref.Kind, view.Ref.Value, recordedSession)
-	case recordedSession != "" && !view.HasRef && !probe.SameTerminal:
-		probe.Refusal = "the pane reports no session reference and is not the terminal the binding recorded"
+	case recordedSession != "" && !view.HasRef:
+		// Herdr published no reference for this pane, so the session the binding
+		// recorded cannot be proven - not even on the recorded terminal. A probe
+		// that cannot prove identity is a question for a human, never an adoption.
+		probe.Refusal = "the pane reports no session reference, so the recorded session cannot be proven"
 	case !probe.SameCheckout:
 		probe.Refusal = fmt.Sprintf("the pane works in %s, not the recorded checkout %s", cwd, checkout)
+	case recordedSession == "" && !view.HasRef && !probe.SameTerminal:
+		probe.Refusal = "the pane reports no session reference and is not the terminal the binding recorded"
 	default:
 		probe.Ours = true
-		probe.SessionOK = recordedSession == "" || view.HasRef
+		probe.SessionOK = matched
 	}
 	return probe, nil
 }

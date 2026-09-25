@@ -60,6 +60,10 @@ type fixturePlan struct {
 	SuppressReady bool `json:"suppress_ready"`
 	// SuppressSession makes `agent get` report no native session reference.
 	SuppressSession bool `json:"suppress_session"`
+	// SuppressSessionFor makes `agent get` report no native session reference for
+	// one pane only, which is how a test asks what happens when one agent's
+	// identity cannot be proven while everything else stays healthy.
+	SuppressSessionFor string `json:"suppress_session_for"`
 	// RestartBeforeReady makes Herdr report a different native session once the
 	// store already binds the pane, i.e. the agent was restarted.
 	RestartBeforeReady bool `json:"restart_before_ready"`
@@ -313,6 +317,11 @@ func fixtureAgentGet(dir string, plan fixturePlan, state *fixtureState, argv []s
 	reported := fixtureReference(plan, announced)
 	if plan.SessionRefAfterGets > 0 && agent.Gets <= plan.SessionRefAfterGets {
 		// The integration has not reported session identity for this pane yet.
+		reported = nil
+	}
+	if plan.SuppressSessionFor != "" && plan.SuppressSessionFor == pane {
+		// This one pane's agent has not published its identity, the way a pane
+		// whose integration has not reported yet looks.
 		reported = nil
 	}
 	if plan.RestartBeforeReady && fixtureBound(stateDirOf(), pane, announced) {
