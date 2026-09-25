@@ -327,7 +327,11 @@ func (c *Coordinator) handleAgentStatus(ctx context.Context, event AgentStatusEv
 // fact - the task is marked for a human instead, and its binding is never
 // re-keyed here.
 func (c *Coordinator) observeWorkerStatus(ctx context.Context, st task.Task, status string, event AgentStatusEvent) error {
-	probe, err := c.probePane(ctx, st.PublicPaneID, st.OMPSessionID, st.TerminalID, st.WorktreePath)
+	identity, err := c.identityOf(ctx, st.LaunchPaneID, st.OMPSessionID)
+	if err != nil {
+		return fmt.Errorf("read the confirmed session of task %s: %w", st.ID, err)
+	}
+	probe, err := c.probePane(ctx, st.PublicPaneID, identity, st.TerminalID, st.WorktreePath)
 	if err != nil {
 		return err
 	}
@@ -491,13 +495,17 @@ func (c *Coordinator) applyTaskMove(ctx context.Context, st task.Task, previous 
 			"a %s event reports pane %s moving from %s, which is neither the task's launch pane %s nor its public pane %s",
 			EventPaneMoved, pane.PaneID, previous, st.LaunchPaneID, st.PublicPaneID))
 	}
-	if reason := movedIdentityProblem(st.TerminalID, st.OMPSessionID, st.WorktreePath, pane); reason != "" {
+	identity, err := c.identityOf(ctx, st.LaunchPaneID, st.OMPSessionID)
+	if err != nil {
+		return fmt.Errorf("read the confirmed session of task %s: %w", st.ID, err)
+	}
+	if reason := movedIdentityProblem(st.TerminalID, identity, st.WorktreePath, pane); reason != "" {
 		return c.taskAttention(ctx, st, fmt.Sprintf("the moved pane %s no longer matches task %s: %s", pane.PaneID, st.ID, reason))
 	}
 	// The payload describes what Herdr moved; Herdr's live state decides whether
 	// the pane it moved to is still this task's worker. Without that proof a
 	// public rebind could hand the task to a different OMP session.
-	reason, err := c.proveMovedPane(ctx, pane, st.OMPSessionID, st.TerminalID, st.WorktreePath)
+	reason, err := c.proveMovedPane(ctx, pane, identity, st.TerminalID, st.WorktreePath)
 	if err != nil {
 		return err
 	}
@@ -526,11 +534,15 @@ func (c *Coordinator) applyTaskMove(ctx context.Context, st task.Task, previous 
 // whose session this plugin never recorded cannot be proven either. It returns
 // the reason a pane is not the binding's own, or the error of a probe that could
 // not be read at all.
-func (c *Coordinator) proveMovedPane(ctx context.Context, pane MovedPaneInfo, session, terminal, checkout string) (string, error) {
-	if strings.TrimSpace(session) == "" {
+func (c *Coordinator) proveMovedPane(ctx context.Context, pane MovedPaneInfo, identity recordedIdentity, terminal, checkout string) (string, error) {
+	if strings.TrimSpace(identity.Session) == "" {
 		return "the binding records no OMP session, so the moved pane cannot be proven to be its own", nil
 	}
-	probe, err := c.probePane(ctx, pane.PaneID, session, terminal, checkout)
+	if !identity.Proven {
+		return fmt.Sprintf("the confirmed session of launch pane %s cannot relate the recorded %q to the form Herdr reports, so the moved pane cannot be proven",
+			identity.LaunchPaneID, identity.Session), nil
+	}
+	probe, err := c.probePane(ctx, pane.PaneID, identity, terminal, checkout)
 	if err != nil {
 		return "", err
 	}
@@ -567,10 +579,14 @@ func (c *Coordinator) applyProjectMove(ctx context.Context, project task.Project
 			"a %s event reports pane %s moving from %s, which is neither the primary's launch pane %s nor its public pane %s",
 			EventPaneMoved, pane.PaneID, previous, project.LaunchPaneID, project.PublicPaneID))
 	}
-	if reason := movedIdentityProblem(project.TerminalID, project.OMPSessionID, project.Key, pane); reason != "" {
+	identity, err := c.identityOf(ctx, project.LaunchPaneID, project.OMPSessionID)
+	if err != nil {
+		return fmt.Errorf("read the confirmed session of project %s: %w", project.Key, err)
+	}
+	if reason := movedIdentityProblem(project.TerminalID, identity, project.Key, pane); reason != "" {
 		return c.projectAttention(ctx, project, fmt.Sprintf("the moved primary pane %s no longer matches project %s: %s", pane.PaneID, project.Key, reason))
 	}
-	reason, err := c.proveMovedPane(ctx, pane, project.OMPSessionID, project.TerminalID, project.Key)
+	reason, err := c.proveMovedPane(ctx, pane, identity, project.TerminalID, project.Key)
 	if err != nil {
 		return err
 	}
@@ -607,7 +623,7 @@ func (c *Coordinator) applyProjectMove(ctx context.Context, project task.Project
 // against the terminal's own working directory: the pane may live in another
 // workspace while its foreground cwd still points at the worktree, so a reported
 // directory that matches either one is the task's own.
-func movedIdentityProblem(terminal, session, checkout string, pane MovedPaneInfo) string {
+func movedIdentityProblem(terminal string, identity recordedIdentity, checkout string, pane MovedPaneInfo) string {
 	if recorded := strings.TrimSpace(terminal); recorded != "" && !strings.EqualFold(strings.TrimSpace(pane.TerminalID), recorded) {
 		return fmt.Sprintf("the moved pane reports terminal %q, not the terminal %q it was dispatched with", pane.TerminalID, recorded)
 	}
@@ -616,11 +632,11 @@ func movedIdentityProblem(terminal, session, checkout string, pane MovedPaneInfo
 		switch {
 		case err != nil:
 			return fmt.Sprintf("the moved pane reports a session reference this build cannot read (%v)", err)
-		case !sessionMatchesRef(session, task.SessionRef{Kind: kind, Value: value}):
-			return fmt.Sprintf("the moved pane reports %s session %q, not the recorded worker session %q", kind, value, session)
+		case !identity.proves(task.SessionRef{Kind: kind, Value: value}):
+			return fmt.Sprintf("the moved pane reports %s session %q, not the session %q this task recorded", kind, value, identity.Session)
 		}
 	}
-	if recorded := strings.TrimSpace(checkout); recorded != "" && strings.TrimSpace(session) != "" {
+	if recorded := strings.TrimSpace(checkout); recorded != "" && strings.TrimSpace(identity.Session) != "" {
 		if reported := paneCheckout(pane); reported != "" && !samePath(reported, recorded) {
 			return fmt.Sprintf("the moved pane works in %s, not the task's checkout %s", reported, recorded)
 		}
@@ -635,6 +651,67 @@ func paneCheckout(pane MovedPaneInfo) string {
 		return cwd
 	}
 	return strings.TrimSpace(pane.Cwd)
+}
+
+// recordedIdentity is what one binding knows about its own OMP session: the
+// value it recorded and, when the handshake was confirmed, the announcement that
+// can relate that value to whichever native form Herdr reports now.
+//
+// OMP exposes two identities for one session (an id and the session file), and a
+// record keeps whichever one was written first, so the two values a caller holds
+// may be in different forms. The confirmed announcement is the only thing that
+// knows both, so a proof that cannot consult it proves nothing.
+type recordedIdentity struct {
+	// Session is the session value the binding recorded.
+	Session string
+	// LaunchPaneID is the pane whose confirmed handshake relates that value to
+	// whichever form Herdr reports now.
+	LaunchPaneID string
+	// Announced is the confirmed handshake of the binding's launch pane.
+	Announced task.Announcement
+	// Proven reports whether that handshake was found and confirmed.
+	Proven bool
+}
+
+// proves reports whether Herdr's observed reference is the session this binding
+// recorded, in whatever form each side holds.
+func (id recordedIdentity) proves(ref task.SessionRef) bool {
+	if !id.Proven || strings.TrimSpace(id.Session) == "" {
+		return false
+	}
+	return id.Announced.Proves(id.Session, ref)
+}
+
+// identityOf joins the session a binding recorded to the confirmed handshake of
+// its launch pane.
+//
+// It requires both Store.AnnouncedSession (what the extension announced) and
+// Store.Ready (that the reference Herdr reported was the announced one), because
+// only a confirmed announcement can say that an id and a session file name the
+// same running session. A pane that never announced, or whose confirmation no
+// longer describes the announcement, yields an unproven identity: nothing may be
+// proven from it, and a caller that needs a proof refuses instead of guessing.
+func (c *Coordinator) identityOf(ctx context.Context, launchPaneID, session string) (recordedIdentity, error) {
+	identity := recordedIdentity{Session: strings.TrimSpace(session), LaunchPaneID: strings.TrimSpace(launchPaneID)}
+	if identity.Session == "" || identity.LaunchPaneID == "" {
+		return identity, nil
+	}
+	announced, found, err := c.store.AnnouncedSession(ctx, launchPaneID)
+	switch {
+	case err != nil:
+		return recordedIdentity{}, err
+	case !found:
+		return identity, nil
+	}
+	ready, err := c.store.Ready(ctx, launchPaneID, announced)
+	switch {
+	case err != nil:
+		return recordedIdentity{}, err
+	case !ready:
+		return identity, nil
+	}
+	identity.Announced, identity.Proven = announced, true
+	return identity, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -854,7 +931,11 @@ func (c *Coordinator) probePrimary(ctx context.Context, project task.Project) (p
 	if strings.TrimSpace(project.OMPSessionID) == "" {
 		return paneProbe{Refusal: "the project records no OMP session, so its primary cannot be identified"}, nil
 	}
-	probe, err := c.probePane(ctx, paneID, project.OMPSessionID, project.TerminalID, project.Key)
+	identity, err := c.identityOf(ctx, project.LaunchPaneID, project.OMPSessionID)
+	if err != nil {
+		return paneProbe{}, fmt.Errorf("read the confirmed session of project %s: %w", project.Key, err)
+	}
+	probe, err := c.probePane(ctx, paneID, identity, project.TerminalID, project.Key)
 	if err != nil {
 		return paneProbe{}, err
 	}
@@ -967,7 +1048,11 @@ func reconciles(st task.Task) bool {
 // the user's explicit launch action, and nothing here may substitute a different
 // session for the one the user was talking to.
 func (c *Coordinator) reconcilePrimary(ctx context.Context, project task.Project, snapshot *snapshotView) error {
-	probes, err := c.probeCandidates(ctx, snapshot, []string{project.LaunchPaneID, project.PublicPaneID}, project.OMPSessionID, project.TerminalID, project.Key)
+	identity, err := c.identityOf(ctx, project.LaunchPaneID, project.OMPSessionID)
+	if err != nil {
+		return fmt.Errorf("read the confirmed session of project %s: %w", project.Key, err)
+	}
+	probes, err := c.probeCandidates(ctx, snapshot, []string{project.LaunchPaneID, project.PublicPaneID}, identity, project.TerminalID, project.Key)
 	if err != nil {
 		return err
 	}
@@ -989,7 +1074,11 @@ func (c *Coordinator) reconcilePrimary(ctx context.Context, project task.Project
 
 // reconcileTask re-derives one unfinished worker's pane from the snapshot.
 func (c *Coordinator) reconcileTask(ctx context.Context, project task.Project, st task.Task, snapshot *snapshotView, listed *herdr.WorktreeList) error {
-	probes, err := c.probeCandidates(ctx, snapshot, []string{st.LaunchPaneID, st.PublicPaneID}, st.OMPSessionID, st.TerminalID, st.WorktreePath)
+	identity, err := c.identityOf(ctx, st.LaunchPaneID, st.OMPSessionID)
+	if err != nil {
+		return fmt.Errorf("read the confirmed session of task %s: %w", st.ID, err)
+	}
+	probes, err := c.probeCandidates(ctx, snapshot, []string{st.LaunchPaneID, st.PublicPaneID}, identity, st.TerminalID, st.WorktreePath)
 	if err != nil {
 		return err
 	}
@@ -1316,11 +1405,11 @@ type paneProbe struct {
 }
 
 // probeCandidates probes every snapshot pane a binding could be.
-func (c *Coordinator) probeCandidates(ctx context.Context, snapshot *snapshotView, ids []string, session, terminal, checkout string) ([]paneProbe, error) {
+func (c *Coordinator) probeCandidates(ctx context.Context, snapshot *snapshotView, ids []string, identity recordedIdentity, terminal, checkout string) ([]paneProbe, error) {
 	candidates := snapshotCandidates(snapshot.Panes, ids, terminal, checkout)
 	var probes []paneProbe
 	for _, pane := range candidates {
-		probe, err := c.probePane(ctx, pane.PaneID, session, terminal, checkout)
+		probe, err := c.probePane(ctx, pane.PaneID, identity, terminal, checkout)
 		if err != nil {
 			return nil, err
 		}
@@ -1331,7 +1420,7 @@ func (c *Coordinator) probeCandidates(ctx context.Context, snapshot *snapshotVie
 
 // probePane verifies one pane against a recorded identity, using Herdr's live
 // agent projection rather than the payload that raised the question.
-func (c *Coordinator) probePane(ctx context.Context, paneID, session, terminal, checkout string) (paneProbe, error) {
+func (c *Coordinator) probePane(ctx context.Context, paneID string, identity recordedIdentity, terminal, checkout string) (paneProbe, error) {
 	probe := paneProbe{}
 	if strings.TrimSpace(paneID) == "" {
 		probe.Refusal = "no pane is recorded"
@@ -1365,8 +1454,8 @@ func (c *Coordinator) probePane(ctx context.Context, paneID, session, terminal, 
 	recordedCheckout := strings.TrimSpace(checkout)
 	probe.SameCheckout = recordedCheckout == "" || cwd == "" || samePath(cwd, recordedCheckout)
 	probe.CheckoutProven = recordedCheckout != "" && cwd != "" && samePath(cwd, recordedCheckout)
-	recordedSession := strings.TrimSpace(session)
-	matched := recordedSession != "" && view.HasRef && sessionMatchesRef(recordedSession, view.Ref)
+	recordedSession := strings.TrimSpace(identity.Session)
+	matched := recordedSession != "" && view.HasRef && identity.proves(view.Ref)
 	switch {
 	case !strings.EqualFold(strings.TrimSpace(view.Agent.Agent), c.opts.AgentKind):
 		probe.Refutes = true
@@ -1376,7 +1465,8 @@ func (c *Coordinator) probePane(ctx context.Context, paneID, session, terminal, 
 		probe.Refusal = fmt.Sprintf("the pane reports a session reference this build cannot read (%v)", view.RefErr)
 	case recordedSession != "" && view.HasRef && !matched:
 		probe.Refutes = true
-		probe.Refusal = fmt.Sprintf("the pane reports %s session %q, not the recorded %q", view.Ref.Kind, view.Ref.Value, recordedSession)
+		probe.Refusal = fmt.Sprintf("the pane reports %s session %q, which the confirmed handshake of the binding does not relate to the recorded %q",
+			view.Ref.Kind, view.Ref.Value, recordedSession)
 	case recordedSession != "" && !view.HasRef:
 		// Herdr published no reference for this pane, so the session the binding
 		// recorded cannot be proven - not even on the recorded terminal. A probe

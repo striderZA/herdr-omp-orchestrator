@@ -533,7 +533,9 @@ func TestCapturedHookPayloadsDriveTheHandlers(t *testing.T) {
 	// The move payload Herdr delivered for a real cross-workspace move whose
 	// source workspace it closed. The stand-in's own state is moved the same way
 	// first: the plugin re-proves the pane against Herdr, so a payload alone is
-	// not enough.
+	// not enough. The payload's session reference is the session *file* Herdr
+	// reports (kind "path"), while the binding recorded the native id - the
+	// cross-form pair the confirmed announcement has to relate.
 	f.movedWorkerState(t, observed, "w7:p1", "w7", observed.OMPSessionID)
 	move := eventFixtureJSON(t, "captured_pane_moved.json",
 		"{{prev_pane}}", observed.PublicPaneID,
@@ -542,7 +544,7 @@ func TestCapturedHookPayloadsDriveTheHandlers(t *testing.T) {
 		"{{workspace}}", "w7",
 		"{{terminal}}", observed.TerminalID,
 		"{{checkout}}", observed.WorktreePath,
-		"{{session_file}}", observed.OMPSessionID)
+		"{{session_file}}", sessionFileFor(observed.OMPSessionID))
 	f.mustHandle(t, EventPaneMoved, move)
 	after := f.taskByID(t, worker.ID)
 	switch {
@@ -1704,7 +1706,11 @@ func TestReconcileTreatsAMissingSessionReferenceAsUnproven(t *testing.T) {
 	worker := f.boundWorker(t)
 	f.updatePlan(func(plan *fixturePlan) { plan.SuppressSessionFor = worker.PublicPaneID })
 
-	probe, err := f.coord.probePane(ctx, worker.PublicPaneID, worker.OMPSessionID, worker.TerminalID, worker.WorktreePath)
+	identity, err := f.coord.identityOf(ctx, worker.LaunchPaneID, worker.OMPSessionID)
+	if err != nil {
+		t.Fatalf("identityOf: %v", err)
+	}
+	probe, err := f.coord.probePane(ctx, worker.PublicPaneID, identity, worker.TerminalID, worker.WorktreePath)
 	if err != nil {
 		t.Fatalf("probePane: %v", err)
 	}
@@ -1734,7 +1740,11 @@ func TestReconcileTreatsAMissingSessionReferenceAsUnproven(t *testing.T) {
 	// The acceptance case is unchanged: once Herdr reports the recorded session,
 	// the same pane is proven and reconciles silently.
 	f.updatePlan(func(plan *fixturePlan) { plan.SuppressSessionFor = "" })
-	proven, err := f.coord.probePane(ctx, worker.PublicPaneID, worker.OMPSessionID, worker.TerminalID, worker.WorktreePath)
+	restored, err := f.coord.identityOf(ctx, worker.LaunchPaneID, worker.OMPSessionID)
+	if err != nil {
+		t.Fatalf("identityOf after the reference returned: %v", err)
+	}
+	proven, err := f.coord.probePane(ctx, worker.PublicPaneID, restored, worker.TerminalID, worker.WorktreePath)
 	if err != nil {
 		t.Fatalf("probePane after the reference returned: %v", err)
 	}
@@ -1805,9 +1815,207 @@ func tasksStarted(f *coordFixture) []string {
 	return out
 }
 
-// TestReconcileAttentionNamesTheTaskAndKeepsAnExistingBlocker pins that a
-// reconciliation finding never replaces a blocker a dispatch step already
-// recorded.
+// ---------------------------------------------------------------------------
+// cross-form session identity (found by the real Task 8 run)
+// ---------------------------------------------------------------------------
+
+// crossFormFixture is the identity shape a real Herdr session has: the bridge
+// records the OMP native session id for a worker, while Herdr's agent
+// integration reports the same session as its file path (kind "path"). Both are
+// identities of one session, so every path that proves a worker must accept the
+// pair.
+func crossFormFixture(t *testing.T) *coordFixture {
+	t.Helper()
+	return newCoordFixture(t, fixturePlan{SessionRefKind: task.SessionKindPath, AdoptBeforeRecord: true})
+}
+
+// assertCrossFormRecorded pins the shape these regressions depend on: the durable
+// binding holds the native id, and Herdr reports that session as a path.
+func assertCrossFormRecorded(t *testing.T, f *coordFixture, st task.Task) string {
+	t.Helper()
+	agent := f.state().Agents[st.PublicPaneID]
+	if agent == nil {
+		t.Fatalf("no agent is running in pane %q", st.PublicPaneID)
+	}
+	if st.OMPSessionID != agent.Session {
+		t.Fatalf("recorded session = %q, want the native id %q", st.OMPSessionID, agent.Session)
+	}
+	if strings.ContainsAny(st.OMPSessionID, `/\`) {
+		t.Fatalf("recorded session %q looks like a path, want the native id", st.OMPSessionID)
+	}
+	return sessionFileFor(agent.Session)
+}
+
+func TestEventStatusAcceptsTheRecordedIDWhenHerdrReportsThePath(t *testing.T) {
+	f := crossFormFixture(t)
+	worker := f.boundWorker(t)
+	file := assertCrossFormRecorded(t, f, worker)
+
+	f.setAgentStatus(t, worker.PublicPaneID, "blocked")
+	f.mustHandle(t, EventAgentStatus, statusEventPayload(t, worker.PublicPaneID, "blocked"))
+	after := f.taskByID(t, worker.ID)
+	if after.Activity != "blocked" {
+		t.Fatalf("activity = %q, want %q: the session was recorded as the id %q and reported as the path %q",
+			after.Activity, "blocked", worker.OMPSessionID, file)
+	}
+	if after.Attention != "" {
+		t.Fatalf("attention = %q, want none for one session in two forms", after.Attention)
+	}
+	if notes := f.notesOfKind(t, noteKindActivity); len(notes) != 1 {
+		t.Fatalf("activity notes = %d, want 1", len(notes))
+	}
+}
+
+func TestMoveAcceptsTheRecordedIDWhenHerdrReportsThePath(t *testing.T) {
+	f := crossFormFixture(t)
+	worker := f.boundWorker(t)
+	assertCrossFormRecorded(t, f, worker)
+
+	move := f.moveResult(t, worker.PublicPaneID)
+	newPane, _ := move["pane"].(map[string]any)["pane_id"].(string)
+	f.mustHandle(t, EventPaneMoved, eventFromMoveResult(t, move))
+	after := f.taskByID(t, worker.ID)
+	if after.PublicPaneID != newPane || after.CurrentWorkspaceID == worker.CurrentWorkspaceID {
+		t.Fatalf("the move was not recorded: pane %q workspace %q", after.PublicPaneID, after.CurrentWorkspaceID)
+	}
+	if after.Attention != "" || after.Blocker != "" {
+		t.Fatalf("attention = %q blocker = %q, want none for the same session in two forms", after.Attention, after.Blocker)
+	}
+	if after.LaunchPaneID != worker.LaunchPaneID || after.TerminalID != worker.TerminalID {
+		t.Fatalf("the move re-keyed launch %q terminal %q", after.LaunchPaneID, after.TerminalID)
+	}
+}
+
+func TestReconcileAcceptsTheRecordedIDWhenHerdrReportsThePath(t *testing.T) {
+	ctx := context.Background()
+	f := crossFormFixture(t)
+	worker := f.boundWorker(t)
+	assertCrossFormRecorded(t, f, worker)
+
+	// The pane moves and the event is lost; only Herdr's live state knows.
+	move := f.moveResult(t, worker.PublicPaneID)
+	newPane, _ := move["pane"].(map[string]any)["pane_id"].(string)
+	if err := f.coord.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	after := f.taskByID(t, worker.ID)
+	if after.PublicPaneID != newPane {
+		t.Fatalf("public pane = %q, want %q", after.PublicPaneID, newPane)
+	}
+	if after.Attention != "" || after.Blocker != "" {
+		t.Fatalf("attention = %q blocker = %q, want none for the same session in two forms", after.Attention, after.Blocker)
+	}
+	if after.LaunchPaneID != worker.LaunchPaneID {
+		t.Fatalf("launch pane = %q, want the unchanged %q", after.LaunchPaneID, worker.LaunchPaneID)
+	}
+}
+
+func TestFlushAcceptsTheRecordedIDWhenHerdrReportsThePath(t *testing.T) {
+	ctx := context.Background()
+	f := crossFormFixture(t)
+	worker := f.boundWorker(t)
+	primary := f.boundProject(t).PublicPaneID
+	assertCrossFormRecorded(t, f, worker)
+
+	// A real note, queued without depending on the worker reporting path.
+	note := f.coord.noteFor(worker, "progress", "halfway", "worker progress")
+	if _, err := f.store.AddInbox(ctx, note); err != nil {
+		t.Fatalf("AddInbox: %v", err)
+	}
+	if err := f.coord.FlushInbox(ctx, f.projectKey()); err != nil {
+		t.Fatalf("FlushInbox: %v", err)
+	}
+	prompts := f.promptsTo(t, primary)
+	if len(prompts) != 1 {
+		t.Fatalf("prompts = %d, want 1: the recorded primary id and the reported path name one session", len(prompts))
+	}
+	if !strings.Contains(prompts[0].Text, worker.ID) {
+		t.Fatalf("prompt text = %q, want the worker's task id", prompts[0].Text)
+	}
+	if state := f.noteState(t, note.ID); state != task.DeliveryDelivered {
+		t.Fatalf("note state = %q, want %q", state, task.DeliveryDelivered)
+	}
+}
+
+func TestCrossFormIdentityStillRefusesADifferentSession(t *testing.T) {
+	ctx := context.Background()
+	f := crossFormFixture(t)
+	worker := f.boundWorker(t)
+	assertCrossFormRecorded(t, f, worker)
+
+	// A different session now runs in the worker's pane. Its path is just as
+	// path-shaped as the recorded one's, so accepting a path because the binding
+	// holds an id would hand this task to a stranger.
+	f.rewriteState(func(current *fixtureState) {
+		current.Agents[worker.PublicPaneID].Session = "someone-elses-session"
+	})
+	f.setAgentStatus(t, worker.PublicPaneID, "blocked")
+	err := f.coord.HandleEvent(ctx, EventAgentStatus, statusEventPayload(t, worker.PublicPaneID, "blocked"))
+	if !errors.Is(err, ErrAgentChanged) {
+		t.Fatalf("status event err = %v, want ErrAgentChanged", err)
+	}
+	refused := f.taskByID(t, worker.ID)
+	if refused.Attention == "" {
+		t.Fatalf("a different session left no attention for a human")
+	}
+	if refused.Activity == "blocked" {
+		t.Fatalf("a different session's status was recorded as the worker's")
+	}
+
+	if err := f.coord.Reconcile(ctx); !errors.Is(err, ErrAgentChanged) {
+		t.Fatalf("Reconcile err = %v, want the recorded refusal", err)
+	}
+	if after := f.taskByID(t, worker.ID); after.PublicPaneID != worker.PublicPaneID {
+		t.Fatalf("a different session re-keyed the task to %q", after.PublicPaneID)
+	}
+}
+
+// TestSessionsAreProvenOnlyThroughAConfirmedHandshake pins the contract's second
+// half: Store.AnnouncedSession and Store.Ready are both required, so a pane whose
+// confirmation no longer describes its announcement - or a pane that never
+// announced - proves nothing and is refused instead of adopted.
+func TestSessionsAreProvenOnlyThroughAConfirmedHandshake(t *testing.T) {
+	ctx := context.Background()
+	f := newCoordFixture(t, fixturePlan{})
+	worker := f.boundWorker(t)
+
+	// The pane announces a different session, and Herdr has not confirmed that
+	// announcement: the recorded confirmation no longer describes it.
+	if err := f.store.RecordReady(ctx, worker.LaunchPaneID,
+		task.Announcement{ID: "reannounced", File: sessionFileFor("reannounced")}, 1); err != nil {
+		t.Fatalf("RecordReady: %v", err)
+	}
+	identity, err := f.coord.identityOf(ctx, worker.LaunchPaneID, worker.OMPSessionID)
+	if err != nil {
+		t.Fatalf("identityOf: %v", err)
+	}
+	if identity.Proven {
+		t.Fatalf("an unconfirmed announcement proved session %q", worker.OMPSessionID)
+	}
+
+	f.setAgentStatus(t, worker.PublicPaneID, "blocked")
+	err = f.coord.HandleEvent(ctx, EventAgentStatus, statusEventPayload(t, worker.PublicPaneID, "blocked"))
+	if !errors.Is(err, ErrAgentChanged) {
+		t.Fatalf("status event err = %v, want ErrAgentChanged", err)
+	}
+	after := f.taskByID(t, worker.ID)
+	if after.Activity == "blocked" {
+		t.Fatalf("a status observation was recorded from a session that could not be proven")
+	}
+	if after.Attention == "" {
+		t.Fatalf("an unprovable session left no attention for a human")
+	}
+
+	// A launch pane that never announced at all proves nothing either.
+	unknown, err := f.coord.identityOf(ctx, "w9:p9", worker.OMPSessionID)
+	if err != nil {
+		t.Fatalf("identityOf(unknown pane): %v", err)
+	}
+	if unknown.Proven || unknown.proves(task.SessionRef{Kind: task.SessionKindID, Value: worker.OMPSessionID}) {
+		t.Fatalf("a pane that never announced a session proved one")
+	}
+}
+
 func TestReconcileAttentionNamesTheTaskAndKeepsAnExistingBlocker(t *testing.T) {
 	f := newCoordFixture(t, fixturePlan{})
 	worker := f.boundWorker(t)
