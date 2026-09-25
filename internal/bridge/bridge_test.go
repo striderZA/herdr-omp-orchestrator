@@ -2210,9 +2210,17 @@ func (f *bridgeFixture) coordinator(t *testing.T) *coord.Coordinator {
 	return coordinator
 }
 
-// workerAgents is the stand-in's answer for one worker pane whose live agent
-// still reports the recorded session.
+// workerAgent is the stand-in's answer for one worker pane whose live agent
+// reports the recorded session as an id, which is the form this fixture uses by
+// default.
 func workerAgent(pane, session, worktree string) stubAgent {
+	return workerAgentOn(pane, task.SessionKindID, session, worktree)
+}
+
+// workerAgentOn is workerAgent for one explicit reference form, so a test can make
+// Herdr report the session the way a build that only publishes the session file
+// does.
+func workerAgentOn(pane, kind, value, worktree string) stubAgent {
 	return stubAgent{
 		Name:         "orch_worker",
 		Agent:        "omp",
@@ -2221,8 +2229,21 @@ func workerAgent(pane, session, worktree string) stubAgent {
 		TerminalID:   "term-worker",
 		WorkspaceID:  workerWorktree,
 		Cwd:          worktree,
-		SessionKind:  "id",
-		SessionValue: session,
+		SessionKind:  kind,
+		SessionValue: value,
+	}
+}
+
+// recordSession rewrites what a seeded task records as its OMP session, which is
+// the identity a build keeps when Herdr reported that form.
+func (f *bridgeFixture) recordSession(t *testing.T, id, session string) {
+	t.Helper()
+	st := f.task(t, id)
+	if _, err := f.store.UpdateTask(context.Background(), id, st.Revision, func(next *task.Task) error {
+		next.OMPSessionID = session
+		return nil
+	}); err != nil {
+		t.Fatalf("record session %q on %s: %v", session, id, err)
 	}
 }
 
@@ -2240,6 +2261,15 @@ func (f *bridgeFixture) asWorker() {
 	f.t.Helper()
 	f.confirm(workerPane, workerSession)
 	f.env["HERDR_PANE_ID"] = workerPane
+}
+
+// asWorkerWith is asWorker for a handshake the test describes in full: the whole
+// announcement and the reference Herdr reported for it, which is what a build that
+// publishes one of the two identities actually stores.
+func (f *bridgeFixture) asWorkerWith(launchPane string, announced task.Announcement, ref task.SessionRef) {
+	f.t.Helper()
+	f.confirmRef(launchPane, announced, ref)
+	f.env["HERDR_PANE_ID"] = launchPane
 }
 
 // movePublicPane records a cross-workspace move of a worker's public pane, which
@@ -2476,6 +2506,7 @@ func TestAnswerRelaysToTheCurrentPublicPaneOnly(t *testing.T) {
 	f := newBridgeFixture(t)
 	f.seedPrimary()
 	f.seedWorker("t1", workerPane, workerPane, workerSession)
+	f.asWorker()
 	f.asPrimary()
 	// Herdr moved the worker into another workspace: only the public id changes.
 	moved := "w4:p8"
@@ -2536,6 +2567,7 @@ func TestDialogApprovalRevalidatesTheApprovedScreen(t *testing.T) {
 	f := newBridgeFixture(t)
 	f.seedPrimary()
 	f.seedWorker("t1", workerPane, workerPane, workerSession)
+	f.asWorker()
 	f.asPrimary()
 
 	approved := "Choose an option:\r\n  1. Allow once\r\n  2. Deny\r\n"
@@ -2639,6 +2671,114 @@ func TestDialogApprovalRevalidatesTheApprovedScreen(t *testing.T) {
 	})
 }
 
+// TestDialogAndCleanupAcceptTheSessionFormsHerdrReallyReports reproduces the Run-2
+// failure: a build reports the session file while the record kept the announced
+// id (or the other way round). The two values name one running OMP session, and
+// only the announcement of the pane's handshake knows both, so relay and cleanup
+// must decide identity through it instead of comparing the two raw strings.
+func TestDialogAndCleanupAcceptTheSessionFormsHerdrReallyReports(t *testing.T) {
+	t.Run("the recorded id and Herdr's path are one session", func(t *testing.T) {
+		f := newBridgeFixture(t)
+		f.seedPrimary()
+		f.seedWorker("t1", workerPane, workerPane, workerSession)
+		// The extension announced both forms; the coordinator confirmed the path.
+		f.asWorkerWith(workerPane, task.Announcement{ID: workerSession, File: workerSessionFile},
+			task.SessionRef{Kind: task.SessionKindPath, Value: workerSessionFile})
+		f.asPrimary()
+		stub := f.useHerdrStub(stubScript{
+			RepoRoot: f.repoRoot,
+			Agents:   map[string]stubAgent{workerPane: workerAgentOn(workerPane, task.SessionKindPath, workerSessionFile, f.worktree)},
+		})
+		stub.queueReads(stubRead{Text: "  1. Allow once\n  2. Deny\n"})
+		ops := CoordinatorOps(f.coordinator(t))
+
+		var preview coord.DialogPreview
+		f.callWith("dialog_preview", primarySession, `{"taskId":"t1"}`, ops).decodeResult(t, &preview)
+		if preview.TaskID != "t1" || preview.PublicPaneID != workerPane {
+			t.Fatalf("preview = %+v, want the worker the record names", preview)
+		}
+	})
+
+	t.Run("the recorded path and Herdr's id are one session", func(t *testing.T) {
+		f := newBridgeFixture(t)
+		f.seedPrimary()
+		f.seedWorker("t1", workerPane, workerPane, workerSession)
+		f.recordSession(t, "t1", workerSessionFile)
+		f.asWorkerWith(workerPane, task.Announcement{ID: workerSession, File: workerSessionFile},
+			task.SessionRef{Kind: task.SessionKindID, Value: workerSession})
+		f.asPrimary()
+		stub := f.useHerdrStub(stubScript{
+			RepoRoot: f.repoRoot,
+			Agents:   map[string]stubAgent{workerPane: workerAgent(workerPane, workerSession, f.worktree)},
+		})
+		stub.queueReads(stubRead{Text: "  1. Allow once\n  2. Deny\n"})
+		ops := CoordinatorOps(f.coordinator(t))
+
+		var preview coord.DialogPreview
+		f.callWith("dialog_preview", primarySession, `{"taskId":"t1"}`, ops).decodeResult(t, &preview)
+		if preview.TaskID != "t1" {
+			t.Fatalf("preview = %+v, want the worker the record names", preview)
+		}
+	})
+
+	t.Run("liveness is decided across the forms too", func(t *testing.T) {
+		f := newBridgeFixture(t)
+		f.seedPrimary()
+		worker := f.seedWorker("t1", workerPane, workerPane, workerSession)
+		f.asWorker()
+		f.asPrimary()
+		root, checkout := bridgeRepoWithWorktree(t, worker.Branch)
+		if _, err := f.store.UpdateTask(context.Background(), worker.ID, worker.Revision, func(next *task.Task) error {
+			next.WorktreePath = checkout
+			return nil
+		}); err != nil {
+			t.Fatalf("record the checkout: %v", err)
+		}
+		f.useHerdrStub(stubScript{
+			RepoRoot: root,
+			Agents:   map[string]stubAgent{workerPane: workerAgentOn(workerPane, task.SessionKindPath, workerSessionFile, checkout)},
+			Worktree: []stubWorktree{{Path: checkout, Branch: worker.Branch, OpenWorkspaceID: workerWorktree}},
+		})
+		ops := CoordinatorOps(f.coordinator(t))
+		f.approve(t, ops)
+
+		// The build that publishes the session file, recorded after the review so
+		// nothing rewrites the handshake: the task keeps the announced id, Herdr
+		// reports the path, and the two are one session.
+		f.confirmRef(workerPane, task.Announcement{ID: workerSession, File: workerSessionFile},
+			task.SessionRef{Kind: task.SessionKindPath, Value: workerSessionFile})
+
+		// The worker is identified, so its liveness is the answer — not "cannot
+		// verify which session this is".
+		wantError(t, f.callWith("cleanup", primarySession, `{"taskId":"t1"}`, ops), "worker_live")
+	})
+
+	t.Run("an unverified handshake cannot be trusted", func(t *testing.T) {
+		f := newBridgeFixture(t)
+		f.seedPrimary()
+		f.seedWorker("t1", workerPane, workerPane, workerSession)
+		if err := f.store.RecordReady(context.Background(), workerPane,
+			task.Announcement{ID: workerSession, File: workerSessionFile}, 1); err != nil {
+			t.Fatalf("RecordReady: %v", err)
+		}
+		f.confirm(primaryPane, primarySession)
+		f.env["HERDR_PANE_ID"] = primaryPane
+		f.useHerdrStub(stubScript{
+			RepoRoot: f.repoRoot,
+			Agents:   map[string]stubAgent{workerPane: workerAgentOn(workerPane, task.SessionKindPath, workerSessionFile, f.worktree)},
+		})
+		ops := CoordinatorOps(f.coordinator(t))
+
+		// Only the coordinator's comparison with `agent get` may confirm a
+		// handshake, and until it has, the announcement proves nothing.
+		resp := f.callWith("dialog_preview", primarySession, `{"taskId":"t1"}`, ops)
+		wantError(t, resp, "agent_changed")
+		if !strings.Contains(resp.Error.Message, "verified") {
+			t.Errorf("the refusal does not say the handshake is unverified: %q", resp.Error.Message)
+		}
+	})
+}
+
 // TestCleanupRequiresReviewedDoneAndACleanProvenanceCheckout drives the whole
 // cleanup gate: nothing is refused more weakly than the acceptance requires, and
 // a removal is never forced, never touches the branch and never happens twice.
@@ -2646,6 +2786,7 @@ func TestCleanupRequiresReviewedDoneAndACleanProvenanceCheckout(t *testing.T) {
 	f := newBridgeFixture(t)
 	f.seedPrimary()
 	worker := f.seedWorker("t1", workerPane, workerPane, workerSession)
+	f.asWorker()
 	f.asPrimary()
 
 	// A real checkout, so clean and dirty are decided by git itself.
@@ -2798,20 +2939,50 @@ func TestCleanupRequiresReviewedDoneAndACleanProvenanceCheckout(t *testing.T) {
 	})
 
 	t.Run("a second cleanup removes nothing more", func(t *testing.T) {
-		wantError(t, f.callWith("cleanup", primarySession, `{"taskId":"t1"}`, ops), "provenance_unconfirmed")
+		// The task no longer names a worker or a workspace, so a repeat is refused
+		// before it can look for anything to remove.
+		resp := f.callWith("cleanup", primarySession, `{"taskId":"t1"}`, ops)
+		wantError(t, resp, "agent_changed")
+		if !strings.Contains(resp.Error.Message, "no launch pane") {
+			t.Errorf("the refusal does not say the task names no worker: %q", resp.Error.Message)
+		}
 		if got := stub.script().Removed; len(got) != 1 {
 			t.Fatalf("a repeated cleanup removed again: %v", got)
 		}
 	})
+}
 
-	t.Run("a checkout Herdr holds in an unknown workspace is refused", func(t *testing.T) {
-		// A workspace this task never recorded is somebody else's: a human
-		// decides what happened to it.
-		stub.update(func(script *stubScript) {
-			script.Worktree = []stubWorktree{{Path: checkout, Branch: worker.Branch, OpenWorkspaceID: "w4"}}
-		})
-		wantError(t, f.callWith("cleanup", primarySession, `{"taskId":"t1"}`, ops), "provenance_unconfirmed")
+// TestCleanupRefusesACheckoutHeldInAnUnknownWorkspace keeps the provenance gate
+// honest: a checkout Herdr holds in a workspace this task never recorded is
+// somebody else's, and cleanup refuses instead of guessing by label.
+func TestCleanupRefusesACheckoutHeldInAnUnknownWorkspace(t *testing.T) {
+	f := newBridgeFixture(t)
+	f.seedPrimary()
+	worker := f.seedWorker("t1", workerPane, workerPane, workerSession)
+	f.asWorker()
+	f.asPrimary()
+
+	root, checkout := bridgeRepoWithWorktree(t, worker.Branch)
+	if _, err := f.store.UpdateTask(context.Background(), worker.ID, worker.Revision, func(next *task.Task) error {
+		next.WorktreePath = checkout
+		return nil
+	}); err != nil {
+		t.Fatalf("record the checkout: %v", err)
+	}
+	stub := f.useHerdrStub(stubScript{
+		RepoRoot: root,
+		Worktree: []stubWorktree{{Path: checkout, Branch: worker.Branch, OpenWorkspaceID: "w4"}},
 	})
+	ops := CoordinatorOps(f.coordinator(t))
+	f.approve(t, ops)
+
+	wantError(t, f.callWith("cleanup", primarySession, `{"taskId":"t1"}`, ops), "provenance_unconfirmed")
+	if got := stub.script().Removed; len(got) != 0 {
+		t.Fatalf("cleanup removed a checkout Herdr holds elsewhere: %v", got)
+	}
+	if after := f.task(t, "t1"); after.WorktreePath != checkout || after.WorktreeWorkspaceID == "" {
+		t.Errorf("a refused cleanup changed the task: %+v", after)
+	}
 }
 
 // TestCleanupRemovesNothingWhenTheOpenResponseContradictsItself pins the other
@@ -2825,6 +2996,7 @@ func TestCleanupRemovesNothingWhenTheOpenResponseContradictsItself(t *testing.T)
 			f := newBridgeFixture(t)
 			f.seedPrimary()
 			worker := f.seedWorker("t1", workerPane, workerPane, workerSession)
+			f.asWorker()
 			f.asPrimary()
 
 			root, checkout := bridgeRepoWithWorktree(t, worker.Branch)
@@ -2884,6 +3056,7 @@ func TestCleanupRefusesARemovalHerdrClaimsItForced(t *testing.T) {
 	f := newBridgeFixture(t)
 	f.seedPrimary()
 	worker := f.seedWorker("t1", workerPane, workerPane, workerSession)
+	f.asWorker()
 	f.asPrimary()
 
 	root, checkout := bridgeRepoWithWorktree(t, worker.Branch)
@@ -2958,6 +3131,7 @@ func TestCleanupRecoversAMovedWorkerCheckout(t *testing.T) {
 	f := newBridgeFixture(t)
 	f.seedPrimary()
 	worker := f.seedWorker("t1", workerPane, workerPane, workerSession)
+	f.asWorker()
 	f.asPrimary()
 
 	root, checkout := bridgeRepoWithWorktree(t, worker.Branch)

@@ -254,6 +254,41 @@ func (a Announcement) Matches(ref SessionRef) bool {
 	return SameSessionReference(normalized.Kind, normalized.Value, announced.Value)
 }
 
+// Proves reports whether an announcement makes one recorded session value and one
+// reference Herdr reports now the same running OMP session.
+//
+// OMP exposes two native identities for one session — an id and the session file —
+// and a record keeps whichever one Herdr reported when its handshake was
+// confirmed, so the two values a caller holds may be in different forms. The
+// announcement is the only thing that knows both, which makes it the only thing
+// that can bridge them:
+//
+//  1. the recorded value has to be one of the identities this announcement carries,
+//     compared in the form that identity's kind implies (an id as an id, a session
+//     file as a path); and
+//  2. Herdr's current reference has to be this announcement's identity for the
+//     reference's own kind.
+//
+// Both halves are whole-value comparisons, so a value that merely appears inside
+// another never matches, and an announcement that does not carry the form Herdr
+// reported (or reports a kind this build cannot read) proves nothing. Callers use
+// this instead of parsing an id out of a file name.
+func (a Announcement) Proves(recorded string, ref SessionRef) bool {
+	recorded = strings.TrimSpace(recorded)
+	if recorded == "" {
+		return false
+	}
+	if _, ok := ref.Normalized(); !ok {
+		return false
+	}
+	matchesRecorded := (a.ID != "" && SameSessionReference(SessionKindID, a.ID, recorded)) ||
+		(a.File != "" && SameSessionReference(SessionKindPath, a.File, recorded))
+	if !matchesRecorded {
+		return false
+	}
+	return a.Matches(ref)
+}
+
 // SameSessionReference compares two values in the form their kind implies: an id
 // is trimmed and compared case-insensitively, and a path with the platform's path
 // rules (Windows is case-insensitive and both separators are equivalent).

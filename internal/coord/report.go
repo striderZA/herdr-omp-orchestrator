@@ -1059,8 +1059,9 @@ func (c *Coordinator) workerOccupant(ctx context.Context, st task.Task) (agentVi
 	if pane == "" {
 		return agentView{}, "", fmt.Errorf("%w: task %s records no current public pane", ErrProvenance, st.ID)
 	}
-	if strings.TrimSpace(st.OMPSessionID) == "" {
-		return agentView{}, "", fmt.Errorf("%w: task %s records no OMP session, so its worker cannot be identified", ErrAgentChanged, st.ID)
+	announced, err := c.announcedWorker(ctx, st)
+	if err != nil {
+		return agentView{}, "", err
 	}
 	view, err := c.agentGet(ctx, pane)
 	switch {
@@ -1080,9 +1081,9 @@ func (c *Coordinator) workerOccupant(ctx context.Context, st task.Task) (agentVi
 		return agentView{}, "", fmt.Errorf("%w: %w", ErrAgentChanged, view.RefErr)
 	case !view.HasRef:
 		return agentView{}, "", fmt.Errorf("%w: Herdr reports no session reference for pane %q, so the recorded worker cannot be verified", ErrAgentChanged, pane)
-	case !sessionMatchesRef(st.OMPSessionID, view.Ref):
-		return agentView{}, "", fmt.Errorf("%w: pane %q reports %s session %q, not the recorded worker session %q",
-			ErrAgentChanged, pane, view.Ref.Kind, view.Ref.Value, st.OMPSessionID)
+	case !announced.Proves(st.OMPSessionID, view.Ref):
+		return agentView{}, "", fmt.Errorf("%w: pane %q reports %s session %q, which is not the session task %s recorded (%s)",
+			ErrAgentChanged, pane, view.Ref.Kind, view.Ref.Value, st.ID, announced.Describe())
 	}
 	if cwd := strings.TrimSpace(view.Agent.Cwd); cwd != "" && strings.TrimSpace(st.WorktreePath) != "" && !samePath(cwd, st.WorktreePath) {
 		return agentView{}, "", fmt.Errorf("%w: pane %q works in %s, not the task's checkout %s", ErrAgentChanged, pane, cwd, st.WorktreePath)
@@ -1098,6 +1099,10 @@ func (c *Coordinator) workerOccupant(ctx context.Context, st task.Task) (agentVi
 // treated as live: cleanup may not proceed on a maybe. An agent with a different
 // session in that pane is a changed occupant, which a human decides.
 func (c *Coordinator) workerLive(ctx context.Context, st task.Task) (bool, error) {
+	announced, err := c.announcedWorker(ctx, st)
+	if err != nil {
+		return false, err
+	}
 	for _, pane := range nonEmpty(st.PublicPaneID, st.LaunchPaneID) {
 		view, err := c.agentGet(ctx, pane)
 		switch {
@@ -1113,23 +1118,57 @@ func (c *Coordinator) workerLive(ctx context.Context, st task.Task) (bool, error
 		switch {
 		case !view.HasRef:
 			return true, nil
-		case sessionMatchesRef(st.OMPSessionID, view.Ref):
+		case announced.Proves(st.OMPSessionID, view.Ref):
 			return true, nil
 		default:
-			return false, fmt.Errorf("%w: pane %q now runs %s session %q, not the recorded worker %s",
-				ErrAgentChanged, pane, view.Ref.Kind, view.Ref.Value, st.OMPSessionID)
+			return false, fmt.Errorf("%w: pane %q now runs %s session %q, which is not the session task %s recorded (%s)",
+				ErrAgentChanged, pane, view.Ref.Kind, view.Ref.Value, st.ID, announced.Describe())
 		}
 	}
 	return false, nil
 }
 
-// sessionMatchesRef compares the session a task recorded against the reference
-// Herdr reports for its pane, in the form that reference uses.
+// announcedWorker reads the session identity the worker's pane announced, and
+// requires the coordinator to have verified it against `agent get`.
 //
-// The recorded identity may be either native form — an id where the build
-// exposes one, a session file where Herdr reported a path — and Herdr may report
-// either, so the comparison is by kind rather than by a value parsed out of
-// something else.
+// A recorded session value and a reference Herdr reports now may be in different
+// native forms (an id and a session file), and only the announcement knows both —
+// so this is the fact every identity decision has to be made through.
+// An announcement nothing confirmed proves nothing: the request is refused until
+// the coordinator's own comparison has made it a verified handshake.
+func (c *Coordinator) announcedWorker(ctx context.Context, st task.Task) (task.Announcement, error) {
+	pane := strings.TrimSpace(st.LaunchPaneID)
+	if pane == "" {
+		return task.Announcement{}, fmt.Errorf("%w: task %s records no launch pane, so its worker cannot be identified", ErrAgentChanged, st.ID)
+	}
+	announced, found, err := c.store.AnnouncedSession(ctx, pane)
+	if err != nil {
+		return task.Announcement{}, fmt.Errorf("read the announced session of pane %q: %w", pane, err)
+	}
+	if !found {
+		return task.Announcement{}, fmt.Errorf("%w: pane %q announced no OMP session, so the recorded worker cannot be identified", ErrAgentChanged, pane)
+	}
+	verified, err := c.store.Ready(ctx, pane, announced)
+	if err != nil {
+		return task.Announcement{}, fmt.Errorf("read the handshake of pane %q: %w", pane, err)
+	}
+	if !verified {
+		return task.Announcement{}, fmt.Errorf("%w: pane %q has no verified OMP session, so the recorded worker cannot be trusted", ErrAgentChanged, pane)
+	}
+	if strings.TrimSpace(st.OMPSessionID) == "" {
+		return task.Announcement{}, fmt.Errorf("%w: task %s records no OMP session, so its worker cannot be identified", ErrAgentChanged, st.ID)
+	}
+	return announced, nil
+}
+
+// sessionMatchesRef compares a recorded session value against the reference Herdr
+// reports, in the form that reference uses.
+//
+// It cannot bridge the two native forms: it knows only the reference, so a record
+// that kept the announced id is refused when Herdr reports the session file for
+// the same session. Callers with an announcement must use Announcement.Proves,
+// which proves both identities through the handshake. This remains for callers
+// that hold no announcement while they are migrated.
 func sessionMatchesRef(recorded string, ref task.SessionRef) bool {
 	recorded = strings.TrimSpace(recorded)
 	if recorded == "" {
