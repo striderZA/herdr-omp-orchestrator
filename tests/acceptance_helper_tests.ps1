@@ -51,6 +51,10 @@ Set-Location -LiteralPath $script:PluginRoot
 $script:HarnessRoot = Join-Path $env:TEMP ("orch-acc-helpertest-" + ([guid]::NewGuid().ToString('N')).Substring(0, 6))
 New-Item -ItemType Directory -Path $script:HarnessRoot -Force | Out-Null
 
+# Everything below runs inside try/finally so the owned directory is removed on
+# success, on a terminating error and on exit - an aborted run leaves nothing.
+try {
+
 $script:HelperCopy = Join-Path $script:HarnessRoot 'helpers.ps1'
 $lines = Get-Content -LiteralPath $script:AcceptanceScript
 $driver = @($lines | Select-String -Pattern '^\$script:StartedAt = \(Get-Date\)')
@@ -363,11 +367,14 @@ Check 'hint: materialized with no resume fails' ((Test-ResumeHintImplication -Hi
 Check 'hint: string flag fails' ((Test-ResumeHintImplication -Hint ([pscustomobject]@{ onDisk = 'false'; resume = '' })) -eq $false) 'string'
 Check 'hint: absent flag fails' ((Test-ResumeHintImplication -Hint ([pscustomobject]@{ resume = '' })) -eq $false) 'absent'
 
+} finally {
+    # One owned directory holds every path this run created, so cleanup is a single
+    # removal that cannot touch anything the harness did not create.
+    Remove-Item -LiteralPath $script:HarnessRoot -Recurse -Force -ErrorAction SilentlyContinue
+    Set-Location -LiteralPath $previousLocation
+}
+
 $exitCode = $fails + $projectionFails
-# One owned directory holds every path this run created, so cleanup is one removal
-# and cannot touch anything the harness did not create.
-Remove-Item -LiteralPath $script:HarnessRoot -Recurse -Force -ErrorAction SilentlyContinue
-Set-Location -LiteralPath $previousLocation
 Write-Host ''
 Write-Host "helper check failures: $exitCode of $checks checks"
 exit $exitCode
