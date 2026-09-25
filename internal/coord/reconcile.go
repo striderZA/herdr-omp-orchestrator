@@ -519,10 +519,13 @@ func (c *Coordinator) applyTaskMove(ctx context.Context, st task.Task, previous 
 //
 // The move payload says what Herdr moved; only a live probe proves the pane it
 // moved to still runs the recorded OMP session on the recorded terminal, in the
-// recorded checkout. A binding whose session this plugin never recorded cannot
-// be proven either, so it is refused rather than re-keyed. It returns the reason
-// a pane is not the binding's own, or the error of a probe that could not be
-// read at all.
+// recorded checkout. The proof is the strict one: an absent recorded terminal or
+// checkout, or a live pane Herdr does not report a terminal or working directory
+// for, is a missing proof and refuses the rebind - a reconcile pass may accept a
+// probe that merely contradicts nothing, but adopting a pane may not. A binding
+// whose session this plugin never recorded cannot be proven either. It returns
+// the reason a pane is not the binding's own, or the error of a probe that could
+// not be read at all.
 func (c *Coordinator) proveMovedPane(ctx context.Context, pane MovedPaneInfo, session, terminal, checkout string) (string, error) {
 	if strings.TrimSpace(session) == "" {
 		return "the binding records no OMP session, so the moved pane cannot be proven to be its own", nil
@@ -531,10 +534,18 @@ func (c *Coordinator) proveMovedPane(ctx context.Context, pane MovedPaneInfo, se
 	if err != nil {
 		return "", err
 	}
-	if probe.Ours {
+	switch {
+	case !probe.Ours:
+		return fmt.Sprintf("Herdr's live state does not prove it: %s", probe.Refusal), nil
+	case !probe.TerminalProven:
+		return fmt.Sprintf("Herdr does not report the terminal %q this binding was dispatched with for pane %s, so the pane is not proven to be the same process",
+			strings.TrimSpace(terminal), pane.PaneID), nil
+	case !probe.CheckoutProven:
+		return fmt.Sprintf("Herdr does not report the checkout %q this binding owns for pane %s, so the pane is not proven to work in it",
+			strings.TrimSpace(checkout), pane.PaneID), nil
+	default:
 		return "", nil
 	}
-	return fmt.Sprintf("Herdr's live state does not prove it: %s", probe.Refusal), nil
 }
 
 // applyProjectMove records a primary's new public identity. The project key, its
@@ -1279,6 +1290,15 @@ type paneProbe struct {
 	// SameCheckout reports whether the pane works in the recorded checkout (true
 	// when nothing useful was reported).
 	SameCheckout bool
+	// TerminalProven is the strict form of SameTerminal: both the recorded and the
+	// live terminal are present and the same, so the pane is provably the same
+	// process. A rebind requires this; SameTerminal stays the lenient "nothing
+	// contradicts it" test a reconcile pass may accept.
+	TerminalProven bool
+	// CheckoutProven is the strict form of SameCheckout: both the recorded
+	// checkout and the live working directory are present and the same, so the
+	// worktree is proven rather than merely un-contradicted.
+	CheckoutProven bool
 	// SessionOK reports whether a recorded session was matched.
 	SessionOK bool
 	// Ours reports that this pane is provably the binding's own pane.
@@ -1337,10 +1357,14 @@ func (c *Coordinator) probePane(ctx context.Context, paneID, session, terminal, 
 		return probe, nil
 	}
 	probe.HasRef, probe.Ref = view.HasRef, view.Ref
-	probe.SameTerminal = strings.TrimSpace(terminal) == "" ||
-		strings.EqualFold(strings.TrimSpace(view.Agent.TerminalID), strings.TrimSpace(terminal))
+	recordedTerminal := strings.TrimSpace(terminal)
+	liveTerminal := strings.TrimSpace(view.Agent.TerminalID)
+	probe.SameTerminal = recordedTerminal == "" || strings.EqualFold(liveTerminal, recordedTerminal)
+	probe.TerminalProven = recordedTerminal != "" && liveTerminal != "" && strings.EqualFold(liveTerminal, recordedTerminal)
 	cwd := strings.TrimSpace(view.Agent.Cwd)
-	probe.SameCheckout = strings.TrimSpace(checkout) == "" || cwd == "" || samePath(cwd, checkout)
+	recordedCheckout := strings.TrimSpace(checkout)
+	probe.SameCheckout = recordedCheckout == "" || cwd == "" || samePath(cwd, recordedCheckout)
+	probe.CheckoutProven = recordedCheckout != "" && cwd != "" && samePath(cwd, recordedCheckout)
 	recordedSession := strings.TrimSpace(session)
 	matched := recordedSession != "" && view.HasRef && sessionMatchesRef(recordedSession, view.Ref)
 	switch {

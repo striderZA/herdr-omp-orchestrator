@@ -1608,6 +1608,71 @@ func TestMoveRequiresALiveProofOfTheRecordedSession(t *testing.T) {
 		}
 		assertMoveRefused(t, f, worker)
 	})
+
+	t.Run("the live terminal is not the recorded one", func(t *testing.T) {
+		f := newCoordFixture(t, fixturePlan{})
+		worker := f.boundWorker(t)
+		f.movedWorkerState(t, worker, "w9:p1", "w9", worker.OMPSessionID)
+		f.rewriteState(func(current *fixtureState) {
+			// The same session and checkout, but a different terminal: the pane is
+			// not the process this task was dispatched with.
+			current.Agents["w9:p1"].Terminal = "term-somewhere-else"
+		})
+
+		payload := movePayload(t, worker, "w9:p1", "w9")
+		err := f.coord.HandleEvent(context.Background(), EventPaneMoved, encodeEvent(t, payload))
+		if !errors.Is(err, ErrAgentChanged) {
+			t.Fatalf("err = %v, want ErrAgentChanged", err)
+		}
+		assertMoveRefused(t, f, worker)
+	})
+
+	t.Run("the live pane reports no checkout directory", func(t *testing.T) {
+		f := newCoordFixture(t, fixturePlan{})
+		worker := f.boundWorker(t)
+		f.movedWorkerState(t, worker, "w9:p1", "w9", worker.OMPSessionID)
+		f.updatePlan(func(plan *fixturePlan) { plan.BlankCwdFor = "w9:p1" })
+
+		payload := movePayload(t, worker, "w9:p1", "w9")
+		err := f.coord.HandleEvent(context.Background(), EventPaneMoved, encodeEvent(t, payload))
+		if !errors.Is(err, ErrAgentChanged) {
+			t.Fatalf("err = %v, want ErrAgentChanged", err)
+		}
+		assertMoveRefused(t, f, worker)
+	})
+
+	t.Run("the live pane works in a different checkout", func(t *testing.T) {
+		f := newCoordFixture(t, fixturePlan{})
+		worker := f.boundWorker(t)
+		f.movedWorkerState(t, worker, "w9:p1", "w9", worker.OMPSessionID)
+		f.rewriteState(func(current *fixtureState) {
+			// The moved workspace holds the repository root, not the task's
+			// worktree.
+			current.Workspaces["w9"] = f.root
+		})
+
+		payload := movePayload(t, worker, "w9:p1", "w9")
+		err := f.coord.HandleEvent(context.Background(), EventPaneMoved, encodeEvent(t, payload))
+		if !errors.Is(err, ErrAgentChanged) {
+			t.Fatalf("err = %v, want ErrAgentChanged", err)
+		}
+		assertMoveRefused(t, f, worker)
+	})
+
+	t.Run("the recorded terminal and checkout are proven live", func(t *testing.T) {
+		f := newCoordFixture(t, fixturePlan{})
+		worker := f.boundWorker(t)
+		f.movedWorkerState(t, worker, "w9:p1", "w9", worker.OMPSessionID)
+
+		f.mustHandle(t, EventPaneMoved, encodeEvent(t, movePayload(t, worker, "w9:p1", "w9")))
+		after := f.taskByID(t, worker.ID)
+		if after.PublicPaneID != "w9:p1" || after.CurrentWorkspaceID != "w9" {
+			t.Fatalf("a fully proven move was not recorded: pane %q workspace %q", after.PublicPaneID, after.CurrentWorkspaceID)
+		}
+		if after.LaunchPaneID != worker.LaunchPaneID || after.TerminalID != worker.TerminalID {
+			t.Fatalf("the move re-keyed launch %q terminal %q", after.LaunchPaneID, after.TerminalID)
+		}
+	})
 }
 
 // assertMoveRefused checks the durable outcome of a refused move: the binding is

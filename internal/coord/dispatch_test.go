@@ -99,6 +99,10 @@ type fixturePlan struct {
 	// PromptError makes `agent prompt` refuse with that Herdr code before any
 	// input is written, the way a blocked or vanished agent is refused.
 	PromptError string `json:"prompt_error"`
+	// BlankCwdFor makes `agent get` report an empty working directory for one
+	// pane, which is how a test asks what happens when the pane's checkout
+	// cannot be read back.
+	BlankCwdFor string `json:"blank_cwd_for"`
 	// WorktreeCreateError makes `worktree create` fail with that Herdr code
 	// before any checkout exists.
 	WorktreeCreateError string `json:"worktree_create_error"`
@@ -386,6 +390,11 @@ func fixtureReference(plan fixturePlan, announced task.Announcement) *task.Sessi
 // checkout the workspace was created for, or the primary checkout bind was
 // invoked from.
 func fixtureCwd(plan fixturePlan, state fixtureState, pane string) string {
+	if plan.BlankCwdFor != "" && plan.BlankCwdFor == pane {
+		// This pane's agent reports no working directory, the way a pane whose
+		// process has not settled into a checkout looks.
+		return ""
+	}
 	if cwd := state.Workspaces[workspaceOfPane(pane)]; cwd != "" {
 		return cwd
 	}
