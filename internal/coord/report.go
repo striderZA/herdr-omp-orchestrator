@@ -869,7 +869,16 @@ func (c *Coordinator) Review(ctx context.Context, primaryLaunchPaneID, taskID, d
 	if err != nil {
 		return ReviewResult{}, err
 	}
-	return ReviewResult{TaskID: updated.ID, Disposition: updated.Disposition, Stage: task.StageOf(updated)}, nil
+	result := ReviewResult{TaskID: updated.ID, Disposition: updated.Disposition, Stage: task.StageOf(updated)}
+
+	// The disposition is what the tasks waiting on this one were gated on, and it is the
+	// only thing that frees this task's slot, so the queued work starts here — after the
+	// write that recorded it. The queue is otherwise only consulted when a new dispatch
+	// arrives, which for a reviewed-but-idle project may never happen.
+	if _, err := c.DrainQueued(ctx, project.Key); err != nil {
+		return result, fmt.Errorf("the disposition was recorded, but the queued tasks of %s could not be drained: %w", project.Key, err)
+	}
+	return result, nil
 }
 
 // isReviewed reports whether a task carries a final result a primary can decide

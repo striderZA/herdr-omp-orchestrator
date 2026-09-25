@@ -691,6 +691,55 @@ func TestReportOnlyAPrimaryDispositionMovesATaskToDone(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// the disposition of a prerequisite starts the work waiting on it
+// ---------------------------------------------------------------------------
+
+// TestReviewDrainsTheTasksItsDispositionUnblocks pins the wiring the plan asks for:
+// recording the user's disposition is also what lets the tasks waiting on that
+// prerequisite start, so a reviewed decision does not leave dependent work parked
+// until something else happens to run.
+func TestReviewDrainsTheTasksItsDispositionUnblocks(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	ctx := context.Background()
+
+	first := f.mustDispatch("first", "First brief.")
+	dependent, err := f.dispatch("dependent", "Dependent brief.", []string{"go test ./... ok"}, []string{first.ID}, nil, f.base)
+	if err != nil {
+		t.Fatalf("dispatch the dependent task: %v", err)
+	}
+	if dependent.Phase != task.Intent || task.StageOf(dependent) != task.Queued {
+		t.Fatalf("the dependent task was not gated on its prerequisite: %+v", dependent)
+	}
+
+	// The prerequisite is reviewed: the user's decision frees its slot and unblocks the
+	// task that was waiting on it.
+	f.satisfyReview(first)
+	project, err := f.store.Project(ctx, f.projectKey())
+	if err != nil {
+		t.Fatalf("read the bound project: %v", err)
+	}
+	result, err := f.coord.Review(ctx, project.LaunchPaneID, first.ID, "accepted")
+	if err != nil {
+		t.Fatalf("Review: %v", err)
+	}
+	if result.TaskID != first.ID || result.Disposition != "accepted" || result.Stage != task.Done {
+		t.Errorf("Review = %+v, want the recorded disposition on a done task", result)
+	}
+
+	drained, err := f.store.Task(ctx, dependent.ID)
+	if err != nil {
+		t.Fatalf("read the dependent task: %v", err)
+	}
+	if drained.Phase != task.PromptSubmitted {
+		t.Errorf("the dependent task is at phase %q after its prerequisite was reviewed, want %q (task %+v)",
+			drained.Phase, task.PromptSubmitted, drained)
+	}
+	if got := f.prompts(drained.PublicPaneID); len(got) != 1 {
+		t.Errorf("the drained task's prompts = %v, want its brief submitted exactly once", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // ownership rechecks
 // ---------------------------------------------------------------------------
 
