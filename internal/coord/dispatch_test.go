@@ -2161,6 +2161,73 @@ func TestFailureThatCannotBeRecordedIsReportedNotDropped(t *testing.T) {
 	}
 }
 
+func TestAmbiguousFailureThatCannotBeRecordedAdvisesInspectionNotResume(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	f.projectKey()
+	// An ambiguous brief may already be the worker's turn. If the blocker cannot be
+	// persisted either, the caller must not be told to resume: resuming would
+	// resubmit a brief that may have been delivered.
+	ghost := task.Task{
+		ID:           "orch_000000000001",
+		ProjectKey:   f.root,
+		Branch:       "orch/000000000001",
+		WorktreePath: filepath.Join(f.dir, "worktrees", "orch-000000000001"),
+		PublicPaneID: "w2:p1",
+		AgentName:    "orch_000000000001",
+		Phase:        task.AgentStarted,
+		Revision:     7,
+	}
+	cause := fmt.Errorf("%w: the brief on pane %s may already have been delivered; inspect `agent read %s` before deciding: %w",
+		ErrAmbiguousStep, ghost.PublicPaneID, ghost.PublicPaneID, herdr.ErrAmbiguous)
+	updated, err := f.coord.failTask(context.Background(), ghost, "submit the brief", true, cause)
+	if err == nil {
+		t.Fatal("failTask reported success although it could not write")
+	}
+	// Classification: the persistence failure, the ambiguity and the step error all
+	// stay reachable.
+	if !errors.Is(err, ErrPersistence) {
+		t.Errorf("err = %v, want ErrPersistence", err)
+	}
+	if !errors.Is(err, ErrAmbiguousStep) || !errors.Is(err, herdr.ErrAmbiguous) {
+		t.Errorf("err = %v, want the ambiguity still classified", err)
+	}
+	var step *StepError
+	if !errors.As(err, &step) {
+		t.Fatalf("err = %v, want the *StepError reachable through it", err)
+	}
+	if step.Step != "submit the brief" || step.Phase != task.AgentStarted {
+		t.Errorf("step error = %+v, want the failed step and phase", step)
+	}
+	for _, want := range []string{
+		"orch_000000000001",
+		"submit the brief",
+		"phase agent_started",
+		"worktree " + ghost.WorktreePath,
+		"pane w2:p1",
+		"agent orch_000000000001",
+		"could not be recorded",
+		"before any retry",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err %q does not name %q", err, want)
+		}
+	}
+	// The contradiction this test guards against: never recommend resuming (or
+	// resubmitting) a brief whose delivery is unknown. A prohibition on
+	// resubmitting is exactly right; a recommendation is not.
+	for _, unwanted := range []string{"resume", "Resume", "resubmit it", "retry it"} {
+		if strings.Contains(err.Error(), unwanted) {
+			t.Errorf("err %q recommends %q for an ambiguous, unrecorded failure", err, unwanted)
+		}
+	}
+	if !strings.Contains(err.Error(), "do not resubmit") {
+		t.Errorf("err %q does not forbid resubmitting an unidentified submission", err)
+	}
+	if updated.Attention != "" || updated.Blocker != "" {
+		t.Errorf("a ghost task was reported as updated: %+v", updated)
+	}
+}
+
 func TestDispatchToleratesTheBridgeAdoptingTheSessionFirst(t *testing.T) {
 	f := newCoordFixture(t, fixturePlan{AdoptBeforeRecord: true})
 	st, err := f.dispatch("one", "brief one", []string{"go test ./... ok"}, nil, nil, f.base)

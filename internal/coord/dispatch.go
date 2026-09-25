@@ -806,12 +806,16 @@ func (c *Coordinator) record(ctx context.Context, st task.Task, mutate func(*tas
 // database to find out what happened, and it always says that the task is
 // resumable rather than something to retry blindly.
 type StepError struct {
-	TaskID  string
-	Step    string
-	Phase   task.Phase
-	Facts   task.Task
-	Cause   error
+	TaskID string
+	Step   string
+	Phase  task.Phase
+	Facts  task.Task
+	Cause  error
+	// Stalled marks a failure the caller must not retry by dispatching again.
 	Stalled bool
+	// Ambiguous marks a step whose outcome could not be identified. Its advice is
+	// to inspect the recorded pane and the task before any retry.
+	Ambiguous bool
 }
 
 // Error renders one line naming the step, the cause and the recorded resources.
@@ -833,11 +837,30 @@ func (e *StepError) Error() string {
 	if len(recorded) > 0 {
 		detail += ", " + strings.Join(recorded, ", ")
 	}
-	advice := "the task is resumable: fix the cause and resume it from the recorded phase instead of dispatching the same work again"
-	if !e.Stalled {
-		advice = "the task is resumable: this step is retried from the recorded phase, and nothing was repeated"
-	}
+	advice := e.advice()
 	return fmt.Sprintf("task %s could not %s: %v (task %s; %s)", e.TaskID, e.Step, e.Cause, detail, advice)
+}
+
+// advice is what the caller should do next.
+//
+// An ambiguous step is never resumed blindly: its outcome is unknown, so a human
+// inspects the recorded pane and the task first. That matters most for an
+// ambiguous brief, where resuming would resubmit a brief that may already have
+// been delivered — the guidance must not contradict the blocker it accompanies.
+// A definite failure keeps the resumable advice, because resuming it re-runs the
+// recorded phase and repeats nothing.
+func (e *StepError) advice() string {
+	if e.Ambiguous {
+		target := "the recorded pane"
+		if strings.TrimSpace(e.Facts.PublicPaneID) != "" {
+			target = "pane " + e.Facts.PublicPaneID
+		}
+		return fmt.Sprintf("the outcome is unknown: inspect %s and the task before any retry, and do not resubmit this step's input until delivery is determined", target)
+	}
+	if e.Stalled {
+		return "the task is resumable: fix the cause and resume it from the recorded phase instead of dispatching the same work again"
+	}
+	return "the task is resumable: this step is retried from the recorded phase, and nothing was repeated"
 }
 
 // Unwrap keeps the cause reachable, so a caller still classifies with errors.Is
@@ -853,6 +876,10 @@ func stepError(st task.Task, step string, terminal bool, cause error) *StepError
 		Facts:   st,
 		Cause:   cause,
 		Stalled: terminal,
+		// Ambiguity is decided by the cause: the call sites mark a step whose
+		// outcome could not be identified with ErrAmbiguousStep, and Herdr's own
+		// ambiguity classification means the same thing here.
+		Ambiguous: errors.Is(cause, ErrAmbiguousStep) || errors.Is(cause, herdr.ErrAmbiguous),
 	}
 }
 
