@@ -68,7 +68,9 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 )
@@ -117,6 +119,23 @@ var (
 )
 
 var agentNamePattern = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,31}$`)
+
+// samePath compares two paths the way the platform does. Windows is
+// case-insensitive and both separators are equivalent, and a real `worktree open`
+// answer proves why the tolerance is needed: Herdr answers a request made with
+// backslashes with forward slashes for the same checkout. Elsewhere a path is
+// compared exactly, because case is significant there.
+func samePath(a, b string) bool {
+	a, b = strings.TrimSpace(a), strings.TrimSpace(b)
+	if a == "" || b == "" {
+		return false
+	}
+	a, b = filepath.Clean(a), filepath.Clean(b)
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(a, b)
+	}
+	return a == b
+}
 
 // ValidAgentName reports whether name is a legal Herdr agent name: it must start
 // with a lower-case letter, continue with lower-case letters, digits, '_' or '-',
@@ -1076,6 +1095,48 @@ func (c *Client) WorktreeOpen(ctx context.Context, root, path string) (opened *W
 		// otherwise describes the primary repository, which the orchestrator must
 		// never remove as a worker's checkout.
 		return nil, &IdentityError{Op: op, Field: "worktree.is_linked_worktree", Detail: "response does not describe a linked worktree checkout"}
+	}
+	// The caller asked for one repository and one checkout, and is about to delete
+	// the checkout this response names: every path in it has to be the one that was
+	// requested. A response that names the requested checkout in one field and a
+	// different one in another would otherwise let the caller remove the wrong
+	// workspace.
+	if !samePath(res.Workspace.Worktree.RepoRoot, root) {
+		return nil, &IdentityError{
+			Op:    op,
+			Field: "workspace.worktree.repo_root",
+			Detail: fmt.Sprintf("response names repository %q, not the requested %q",
+				res.Workspace.Worktree.RepoRoot, root),
+		}
+	}
+	for _, named := range []struct{ field, value string }{
+		{"workspace.worktree.checkout_path", res.Workspace.Worktree.CheckoutPath},
+		{"worktree.path", res.Worktree.Path},
+	} {
+		if !samePath(named.value, path) {
+			return nil, &IdentityError{
+				Op:    op,
+				Field: named.field,
+				Detail: fmt.Sprintf("response names checkout %q, not the requested %q",
+					named.value, path),
+			}
+		}
+	}
+	// The layout has to describe one place: a tab, root pane or open-worktree id
+	// that points somewhere else means this response is not one coherent answer.
+	for _, agree := range []struct{ field, want, got string }{
+		{"tab.workspace_id", res.Workspace.WorkspaceID, res.Tab.WorkspaceID},
+		{"tab.tab_id", res.Workspace.ActiveTabID, res.Tab.TabID},
+		{"root_pane.tab_id", res.Tab.TabID, res.RootPane.TabID},
+	} {
+		if agree.got != agree.want {
+			return nil, &IdentityError{
+				Op:    op,
+				Field: agree.field,
+				Detail: fmt.Sprintf("response has %q where the rest of it names %q",
+					agree.got, agree.want),
+			}
+		}
 	}
 	if res.Worktree.OpenWorkspaceID != nil && *res.Worktree.OpenWorkspaceID != res.Workspace.WorkspaceID {
 		return nil, &IdentityError{

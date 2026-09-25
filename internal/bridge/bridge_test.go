@@ -1619,6 +1619,11 @@ type stubScript struct {
 	// checkout no workspace holds, standing in for the workspace Herdr creates
 	// for that checkout.
 	OpenWorkspace string `json:"openWorkspace"`
+	// OpenContradiction makes `worktree open` contradict itself by naming another
+	// checkout or repository in one field: "checkout_path", "repo_root" or
+	// "worktree_path" selects which. A caller that trusted such an answer could
+	// remove the wrong workspace.
+	OpenContradiction string `json:"openContradiction"`
 	// RemoveError makes `worktree remove` refuse; a dirty checkout is one way.
 	RemoveError string `json:"removeError"`
 
@@ -1846,24 +1851,36 @@ func stubWorktreeOpen(script *stubScript, scriptPath string, argv []string) int 
 		return 45
 	}
 	branch := script.Worktree[index].Branch
-	// A real response spells the same checkout two ways: the request carried the
-	// recorded path, and Herdr answers with forward slashes. Callers must compare
-	// paths with the platform's own rules, and this stand-in keeps that difference
-	// real so a regression cannot hide behind it.
+	// A real response names the paths it was asked for, in its own spelling: the
+	// request carried the recorded path and Herdr answers with forward slashes for
+	// the same checkout, and reports the repository it was told to open. Callers
+	// must compare paths with the platform's own rules, and this stand-in keeps
+	// that difference real so a regression cannot hide behind it.
 	reported := filepath.ToSlash(checkout)
+	workspaceCheckout, worktreePath := reported, reported
+	repoRoot := stubFlag(argv, "--cwd")
+	otherCheckout := filepath.ToSlash(filepath.Join(filepath.Dir(checkout), "someone-else"))
+	switch script.OpenContradiction {
+	case "checkout_path":
+		workspaceCheckout = otherCheckout
+	case "repo_root":
+		repoRoot = filepath.ToSlash(filepath.Join(filepath.Dir(repoRoot), "another-repo"))
+	case "worktree_path":
+		worktreePath = otherCheckout
+	}
 	return stubResult(map[string]any{
 		"type":         "worktree_opened",
 		"already_open": true,
-		"workspace":    stubWorkspaceBody(script.RepoRoot, workspace, reported),
+		"workspace":    stubWorkspaceBody(repoRoot, workspace, workspaceCheckout),
 		"tab": map[string]any{
 			"tab_id": workspace + ":t1", "workspace_id": workspace, "label": "1",
 			"number": 1, "pane_count": 1,
 		},
 		"root_pane": stubPaneBody(stubPane{
 			PaneID: workspace + ":p1", TerminalID: "term-" + workspace,
-			WorkspaceID: workspace, Cwd: checkout,
+			WorkspaceID: workspace, TabID: workspace + ":t1", Cwd: checkout,
 		}),
-		"worktree": stubWorktreeBody(workspace, reported, branch),
+		"worktree": stubWorktreeBody(workspace, worktreePath, branch),
 	})
 }
 
@@ -2762,6 +2779,56 @@ func TestCleanupRequiresReviewedDoneAndACleanProvenanceCheckout(t *testing.T) {
 		})
 		wantError(t, f.callWith("cleanup", primarySession, `{"taskId":"t1"}`, ops), "provenance_unconfirmed")
 	})
+}
+
+// TestCleanupRemovesNothingWhenTheOpenResponseContradictsItself pins the other
+// half of the recovery: the answer that authorises a removal has to describe the
+// checkout that was opened. A response that names the requested checkout in one
+// field and a different one in another refuses cleanup, and no removal is
+// attempted at all.
+func TestCleanupRemovesNothingWhenTheOpenResponseContradictsItself(t *testing.T) {
+	for _, contradiction := range []string{"checkout_path", "repo_root", "worktree_path"} {
+		t.Run(contradiction, func(t *testing.T) {
+			f := newBridgeFixture(t)
+			f.seedPrimary()
+			worker := f.seedWorker("t1", workerPane, workerPane, workerSession)
+			f.asPrimary()
+
+			root, checkout := bridgeRepoWithWorktree(t, worker.Branch)
+			if _, err := f.store.UpdateTask(context.Background(), worker.ID, worker.Revision, func(next *task.Task) error {
+				next.WorktreePath = checkout
+				next.CurrentWorkspaceID = movedWorkspace
+				return nil
+			}); err != nil {
+				t.Fatalf("record the move: %v", err)
+			}
+			stub := f.useHerdrStub(stubScript{
+				RepoRoot:          root,
+				Worktree:          []stubWorktree{{Path: filepath.ToSlash(checkout), Branch: worker.Branch, OpenWorkspaceID: movedWorkspace}},
+				NotLinked:         []string{movedWorkspace},
+				OpenContradiction: contradiction,
+			})
+			ops := CoordinatorOps(f.coordinator(t))
+			f.approve(t, ops)
+
+			wantError(t, f.callWith("cleanup", primarySession, `{"taskId":"t1"}`, ops), "provenance_unconfirmed")
+			if got := stub.script().Removed; len(got) != 0 {
+				t.Fatalf("a contradictory open response still removed a checkout: %v", got)
+			}
+			open := stub.callIndex("worktree", "open", "--cwd", f.repoRoot, "--path", checkout, "--no-focus")
+			if open < 0 {
+				t.Fatalf("cleanup never opened the recorded checkout: %v", stub.calls())
+			}
+			if stub.lastCallIndex("worktree", "remove", "--workspace", movedWorkspace) > open {
+				t.Errorf("a removal was attempted after a contradictory open response: %v", stub.calls())
+			}
+			// Nothing about the failed recovery may be recorded as removed.
+			after := f.task(t, "t1")
+			if after.WorktreePath != checkout || after.WorktreeWorkspaceID == "" || after.LaunchPaneID == "" {
+				t.Errorf("a refused cleanup changed the task: %+v", after)
+			}
+		})
+	}
 }
 
 // assertCheckoutNotOpened pins the ordering the cleanup gate requires: the

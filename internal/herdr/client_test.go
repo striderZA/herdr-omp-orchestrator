@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -437,36 +438,164 @@ func TestDecodeWorktreeOpenResponse(t *testing.T) {
 	f.assertDirectChild()
 }
 
+// worktreeOpenResponse decodes the captured `worktree open` answer so one test
+// can contradict exactly one field of it, which is how a contradictory response
+// is simulated without inventing a payload.
+func worktreeOpenResponse(t *testing.T) map[string]any {
+	t.Helper()
+	var envelope map[string]any
+	if err := json.Unmarshal([]byte(readFixture(t, "worktree-open.json")), &envelope); err != nil {
+		t.Fatalf("decode worktree-open.json: %v", err)
+	}
+	return envelope
+}
+
+// object reads one nested JSON object of a decoded response.
+func object(t *testing.T, parent map[string]any, key string) map[string]any {
+	t.Helper()
+	child, ok := parent[key].(map[string]any)
+	if !ok {
+		t.Fatalf("response has no %s object", key)
+	}
+	return child
+}
+
+// encodeResponse renders one mutated response the way the stand-in Herdr would
+// print it.
+func encodeResponse(t *testing.T, envelope map[string]any) string {
+	t.Helper()
+	encoded, err := json.Marshal(envelope)
+	if err != nil {
+		t.Fatalf("encode response: %v", err)
+	}
+	return string(encoded)
+}
+
+// worktreeOpenPayloadFor renders the captured `worktree open` answer for one
+// requested repository and checkout, which is what the client requires such an
+// answer to describe.
+func worktreeOpenPayloadFor(t *testing.T, root, checkout string) string {
+	t.Helper()
+	envelope := worktreeOpenResponse(t)
+	workspaceWorktree := object(t, object(t, object(t, envelope, "result"), "workspace"), "worktree")
+	workspaceWorktree["repo_root"] = root
+	workspaceWorktree["checkout_path"] = checkout
+	object(t, object(t, envelope, "result"), "worktree")["path"] = checkout
+	return encodeResponse(t, envelope)
+}
+
 // TestWorktreeOpenRefusesResponsesThatDoNotDescribeTheCheckout pins the client's
 // fail-closed reading of a `worktree open` answer: the caller is about to delete
-// the checkout, so a response that does not name that linked checkout, or that
-// does not say whether it was already open, is refused rather than interpreted.
+// the checkout the response names, so a response that contradicts the request —
+// a different checkout, a different repository, or parts of the layout that
+// disagree with each other — is refused rather than interpreted. Every case
+// contradicts exactly one field of the response captured from the real probe.
 func TestWorktreeOpenRefusesResponsesThatDoNotDescribeTheCheckout(t *testing.T) {
-	captured := readFixture(t, "worktree-open.json")
+	const (
+		root     = `C:/work/orch-probe-repo`
+		checkout = `C:/work/herdr/worktrees/orch-probe-repo/probe-moved`
+	)
+	otherCheckout := `C:/work/herdr/worktrees/orch-probe-repo/other-branch`
+
 	cases := []struct {
-		name    string
-		payload string
-		want    error
+		name   string
+		mutate func(envelope map[string]any)
+		want   error
 	}{
-		{"wrong result type", strings.Replace(captured, `"type":"worktree_opened"`, `"type":"worktree_created"`, 1), ErrMalformedResponse},
-		{"missing already_open", strings.Replace(captured, `"already_open":true,`, "", 1), ErrIdentity},
-		{"not a linked worktree", strings.ReplaceAll(captured, `"is_linked_worktree":true`, `"is_linked_worktree":false`), ErrIdentity},
-		{"no workspace", strings.Replace(captured, `"workspace_id":"wY"`, `"workspace_id":""`, 1), ErrIdentity},
-		{"no worktree provenance", strings.Replace(captured, `"worktree":{`, `"worktree":null,"unused":{`, 1), ErrIdentity},
+		{"wrong result type", func(envelope map[string]any) {
+			object(t, envelope, "result")["type"] = "worktree_created"
+		}, ErrMalformedResponse},
+		{"missing already_open", func(envelope map[string]any) {
+			delete(object(t, envelope, "result"), "already_open")
+		}, ErrIdentity},
+		{"workspace checkout path disagrees", func(envelope map[string]any) {
+			result := object(t, envelope, "result")
+			object(t, object(t, result, "workspace"), "worktree")["checkout_path"] = otherCheckout
+		}, ErrIdentity},
+		{"workspace repo root disagrees", func(envelope map[string]any) {
+			result := object(t, envelope, "result")
+			object(t, object(t, result, "workspace"), "worktree")["repo_root"] = `C:/work/other-repo`
+		}, ErrIdentity},
+		{"worktree path disagrees", func(envelope map[string]any) {
+			object(t, object(t, envelope, "result"), "worktree")["path"] = otherCheckout
+		}, ErrIdentity},
+		{"not a linked worktree", func(envelope map[string]any) {
+			object(t, object(t, envelope, "result"), "worktree")["is_linked_worktree"] = false
+		}, ErrIdentity},
+		{"no workspace", func(envelope map[string]any) {
+			object(t, object(t, envelope, "result"), "workspace")["workspace_id"] = ""
+		}, ErrIdentity},
+		{"no worktree provenance", func(envelope map[string]any) {
+			object(t, object(t, envelope, "result"), "workspace")["worktree"] = nil
+		}, ErrIdentity},
+		{"open workspace disagrees", func(envelope map[string]any) {
+			object(t, object(t, envelope, "result"), "worktree")["open_workspace_id"] = "wZ"
+		}, ErrIdentity},
+		{"root pane in another workspace", func(envelope map[string]any) {
+			object(t, object(t, envelope, "result"), "root_pane")["workspace_id"] = "wZ"
+		}, ErrIdentity},
+		{"tab in another workspace", func(envelope map[string]any) {
+			object(t, object(t, envelope, "result"), "tab")["workspace_id"] = "wZ"
+		}, ErrIdentity},
+		{"workspace active tab disagrees", func(envelope map[string]any) {
+			object(t, object(t, envelope, "result"), "workspace")["active_tab_id"] = "wY:t9"
+		}, ErrIdentity},
+		{"root pane in another tab", func(envelope map[string]any) {
+			object(t, object(t, envelope, "result"), "root_pane")["tab_id"] = "wY:t9"
+		}, ErrIdentity},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			f := newFixture(t).stdout(tc.payload)
-			_, err := f.client.WorktreeOpen(shortCtx(t, 5*time.Second), `C:/work/orch-probe-repo`, `C:/work/herdr/worktrees/orch-probe-repo/probe-moved`)
+			envelope := worktreeOpenResponse(t)
+			tc.mutate(envelope)
+			f := newFixture(t).stdout(encodeResponse(t, envelope))
+			_, err := f.client.WorktreeOpen(shortCtx(t, 5*time.Second), root, checkout)
 			if !errors.Is(err, tc.want) {
 				t.Fatalf("WorktreeOpen err = %v, want %v", err, tc.want)
 			}
 			f.assertDirectChild()
 		})
 	}
+}
+
+// TestWorktreeOpenAcceptsTheSpellingsHerdrReallyUses pins the tolerance the real
+// capture demands: Herdr answers a request made with backslashes with forward
+// slashes, and on Windows the same path in different case is the same path. The
+// comparison stays platform-correct rather than case-folding everywhere.
+func TestWorktreeOpenAcceptsTheSpellingsHerdrReallyUses(t *testing.T) {
+	envelope := worktreeOpenResponse(t)
+	payload := encodeResponse(t, envelope)
+
+	requests := []struct{ name, root, checkout string }{
+		{"the same spelling as the response", `C:/work/orch-probe-repo`, `C:/work/herdr/worktrees/orch-probe-repo/probe-moved`},
+		{"backslashes and a trailing separator", `C:\work\orch-probe-repo`, `C:\work\herdr\worktrees\orch-probe-repo\probe-moved\`},
+	}
+	if runtime.GOOS == "windows" {
+		requests = append(requests, struct{ name, root, checkout string }{
+			"a different case", `C:/WORK/Orch-Probe-Repo`, `c:/work/HERDR/worktrees/orch-probe-repo/PROBE-MOVED`,
+		})
+	}
+	for _, tc := range requests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t).stdout(payload)
+			opened, err := f.client.WorktreeOpen(shortCtx(t, 5*time.Second), tc.root, tc.checkout)
+			if err != nil {
+				t.Fatalf("WorktreeOpen(%q, %q): %v", tc.root, tc.checkout, err)
+			}
+			if opened.WorktreePath != `C:/work/herdr/worktrees/orch-probe-repo/probe-moved` {
+				t.Errorf("WorktreePath = %q, want the checkout the response named", opened.WorktreePath)
+			}
+			if opened.RepoRoot != `C:/work/orch-probe-repo` {
+				t.Errorf("RepoRoot = %q, want the repository the response named", opened.RepoRoot)
+			}
+			f.assertDirectChild()
+		})
+	}
 
 	// An `already_open:false` answer is the other documented state and decodes.
-	f := newFixture(t).stdout(strings.Replace(captured, `"already_open":true`, `"already_open":false`, 1))
+	openFalse := worktreeOpenResponse(t)
+	object(t, openFalse, "result")["already_open"] = false
+	f := newFixture(t).stdout(encodeResponse(t, openFalse))
 	opened, err := f.client.WorktreeOpen(shortCtx(t, 5*time.Second), `C:/work/orch-probe-repo`, `C:/work/herdr/worktrees/orch-probe-repo/probe-moved`)
 	if err != nil {
 		t.Fatalf("WorktreeOpen(already open false): %v", err)
@@ -1426,7 +1555,7 @@ func TestArgvWindowsPathsWithSpacesStayDiscrete(t *testing.T) {
 		},
 		{
 			name:    "worktree open",
-			payload: readFixture(t, "worktree-open.json"),
+			payload: worktreeOpenPayloadFor(t, root, root+`\\linked checkout`),
 			call: func(ctx context.Context, c *Client) error {
 				_, err := c.WorktreeOpen(ctx, root, root+`\\linked checkout`)
 				return err
