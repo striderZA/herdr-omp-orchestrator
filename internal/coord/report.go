@@ -320,10 +320,11 @@ func (c *Coordinator) Question(ctx context.Context, launchPaneID, text string) (
 // review. It never completes the task: only the primary's recorded disposition
 // does.
 //
-// The write is one compare-and-swap task update followed by one deduplicated
-// inbox note, so a retry after an ambiguous answer either re-records the same
-// report (writing nothing) or leaves the durability of the report to the task
-// row itself.
+// The report and the note that announces it are one durable fact: they are
+// written in a single store transaction, so a task can never read as ready for
+// review without the primary having been told. Re-submitting an identical report
+// writes nothing to the task — it only re-confirms the note, which is
+// deduplicated by its own identity.
 func (c *Coordinator) FinalReport(ctx context.Context, launchPaneID string, report task.Report) (FinalReportResult, error) {
 	st, err := c.workerTask(ctx, launchPaneID)
 	if err != nil {
@@ -334,9 +335,13 @@ func (c *Coordinator) FinalReport(ctx context.Context, launchPaneID string, repo
 		return FinalReportResult{}, err
 	}
 
+	// A worker path always has a bound project (workerTask re-reads it), which is
+	// what makes the note addressable.
+	note := c.noteFor(st, "result", reportNote(complete), "worker result")
 	recorded := st
+	inserted := false
 	if st.Report == nil || !sameReport(*st.Report, complete) || isQuestionAttention(st.Attention) {
-		updated, err := c.record(ctx, st, func(next *task.Task) error {
+		updated, insertedNote, err := c.recordWithNote(ctx, st, func(next *task.Task) error {
 			// Re-checked on every attempt: a report only ever describes the
 			// branch this task owns, whatever landed in between.
 			if !sameBranch(next.Branch, complete.Branch) {
@@ -347,16 +352,19 @@ func (c *Coordinator) FinalReport(ctx context.Context, launchPaneID string, repo
 			}
 			next.Report = &complete
 			return nil
-		}, "record the final report")
+		}, note, "record the final report")
 		if err != nil {
 			return FinalReportResult{}, err
 		}
-		recorded = updated
-	}
-
-	inserted, err := c.note(ctx, recorded, "result", reportNote(complete), "worker result")
-	if err != nil {
-		return FinalReportResult{}, err
+		recorded, inserted = updated, insertedNote
+	} else {
+		// The report is already durable, so only the deduplicated note is
+		// (re)confirmed; a note that never landed is repaired here without
+		// rewriting the task.
+		inserted, err = c.note(ctx, st, "result", reportNote(complete), "worker result")
+		if err != nil {
+			return FinalReportResult{}, err
+		}
 	}
 	return FinalReportResult{TaskID: recorded.ID, Stage: task.StageOf(recorded), Report: complete, Duplicate: !inserted}, nil
 }
@@ -1133,27 +1141,66 @@ func approvedKeys(keys []string) ([]string, error) {
 // durable notes
 // ---------------------------------------------------------------------------
 
-// note records one deduplicated inbox entry for a task's project and reports
-// whether it was new.
+// recordWithNote applies one update to a task and stores its deduplicated inbox
+// note in a single store transaction, so a fact that announces itself can never
+// land without the announcement.
+//
+// Like record, it builds on the revision the store holds at the moment of the
+// write and retries only the compare-and-swap collision: a concurrent writer
+// (the bridge adopting a session, or another coordinator call) must not make a
+// legitimate report fail.
+func (c *Coordinator) recordWithNote(
+	ctx context.Context,
+	st task.Task,
+	mutate func(*task.Task) error,
+	note task.Inbox,
+	what string,
+) (task.Task, bool, error) {
+	var lastErr error
+	for range recordAttempts {
+		current, err := c.store.Task(ctx, st.ID)
+		if err != nil {
+			return st, false, fmt.Errorf("task %s: %s: %w", st.ID, what, err)
+		}
+		updated, inserted, err := c.store.UpdateTaskWithNote(ctx, st.ID, current.Revision, mutate, note)
+		if err == nil {
+			return updated, inserted, nil
+		}
+		if !errors.Is(err, state.ErrConflict) {
+			return st, false, fmt.Errorf("task %s: %s: %w", st.ID, what, err)
+		}
+		lastErr = err
+	}
+	return st, false, fmt.Errorf("task %s: %s: %w", st.ID, what, lastErr)
+}
+
+// noteFor builds the durable inbox entry one task fact leaves behind, with the
+// identity that makes recording it twice a no-op.
 //
 // The identity is the note's whole content, so asking the same question or
 // reporting the same progress twice writes nothing new while a different one
-// always notifies the primary. It deliberately shares the recipe the dispatch
-// step machine uses for its own notes: one kind, one task and one text are one
+// always notifies the primary. It deliberately shares one recipe with the
+// dispatch step machine's own notes: one kind, one task and one text are one
 // durable entry, whichever path wrote it first.
-func (c *Coordinator) note(ctx context.Context, st task.Task, kind, summary, delivery string) (bool, error) {
-	if strings.TrimSpace(st.ProjectKey) == "" {
-		return false, nil
-	}
+func (c *Coordinator) noteFor(st task.Task, kind, summary, delivery string) task.Inbox {
 	sum := sha256.Sum256([]byte(kind + "\x00" + st.ID + "\x00" + summary))
-	inserted, err := c.store.AddInbox(ctx, task.Inbox{
+	return task.Inbox{
 		ID:         kind + ":" + st.ID + ":" + hex.EncodeToString(sum[:6]),
 		ProjectKey: st.ProjectKey,
 		TaskID:     st.ID,
 		Kind:       kind,
 		Summary:    summary,
 		Delivery:   delivery,
-	})
+	}
+}
+
+// note records one deduplicated inbox entry for a task's project and reports
+// whether it was new, for the facts that carry no transactional partner.
+func (c *Coordinator) note(ctx context.Context, st task.Task, kind, summary, delivery string) (bool, error) {
+	if strings.TrimSpace(st.ProjectKey) == "" {
+		return false, nil
+	}
+	inserted, err := c.store.AddInbox(ctx, c.noteFor(st, kind, summary, delivery))
 	if err != nil {
 		return false, fmt.Errorf("record the %s note for task %s: %w", kind, st.ID, err)
 	}

@@ -312,6 +312,111 @@ func TestQuestionAndProgressNeverCompleteATask(t *testing.T) {
 	}
 }
 
+// stateDB opens the fixture's state database for reading and writing, the way a
+// migration or an operator tool would. It is what lets a test make one table
+// refuse a write while the rest of the database stays usable.
+func (f *reportFixture) stateDB(t *testing.T) *sql.DB {
+	t.Helper()
+	path := filepath.Join(f.stateDir, "orchestrator.sqlite")
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path))
+	if err != nil {
+		t.Fatalf("open state: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	return db
+}
+
+// poisonInbox makes every insert into the durable inbox fail, the way a locked or
+// read-only database does, so a test can prove that a fact never lands without the
+// note that announces it.
+func (f *reportFixture) poisonInbox(t *testing.T) {
+	t.Helper()
+	if _, err := f.stateDB(t).ExecContext(context.Background(),
+		`CREATE TRIGGER refuse_inbox BEFORE INSERT ON inbox BEGIN SELECT RAISE(ABORT, 'inbox is not writable'); END`); err != nil {
+		t.Fatalf("install the inbox trigger: %v", err)
+	}
+}
+
+func (f *reportFixture) healInbox(t *testing.T) {
+	t.Helper()
+	if _, err := f.stateDB(t).ExecContext(context.Background(), `DROP TRIGGER refuse_inbox`); err != nil {
+		t.Fatalf("remove the inbox trigger: %v", err)
+	}
+}
+
+func TestReportIsDurableOnlyTogetherWithItsNote(t *testing.T) {
+	f := newReportFixture(t)
+	_, worker := f.seed()
+	ctx := context.Background()
+
+	// The durable inbox cannot be written at all: a report that would show the
+	// task ready for review while nobody was told must not land either, and the
+	// revision and attention it touches must be exactly what they were.
+	f.poisonInbox(t)
+	before := f.reload(worker.ID)
+	if _, err := f.coord.FinalReport(ctx, worker.LaunchPaneID, f.completeReport(worker)); err == nil {
+		t.Fatal("FinalReport succeeded although its note could not be written")
+	}
+	after := f.reload(worker.ID)
+	if after.Report != nil {
+		t.Errorf("the report landed without the note that announces it: %+v", after.Report)
+	}
+	if after.Revision != before.Revision {
+		t.Errorf("a report that could not be announced wrote revision %d (was %d)", after.Revision, before.Revision)
+	}
+	if after.Attention != before.Attention || after.Disposition != before.Disposition {
+		t.Errorf("a failed report changed the task: attention %q, disposition %q", after.Attention, after.Disposition)
+	}
+	if stage := task.StageOf(after); stage != task.Running {
+		t.Errorf("stage after a failed report = %q, want %q", stage, task.Running)
+	}
+	if got := len(f.notes("result")); got != 0 {
+		t.Errorf("a failed report left %d result notes", got)
+	}
+
+	// The same report whose pending question is waiting to be cleared must roll
+	// the cleared attention back too: half a transaction would silently drop the
+	// question. The question is recorded while the inbox is writable, so the only
+	// failing write is the report's own pair.
+	f.healInbox(t)
+	if _, err := f.coord.Question(ctx, worker.LaunchPaneID, "Which branch should I target?"); err != nil {
+		t.Fatalf("Question: %v", err)
+	}
+	asked := f.reload(worker.ID)
+	f.poisonInbox(t)
+	if _, err := f.coord.FinalReport(ctx, worker.LaunchPaneID, f.completeReport(worker)); err == nil {
+		t.Fatal("FinalReport succeeded although its note could not be written")
+	}
+	rolledBack := f.reload(worker.ID)
+	if rolledBack.Attention != asked.Attention {
+		t.Errorf("a failed report cleared the pending question: %q, want %q", rolledBack.Attention, asked.Attention)
+	}
+	if rolledBack.Report != nil || rolledBack.Revision != asked.Revision {
+		t.Errorf("a failed report left a partial write: %+v", rolledBack)
+	}
+
+	// With the inbox writable again, that same report lands with its note, and
+	// the question it answers is cleared in the same write.
+	f.healInbox(t)
+	result, err := f.coord.FinalReport(ctx, worker.LaunchPaneID, f.completeReport(worker))
+	if err != nil {
+		t.Fatalf("FinalReport after the inbox recovered: %v", err)
+	}
+	if result.Duplicate {
+		t.Error("the report was reported as a duplicate although it never landed")
+	}
+	recorded := f.reload(worker.ID)
+	if recorded.Report == nil || recorded.Attention != "" {
+		t.Fatalf("the recovered report is not complete: %+v", recorded)
+	}
+	if stage := task.StageOf(recorded); stage != task.ReadyForReview {
+		t.Errorf("stage after the recovered report = %q, want %q", stage, task.ReadyForReview)
+	}
+	if got := len(f.notes("result")); got != 1 {
+		t.Errorf("result notes after the recovered report = %d, want 1", got)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // the final report
 // ---------------------------------------------------------------------------

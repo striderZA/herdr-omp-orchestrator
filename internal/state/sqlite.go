@@ -259,6 +259,62 @@ func (s *Store) UpdateTask(ctx context.Context, id string, expectedRevision int6
 	}
 	defer tx.rollback()
 
+	next, err := updateTask(ctx, tx, id, expectedRevision, mutate)
+	if err != nil {
+		return task.Task{}, err
+	}
+	if err := tx.commit("update task " + id); err != nil {
+		return task.Task{}, err
+	}
+	return next, nil
+}
+
+// UpdateTaskWithNote applies mutate to a task and stores one deduplicated inbox
+// note in the same transaction: either both are durable or neither is.
+//
+// Some facts are only meaningful together. A worker's final report and the note
+// that announces it are one fact, and a store that could record the report
+// without the note would show a task ready for review that the primary was never
+// told about. The task side keeps every guarantee UpdateTask gives (revision
+// compare-and-swap, immutable id and project key, pane exclusivity) and the note
+// keeps AddInbox's deduplication: repeating an existing note changes nothing and
+// reports false.
+func (s *Store) UpdateTaskWithNote(
+	ctx context.Context,
+	id string,
+	expectedRevision int64,
+	mutate func(*task.Task) error,
+	note task.Inbox,
+) (task.Task, bool, error) {
+	if mutate == nil {
+		return task.Task{}, false, fmt.Errorf("%w: nil mutation for task %q", ErrInvalid, id)
+	}
+	if note.ID == "" {
+		return task.Task{}, false, fmt.Errorf("%w: inbox id is required", ErrInvalid)
+	}
+	tx, err := s.begin(ctx, "update task "+id+" with note "+note.ID)
+	if err != nil {
+		return task.Task{}, false, err
+	}
+	defer tx.rollback()
+
+	next, err := updateTask(ctx, tx, id, expectedRevision, mutate)
+	if err != nil {
+		return task.Task{}, false, err
+	}
+	inserted, err := addInbox(ctx, tx, note)
+	if err != nil {
+		return task.Task{}, false, err
+	}
+	if err := tx.commit("update task " + id + " with note " + note.ID); err != nil {
+		return task.Task{}, false, err
+	}
+	return next, inserted, nil
+}
+
+// updateTask applies one compare-and-swap update inside tx, leaving the commit to
+// its caller so a step can be part of a larger transaction.
+func updateTask(ctx context.Context, tx *tx, id string, expectedRevision int64, mutate func(*task.Task) error) (task.Task, error) {
 	current, err := scanTask(tx.QueryRowContext(ctx, `SELECT data FROM tasks WHERE id = ?`, id), "task "+id)
 	if err != nil {
 		return task.Task{}, err
@@ -296,9 +352,6 @@ func (s *Store) UpdateTask(ctx context.Context, id string, expectedRevision int6
 		return task.Task{}, fmt.Errorf("update task %q: %w", id, err)
 	}
 	if err := requireOneRow(res, ErrConflict, "update task "+id); err != nil {
-		return task.Task{}, err
-	}
-	if err := tx.commit("update task " + id); err != nil {
 		return task.Task{}, err
 	}
 	return next, nil
@@ -506,10 +559,24 @@ func (s *Store) readyRecord(ctx context.Context, launchPaneID string) (readyReco
 
 // AddInbox stores a note once, reporting whether it was new.
 func (s *Store) AddInbox(ctx context.Context, in task.Inbox) (bool, error) {
+	return addInbox(ctx, s.db, in)
+}
+
+// execer is the write surface shared by the database handle and one write
+// transaction, so a helper can be used on its own or as part of a larger
+// transaction without a second implementation of the same statement.
+type execer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+// addInbox stores one deduplicated note through q and reports whether it was
+// new. The note's id is the identity: an insert that would only repeat it
+// changes nothing.
+func addInbox(ctx context.Context, q execer, in task.Inbox) (bool, error) {
 	if in.ID == "" {
 		return false, fmt.Errorf("%w: inbox id is required", ErrInvalid)
 	}
-	res, err := s.db.ExecContext(ctx, `
+	res, err := q.ExecContext(ctx, `
 		INSERT INTO inbox (id, project_key, task_id, kind, summary, delivery)
 		VALUES (?, ?, ?, ?, ?, ?)
 		ON CONFLICT (id) DO NOTHING`,

@@ -323,6 +323,135 @@ func TestStoreInboxDeduplicates(t *testing.T) {
 	}
 }
 
+// rawState opens the state database the way a migration or an operator tool
+// would: a second handle on the same file, which is what lets a test make one
+// table refuse a write while everything else stays usable.
+func rawState(t *testing.T, dir string) *sql.DB {
+	t.Helper()
+	path := filepath.Join(dir, "orchestrator.sqlite")
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path))
+	if err != nil {
+		t.Fatalf("sql.Open(%q): %v", path, err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close raw handle: %v", err)
+		}
+	})
+	return db
+}
+
+// countNotes reports how many durable notes of one kind exist.
+func countNotes(t *testing.T, db *sql.DB, kind string) int {
+	t.Helper()
+	var count int
+	if err := db.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM inbox WHERE kind = ?`, kind).Scan(&count); err != nil {
+		t.Fatalf("count %s notes: %v", kind, err)
+	}
+	return count
+}
+
+// TestUpdateTaskWithNoteIsOneTransaction pins the store primitive a worker's
+// final report stands on: the task's compare-and-swap update and the note that
+// announces it are one transaction, so a task can never be recorded as ready for
+// review without the primary being told about it.
+func TestUpdateTaskWithNoteIsOneTransaction(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	s := open(t, dir)
+	if err := s.CreateTask(ctx, seedTask("task-1")); err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	before, err := s.Task(ctx, "task-1")
+	if err != nil {
+		t.Fatalf("Task: %v", err)
+	}
+	note := task.Inbox{
+		ID: "result:task-1", ProjectKey: before.ProjectKey, TaskID: before.ID,
+		Kind: "result", Summary: "done", Delivery: "worker result",
+	}
+	record := func(next *task.Task) error {
+		next.Report = &task.Report{Kind: "result", Summary: "done", Branch: before.Branch}
+		return nil
+	}
+
+	raw := rawState(t, dir)
+	trigger := func(query string) {
+		t.Helper()
+		if _, err := raw.ExecContext(ctx, query); err != nil {
+			t.Fatalf("exec %q: %v", query, err)
+		}
+	}
+	trigger(`CREATE TRIGGER refuse_inbox BEFORE INSERT ON inbox BEGIN SELECT RAISE(ABORT, 'inbox is not writable'); END`)
+
+	// The note cannot be written, so the update must not be either.
+	if _, _, err := s.UpdateTaskWithNote(ctx, "task-1", before.Revision, record, note); err == nil {
+		t.Fatal("UpdateTaskWithNote succeeded although its note could not be written")
+	}
+	rolledBack, err := s.Task(ctx, "task-1")
+	if err != nil {
+		t.Fatalf("Task after the refused update: %v", err)
+	}
+	if rolledBack.Report != nil || rolledBack.Revision != before.Revision {
+		t.Errorf("a refused update left a partial write: %+v", rolledBack)
+	}
+	if got := countNotes(t, raw, "result"); got != 0 {
+		t.Errorf("a refused update left %d result notes", got)
+	}
+
+	trigger(`DROP TRIGGER refuse_inbox`)
+
+	// Together they land, and both are reported as new.
+	updated, inserted, err := s.UpdateTaskWithNote(ctx, "task-1", before.Revision, record, note)
+	if err != nil {
+		t.Fatalf("UpdateTaskWithNote: %v", err)
+	}
+	if !inserted {
+		t.Error("the first note was not reported as new")
+	}
+	if updated.Report == nil || updated.Revision != before.Revision+1 {
+		t.Errorf("updated task = %+v, want the report on revision %d", updated, before.Revision+1)
+	}
+	if got := countNotes(t, raw, "result"); got != 1 {
+		t.Errorf("result notes = %d, want 1", got)
+	}
+
+	// Repeating the note is deduplicated: the task side still applies, and the
+	// duplicate is reported so a caller can answer "nothing new".
+	again, reinserted, err := s.UpdateTaskWithNote(ctx, "task-1", updated.Revision, func(*task.Task) error { return nil }, note)
+	if err != nil {
+		t.Fatalf("UpdateTaskWithNote (repeat): %v", err)
+	}
+	if reinserted {
+		t.Error("a repeated note was reported as new")
+	}
+	if again.Revision != updated.Revision+1 {
+		t.Errorf("revision = %d, want %d", again.Revision, updated.Revision+1)
+	}
+	if got := countNotes(t, raw, "result"); got != 1 {
+		t.Errorf("result notes after the repeat = %d, want 1", got)
+	}
+
+	// A stale revision is still a conflict, and neither side is written.
+	if _, _, err := s.UpdateTaskWithNote(ctx, "task-1", before.Revision, record, task.Inbox{
+		ID: "result:task-1:stale", ProjectKey: before.ProjectKey, TaskID: before.ID,
+		Kind: "result", Summary: "stale", Delivery: "worker result",
+	}); !errors.Is(err, state.ErrConflict) {
+		t.Fatalf("stale revision err = %v, want ErrConflict", err)
+	}
+	if got := countNotes(t, raw, "result"); got != 1 {
+		t.Errorf("a conflicted update wrote a note: %d result notes", got)
+	}
+
+	// An empty note identity is refused before anything is written.
+	if _, _, err := s.UpdateTaskWithNote(ctx, "task-1", again.Revision, record, task.Inbox{}); !errors.Is(err, state.ErrInvalid) {
+		t.Errorf("empty note id err = %v, want ErrInvalid", err)
+	}
+	if _, err := s.Task(ctx, "task-1"); err != nil {
+		t.Fatalf("Task after the refused calls: %v", err)
+	}
+}
+
 func TestStoreReadyHandshake(t *testing.T) {
 	ctx := context.Background()
 	s := open(t, t.TempDir())
