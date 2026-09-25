@@ -1026,7 +1026,14 @@ function Invoke-BridgeAs {
     )
     $handshake = Get-ReadySession -LaunchPaneId $LaunchPaneId
     if (-not $handshake) {
-        return [pscustomobject]@{ Ok = $false; Error = [pscustomobject]@{ code = 'no_handshake'; message = "no ready_sessions row for launch pane $LaunchPaneId" }; Result = $null; Invocation = $null }
+        return [pscustomobject]@{
+            Envelope   = $false
+            Ok         = $false
+            Result     = $null
+            Error      = [pscustomobject]@{ code = 'no_handshake'; message = "no ready_sessions row for launch pane $LaunchPaneId" }
+            Raw        = ''
+            Invocation = $null
+        }
     }
     $body = @{
         version          = 1
@@ -1058,14 +1065,30 @@ function Invoke-BridgeAs {
             Invocation = $result
         }
     }
-    # Envelopes are read with safe defaults: a v1 answer always carries ok, but a
-    # malformed or truncated one must not raise under Set-StrictMode.
+    # Envelopes are read with safe defaults and validated structurally: parseable
+    # JSON that is not a v1 envelope ({} or an unrelated object) must NOT be
+    # reported as an envelope, or the assertions below would pass on garbage.
     $ok = (Get-Flag $answer 'ok')
+    $resultField = Get-Field $answer 'result' $null
+    $errorField = Get-Field $answer 'error' $null
+    $hasOk = ($null -ne $answer.PSObject.Properties['ok'])
+    $hasError = ($null -ne $errorField) -and ([string](Get-Field $errorField 'code') -ne '')
+    $isEnvelope = ($hasOk -and (($ok -and ($null -ne $resultField)) -or ((-not $ok) -and $hasError)))
+    if (-not $isEnvelope) {
+        return [pscustomobject]@{
+            Envelope   = $false
+            Ok         = $false
+            Result     = $null
+            Error      = [pscustomobject]@{ code = 'bridge_protocol'; message = 'the bridge answer is not a v1 envelope' }
+            Raw        = [string]$result.Stdout
+            Invocation = $result
+        }
+    }
     return [pscustomobject]@{
         Envelope   = $true
         Ok         = $ok
-        Result     = Get-Field $answer 'result' $null
-        Error      = Get-Field $answer 'error' $null
+        Result     = $resultField
+        Error      = $errorField
         Raw        = [string]$result.Stdout
         Invocation = $result
     }
@@ -1123,6 +1146,10 @@ function Get-FocusProjection {
     foreach ($a in @($agents | Sort-Object { [string](Get-Field $_ 'pane_id') })) {
         [void]$parts.Add("a:$([string](Get-Field $a 'pane_id')):$([string](Get-Field $a 'agent')):$(ConvertTo-NormalPath ([string](Get-Field $a 'cwd')))")
     }
+    # The focused identities are part of the projection: without them a phase could
+    # leave focus somewhere else and still compare equal.
+    [void]$parts.Add("fw:$([string](Get-Field $Snapshot 'focused_workspace_id'))")
+    [void]$parts.Add("fp:$([string](Get-Field $Snapshot 'focused_pane_id'))")
     return ($parts -join ';')
 }
 
@@ -1556,6 +1583,30 @@ function Invoke-TempRepo {
 # Phase 6: the explicit setup action installs the extension
 # ---------------------------------------------------------------------------
 
+function Get-ExpectedExtensionContent {
+    <#
+        The exact bytes setup should install: the plugin's canonical extension
+        source with the three placeholders replaced by JSON-escaped absolute paths
+        (the same substitution internal/setup performs). Comparing the installed
+        file against this proves it is the CURRENT source, not merely a file that
+        happens to carry the marker and the right three paths.
+    #>
+    param([Parameter(Mandatory)][string]$Executable, [Parameter(Mandatory)][string]$StateDir, [Parameter(Mandatory)][string]$HerdrBinary)
+    $sourcePath = Join-Path $script:RepoRoot 'omp\herdr-orchestrator.ts'
+    # The assertion record must not leak into this function's output.
+    [void](Assert-True -Id 'U2.4a' -What 'the canonical extension source exists in the plugin root' -Condition (Test-Path -LiteralPath $sourcePath) -Evidence $sourcePath)
+    if (-not (Test-Path -LiteralPath $sourcePath)) { return $null }
+    $source = Get-Content -LiteralPath $sourcePath -Raw
+    foreach ($pair in @(
+            @('@@OMP_ORCH_EXECUTABLE@@', $Executable),
+            @('@@OMP_ORCH_STATE_DIR@@', $StateDir),
+            @('@@OMP_ORCH_HERDR_BINARY@@', $HerdrBinary))) {
+        $escaped = (ConvertTo-Json -Compress -InputObject ([string]$pair[1])).Trim('"')
+        $source = $source.Replace([string]$pair[0], $escaped)
+    }
+    return ($source -replace "`r`n", "`n")
+}
+
 function Get-ExtensionConstants {
     param([string]$Path)
     $text = Get-Content -LiteralPath $Path -Raw
@@ -1634,6 +1685,16 @@ function Invoke-SetupAction {
         Assert-True -Id 'U4.2d' -What 'the repeated setup answered ok=true' -Condition (Get-Flag $secondOut.Payload 'ok') -Evidence (Protect-Text (Get-Json $secondOut.Payload) 300)
     }
     Assert-Equal -Id 'U4.2e' -What 'setup is idempotent: a second run leaves the extension byte-identical' -Expected $firstHash -Actual (Get-FileHashSafe $reported)
+    # Currentness: the installed bytes must equal what this build renders from its
+    # own source, so a stale or altered body with the marker and the right paths
+    # cannot pass.
+    $expectedContent = Get-ExpectedExtensionContent -Executable (Get-PluginExe) -StateDir $script:StateDir -HerdrBinary $script:HerdrExe
+    if ($null -ne $expectedContent) {
+        $installedContent = (Get-Content -LiteralPath $reported -Raw) -replace "`r`n", "`n"
+        Assert-True -Id 'U4.2f' -What 'the installed extension is exactly what this build renders from its canonical source' `
+            -Condition ($installedContent -ceq $expectedContent) `
+            -Evidence ("installed_bytes={0} expected_bytes={1}" -f $installedContent.Length, $expectedContent.Length)
+    }
     $script:ExtensionFileHashAfter = Get-FileHashSafe $reported
 
     $status = Invoke-Herdr -Arguments @('integration', 'status') -NoSessionScope
@@ -2450,7 +2511,10 @@ function Invoke-Board {
     Write-Step 'Phase 15: the read-only board renders the tasks'
     $tasksBefore = @(Get-ProjectTasks -Key (Get-Field $script:Project 'Key'))
     $jsonBefore = (@($tasksBefore | Sort-Object { Get-Field $_ 'id' } | ForEach-Object { Get-Json $_ }) -join '|')
-    $focusBefore = Get-FocusProjection -Snapshot (Get-Snapshot)
+    $focusSnapshotBefore = Get-Snapshot
+    $focusBefore = Get-FocusProjection -Snapshot $focusSnapshotBefore
+    $focusWorkspaceBefore = [string](Get-Field $focusSnapshotBefore 'focused_workspace_id')
+    if ([string]::IsNullOrWhiteSpace($focusWorkspaceBefore)) { $focusWorkspaceBefore = $script:PrimaryWorkspace }
 
     # The registered `board` action is what a user invokes, and it is the route
     # that knows the bound workspace: `plugin pane open --no-focus` cannot place an
@@ -2530,15 +2594,17 @@ function Invoke-Board {
     $gone = Invoke-Herdr -Arguments @('pane', 'get', $boardPane) -TimeoutSeconds 60
     Assert-True -Id 'A5.2' -What 'the board pane is gone' -Condition ($gone.ExitCode -ne 0) -Evidence (Protect-Text $gone.Stderr 200)
     [void]$script:CreatedPanes.Remove($boardPane)
-    # Put the session back where the phase found it (the board action legitimately
-    # moved focus to its own pane), then assert the restoration.
-    [void](Invoke-Herdr -Arguments @('workspace', 'focus', $script:PrimaryWorkspace) -TimeoutSeconds 60)
+    # Put the session back exactly where the phase found it (the board action
+    # legitimately moved focus to its own pane): the captured focused workspace is
+    # restored, and the whole projection - which now includes the focused workspace
+    # and pane ids - must match the pre-phase one.
+    [void](Invoke-Herdr -Arguments @('workspace', 'focus', $focusWorkspaceBefore) -TimeoutSeconds 60)
     $restored = Wait-Until -TimeoutSeconds 60 -IntervalSeconds 2 -What 'focus restored' -Probe {
         $snap = Get-Snapshot
-        if ([string](Get-Field $snap 'focused_workspace_id') -ne $script:PrimaryWorkspace) { return $null }
+        if ([string](Get-Field $snap 'focused_workspace_id') -ne $focusWorkspaceBefore) { return $null }
         return (Get-FocusProjection -Snapshot $snap)
     }
-    Assert-True -Id 'A5.3' -What 'the session focus is back on the bound workspace when the board phase ends' `
+    Assert-True -Id 'A5.3' -What 'the session focus (workspace and pane) is exactly what it was before the board phase' `
         -Condition ($restored.Ok -and $restored.Value -ceq $focusBefore) -Evidence ("restored=[" + (Protect-Text ([string]$restored.Value) 400) + "] before=[" + (Protect-Text $focusBefore 400) + "]")
 }
 
