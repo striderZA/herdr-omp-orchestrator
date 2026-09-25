@@ -1171,29 +1171,6 @@ func (c *Coordinator) announcedWorker(ctx context.Context, st task.Task) (task.A
 	return announced, nil
 }
 
-// sessionMatchesRef compares a recorded session value against the reference Herdr
-// reports, in the form that reference uses.
-//
-// It cannot bridge the two native forms: it knows only the reference, so a record
-// that kept the announced id is refused when Herdr reports the session file for
-// the same session. Callers with an announcement must use Announcement.Proves,
-// which proves both identities through the handshake. This remains for callers
-// that hold no announcement while they are migrated.
-func sessionMatchesRef(recorded string, ref task.SessionRef) bool {
-	recorded = strings.TrimSpace(recorded)
-	if recorded == "" {
-		return false
-	}
-	announced, ok := task.AnnouncementOfRef(ref)
-	if !ok {
-		return false
-	}
-	if announced.ID != "" {
-		return task.SameSessionReference(task.SessionKindID, recorded, announced.ID)
-	}
-	return task.SameSessionReference(task.SessionKindPath, recorded, announced.File)
-}
-
 // isBlocked reports whether a live agent is showing a full-screen dialog and
 // waiting for keys.
 func isBlocked(view agentView) bool {
