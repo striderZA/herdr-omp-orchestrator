@@ -186,32 +186,16 @@ func openCoordinator(env map[string]string) (*coord.Coordinator, func(), error) 
 	return coordinator, func() { _ = store.Close() }, nil
 }
 
-// bridgeOps wires the coordinator's dispatch operation into the bridge, which
-// authorizes the caller before calling it.
+// bridgeOps wires the coordinator's operations into the bridge, which authorizes
+// the caller before any of them runs. A coordinator that could not be opened is
+// answered with one code for every method, so the failure names what is missing
+// instead of pretending the method does not exist.
 func bridgeOps(env map[string]string) (bridge.Ops, func(), error) {
 	coordinator, closeCoordinator, err := openCoordinator(env)
 	if err != nil {
-		cause := err
-		return bridge.Ops{
-			Dispatch: func(context.Context, bridge.Principal, json.RawMessage) (any, error) {
-				return nil, &bridge.Error{Code: "herdr_unavailable", Message: "the coordinator is unavailable: " + cause.Error()}
-			},
-		}, func() {}, err
+		return bridge.UnavailableOps(err), func() {}, err
 	}
-	ops := bridge.Ops{
-		Dispatch: func(ctx context.Context, principal bridge.Principal, params json.RawMessage) (any, error) {
-			var request coord.DispatchParams
-			if err := json.Unmarshal(params, &request); err != nil {
-				return nil, &bridge.Error{Code: "bad_params", Message: "the dispatch request is not a JSON object"}
-			}
-			result, err := coordinator.DispatchFor(ctx, principal.ProjectKey, request)
-			if err != nil {
-				return nil, &bridge.Error{Code: coordCode(err), Message: err.Error()}
-			}
-			return result, nil
-		},
-	}
-	return ops, closeCoordinator, nil
+	return bridge.CoordinatorOps(coordinator), closeCoordinator, nil
 }
 
 // herdrBinary resolves the Herdr executable path for this route.

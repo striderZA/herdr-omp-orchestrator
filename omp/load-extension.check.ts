@@ -18,7 +18,12 @@
 // Run it with the OMP builder resolvable, e.g.
 //   NODE_PATH=%USERPROFILE%\node_modules bun omp/load-extension.check.ts
 // or point OMP_TYPED_BUILDER straight at the zod module file.
-import extension from "./herdr-orchestrator.ts";
+import extension, {
+  cleanupConfirmRequest,
+  confirmThen,
+  dialogConfirmRequest,
+  uiGate,
+} from "./herdr-orchestrator.ts";
 
 // OMP's builder returns a *callable* schema (ArkType-compatible validation from
 // @oh-my-pi/omptype), not zod's plain object: it has .parse() and no .shape.
@@ -127,9 +132,19 @@ try {
 // --- registrations ----------------------------------------------------------
 
 const names = tools.map((tool) => tool.name).sort();
+const wantNames = [
+  "orch_answer",
+  "orch_approve_dialog",
+  "orch_cleanup",
+  "orch_dispatch",
+  "orch_progress",
+  "orch_question",
+  "orch_report",
+  "orch_review",
+];
 check(
-  names.join(",") === "orch_dispatch,orch_report",
-  `registered tools are ${JSON.stringify(names)}, want orch_dispatch and orch_report`,
+  names.join(",") === wantNames.join(","),
+  `registered tools are ${JSON.stringify(names)}, want ${JSON.stringify(wantNames)}`,
 );
 check(events.includes("session_start"), "the extension does not listen to session_start");
 check(events.includes("before_agent_start"), "the extension does not listen to before_agent_start");
@@ -266,7 +281,7 @@ if (!report) {
     branch: "orch/abc",
     evidence: ["commit abc"],
     checks: ["go test ./..."],
-    risk: "",
+    risk: "none: no new path is reachable",
   };
   const parsed = tryParse(schema, valid);
   if (!parsed.ok) {
@@ -284,14 +299,196 @@ if (!report) {
     );
   }
   check(
-    !tryParse(schema, { kind: "result", summary: "done", branch: "orch/abc", evidence: ["commit abc"], risk: "" }).ok,
+    !tryParse(schema, { kind: "result", summary: "done", branch: "orch/abc", evidence: ["commit abc"], risk: "none" }).ok,
     "orch_report accepted a final report without checks",
   );
   check(
     !tryParse(schema, { ...valid, kind: "partial" }).ok,
     "orch_report accepted kind partial; only kind result is final",
   );
+  // The schema requires the field; a whitespace-only risk is what the
+  // coordinator's own trim refuses on the way in.
+  check(
+    !tryParse(schema, { ...valid, risk: "" }).ok,
+    "orch_report accepted a report without a stated risk",
+  );
+  check(
+    !tryParse(schema, { ...valid, evidence: [] }).ok,
+    "orch_report accepted a report without changed-file/commit evidence",
+  );
 }
+
+// --- the rest of the typed tool parameters ---------------------------------
+
+// Every tool the two roles use has to build under OMP's builder and accept the
+// call the model is told to make; a missing or too-loose schema is a load
+// failure waiting for the user's machine.
+const toolCalls: { name: string; params: Record<string, unknown>; bad: Record<string, unknown> }[] = [
+  { name: "orch_progress", params: { summary: "ported the lexer" }, bad: { summary: "" } },
+  { name: "orch_question", params: { text: "Which branch should I target?" }, bad: { text: "" } },
+  { name: "orch_answer", params: { taskId: "orch_abc", text: "Keep the old API." }, bad: { taskId: "", text: "" } },
+  {
+    name: "orch_approve_dialog",
+    params: { taskId: "orch_abc", keys: ["1"] },
+    bad: { taskId: "orch_abc", keys: [] },
+  },
+  { name: "orch_review", params: { taskId: "orch_abc", disposition: "accepted" }, bad: { taskId: "orch_abc" } },
+  { name: "orch_cleanup", params: { taskId: "orch_abc" }, bad: {} },
+];
+
+for (const call of toolCalls) {
+  const tool = tools.find((candidate) => candidate.name === call.name);
+  if (!tool) {
+    failures.push(`${call.name} was not registered`);
+    continue;
+  }
+  const schema = requireSchema(tool);
+  const rebuilt = rebuildSchema(schema);
+  check(rebuilt.ok, `${call.name} parameters cannot be rebuilt by OMP's builder${rebuilt.ok ? "" : `: ${rebuilt.error}`}`);
+  const parsed = tryParse(schema, call.params);
+  check(parsed.ok, `${call.name} rejected the call its description tells the model to make: ${parsed.ok ? "" : parsed.error}`);
+  check(
+    !tryParse(schema, call.bad).ok,
+    `${call.name} accepted an empty ${JSON.stringify(call.bad)}`,
+  );
+}
+
+// --- the user-confirmed gates ----------------------------------------------
+
+// A UI confirmation is the only thing that may send keys or remove a checkout.
+// These checks exercise the gate itself: no UI and a declined confirmation must
+// both return before the action runs, which is what makes "nothing was done"
+// true rather than hopeful.
+async function checkGates(): Promise<void> {
+  const workerDialog = {
+    taskId: "orch_abc",
+    publicPaneId: "w2:p1",
+    agentName: "orch_abc",
+    agentStatus: "blocked",
+    blocked: true,
+    dialog: "  1. Allow once\n  2. Deny",
+    digest: "0123456789abcdef",
+  };
+
+  const plan = dialogConfirmRequest(workerDialog, ["1"]);
+  if (!plan.ok) {
+    failures.push(`the dialog approval was refused for a blocked worker: ${plan.reason}`);
+  } else {
+    check(
+      plan.request.title === "Approve worker choice",
+      `the dialog confirmation is titled ${JSON.stringify(plan.request.title)}`,
+    );
+    check(
+      plan.request.message.includes(workerDialog.dialog) && plan.request.message.includes("Keys: 1"),
+      `the dialog confirmation does not name the dialog and its keys: ${JSON.stringify(plan.request.message)}`,
+    );
+  }
+  check(
+    !dialogConfirmRequest(workerDialog, []).ok,
+    "the dialog approval accepted an empty key list",
+  );
+  check(
+    !dialogConfirmRequest({ ...workerDialog, blocked: false }, ["1"]).ok,
+    "the dialog approval accepted a worker that is not blocked",
+  );
+  check(
+    !dialogConfirmRequest({ ...workerDialog, digest: "" }, ["1"]).ok,
+    "the dialog approval accepted a dialog with no digest",
+  );
+
+  const checkout = {
+    taskId: "orch_abc",
+    branch: "orch/abc",
+    path: "C:/worktrees/orch-abc",
+    workspaceId: "w7",
+    reviewed: true,
+    clean: true,
+    liveWorker: false,
+    removable: true,
+    detail: "removes the checkout",
+  };
+  const removal = cleanupConfirmRequest(checkout);
+  if (!removal.ok) {
+    failures.push(`the removal was refused for a reviewed clean checkout: ${removal.reason}`);
+  } else {
+    check(
+      removal.request.title === "Remove worker checkout",
+      `the removal confirmation is titled ${JSON.stringify(removal.request.title)}`,
+    );
+    for (const named of [checkout.taskId, checkout.branch, checkout.path]) {
+      check(
+        removal.request.message.includes(named),
+        `the removal confirmation does not name ${named}: ${JSON.stringify(removal.request.message)}`,
+      );
+    }
+  }
+  check(!cleanupConfirmRequest({ ...checkout, reviewed: false }).ok, "the removal accepted an unreviewed task");
+  check(!cleanupConfirmRequest({ ...checkout, liveWorker: true }).ok, "the removal accepted a live worker");
+  check(!cleanupConfirmRequest({ ...checkout, clean: false, detail: "?? notes.txt" }).ok, "the removal accepted a dirty checkout");
+
+  // No UI: the action must not run at all.
+  let acted = 0;
+  const noUI = await confirmThen(
+    { hasUI: false, confirm: async () => true },
+    { title: "Remove worker checkout", message: "x" },
+    async () => {
+      acted++;
+      return "removed";
+    },
+  );
+  check(!noUI.ok, "the gate proceeded without an interactive UI");
+  check(acted === 0, "the gate ran the action without an interactive UI");
+
+  // A declined confirmation: the action must not run at all.
+  acted = 0;
+  const declined = await confirmThen(
+    { hasUI: true, confirm: async () => false },
+    { title: "Remove worker checkout", message: "x" },
+    async () => {
+      acted++;
+      return "removed";
+    },
+  );
+  check(!declined.ok, "the gate proceeded after the user declined");
+  check(acted === 0, "the gate ran the action after the user declined");
+
+  // A confirmation that throws is a refusal too, not a green light.
+  acted = 0;
+  const failed = await confirmThen(
+    {
+      hasUI: true,
+      confirm: async () => {
+        throw new Error("the dialog was abandoned");
+      },
+    },
+    { title: "Remove worker checkout", message: "x" },
+    async () => {
+      acted++;
+      return "removed";
+    },
+  );
+  check(!failed.ok, "the gate proceeded after the confirmation failed");
+  check(acted === 0, "the gate ran the action after the confirmation failed");
+
+  // An answered confirmation runs the action exactly once.
+  acted = 0;
+  const approved = await confirmThen(
+    { hasUI: true, confirm: async () => true },
+    { title: "Remove worker checkout", message: "x" },
+    async () => {
+      acted++;
+      return "removed";
+    },
+  );
+  check(approved.ok, "the gate refused an approved confirmation");
+  check(acted === 1, `the approved gate ran the action ${acted} times, want 1`);
+
+  // The adapter reads the context it was given, never a guess.
+  check(uiGate({ hasUI: false, ui: { confirm: async () => true } }).hasUI === false, "uiGate invented a UI");
+  check(uiGate({ hasUI: true, ui: { confirm: async () => true } }).hasUI === true, "uiGate dropped a UI");
+}
+
+await checkGates();
 
 if (failures.length > 0) {
   for (const failure of failures) console.error(`load check FAILED: ${failure}`);

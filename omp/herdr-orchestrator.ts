@@ -108,6 +108,201 @@ function sessionIdentity(sessionManager: {
   };
 }
 
+// ---------------------------------------------------------------------------
+// user-confirmed gates
+// ---------------------------------------------------------------------------
+//
+// Two actions inject input or destroy a checkout, and neither may happen because
+// a model decided it should: the primary user confirms the exact keys of a
+// blocked worker's dialog, and confirms a specific checkout removal. Both go
+// through confirmThen, which checks the UI first and returns *before* invoking
+// the action when the confirmation is missing or declined — so a refusal can
+// never have a side effect to undo.
+
+interface ConfirmRequest {
+  title: string;
+  message: string;
+}
+
+// UIGate is the part of OMP's extension context these gates need: whether an
+// interactive UI exists at all, and the confirmation dialog itself.
+interface UIGate {
+  hasUI: boolean;
+  confirm(title: string, message: string): Promise<boolean>;
+}
+
+// uiGate adapts the tool execution context to a UIGate. It is exported so the
+// load check can exercise the gate with a stubbed context, and so the
+// "a session with no UI can confirm nothing" rule is testable rather than
+// assumed.
+export function uiGate(ctx: {
+  hasUI: boolean;
+  ui: { confirm(title: string, message: string): Promise<boolean> };
+}): UIGate {
+  return {
+    hasUI: ctx.hasUI === true,
+    confirm: (title: string, message: string) => ctx.ui.confirm(title, message),
+  };
+}
+
+// DialogPreview is what the bridge read off a worker's screen: the on-screen
+// dialog and the digest that ties an approval to exactly that text.
+interface DialogPreview {
+  taskId: string;
+  publicPaneId: string;
+  agentName: string;
+  agentStatus: string;
+  blocked: boolean;
+  dialog: string;
+  digest: string;
+}
+
+// CleanupPreview is what the bridge found about one checkout: which task, which
+// branch, which exact path, and whether removing it is allowed at all.
+interface CleanupPreview {
+  taskId: string;
+  branch: string;
+  path: string;
+  workspaceId: string;
+  reviewed: boolean;
+  clean: boolean;
+  liveWorker: boolean;
+  removable: boolean;
+  detail: string;
+}
+
+type ConfirmPlan = { ok: true; request: ConfirmRequest } | { ok: false; reason: string };
+type GateOutcome<T> = { ok: true; value: T } | { ok: false; reason: string };
+
+function previewText(value: unknown, key: string): string {
+  if (typeof value !== "object" || value === null || !(key in value)) return "";
+  const field = value[key];
+  return typeof field === "string" ? field : "";
+}
+
+function previewFlag(value: unknown, key: string): boolean {
+  if (typeof value !== "object" || value === null || !(key in value)) return false;
+  return value[key] === true;
+}
+
+function readDialogPreview(value: unknown): DialogPreview {
+  return {
+    taskId: previewText(value, "taskId"),
+    publicPaneId: previewText(value, "publicPaneId"),
+    agentName: previewText(value, "agentName"),
+    agentStatus: previewText(value, "agentStatus"),
+    blocked: previewFlag(value, "blocked"),
+    dialog: previewText(value, "dialog"),
+    digest: previewText(value, "digest"),
+  };
+}
+
+function readCleanupPreview(value: unknown): CleanupPreview {
+  return {
+    taskId: previewText(value, "taskId"),
+    branch: previewText(value, "branch"),
+    path: previewText(value, "path"),
+    workspaceId: previewText(value, "workspaceId"),
+    reviewed: previewFlag(value, "reviewed"),
+    clean: previewFlag(value, "clean"),
+    liveWorker: previewFlag(value, "liveWorker"),
+    removable: previewFlag(value, "removable"),
+    detail: previewText(value, "detail"),
+  };
+}
+
+// dialogConfirmRequest is the confirmation one blocked worker's dialog needs: the
+// exact on-screen text and the exact keys, so the user approves a specific choice
+// for a specific dialog rather than a blanket yes.
+export function dialogConfirmRequest(preview: DialogPreview, keys: string[]): ConfirmPlan {
+  if (keys.length === 0) {
+    return { ok: false, reason: "no keys were requested; an approval must name the exact keys" };
+  }
+  if (preview.digest.length === 0) {
+    return { ok: false, reason: "the dialog has no digest, so an approval cannot be tied to it" };
+  }
+  if (!preview.blocked) {
+    return {
+      ok: false,
+      reason: `task ${preview.taskId} is not blocked on a dialog (agent status ${
+        preview.agentStatus.length > 0 ? preview.agentStatus : "unknown"
+      }), so there is nothing to approve`,
+    };
+  }
+  return {
+    ok: true,
+    request: {
+      title: "Approve worker choice",
+      message: `Task ${preview.taskId}: ${preview.dialog}\nKeys: ${keys.join(" ")}`,
+    },
+  };
+}
+
+// cleanupConfirmRequest is the confirmation one checkout removal needs: the task,
+// the branch and the exact path, with the state the user is deciding on. It
+// refuses before the user is asked when the removal could not be honored anyway.
+export function cleanupConfirmRequest(preview: CleanupPreview): ConfirmPlan {
+  if (!preview.reviewed) {
+    return {
+      ok: false,
+      reason: `task ${preview.taskId} is not a reviewed done task, so its checkout may not be removed`,
+    };
+  }
+  if (preview.liveWorker) {
+    return { ok: false, reason: `the worker agent of task ${preview.taskId} is still running` };
+  }
+  if (!preview.clean) {
+    return { ok: false, reason: `the checkout ${preview.path} is not clean: ${preview.detail}` };
+  }
+  if (preview.path.length === 0 || preview.workspaceId.length === 0) {
+    return { ok: false, reason: `task ${preview.taskId} records no checkout that can be removed` };
+  }
+  return {
+    ok: true,
+    request: {
+      title: "Remove worker checkout",
+      message:
+        `Task ${preview.taskId}: remove ${preview.path} on branch ${preview.branch} ` +
+        `(workspace ${preview.workspaceId}). The branch is kept and the removal is never forced.`,
+    },
+  };
+}
+
+// confirmThen is the gate itself: without an interactive UI nothing happens, and
+// a failed or declined confirmation returns before act() is ever called.
+export async function confirmThen<T>(
+  gate: UIGate,
+  request: ConfirmRequest,
+  act: () => Promise<T>,
+): Promise<GateOutcome<T>> {
+  if (!gate.hasUI) {
+    return {
+      ok: false,
+      reason: "this session has no interactive UI, so the user could not confirm and nothing was done",
+    };
+  }
+  let approved: unknown;
+  try {
+    approved = await gate.confirm(request.title, request.message);
+  } catch (error) {
+    return { ok: false, reason: `the confirmation failed (${String(error)}), so nothing was done` };
+  }
+  if (approved !== true) {
+    return { ok: false, reason: "the user did not confirm, so nothing was done" };
+  }
+  return { ok: true, value: await act() };
+}
+
+// toolResult and toolRefusal are the two shapes these tools answer with: the
+// bridge's value, or the reason an action was not taken.
+function toolResult(value: unknown) {
+  return { content: [{ type: "text", text: JSON.stringify(value) }], details: value };
+}
+
+function toolRefusal(reason: string) {
+  return { content: [{ type: "text", text: reason }], isError: true };
+}
+
 // callBridge runs one versioned bridge command. The Herdr binary path and the
 // plugin state directory are handed to every child explicitly: an ordinary
 // Herdr-managed OMP pane is not guaranteed to inherit plugin-command
@@ -278,8 +473,11 @@ export default function (pi: ExtensionAPI) {
   if (process.env.HERDR_ENV !== "1" || !process.env.HERDR_PANE_ID) return;
 
   const z = pi.zod;
-  const primaryNames = ["orch_dispatch"];
-  const workerNames = ["orch_report"];
+  // A primary decides and relays; a worker reports. The tool sets are disjoint,
+  // and the bridge enforces the same split on every call, so an active tool is
+  // never the only thing standing between a role and the other role's actions.
+  const primaryNames = ["orch_dispatch", "orch_answer", "orch_approve_dialog", "orch_review", "orch_cleanup"];
+  const workerNames = ["orch_progress", "orch_question", "orch_report"];
   const ownNames = [...primaryNames, ...workerNames];
   let role: Role | null = null;
 
@@ -321,8 +519,8 @@ export default function (pi: ExtensionAPI) {
       systemPrompt: [
         ...event.systemPrompt,
         currentRole === "primary"
-          ? "You are the sole user liaison. Delegate independent bounded work with orch_dispatch, avoid editing paths reserved for workers, relay their questions to the user, and request a decision before integrating reports."
-          : "Work only in this assigned worktree. Use orch_question when blocked and orch_report with changed-file/commit evidence and checks when finished. Do not merge or remove the branch.",
+          ? "You are the sole user liaison. Delegate independent bounded work with orch_dispatch, avoid editing paths reserved for workers, and keep the user in the loop: relay an ordinary worker question with orch_answer, approve a blocked worker's exact dialog keys with orch_approve_dialog only after the user confirms them, record the user's decision on a reviewed report with orch_review, and remove a reviewed checkout with orch_cleanup only after the user confirms it. A worker's report is never a merge and never completes the task: only a disposition the user recorded does. Never approve keys or remove a checkout the user has not confirmed."
+          : "Work only in this assigned worktree. Use orch_progress for partial progress, orch_question when you are blocked and need the primary to ask the user, and orch_report with a complete result — summary, branch, changed-file/commit evidence, checks and a stated risk — when you are finished. Only the primary records the user's disposition for your result; do not merge and do not remove the branch or the checkout.",
       ],
     };
   });
@@ -352,21 +550,133 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    name: "orch_progress",
+    label: "Report progress",
+    defaultInactive: true,
+    description: "Report partial progress to the primary. This never completes the task.",
+    parameters: z.object({
+      summary: z.string().min(1).max(2000),
+    }),
+    async execute(_callId, params, signal, _update, ctx) {
+      const result = await callBridge("progress", params, sessionIdentity(ctx.sessionManager), signal);
+      return toolResult(result);
+    },
+  });
+
+  pi.registerTool({
+    name: "orch_question",
+    label: "Ask the primary",
+    defaultInactive: true,
+    description:
+      "Ask the primary (and the user) a question you cannot answer yourself. The task becomes Needs input until the answer is relayed back.",
+    parameters: z.object({
+      text: z.string().min(1).max(4000),
+    }),
+    async execute(_callId, params, signal, _update, ctx) {
+      const result = await callBridge("question", params, sessionIdentity(ctx.sessionManager), signal);
+      return toolResult(result);
+    },
+  });
+
+  pi.registerTool({
     name: "orch_report",
     label: "Report result",
     defaultInactive: true,
-    description: "Submit final evidence and checks for review.",
+    description:
+      "Submit a complete final result for review: summary, branch, changed-file/commit evidence, checks and a stated risk. The task becomes Ready for review; only the primary's recorded disposition completes it.",
     parameters: z.object({
       kind: z.literal("result"),
       summary: z.string().min(1).max(4000),
       branch: z.string().min(1),
-      evidence: z.array(z.string().min(1)).min(1),
-      checks: z.array(z.string().min(1)),
-      risk: z.string().max(4000),
+      evidence: z.array(z.string().min(1).max(512)).min(1),
+      checks: z.array(z.string().min(1).max(512)).min(1),
+      risk: z.string().min(1).max(4000),
     }),
     async execute(_callId, params, signal, _update, ctx) {
       const result = await callBridge("report", params, sessionIdentity(ctx.sessionManager), signal);
-      return { content: [{ type: "text", text: JSON.stringify(result) }], details: result };
+      return toolResult(result);
+    },
+  });
+
+  pi.registerTool({
+    name: "orch_answer",
+    label: "Answer worker",
+    defaultInactive: true,
+    description:
+      "Relay the user's answer to a worker that asked a question. The answer goes to that task's current public pane only.",
+    parameters: z.object({
+      taskId: z.string().min(1),
+      text: z.string().min(1).max(8000),
+    }),
+    async execute(_callId, params, signal, _update, ctx) {
+      const result = await callBridge("answer", params, sessionIdentity(ctx.sessionManager), signal);
+      return toolResult(result);
+    },
+  });
+
+  pi.registerTool({
+    name: "orch_approve_dialog",
+    label: "Approve worker choice",
+    defaultInactive: true,
+    description:
+      "Approve the exact keys of a blocked worker's full-screen dialog, after the user confirms those keys. Never a blanket approval, and never for a dialog the user has not seen.",
+    parameters: z.object({
+      taskId: z.string().min(1),
+      keys: z.array(z.string().min(1).max(64)).min(1).max(16),
+    }),
+    async execute(_callId, params, signal, _update, ctx) {
+      const identity = sessionIdentity(ctx.sessionManager);
+      const preview = readDialogPreview(await callBridge("dialog_preview", { taskId: params.taskId }, identity, signal));
+      const plan = dialogConfirmRequest(preview, params.keys);
+      if (!plan.ok) return toolRefusal(plan.reason);
+      const gated = await confirmThen(uiGate(ctx), plan.request, () =>
+        callBridge(
+          "approve_dialog",
+          { taskId: params.taskId, observedDigest: preview.digest, keys: params.keys },
+          identity,
+          signal,
+        ),
+      );
+      if (!gated.ok) return toolRefusal(gated.reason);
+      return toolResult(gated.value);
+    },
+  });
+
+  pi.registerTool({
+    name: "orch_review",
+    label: "Record decision",
+    defaultInactive: true,
+    description:
+      "Record the user's disposition for a reviewed worker result. This is the only thing that moves a task to Done; a report alone does not.",
+    parameters: z.object({
+      taskId: z.string().min(1),
+      disposition: z.string().min(1).max(200),
+    }),
+    async execute(_callId, params, signal, _update, ctx) {
+      const result = await callBridge("review", params, sessionIdentity(ctx.sessionManager), signal);
+      return toolResult(result);
+    },
+  });
+
+  pi.registerTool({
+    name: "orch_cleanup",
+    label: "Remove worker checkout",
+    defaultInactive: true,
+    description:
+      "Remove a reviewed worker's checkout after the user confirms it. The branch is kept, the removal is never forced, and a live worker or a dirty checkout is refused.",
+    parameters: z.object({
+      taskId: z.string().min(1),
+    }),
+    async execute(_callId, params, signal, _update, ctx) {
+      const identity = sessionIdentity(ctx.sessionManager);
+      const preview = readCleanupPreview(await callBridge("cleanup_preview", { taskId: params.taskId }, identity, signal));
+      const plan = cleanupConfirmRequest(preview);
+      if (!plan.ok) return toolRefusal(plan.reason);
+      const gated = await confirmThen(uiGate(ctx), plan.request, () =>
+        callBridge("cleanup", { taskId: params.taskId }, identity, signal),
+      );
+      if (!gated.ok) return toolRefusal(gated.reason);
+      return toolResult(gated.value);
     },
   });
 }

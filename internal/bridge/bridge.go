@@ -46,6 +46,7 @@ import (
 	"strings"
 	"time"
 
+	"herdr-omp-orchestrator/internal/coord"
 	"herdr-omp-orchestrator/internal/herdr"
 	"herdr-omp-orchestrator/internal/state"
 	"herdr-omp-orchestrator/internal/task"
@@ -69,6 +70,17 @@ const (
 	MethodReady    = "ready"
 	MethodDispatch = "dispatch"
 	MethodReport   = "report"
+	// The worker's own reports. They describe facts and never complete a task.
+	MethodProgress = "progress"
+	MethodQuestion = "question"
+	// The primary's decisions, and the two read-only previews they are shown
+	// before deciding.
+	MethodAnswer         = "answer"
+	MethodDialogPreview  = "dialog_preview"
+	MethodApproveDialog  = "approve_dialog"
+	MethodReview         = "review"
+	MethodCleanupPreview = "cleanup_preview"
+	MethodCleanup        = "cleanup"
 )
 
 // Reasons a resolve result is not bound. The extension only needs `bound`; the
@@ -149,10 +161,22 @@ type Principal struct {
 // Ops are the coordinator operations the bridge authorizes before calling. A
 // nil field means that operation is not wired yet: the bridge answers
 // `not_implemented` only *after* the caller has been fully authorized, so role
-// enforcement is never conditional on the wiring. Tasks 4 and 5 fill these in.
+// enforcement is never conditional on the wiring. Tasks 4 and 5 fill these in,
+// and CoordinatorOps builds the whole set from one coordinator.
 type Ops struct {
 	Dispatch func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
+	// Worker role.
 	Report   func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
+	Progress func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
+	Question func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
+	// Primary role. The two previews are read-only; the bridge authorizes them
+	// exactly like a mutation and their operation performs none.
+	Answer         func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
+	DialogPreview  func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
+	ApproveDialog  func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
+	Review         func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
+	CleanupPreview func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
+	Cleanup        func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
 }
 
 // Options carries what the caller observed before reading the request.
@@ -161,6 +185,202 @@ type Options struct {
 	// with the request body, which is the authority.
 	ArgvMethod string
 	Ops        Ops
+}
+
+// CoordinatorOps wires one coordinator's operations into the bridge. The bridge
+// authorizes a caller before any of them runs, so each operation receives the
+// verified principal and decodes only that method's own body: the project, the
+// task and the pane all come from persisted facts, and a caller that names one in
+// params changes nothing.
+//
+// Every coordinator failure is answered with a stable code, so the extension and
+// the plugin log classify it the same way.
+func CoordinatorOps(c *coord.Coordinator) Ops {
+	if c == nil {
+		return UnavailableOps(errors.New("no coordinator was opened"))
+	}
+	return Ops{
+		Dispatch: func(ctx context.Context, p Principal, params json.RawMessage) (any, error) {
+			var request coord.DispatchParams
+			if err := decodeParams(params, &request); err != nil {
+				return nil, err
+			}
+			result, err := c.DispatchFor(ctx, p.ProjectKey, request)
+			return result, coordError(err)
+		},
+		Report: func(ctx context.Context, p Principal, params json.RawMessage) (any, error) {
+			var request coord.ReportParams
+			if err := decodeParams(params, &request); err != nil {
+				return nil, err
+			}
+			result, err := c.FinalReport(ctx, p.LaunchPaneID, request.Report())
+			return result, coordError(err)
+		},
+		Progress: func(ctx context.Context, p Principal, params json.RawMessage) (any, error) {
+			var request coord.ProgressParams
+			if err := decodeParams(params, &request); err != nil {
+				return nil, err
+			}
+			result, err := c.Progress(ctx, p.LaunchPaneID, request.Summary)
+			return result, coordError(err)
+		},
+		Question: func(ctx context.Context, p Principal, params json.RawMessage) (any, error) {
+			var request coord.QuestionParams
+			if err := decodeParams(params, &request); err != nil {
+				return nil, err
+			}
+			result, err := c.Question(ctx, p.LaunchPaneID, request.Text)
+			return result, coordError(err)
+		},
+		Answer: func(ctx context.Context, p Principal, params json.RawMessage) (any, error) {
+			var request coord.AnswerParams
+			if err := decodeParams(params, &request); err != nil {
+				return nil, err
+			}
+			result, err := c.Answer(ctx, p.LaunchPaneID, request.TaskID, request.Text)
+			return result, coordError(err)
+		},
+		DialogPreview: func(ctx context.Context, p Principal, params json.RawMessage) (any, error) {
+			var request coord.CleanupParams
+			if err := decodeParams(params, &request); err != nil {
+				return nil, err
+			}
+			result, err := c.DialogPreview(ctx, p.LaunchPaneID, request.TaskID)
+			return result, coordError(err)
+		},
+		ApproveDialog: func(ctx context.Context, p Principal, params json.RawMessage) (any, error) {
+			var request coord.ApproveDialogParams
+			if err := decodeParams(params, &request); err != nil {
+				return nil, err
+			}
+			result, err := c.ApproveDialog(ctx, p.LaunchPaneID, request.TaskID, request.ObservedDigest, request.Keys)
+			return result, coordError(err)
+		},
+		Review: func(ctx context.Context, p Principal, params json.RawMessage) (any, error) {
+			var request coord.ReviewParams
+			if err := decodeParams(params, &request); err != nil {
+				return nil, err
+			}
+			result, err := c.Review(ctx, p.LaunchPaneID, request.TaskID, request.Disposition)
+			return result, coordError(err)
+		},
+		CleanupPreview: func(ctx context.Context, p Principal, params json.RawMessage) (any, error) {
+			var request coord.CleanupParams
+			if err := decodeParams(params, &request); err != nil {
+				return nil, err
+			}
+			result, err := c.CleanupPreview(ctx, p.LaunchPaneID, request.TaskID)
+			return result, coordError(err)
+		},
+		Cleanup: func(ctx context.Context, p Principal, params json.RawMessage) (any, error) {
+			var request coord.CleanupParams
+			if err := decodeParams(params, &request); err != nil {
+				return nil, err
+			}
+			result, err := c.Cleanup(ctx, p.LaunchPaneID, request.TaskID)
+			return result, coordError(err)
+		},
+	}
+}
+
+// UnavailableOps answers every method with one code. A build whose coordinator
+// could not be opened still authorizes its callers and then says exactly what is
+// missing, instead of claiming a method is not implemented.
+func UnavailableOps(cause error) Ops {
+	if cause == nil {
+		cause = errors.New("no reason was reported")
+	}
+	unavailable := func(context.Context, Principal, json.RawMessage) (any, error) {
+		return nil, &Error{Code: CodeHerdrUnavailable, Message: "the coordinator is unavailable: " + cause.Error()}
+	}
+	return Ops{
+		Dispatch:       unavailable,
+		Report:         unavailable,
+		Progress:       unavailable,
+		Question:       unavailable,
+		Answer:         unavailable,
+		DialogPreview:  unavailable,
+		ApproveDialog:  unavailable,
+		Review:         unavailable,
+		CleanupPreview: unavailable,
+		Cleanup:        unavailable,
+	}
+}
+
+// decodeParams reads one method's body. A body that is not the object the method
+// takes is refused with a specific code rather than being interpreted loosely.
+func decodeParams(params json.RawMessage, into any) error {
+	if trimmed := strings.TrimSpace(string(params)); trimmed == "" || trimmed == "null" {
+		params = json.RawMessage("{}")
+	}
+	if err := json.Unmarshal(params, into); err != nil {
+		return fail(CodeBadParams, "the request body is not the JSON object this method takes")
+	}
+	return nil
+}
+
+// coordError turns one coordinator failure into a stable code. It mirrors the
+// executable's own mapping for its bind route, so the same failure classifies the
+// same way whether it arrived through a tool call or a plugin action.
+func coordError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &Error{Code: coordErrorCode(err), Message: err.Error()}
+}
+
+func coordErrorCode(err error) string {
+	switch {
+	case errors.Is(err, coord.ErrOwnership):
+		return CodeForbidden
+	case errors.Is(err, coord.ErrInvalidRequest):
+		return "bad_request"
+	case errors.Is(err, coord.ErrReportInvalid):
+		return "invalid_report"
+	case errors.Is(err, coord.ErrNotReviewed):
+		return "not_reviewed"
+	case errors.Is(err, coord.ErrWorkerLive):
+		return "worker_live"
+	case errors.Is(err, coord.ErrCheckoutDirty):
+		return "checkout_dirty"
+	case errors.Is(err, coord.ErrProvenance):
+		return "provenance_unconfirmed"
+	case errors.Is(err, coord.ErrDialogChanged):
+		return "dialog_changed"
+	case errors.Is(err, coord.ErrNotBlocked):
+		return "not_blocked"
+	case errors.Is(err, coord.ErrBlocked):
+		return "blocked"
+	case errors.Is(err, coord.ErrAgentChanged):
+		return "agent_changed"
+	case errors.Is(err, coord.ErrProjectUnknown):
+		return "project_unknown"
+	case errors.Is(err, coord.ErrPrimaryNotLive):
+		return "primary_not_live"
+	case errors.Is(err, coord.ErrDifferentRepository):
+		return "different_repository"
+	case errors.Is(err, coord.ErrNotGitRepository):
+		return "not_git_repository"
+	case errors.Is(err, coord.ErrBaseRevision):
+		return "bad_base_revision"
+	case errors.Is(err, coord.ErrReservedConflict):
+		return "reserved_conflict"
+	case errors.Is(err, coord.ErrSessionUnavailable):
+		return "session_unavailable"
+	case errors.Is(err, coord.ErrSessionRefUnsupported):
+		return "session_reference_unsupported"
+	case errors.Is(err, coord.ErrReadinessTimeout):
+		return "readiness_timeout"
+	case errors.Is(err, coord.ErrAmbiguousStep):
+		return "ambiguous_step"
+	case errors.Is(err, coord.ErrPersistence):
+		return "state_write_failed"
+	case errors.Is(err, coord.ErrHerdrUnavailable), errors.Is(err, herdr.ErrCLI),
+		errors.Is(err, herdr.ErrTimeout), errors.Is(err, herdr.ErrAmbiguous):
+		return CodeHerdrUnavailable
+	default:
+		return CodeInternal
+	}
 }
 
 // request is the v1 request body. Unknown fields are tolerated so a later
@@ -247,6 +467,22 @@ func run(ctx context.Context, env map[string]string, input io.Reader, opts Optio
 		return h.mutate(req, state.RolePrimary, announced, h.ops.Dispatch)
 	case MethodReport:
 		return h.mutate(req, state.RoleWorker, announced, h.ops.Report)
+	case MethodProgress:
+		return h.mutate(req, state.RoleWorker, announced, h.ops.Progress)
+	case MethodQuestion:
+		return h.mutate(req, state.RoleWorker, announced, h.ops.Question)
+	case MethodAnswer:
+		return h.mutate(req, state.RolePrimary, announced, h.ops.Answer)
+	case MethodDialogPreview:
+		return h.mutate(req, state.RolePrimary, announced, h.ops.DialogPreview)
+	case MethodApproveDialog:
+		return h.mutate(req, state.RolePrimary, announced, h.ops.ApproveDialog)
+	case MethodReview:
+		return h.mutate(req, state.RolePrimary, announced, h.ops.Review)
+	case MethodCleanupPreview:
+		return h.mutate(req, state.RolePrimary, announced, h.ops.CleanupPreview)
+	case MethodCleanup:
+		return h.mutate(req, state.RolePrimary, announced, h.ops.Cleanup)
 	default:
 		return nil, fail(CodeUnsupportedMethod, "unknown bridge method %q", req.Method)
 	}
@@ -784,10 +1020,15 @@ func (h *handler) ready(announced task.Announcement) (any, error) {
 // mutating methods
 // ---------------------------------------------------------------------------
 
-// mutate authorizes one mutating method and hands it to its coordinator
-// operation: the caller's binding must be this process's, the role must be
-// exactly the one the method requires, and the coordinator must already have
-// confirmed this session. Authorization is repeated for every call.
+// mutate authorizes one method and hands it to its coordinator operation: the
+// caller's binding must be this process's, the role must be exactly the one the
+// method requires, and the coordinator must already have confirmed this session.
+// Authorization is repeated for every call, so a call is never legal because an
+// earlier one was.
+//
+// The two read-only previews are authorized by the same function: a preview needs
+// the same proof of role and identity as a mutation, and the coordinator
+// operation behind it performs no write.
 func (h *handler) mutate(req request, want state.Role, announced task.Announcement, op func(context.Context, Principal, json.RawMessage) (any, error)) (any, error) {
 	binding, err := h.authorize(announced)
 	if err != nil {

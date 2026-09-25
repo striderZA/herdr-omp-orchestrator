@@ -4,15 +4,21 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"herdr-omp-orchestrator/internal/coord"
+	"herdr-omp-orchestrator/internal/herdr"
 	"herdr-omp-orchestrator/internal/state"
 	"herdr-omp-orchestrator/internal/task"
 
@@ -31,6 +37,12 @@ const (
 	fixturePaneFile = "BRIDGE_FIXTURE_PANE_FILE"
 	fixtureErrFile  = "BRIDGE_FIXTURE_ERROR_FILE"
 	fixtureArgvFile = "BRIDGE_FIXTURE_ARGV_FILE"
+	// fixtureScriptFile selects the scripted stand-in the Task 5 tests use: it
+	// answers every command a report, relay, approval or cleanup makes, rather
+	// than only `pane get`. fixtureCallsFile appends every argv it was invoked
+	// with, so a test can assert the exact commands an operation made.
+	fixtureScriptFile = "BRIDGE_FIXTURE_SCRIPT_FILE"
+	fixtureCallsFile  = "BRIDGE_FIXTURE_CALLS_FILE"
 )
 
 var (
@@ -41,7 +53,7 @@ var (
 )
 
 func TestMain(m *testing.M) {
-	if os.Getenv(fixturePaneFile) != "" || os.Getenv(fixtureErrFile) != "" {
+	if os.Getenv(fixturePaneFile) != "" || os.Getenv(fixtureErrFile) != "" || os.Getenv(fixtureScriptFile) != "" {
 		os.Exit(runHerdrFixture())
 	}
 	dir, err := os.MkdirTemp("", "herdr-omp-bridge-cmd-")
@@ -63,7 +75,16 @@ func runHerdrFixture() int {
 			return 11
 		}
 	}
-	if len(os.Args) < 3 || os.Args[1] != "pane" || os.Args[2] != "get" {
+	if len(os.Args) < 3 {
+		fmt.Fprintf(os.Stderr, "unexpected argv: %q\n", os.Args)
+		return 12
+	}
+	// One path answers a single read; the other answers whole flows, so which
+	// scripted stand-in this process is decides how the argv is dispatched.
+	if path := os.Getenv(fixtureScriptFile); path != "" {
+		return runHerdrScript(path)
+	}
+	if os.Args[1] != "pane" || os.Args[2] != "get" {
 		fmt.Fprintf(os.Stderr, "unexpected argv: %q\n", os.Args)
 		return 12
 	}
@@ -136,6 +157,7 @@ func (f *bridgeFixture) seedWorker(id, launchPane, publicPane, session string) t
 		Title:               "Implement the thing",
 		Brief:               "Do the bounded thing.",
 		BaseRevision:        "0123456",
+		Branch:              "orch/" + id,
 		Checks:              []string{"go test ./..."},
 		WorktreePath:        f.worktree,
 		WorktreeWorkspaceID: workerWorktree,
@@ -1520,3 +1542,1163 @@ func TestBridgeProtocolSurface(t *testing.T) {
 		t.Errorf("MaxResponseBytes = %d is not bounded relative to the request bound", MaxResponseBytes)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Task 5: a scripted Herdr, worker reports and reviewed decisions
+// ---------------------------------------------------------------------------
+//
+// The scripted stand-in below answers the commands a Task 5 operation makes —
+// `agent get`, `agent read`, `agent prompt`, `agent send-keys`, `worktree list`
+// and `worktree remove` — from a JSON script this process writes, and records
+// every argv it was invoked with. It is a real child process, so argv
+// construction, stdout and exit status all cross an exec boundary exactly as they
+// do against Herdr, and the coordinator under test is the real one.
+
+// stubPane is one pane projection the stand-in answers `pane get` with.
+type stubPane struct {
+	PaneID      string `json:"paneId"`
+	TerminalID  string `json:"terminalId"`
+	WorkspaceID string `json:"workspaceId"`
+	TabID       string `json:"tabId"`
+	Cwd         string `json:"cwd"`
+	Agent       string `json:"agent"`
+	AgentStatus string `json:"agentStatus"`
+}
+
+// stubAgent is one live agent the stand-in reports. The session pair is the
+// reference Herdr publishes for it, in the form that build reports.
+type stubAgent struct {
+	Name         string `json:"name"`
+	Agent        string `json:"agent"`
+	AgentStatus  string `json:"agentStatus"`
+	PaneID       string `json:"paneId"`
+	TerminalID   string `json:"terminalId"`
+	WorkspaceID  string `json:"workspaceId"`
+	TabID        string `json:"tabId"`
+	Cwd          string `json:"cwd"`
+	SessionKind  string `json:"sessionKind"`
+	SessionValue string `json:"sessionValue"`
+}
+
+// stubRead is one `agent read` answer, consumed in order: a test that needs the
+// dialog to change between a preview and an approval scripts two of them.
+type stubRead struct {
+	Text      string `json:"text"`
+	ErrorCode string `json:"errorCode"`
+	ErrorText string `json:"errorText"`
+}
+
+// stubWorktree is one entry of `worktree list`.
+type stubWorktree struct {
+	Path            string `json:"path"`
+	Branch          string `json:"branch"`
+	OpenWorkspaceID string `json:"openWorkspaceId"`
+}
+
+// stubScript is everything the stand-in answers with, plus what it recorded.
+// The stand-in rewrites the file after every call that changes what Herdr knows.
+type stubScript struct {
+	RepoRoot string               `json:"repoRoot"`
+	Panes    map[string]stubPane  `json:"panes"`
+	Agents   map[string]stubAgent `json:"agents"`
+	Reads    []stubRead           `json:"reads"`
+	ReadAt   int                  `json:"readAt"`
+	Worktree []stubWorktree       `json:"worktree"`
+	// PromptError and SendKeysError make those two calls refuse the way Herdr
+	// refuses them (a blocked agent, an unknown key) without writing anything.
+	PromptError   string `json:"promptError"`
+	SendKeysError string `json:"sendKeysError"`
+	// RemoveNotFound names workspaces Herdr no longer has, the state a move into
+	// another workspace leaves behind.
+	RemoveNotFound []string `json:"removeNotFound"`
+	// RemoveError makes `worktree remove` refuse; a dirty checkout is one way.
+	RemoveError string `json:"removeError"`
+
+	Prompts  []stubPrompt   `json:"prompts"`
+	SentKeys []stubSendKeys `json:"sentKeys"`
+	Removed  []string       `json:"removed"`
+}
+
+type stubPrompt struct {
+	Pane string `json:"pane"`
+	Text string `json:"text"`
+}
+
+type stubSendKeys struct {
+	Pane string   `json:"pane"`
+	Keys []string `json:"keys"`
+}
+
+func readStubScript(path string) (stubScript, error) {
+	var script stubScript
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return script, err
+	}
+	if err := json.Unmarshal(data, &script); err != nil {
+		return script, err
+	}
+	if script.Panes == nil {
+		script.Panes = map[string]stubPane{}
+	}
+	if script.Agents == nil {
+		script.Agents = map[string]stubAgent{}
+	}
+	return script, nil
+}
+
+func writeStubScript(path string, script stubScript) error {
+	data, err := json.Marshal(script)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o600)
+}
+
+// runHerdrScript answers one command from the script, recording the argv first
+// so a test sees every call even when the answer is a refusal.
+func runHerdrScript(path string) int {
+	if calls := os.Getenv(fixtureCallsFile); calls != "" {
+		line, err := json.Marshal(os.Args[1:])
+		if err != nil {
+			return 31
+		}
+		file, err := os.OpenFile(calls, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+		if err != nil {
+			return 32
+		}
+		_, err = file.Write(append(line, '\n'))
+		_ = file.Close()
+		if err != nil {
+			return 33
+		}
+	}
+	script, err := readStubScript(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "stub: script: %v\n", err)
+		return 34
+	}
+	argv := os.Args[1:]
+	switch argv[0] + " " + argv[1] {
+	case "pane get":
+		pane, ok := script.Panes[argv[2]]
+		if !ok {
+			return stubError("pane_not_found", "pane "+argv[2]+" not found")
+		}
+		return stubResult(map[string]any{"type": "pane_info", "pane": stubPaneBody(pane)})
+	case "agent get":
+		agent, ok := script.agent(argv[2])
+		if !ok {
+			return stubError("agent_not_found", "agent target "+argv[2]+" not found")
+		}
+		return stubResult(map[string]any{"type": "agent_info", "agent": stubAgentBody(agent)})
+	case "agent prompt":
+		script.Prompts = append(script.Prompts, stubPrompt{Pane: argv[2], Text: argv[3]})
+		if err := writeStubScript(path, script); err != nil {
+			return 35
+		}
+		if script.PromptError != "" {
+			return stubError(script.PromptError, "the prompt was refused before any input")
+		}
+		agent, ok := script.agent(argv[2])
+		if !ok {
+			return stubError("agent_not_found", "agent target "+argv[2]+" not found")
+		}
+		return stubResult(map[string]any{"type": "agent_prompted", "agent": stubAgentBody(agent)})
+	case "agent read":
+		if script.ReadAt >= len(script.Reads) {
+			// Nothing left to show: an exhausted script is a refusal, never the
+			// previous dialog again.
+			return stubError("agent_not_idle", "the stand-in has no further screen scripted")
+		}
+		read := script.Reads[script.ReadAt]
+		script.ReadAt++
+		if err := writeStubScript(path, script); err != nil {
+			return 36
+		}
+		if read.ErrorCode != "" {
+			return stubError(read.ErrorCode, stubText(read.ErrorText, "the read was refused"))
+		}
+		if _, err := os.Stdout.WriteString(read.Text); err != nil {
+			return 37
+		}
+		return 0
+	case "agent send-keys":
+		script.SentKeys = append(script.SentKeys, stubSendKeys{Pane: argv[2], Keys: argv[3:]})
+		if err := writeStubScript(path, script); err != nil {
+			return 38
+		}
+		if script.SendKeysError != "" {
+			return stubError(script.SendKeysError, "the keys were refused before any were written")
+		}
+		return stubResult(map[string]any{"type": "ok"})
+	case "worktree list":
+		worktrees := make([]map[string]any, 0, len(script.Worktree))
+		for _, wt := range script.Worktree {
+			entry := map[string]any{
+				"path":               wt.Path,
+				"label":              filepath.Base(wt.Path),
+				"branch":             wt.Branch,
+				"open_workspace_id":  nil,
+				"is_bare":            false,
+				"is_detached":        false,
+				"is_prunable":        false,
+				"is_linked_worktree": true,
+			}
+			if wt.OpenWorkspaceID != "" {
+				entry["open_workspace_id"] = wt.OpenWorkspaceID
+			}
+			worktrees = append(worktrees, entry)
+		}
+		return stubResult(map[string]any{
+			"type": "worktree_list",
+			"source": map[string]any{
+				"repo_key":             strings.ToLower(filepath.ToSlash(script.RepoRoot)) + "/.git",
+				"repo_name":            filepath.Base(script.RepoRoot),
+				"repo_root":            script.RepoRoot,
+				"source_checkout_path": script.RepoRoot,
+				"source_workspace_id":  "",
+			},
+			"worktrees": worktrees,
+		})
+	case "worktree remove":
+		workspace := stubFlag(argv, "--workspace")
+		for _, gone := range script.RemoveNotFound {
+			if gone == workspace {
+				return stubError("workspace_not_found", "workspace "+workspace+" no longer exists")
+			}
+		}
+		if script.RemoveError != "" {
+			return stubError(script.RemoveError, "the checkout was refused")
+		}
+		checkout := ""
+		remaining := make([]stubWorktree, 0, len(script.Worktree))
+		for _, wt := range script.Worktree {
+			if wt.OpenWorkspaceID == workspace && checkout == "" {
+				checkout = wt.Path
+				continue
+			}
+			remaining = append(remaining, wt)
+		}
+		if checkout == "" {
+			return stubError("worktree_not_found", "no worktree is open in workspace "+workspace)
+		}
+		script.Worktree = remaining
+		script.Removed = append(script.Removed, workspace)
+		if err := writeStubScript(path, script); err != nil {
+			return 39
+		}
+		return stubResult(map[string]any{
+			"type":         "worktree_removed",
+			"workspace_id": workspace,
+			"path":         checkout,
+			"forced":       slices.Contains(argv, "--force"),
+		})
+	default:
+		fmt.Fprintf(os.Stderr, "stub: unsupported command: argv %q\n", argv)
+		return 40
+	}
+}
+
+// agent finds one live agent by pane id or by its live name.
+func (s stubScript) agent(target string) (stubAgent, bool) {
+	if agent, ok := s.Agents[target]; ok {
+		return agent, true
+	}
+	for _, agent := range s.Agents {
+		if agent.Name == target {
+			return agent, true
+		}
+	}
+	return stubAgent{}, false
+}
+
+func stubFlag(argv []string, name string) string {
+	for i, arg := range argv {
+		if arg == name && i+1 < len(argv) {
+			return argv[i+1]
+		}
+	}
+	return ""
+}
+
+func stubText(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func stubResult(result any) int {
+	body, err := json.Marshal(map[string]any{"id": "cli:stub", "result": result})
+	if err != nil {
+		return 41
+	}
+	if _, err := os.Stdout.Write(append(body, '\n')); err != nil {
+		return 42
+	}
+	return 0
+}
+
+func stubError(code, message string) int {
+	body, err := json.Marshal(map[string]any{
+		"id":    "cli:stub",
+		"error": map[string]any{"code": code, "message": message},
+	})
+	if err != nil {
+		return 43
+	}
+	if _, err := os.Stderr.Write(append(body, '\n')); err != nil {
+		return 44
+	}
+	return 1
+}
+
+func stubPaneBody(p stubPane) map[string]any {
+	return map[string]any{
+		"pane_id":       p.PaneID,
+		"terminal_id":   stubText(p.TerminalID, "term-"+p.PaneID),
+		"workspace_id":  stubText(p.WorkspaceID, stubWorkspaceOf(p.PaneID)),
+		"tab_id":        stubText(p.TabID, "tab-1"),
+		"label":         "",
+		"title":         "omp",
+		"agent":         p.Agent,
+		"display_agent": p.Agent,
+		"agent_status":  stubText(p.AgentStatus, "idle"),
+		"cwd":           p.Cwd,
+		"focused":       false,
+		"revision":      1,
+	}
+}
+
+func stubAgentBody(a stubAgent) map[string]any {
+	body := map[string]any{
+		"name":                    stubText(a.Name, "orch_worker"),
+		"agent":                   stubText(a.Agent, "omp"),
+		"display_agent":           stubText(a.Agent, "omp"),
+		"agent_status":            stubText(a.AgentStatus, "idle"),
+		"pane_id":                 a.PaneID,
+		"terminal_id":             stubText(a.TerminalID, "term-"+a.PaneID),
+		"workspace_id":            stubText(a.WorkspaceID, stubWorkspaceOf(a.PaneID)),
+		"tab_id":                  stubText(a.TabID, "tab-1"),
+		"cwd":                     a.Cwd,
+		"focused":                 false,
+		"revision":                2,
+		"state_change_seq":        1,
+		"interactive_ready":       true,
+		"launch_pending":          false,
+		"terminal_title":          "omp",
+		"terminal_title_stripped": "omp",
+	}
+	if strings.TrimSpace(a.SessionValue) != "" {
+		body["agent_session"] = map[string]any{
+			"source": "herdr:omp",
+			"agent":  "omp",
+			"kind":   stubText(a.SessionKind, "id"),
+			"value":  a.SessionValue,
+		}
+	}
+	return body
+}
+
+func stubWorkspaceOf(pane string) string {
+	workspace, _, _ := strings.Cut(pane, ":")
+	return workspace
+}
+
+// herdrStub is the scripted stand-in one bridge test talks to.
+type herdrStub struct {
+	t         *testing.T
+	path      string
+	callsFile string
+}
+
+// useHerdrStub points the coordinator under test at this test binary as its
+// Herdr CLI and makes it answer from the script.
+func (f *bridgeFixture) useHerdrStub(script stubScript) *herdrStub {
+	f.t.Helper()
+	dir := f.t.TempDir()
+	path := filepath.Join(dir, "herdr-script.json")
+	calls := filepath.Join(dir, "herdr-calls.jsonl")
+	if err := writeStubScript(path, script); err != nil {
+		f.t.Fatalf("write stub script: %v", err)
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		f.t.Fatalf("os.Executable: %v", err)
+	}
+	f.env["HERDR_ORCH_HERDR_BIN_PATH"] = executable
+	f.t.Setenv(fixtureScriptFile, path)
+	f.t.Setenv(fixtureCallsFile, calls)
+	return &herdrStub{t: f.t, path: path, callsFile: calls}
+}
+
+func (s *herdrStub) script() stubScript {
+	s.t.Helper()
+	script, err := readStubScript(s.path)
+	if err != nil {
+		s.t.Fatalf("read stub script: %v", err)
+	}
+	return script
+}
+
+func (s *herdrStub) update(mutate func(*stubScript)) {
+	s.t.Helper()
+	script := s.script()
+	mutate(&script)
+	if err := writeStubScript(s.path, script); err != nil {
+		s.t.Fatalf("write stub script: %v", err)
+	}
+}
+
+// queueReads scripts the next `agent read` answers and rewinds the cursor, so a
+// scenario that needs the screen to change scripts exactly what is shown when.
+func (s *herdrStub) queueReads(reads ...stubRead) {
+	s.t.Helper()
+	s.update(func(script *stubScript) {
+		script.Reads = reads
+		script.ReadAt = 0
+	})
+}
+
+// setAgent replaces what the stand-in reports for one pane.
+func (s *herdrStub) setAgent(pane string, agent stubAgent) {
+	s.t.Helper()
+	s.update(func(script *stubScript) { script.Agents[pane] = agent })
+}
+
+func (s *herdrStub) dropAgent(pane string) {
+	s.t.Helper()
+	s.update(func(script *stubScript) { delete(script.Agents, pane) })
+}
+
+// calls lists every argv the stand-in was invoked with, in order.
+func (s *herdrStub) calls() [][]string {
+	s.t.Helper()
+	data, err := os.ReadFile(s.callsFile)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		s.t.Fatalf("read stub calls: %v", err)
+	}
+	var out [][]string
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var argv []string
+		if err := json.Unmarshal([]byte(line), &argv); err != nil {
+			s.t.Fatalf("decode stub call %q: %v", line, err)
+		}
+		out = append(out, argv)
+	}
+	return out
+}
+
+// called reports whether one exact argv was made.
+func (s *herdrStub) called(argv ...string) bool {
+	s.t.Helper()
+	for _, call := range s.calls() {
+		if slices.Equal(call, argv) {
+			return true
+		}
+	}
+	return false
+}
+
+// forced reports whether any removal asked Herdr to force it, which this plugin
+// must never do.
+func (s *herdrStub) forced() bool {
+	s.t.Helper()
+	for _, call := range s.calls() {
+		if len(call) >= 2 && call[0] == "worktree" && call[1] == "remove" && slices.Contains(call, "--force") {
+			return true
+		}
+	}
+	return false
+}
+
+// notesOf lists the durable inbox rows of one kind.
+func notesOf(t *testing.T, f *bridgeFixture, kind string) []task.Inbox {
+	t.Helper()
+	var out []task.Inbox
+	for _, note := range readInbox(t, f) {
+		if note.Kind == kind {
+			out = append(out, note)
+		}
+	}
+	return out
+}
+
+// coordinator wires a real coordinator over this fixture's store and the
+// scripted Herdr, so a bridge test authorizes the caller and then exercises the
+// coordinator's own persistence and identity checks, exactly as the executable
+// does.
+func (f *bridgeFixture) coordinator(t *testing.T) *coord.Coordinator {
+	t.Helper()
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	client, err := herdr.NewClient(executable)
+	if err != nil {
+		t.Fatalf("herdr.NewClient: %v", err)
+	}
+	coordinator, err := coord.New(f.store, client, coord.Options{
+		CallTimeout:      5 * time.Second,
+		ReadinessTimeout: time.Second,
+		PollInterval:     10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("coord.New: %v", err)
+	}
+	return coordinator
+}
+
+// workerAgents is the stand-in's answer for one worker pane whose live agent
+// still reports the recorded session.
+func workerAgent(pane, session, worktree string) stubAgent {
+	return stubAgent{
+		Name:         "orch_worker",
+		Agent:        "omp",
+		AgentStatus:  "idle",
+		PaneID:       pane,
+		TerminalID:   "term-worker",
+		WorkspaceID:  workerWorktree,
+		Cwd:          worktree,
+		SessionKind:  "id",
+		SessionValue: session,
+	}
+}
+
+// asPrimary makes this bridge process the primary's pane and records its
+// confirmed handshake: the bridge keys a caller by the pane its process inherited,
+// so a primary method is only addressable from the primary's own pane.
+func (f *bridgeFixture) asPrimary() {
+	f.t.Helper()
+	f.confirm(primaryPane, primarySession)
+	f.env["HERDR_PANE_ID"] = primaryPane
+}
+
+// asWorker makes this bridge process the worker's pane.
+func (f *bridgeFixture) asWorker() {
+	f.t.Helper()
+	f.confirm(workerPane, workerSession)
+	f.env["HERDR_PANE_ID"] = workerPane
+}
+
+// movePublicPane records a cross-workspace move of a worker's public pane, which
+// is the only identity a later Herdr call may target.
+func (f *bridgeFixture) movePublicPane(t *testing.T, launchPane, newPublicPane string) {
+	t.Helper()
+	if err := f.store.MovePublicPane(context.Background(), launchPane, launchPane, newPublicPane); err != nil {
+		t.Fatalf("MovePublicPane: %v", err)
+	}
+}
+
+func (f *bridgeFixture) task(t *testing.T, id string) task.Task {
+	t.Helper()
+	st, err := f.store.Task(context.Background(), id)
+	if err != nil {
+		t.Fatalf("read task %s: %v", id, err)
+	}
+	return st
+}
+
+// reportPayload is a complete final report for one task, in the wire spelling
+// the extension sends.
+func (f *bridgeFixture) reportPayload(t *testing.T, id, kind string) string {
+	t.Helper()
+	payload, err := json.Marshal(map[string]any{
+		"kind":     kind,
+		"summary":  "Ported the parser and covered it with the recorded checks.",
+		"branch":   "orch/" + id,
+		"evidence": []string{"commit 773efbc4c9a0d7f0f6f2b3f2d5f1c0b8f0a1d2e3 internal/coord/report.go"},
+		"checks":   []string{"go test ./internal/coord ok"},
+		"risk":     "none: reachable only from the worker role",
+	})
+	if err != nil {
+		t.Fatalf("encode report: %v", err)
+	}
+	return string(payload)
+}
+
+// TestReportMethodsAreRoleGated pins which role each new method needs: a worker
+// that names its own work can never decide it, and a primary can never report as
+// one.
+func TestReportMethodsAreRoleGated(t *testing.T) {
+	f := newBridgeFixture(t)
+	f.seedPrimary()
+	f.seedWorker("t1", workerPane, workerPane, workerSession)
+
+	calls := map[string]int{}
+	ops := Ops{}
+	record := func(name string) func(context.Context, Principal, json.RawMessage) (any, error) {
+		return func(context.Context, Principal, json.RawMessage) (any, error) {
+			calls[name]++
+			return map[string]any{"recorded": true}, nil
+		}
+	}
+	for name, field := range map[string]*func(context.Context, Principal, json.RawMessage) (any, error){
+		"progress":        &ops.Progress,
+		"question":        &ops.Question,
+		"report":          &ops.Report,
+		"answer":          &ops.Answer,
+		"dialog_preview":  &ops.DialogPreview,
+		"approve_dialog":  &ops.ApproveDialog,
+		"review":          &ops.Review,
+		"cleanup_preview": &ops.CleanupPreview,
+		"cleanup":         &ops.Cleanup,
+	} {
+		*field = record(name)
+	}
+
+	primaryMethods := []string{"answer", "dialog_preview", "approve_dialog", "review", "cleanup_preview", "cleanup"}
+	workerMethods := []string{"progress", "question", "report"}
+
+	t.Run("a worker cannot decide", func(t *testing.T) {
+		f.asWorker()
+		for _, method := range primaryMethods {
+			wantError(t, f.callWith(method, workerSession, `{"taskId":"t1"}`, ops), CodeForbidden)
+		}
+		if len(calls) != 0 {
+			t.Fatalf("a worker reached %d coordinator operations", len(calls))
+		}
+	})
+	t.Run("a primary cannot report", func(t *testing.T) {
+		f.asPrimary()
+		for _, method := range workerMethods {
+			wantError(t, f.callWith(method, primarySession, `{"summary":"x"}`, ops), CodeForbidden)
+		}
+		if len(calls) != 0 {
+			t.Fatalf("a primary reached %d coordinator operations", len(calls))
+		}
+	})
+	t.Run("the right role is dispatched", func(t *testing.T) {
+		f.asWorker()
+		if resp := f.callWith("progress", workerSession, `{"summary":"halfway"}`, ops); !resp.OK {
+			t.Fatalf("progress failed: %+v", resp.Error)
+		}
+		f.asPrimary()
+		if resp := f.callWith("review", primarySession, `{"taskId":"t1","disposition":"accepted"}`, ops); !resp.OK {
+			t.Fatalf("review failed: %+v", resp.Error)
+		}
+		if calls["progress"] != 1 || calls["review"] != 1 {
+			t.Fatalf("dispatch counted %v", calls)
+		}
+	})
+}
+
+// TestReportWorkerFactsAreDurableAndHerdrActivityNeverCompletes drives the real
+// coordinator through the bridge: a question puts the task in Needs input, a
+// progress note is durable and deduplicated, and Herdr reporting the agent done
+// completes nothing.
+func TestReportWorkerFactsAreDurableAndHerdrActivityNeverCompletes(t *testing.T) {
+	f := newBridgeFixture(t)
+	f.seedPrimary()
+	f.seedWorker("t1", workerPane, workerPane, workerSession)
+	f.confirm(workerPane, workerSession)
+	stub := f.useHerdrStub(stubScript{
+		RepoRoot: f.repoRoot,
+		Panes:    map[string]stubPane{workerPane: {PaneID: workerPane, TerminalID: "term-worker", WorkspaceID: workerWorktree, Cwd: f.worktree, Agent: "omp"}},
+		Agents:   map[string]stubAgent{workerPane: workerAgent(workerPane, workerSession, f.worktree)},
+	})
+	ops := CoordinatorOps(f.coordinator(t))
+
+	if resp := f.callWith("progress", workerSession, `{"summary":"ported the lexer"}`, ops); !resp.OK {
+		t.Fatalf("progress failed: %+v", resp.Error)
+	}
+	if resp := f.callWith("progress", workerSession, `{"summary":"ported the lexer"}`, ops); !resp.OK {
+		t.Fatalf("repeated progress failed: %+v", resp.Error)
+	}
+	if resp := f.callWith("question", workerSession, `{"text":"Which branch should I target?"}`, ops); !resp.OK {
+		t.Fatalf("question failed: %+v", resp.Error)
+	}
+
+	after := f.task(t, "t1")
+	if stage := task.StageOf(after); stage != task.NeedsInput {
+		t.Errorf("stage after a question = %q, want %q", stage, task.NeedsInput)
+	}
+	if !strings.Contains(after.Attention, "Which branch should I target?") {
+		t.Errorf("attention %q does not carry the question", after.Attention)
+	}
+	if got := len(notesOf(t, f, "progress")); got != 1 {
+		t.Errorf("progress notes = %d, want 1 deduplicated entry", got)
+	}
+	if got := len(notesOf(t, f, "question")); got != 1 {
+		t.Errorf("question notes = %d, want exactly 1 durable entry", got)
+	}
+	// Reporting facts is not a terminal operation: nothing here may have read or
+	// moved a pane.
+	for _, call := range stub.calls() {
+		if len(call) > 0 && (call[0] == "pane" || call[0] == "worktree") {
+			t.Errorf("a worker report made a terminal call: %q", call)
+		}
+	}
+
+	// Herdr can report the agent as done at any moment. That is terminal
+	// activity, and it completes nothing.
+	done := workerAgent(workerPane, workerSession, f.worktree)
+	done.AgentStatus = "done"
+	stub.setAgent(workerPane, done)
+	if resp := f.callWith("progress", workerSession, `{"summary":"still working"}`, ops); !resp.OK {
+		t.Fatalf("progress after Herdr reported done failed: %+v", resp.Error)
+	}
+	activity := f.task(t, "t1")
+	if activity.Report != nil {
+		t.Errorf("Herdr's done activity created a report: %+v", activity.Report)
+	}
+	if activity.Disposition != "" {
+		t.Errorf("Herdr's done activity recorded a disposition: %q", activity.Disposition)
+	}
+	if stage := task.StageOf(activity); stage == task.ReadyForReview || stage == task.Done {
+		t.Errorf("Herdr's done activity moved the task to %q", stage)
+	}
+}
+
+// TestReportRejectsAnIncompleteReportAndReadsTheResult drives validation and the
+// review handoff through the bridge: only a complete result is accepted, it makes
+// the task ready for review, and only a disposition closes it.
+func TestReportRejectsAnIncompleteReportAndReadsTheResult(t *testing.T) {
+	f := newBridgeFixture(t)
+	f.seedPrimary()
+	f.seedWorker("t1", workerPane, workerPane, workerSession)
+	f.confirm(workerPane, workerSession)
+	f.useHerdrStub(stubScript{
+		RepoRoot: f.repoRoot,
+		Agents:   map[string]stubAgent{workerPane: workerAgent(workerPane, workerSession, f.worktree)},
+	})
+	ops := CoordinatorOps(f.coordinator(t))
+
+	wantError(t, f.callWith("report", workerSession, f.reportPayload(t, "t1", "partial"), ops), "invalid_report")
+	wantError(t, f.callWith("report", workerSession, `{"kind":"result","summary":"done","branch":"orch/t1","evidence":[],"checks":[],"risk":"none"}`, ops), "invalid_report")
+	if after := f.task(t, "t1"); after.Report != nil || after.Revision != 1 {
+		t.Fatalf("a refused report was recorded: %+v", after)
+	}
+
+	if resp := f.callWith("report", workerSession, f.reportPayload(t, "t1", "result"), ops); !resp.OK {
+		t.Fatalf("report failed: %+v", resp.Error)
+	}
+	reviewed := f.task(t, "t1")
+	if reviewed.Report == nil || reviewed.Report.Kind != "result" {
+		t.Fatalf("recorded report = %+v", reviewed.Report)
+	}
+	if stage := task.StageOf(reviewed); stage != task.ReadyForReview {
+		t.Errorf("stage after a final report = %q, want %q", stage, task.ReadyForReview)
+	}
+	if got := notesOf(t, f, "result"); len(got) != 1 {
+		t.Errorf("result notes = %d, want exactly 1 durable entry", len(got))
+	}
+	// Ready for review is not done: the user has not decided anything yet.
+	if reviewed.Disposition != "" {
+		t.Errorf("a worker report recorded a disposition: %q", reviewed.Disposition)
+	}
+
+	// Only the primary's own pane can record the user's decision, and that
+	// decision is what closes the task.
+	wantError(t, f.callWith("review", workerSession, `{"taskId":"t1","disposition":"accepted"}`, ops), CodeForbidden)
+	f.asPrimary()
+	wantError(t, f.callWith("review", primarySession, `{"taskId":"t1","disposition":"  "}`, ops), "bad_request")
+	resp := f.callWith("review", primarySession, `{"taskId":"t1","disposition":"accepted: merged by hand"}`, ops)
+	var result coord.ReviewResult
+	resp.decodeResult(t, &result)
+	if result.Stage != task.Done {
+		t.Errorf("review stage = %q, want %q", result.Stage, task.Done)
+	}
+	closed := f.task(t, "t1")
+	if closed.Disposition != "accepted: merged by hand" {
+		t.Errorf("recorded disposition = %q", closed.Disposition)
+	}
+	if stage := task.StageOf(closed); stage != task.Done {
+		t.Errorf("stage after the disposition = %q, want %q", stage, task.Done)
+	}
+}
+
+// TestAnswerRelaysToTheCurrentPublicPaneOnly pins the relay: an answer goes to
+// the recorded current public pane, and a pane whose occupant or session changed
+// is refused with nothing written.
+func TestAnswerRelaysToTheCurrentPublicPaneOnly(t *testing.T) {
+	f := newBridgeFixture(t)
+	f.seedPrimary()
+	f.seedWorker("t1", workerPane, workerPane, workerSession)
+	f.asPrimary()
+	// Herdr moved the worker into another workspace: only the public id changes.
+	moved := "w4:p8"
+	f.movePublicPane(t, workerPane, moved)
+	stub := f.useHerdrStub(stubScript{
+		RepoRoot: f.repoRoot,
+		Agents:   map[string]stubAgent{moved: workerAgent(moved, workerSession, f.worktree)},
+	})
+	ops := CoordinatorOps(f.coordinator(t))
+
+	resp := f.callWith("answer", primarySession, `{"taskId":"t1","text":"Keep the old API."}`, ops)
+	var result coord.AnswerResult
+	resp.decodeResult(t, &result)
+	if result.PublicPaneID != moved {
+		t.Errorf("answer went to %q, want the recorded current public pane %q", result.PublicPaneID, moved)
+	}
+	prompts := stub.script().Prompts
+	if len(prompts) != 1 || prompts[0].Pane != moved || prompts[0].Text != "Keep the old API." {
+		t.Fatalf("prompts = %+v, want one answer on %q", prompts, moved)
+	}
+	if !stub.called("agent", "prompt", moved, "Keep the old API.") {
+		t.Errorf("the relay did not target the recorded public pane: %v", stub.calls())
+	}
+	// The launch-time pane is not the target.
+	if stub.called("agent", "prompt", workerPane, "Keep the old API.") {
+		t.Error("the relay targeted the launch-time pane")
+	}
+
+	t.Run("a changed session is refused", func(t *testing.T) {
+		other := workerAgent(moved, "omp-someone-else", f.worktree)
+		stub.setAgent(moved, other)
+		wantError(t, f.callWith("answer", primarySession, `{"taskId":"t1","text":"Anything?"}`, ops), "agent_changed")
+		if got := len(stub.script().Prompts); got != 1 {
+			t.Errorf("a refused answer still prompted (%d prompts)", got)
+		}
+	})
+
+	t.Run("a blocked worker is refused", func(t *testing.T) {
+		blocked := workerAgent(moved, workerSession, f.worktree)
+		blocked.AgentStatus = "blocked"
+		stub.setAgent(moved, blocked)
+		wantError(t, f.callWith("answer", primarySession, `{"taskId":"t1","text":"Anything?"}`, ops), "blocked")
+		if got := len(stub.script().Prompts); got != 1 {
+			t.Errorf("a blocked worker was prompted anyway (%d prompts)", got)
+		}
+	})
+
+	t.Run("a vanished pane is refused", func(t *testing.T) {
+		stub.dropAgent(moved)
+		wantError(t, f.callWith("answer", primarySession, `{"taskId":"t1","text":"Anything?"}`, ops), "agent_changed")
+	})
+}
+
+// TestDialogApprovalRevalidatesTheApprovedScreen pins the approval path: the
+// preview reads the visible screen passively, and the approval is refused unless
+// the pane, the session and the dialog digest are all still the approved ones.
+func TestDialogApprovalRevalidatesTheApprovedScreen(t *testing.T) {
+	f := newBridgeFixture(t)
+	f.seedPrimary()
+	f.seedWorker("t1", workerPane, workerPane, workerSession)
+	f.asPrimary()
+
+	approved := "Choose an option:\r\n  1. Allow once\r\n  2. Deny\r\n"
+	changed := "Choose an option:\r\n  1. Allow once\r\n  2. Deny\r\n  3. Always allow\r\n"
+	blocked := workerAgent(workerPane, workerSession, f.worktree)
+	blocked.AgentStatus = "blocked"
+	stub := f.useHerdrStub(stubScript{
+		RepoRoot: f.repoRoot,
+		Agents:   map[string]stubAgent{workerPane: blocked},
+		Reads:    []stubRead{{Text: approved}},
+	})
+	ops := CoordinatorOps(f.coordinator(t))
+
+	var preview coord.DialogPreview
+	f.callWith("dialog_preview", primarySession, `{"taskId":"t1"}`, ops).decodeResult(t, &preview)
+	if !preview.Blocked || preview.Digest == "" || !strings.Contains(preview.Dialog, "Allow once") {
+		t.Fatalf("preview = %+v, want the on-screen dialog and its digest", preview)
+	}
+	// The preview is passive: it reads the visible screen, which is the source
+	// that works while a full-screen OMP dialog is up.
+	if !stub.called("agent", "read", workerPane, "--source", "visible") {
+		t.Errorf("the preview did not read the visible source: %v", stub.calls())
+	}
+	for _, call := range stub.calls() {
+		if len(call) > 1 && call[0] == "agent" && call[1] == "read" && slices.Contains(call, "recent-unwrapped") {
+			t.Errorf("the preview used an intrusive read source: %q", call)
+		}
+	}
+
+	approve := func(digest string, keys string) bridgeResponse {
+		return f.callWith("approve_dialog", primarySession,
+			fmt.Sprintf(`{"taskId":"t1","observedDigest":%q,"keys":%s}`, digest, keys), ops)
+	}
+
+	t.Run("the approved keys are sent exactly", func(t *testing.T) {
+		stub.queueReads(stubRead{Text: approved})
+		if resp := approve(preview.Digest, `["1"]`); !resp.OK {
+			t.Fatalf("approve failed: %+v", resp.Error)
+		}
+		sent := stub.script().SentKeys
+		if len(sent) != 1 || sent[0].Pane != workerPane || !slices.Equal(sent[0].Keys, []string{"1"}) {
+			t.Fatalf("sent keys = %+v, want exactly [1] on %q", sent, workerPane)
+		}
+		if !stub.called("agent", "send-keys", workerPane, "1") {
+			t.Errorf("the approval did not send the approved key: %v", stub.calls())
+		}
+	})
+
+	t.Run("a stale digest sends nothing", func(t *testing.T) {
+		stub.queueReads(stubRead{Text: approved})
+		before := len(stub.script().SentKeys)
+		wantError(t, approve("deadbeefdeadbeef", `["1"]`), "dialog_changed")
+		if got := len(stub.script().SentKeys); got != before {
+			t.Errorf("a stale approval still sent keys (%d > %d)", got, before)
+		}
+	})
+
+	t.Run("a changed dialog sends nothing", func(t *testing.T) {
+		stub.queueReads(stubRead{Text: changed})
+		before := len(stub.script().SentKeys)
+		wantError(t, approve(preview.Digest, `["1"]`), "dialog_changed")
+		if got := len(stub.script().SentKeys); got != before {
+			t.Errorf("a changed dialog still sent keys (%d > %d)", got, before)
+		}
+	})
+
+	t.Run("an unreadable dialog sends nothing", func(t *testing.T) {
+		stub.queueReads(stubRead{ErrorCode: "agent_not_idle", ErrorText: "the agent is not idle"})
+		before := len(stub.script().SentKeys)
+		wantError(t, approve(preview.Digest, `["1"]`), "dialog_changed")
+		if got := len(stub.script().SentKeys); got != before {
+			t.Errorf("an unreadable dialog still sent keys (%d > %d)", got, before)
+		}
+	})
+
+	t.Run("a changed session sends nothing", func(t *testing.T) {
+		stub.queueReads(stubRead{Text: approved})
+		stub.setAgent(workerPane, workerAgent(workerPane, "omp-someone-else", f.worktree))
+		defer stub.setAgent(workerPane, blocked)
+		before := len(stub.script().SentKeys)
+		wantError(t, approve(preview.Digest, `["1"]`), "agent_changed")
+		if got := len(stub.script().SentKeys); got != before {
+			t.Errorf("a changed session still sent keys (%d > %d)", got, before)
+		}
+	})
+
+	t.Run("a worker that is not blocked is refused", func(t *testing.T) {
+		stub.queueReads(stubRead{Text: approved})
+		stub.setAgent(workerPane, workerAgent(workerPane, workerSession, f.worktree))
+		defer stub.setAgent(workerPane, blocked)
+		before := len(stub.script().SentKeys)
+		wantError(t, approve(preview.Digest, `["1"]`), "not_blocked")
+		if got := len(stub.script().SentKeys); got != before {
+			t.Errorf("a worker that was not blocked still received keys (%d > %d)", got, before)
+		}
+	})
+
+	t.Run("an approval without a digest is refused", func(t *testing.T) {
+		wantError(t, approve("", `["1"]`), "bad_request")
+		wantError(t, approve(preview.Digest, `[]`), "bad_request")
+	})
+}
+
+// TestCleanupRequiresReviewedDoneAndACleanProvenanceCheckout drives the whole
+// cleanup gate: nothing is refused more weakly than the acceptance requires, and
+// a removal is never forced, never touches the branch and never happens twice.
+func TestCleanupRequiresReviewedDoneAndACleanProvenanceCheckout(t *testing.T) {
+	f := newBridgeFixture(t)
+	f.seedPrimary()
+	worker := f.seedWorker("t1", workerPane, workerPane, workerSession)
+	f.asPrimary()
+
+	// A real checkout, so clean and dirty are decided by git itself.
+	root, checkout := bridgeRepoWithWorktree(t, worker.Branch)
+	if _, err := f.store.UpdateTask(context.Background(), worker.ID, worker.Revision, func(next *task.Task) error {
+		next.WorktreePath = checkout
+		return nil
+	}); err != nil {
+		t.Fatalf("point the task at a real checkout: %v", err)
+	}
+	stub := f.useHerdrStub(stubScript{
+		RepoRoot: root,
+		Agents:   map[string]stubAgent{workerPane: workerAgent(workerPane, workerSession, checkout)},
+		Worktree: []stubWorktree{{Path: checkout, Branch: worker.Branch, OpenWorkspaceID: workerWorktree}},
+	})
+	ops := CoordinatorOps(f.coordinator(t))
+
+	var preview coord.CleanupPreview
+	f.callWith("cleanup_preview", primarySession, `{"taskId":"t1"}`, ops).decodeResult(t, &preview)
+	if preview.Reviewed || preview.Removable {
+		t.Fatalf("preview of an unreviewed task = %+v, want it refused", preview)
+	}
+	if preview.Path != checkout || preview.Branch != worker.Branch {
+		t.Errorf("preview = %+v, want the recorded path and branch", preview)
+	}
+	wantError(t, f.callWith("cleanup", primarySession, `{"taskId":"t1"}`, ops), "not_reviewed")
+	if got := stub.script().Removed; len(got) != 0 {
+		t.Fatalf("cleanup removed a checkout the user never reviewed: %v", got)
+	}
+
+	// Review it the way the user does: a final result, then a disposition. The
+	// report is the worker's own call, so the process is its pane for that one.
+	f.asWorker()
+	if resp := f.callWith("report", workerSession, f.reportPayload(t, "t1", "result"), ops); !resp.OK {
+		t.Fatalf("report failed: %+v", resp.Error)
+	}
+	f.asPrimary()
+	if resp := f.callWith("review", primarySession, `{"taskId":"t1","disposition":"accepted"}`, ops); !resp.OK {
+		t.Fatalf("review failed: %+v", resp.Error)
+	}
+
+	t.Run("a live worker refuses cleanup", func(t *testing.T) {
+		f.callWith("cleanup_preview", primarySession, `{"taskId":"t1"}`, ops).decodeResult(t, &preview)
+		if !preview.LiveWorker || preview.Removable {
+			t.Fatalf("preview with a live worker = %+v", preview)
+		}
+		wantError(t, f.callWith("cleanup", primarySession, `{"taskId":"t1"}`, ops), "worker_live")
+		if got := stub.script().Removed; len(got) != 0 {
+			t.Fatalf("cleanup removed a checkout under a live worker: %v", got)
+		}
+	})
+
+	// The worker exits; its checkout is still not clean.
+	stub.dropAgent(workerPane)
+	if err := os.WriteFile(filepath.Join(checkout, "notes.txt"), []byte("still mine\n"), 0o644); err != nil {
+		t.Fatalf("write into the checkout: %v", err)
+	}
+	t.Run("a dirty checkout refuses cleanup", func(t *testing.T) {
+		f.callWith("cleanup_preview", primarySession, `{"taskId":"t1"}`, ops).decodeResult(t, &preview)
+		if preview.Clean || preview.Removable {
+			t.Fatalf("preview of a dirty checkout = %+v", preview)
+		}
+		wantError(t, f.callWith("cleanup", primarySession, `{"taskId":"t1"}`, ops), "checkout_dirty")
+		if got := stub.script().Removed; len(got) != 0 {
+			t.Fatalf("cleanup removed a dirty checkout: %v", got)
+		}
+	})
+
+	if err := os.Remove(filepath.Join(checkout, "notes.txt")); err != nil {
+		t.Fatalf("clean the checkout: %v", err)
+	}
+
+	t.Run("a reviewed clean checkout is removed without force", func(t *testing.T) {
+		f.callWith("cleanup_preview", primarySession, `{"taskId":"t1"}`, ops).decodeResult(t, &preview)
+		if !preview.Removable || preview.WorkspaceID != workerWorktree {
+			t.Fatalf("preview of a removable checkout = %+v", preview)
+		}
+
+		var result coord.CleanupResult
+		f.callWith("cleanup", primarySession, `{"taskId":"t1"}`, ops).decodeResult(t, &result)
+		if !result.Removed || result.WorkspaceID != workerWorktree || result.Path != checkout {
+			t.Fatalf("cleanup = %+v", result)
+		}
+		if stub.forced() {
+			t.Error("cleanup asked Herdr to force the removal")
+		}
+		if !stub.called("worktree", "remove", "--workspace", workerWorktree) {
+			t.Errorf("cleanup did not remove the verified workspace: %v", stub.calls())
+		}
+		if got := stub.script().Removed; len(got) != 1 {
+			t.Fatalf("removals = %v, want exactly one", got)
+		}
+
+		// The branch is preserved: cleanup never deletes it.
+		if branches := bridgeGit(t, root, "branch", "--list", worker.Branch); !strings.Contains(branches, worker.Branch) {
+			t.Errorf("cleanup deleted the branch: %q", branches)
+		}
+		// Herdr no longer holds the checkout it removed, and nothing ever asked
+		// git to touch the branch in any way.
+		if listed := stub.script().Worktree; len(listed) != 0 {
+			t.Errorf("the removed checkout is still listed: %+v", listed)
+		}
+		for _, call := range stub.calls() {
+			if slices.Contains(call, "branch") || slices.Contains(call, "-D") || slices.Contains(call, "-d") {
+				t.Errorf("cleanup touched a branch: %q", call)
+			}
+		}
+		after := f.task(t, "t1")
+		if after.WorktreeWorkspaceID != "" || after.LaunchPaneID != "" || after.PublicPaneID != "" {
+			t.Errorf("the task still records live resources: %+v", after)
+		}
+		if after.WorktreePath != checkout || after.Branch != worker.Branch || task.StageOf(after) != task.Done {
+			t.Errorf("the task lost its provenance or its decision: %+v", after)
+		}
+		if got := notesOf(t, f, "cleanup"); len(got) != 1 {
+			t.Errorf("cleanup notes = %d, want 1 durable entry", len(got))
+		}
+	})
+
+	t.Run("a second cleanup removes nothing more", func(t *testing.T) {
+		wantError(t, f.callWith("cleanup", primarySession, `{"taskId":"t1"}`, ops), "provenance_unconfirmed")
+		if got := stub.script().Removed; len(got) != 1 {
+			t.Fatalf("a repeated cleanup removed again: %v", got)
+		}
+	})
+
+	t.Run("a checkout Herdr holds in an unknown workspace is refused", func(t *testing.T) {
+		// A workspace this task never recorded is somebody else's: a human
+		// decides what happened to it.
+		stub.update(func(script *stubScript) {
+			script.Worktree = []stubWorktree{{Path: checkout, Branch: worker.Branch, OpenWorkspaceID: "w4"}}
+		})
+		wantError(t, f.callWith("cleanup", primarySession, `{"taskId":"t1"}`, ops), "provenance_unconfirmed")
+	})
+}
+
+// bridgeRepoWithWorktree creates a real repository with a real linked checkout,
+// so a checkout's clean and dirty states are decided by git itself.
+func bridgeRepoWithWorktree(t *testing.T, branch string) (root, checkout string) {
+	t.Helper()
+	root = t.TempDir()
+	for _, args := range [][]string{
+		{"init", "-b", "main"},
+		{"config", "user.email", "orchestrator@example.invalid"},
+		{"config", "user.name", "Orchestrator Test"},
+		{"config", "core.autocrlf", "false"},
+	} {
+		bridgeGit(t, root, args...)
+	}
+	if err := os.WriteFile(filepath.Join(root, "README.md"), []byte("first\n"), 0o644); err != nil {
+		t.Fatalf("write README: %v", err)
+	}
+	bridgeGit(t, root, "add", "-A")
+	bridgeGit(t, root, "commit", "-m", "first commit")
+	checkout = filepath.Join(t.TempDir(), "checkout")
+	bridgeGit(t, root, "worktree", "add", "-b", branch, checkout, "HEAD")
+	return root, checkout
+}
+
+func bridgeGit(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git -C %s %v: %v: %s", dir, args, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// TestEveryMethodTheExtensionCallsIsDispatched pins the extension-to-bridge seam
+// from the bridge's side: a tool that calls a method this build does not dispatch
+// would answer `unsupported_method` in the user's session, and nothing else would
+// catch it, because the extension is not part of this binary.
+func TestEveryMethodTheExtensionCallsIsDispatched(t *testing.T) {
+	source, err := os.ReadFile(filepath.Join("..", "..", "omp", "herdr-orchestrator.ts"))
+	if err != nil {
+		t.Fatalf("read the extension source: %v", err)
+	}
+	called := map[string]int{}
+	for _, match := range callBridgePattern.FindAllStringSubmatch(string(source), -1) {
+		called[match[1]]++
+	}
+	if len(called) < 10 {
+		t.Fatalf("the extension calls %d bridge methods (%v), want every tool's method", len(called), called)
+	}
+
+	f := newBridgeFixture(t)
+	for method := range called {
+		// No binding exists for this session, so every method stops at
+		// authorization — which is exactly how an unknown method would *not*
+		// stop, and the only thing this test needs to distinguish.
+		resp := f.call(method, "omp-unbound", `{}`)
+		if !resp.OK && resp.Error.Code == CodeUnsupportedMethod {
+			t.Errorf("the extension calls %q, which this bridge does not dispatch", method)
+		}
+	}
+	for _, method := range []string{
+		MethodDispatch, MethodReport, MethodProgress, MethodQuestion,
+		MethodAnswer, MethodDialogPreview, MethodApproveDialog, MethodReview,
+		MethodCleanupPreview, MethodCleanup,
+	} {
+		if called[method] == 0 {
+			t.Errorf("no extension tool calls %q, so that capability is unreachable", method)
+		}
+	}
+}
+
+var callBridgePattern = regexp.MustCompile(`callBridge\(\s*"([a-z_]+)"`)
