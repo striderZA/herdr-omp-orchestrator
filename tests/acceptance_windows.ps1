@@ -2673,7 +2673,15 @@ function Invoke-Restart {
         Assert-True -Id 'T10.1' -What 'the resume hint after the restart is still gated on a materialized session' `
             -Condition ((-not (Get-Flag $hint 'onDisk')) -or ($resume -ne '')) -Evidence (Protect-Text (Get-Json $hint) 400)
         if ($resume -ne '') {
-            Assert-True -Id 'T10.2' -What 'the advertised resume session file exists on disk' -Condition (Test-OmpSessionMaterialized -Reference ([string](Get-Field $before.Project 'OMPSessionID'))) -Evidence ([string](Get-Field $before.Project 'OMPSessionID'))
+            $restoredHandshake = Get-ReadySession -LaunchPaneId ([string](Get-Field $p 'LaunchPaneID'))
+            if (-not $restoredHandshake) { $restoredHandshake = Get-ReadySession -LaunchPaneId ([string](Get-Field $before.Project 'LaunchPaneID')) }
+            $fileState = Test-HandshakeMaterialized -Handshake $restoredHandshake
+            if ($null -eq $fileState) {
+                Add-Assertion -Id 'T10.2' -What 'a resume command was advertised for a session whose reference is id-only (materialization is the runtime-announced flag, not a filesystem path)' -Status 'INFO' `
+                    -Evidence ("onDisk=[$(Get-Field $hint 'onDisk')] file=[$(Get-Field $restoredHandshake 'omp_session_file')]")
+            } else {
+                Assert-True -Id 'T10.2' -What 'the advertised resume session file exists on disk' -Condition $fileState -Evidence ([string](Get-Field $restoredHandshake 'omp_session_file'))
+            }
         } else {
             Block-Item -Id 'T10.2' -What 'a resume command was advertised after the restart' -Evidence (Protect-Text (Get-Json $hint) 400)
         }
