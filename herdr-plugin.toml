@@ -47,3 +47,21 @@ id = "bind"
 title = "Bind this repository as an orchestrated project"
 contexts = ["pane", "workspace"]
 command = ["./herdr-omp-orchestrator.exe", "bind"]
+
+# The board is read-only: it reads the task facts, derives each card's stage and
+# can focus one verified worker pane. It has no dispatch, review, merge or
+# cleanup command, so nothing here mutates a task.
+[[panes]]
+id = "board"
+title = "Task board"
+placement = "overlay"
+command = ["./herdr-omp-orchestrator.exe", "board"]
+
+# The action opens that pane in the bound project's workspace. The pane route
+# then maps its own plugin context back to that project, so the action only has
+# to name the workspace.
+[[actions]]
+id = "board"
+title = "Open the task board"
+contexts = ["pane", "workspace"]
+command = ["./herdr-omp-orchestrator.exe", "open-board"]

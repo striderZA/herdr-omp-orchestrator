@@ -1259,6 +1259,92 @@ func (c *Client) AgentGet(ctx context.Context, target string) (*AgentInfo, error
 	return &res.Agent, nil
 }
 
+// AgentSession reads the native session reference Herdr publishes for the agent
+// behind target. ok is false when Herdr reports none, which is not a failure:
+// an installed integration publishes the reference asynchronously. A reference
+// whose kind this build cannot read is an error, never a silently empty session.
+//
+// The typed AgentGet deliberately drops agent_session, so this is the only
+// accessor for it. Its result type and the reference shape are the ones captured
+// from the installed preview build (`agent_info`, kind PATH carrying the OMP
+// session file).
+func (c *Client) AgentSession(ctx context.Context, target string) (kind, value string, ok bool, err error) {
+	const op = "agent get"
+	if strings.TrimSpace(target) == "" {
+		return "", "", false, fmt.Errorf("%w: %s: target is empty", ErrInvalidArgument, op)
+	}
+	raw, err := c.call(ctx, op, []string{"agent", "get", target}, timeoutDefinite)
+	if err != nil {
+		return "", "", false, err
+	}
+	var res struct {
+		Type  string `json:"type"`
+		Agent struct {
+			Session *SessionRef `json:"agent_session"`
+		} `json:"agent"`
+	}
+	if err := decodeResult(op, raw, &res); err != nil {
+		return "", "", false, err
+	}
+	if err := checkType(op, "agent_info", res.Type); err != nil {
+		return "", "", false, err
+	}
+	if res.Agent.Session == nil {
+		return "", "", false, nil
+	}
+	kind, value, err = res.Agent.Session.Identity()
+	if err != nil {
+		return "", "", false, err
+	}
+	return kind, value, true, nil
+}
+
+// AgentFocus focuses the pane that hosts the agent behind target (a live agent
+// name or a pane id); Herdr also marks that target seen.
+//
+// Focusing changes only the user's view, so a timeout is a definite failure -
+// unlike `agent prompt`, no input can have been written.
+//
+// The success result type of this command was not captured (capturing it would
+// have moved the user's focus), and `herdr api schema --json` defines no
+// dedicated focus result: agent.focus takes an agent target and the only
+// agent-shaped response is agent_info. So the shapes the schema can produce are
+// accepted - the focused agent's identity, which the caller compares with the
+// pane it asked for, or a bare acknowledgement - and anything else fails closed
+// rather than being decoded around. A caller that needs the identity must treat
+// a nil *AgentInfo as "focused, identity not reported".
+func (c *Client) AgentFocus(ctx context.Context, target string) (*AgentInfo, error) {
+	const op = "agent focus"
+	if strings.TrimSpace(target) == "" {
+		return nil, fmt.Errorf("%w: %s: target is empty", ErrInvalidArgument, op)
+	}
+	raw, err := c.call(ctx, op, []string{"agent", "focus", target}, timeoutDefinite)
+	if err != nil {
+		return nil, err
+	}
+	var res struct {
+		Type  string     `json:"type"`
+		Agent *AgentInfo `json:"agent"`
+	}
+	if err := decodeResult(op, raw, &res); err != nil {
+		return nil, err
+	}
+	switch res.Type {
+	case "ok":
+		return nil, nil
+	case "agent_info":
+		if res.Agent == nil {
+			return nil, fmt.Errorf("%w: %s: agent_info result carries no agent", ErrMalformedResponse, op)
+		}
+		if err := validateAgent(op, *res.Agent); err != nil {
+			return nil, err
+		}
+		return res.Agent, nil
+	default:
+		return nil, fmt.Errorf("%w: %s: unrecognized result type %q", ErrMalformedResponse, op, res.Type)
+	}
+}
+
 // AgentRead reads the agent's resolved terminal stream. Herdr prints terminal
 // text for this command, not JSON, so the result is returned verbatim and is
 // still bounded by MaxOutputBytes.

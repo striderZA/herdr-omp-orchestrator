@@ -1,13 +1,11 @@
 // Command herdr-omp-orchestrator is the plugin's single Go executable.
 //
-// Herdr runs it as a plugin action (for example `setup`) and the OMP extension
-// runs it as `bridge <method>` for every tool invocation. Both routes read the
-// environment they were started with and answer with one JSON object, so a
-// human reading a Herdr plugin log and the extension parsing stdout see the
-// same result.
-//
-// Later tasks add the `startup`, `event` and board routes; this file
-// deliberately wires only the routes that exist.
+// Herdr runs it as a plugin action (for example `open-board`), its startup and
+// event hooks run `startup`/`event`, its plugin pane runs `board`, and the OMP
+// extension runs it as `bridge <method>` for every tool invocation. Every
+// route reads the environment it was started with; the non-interactive ones
+// answer with one JSON object, so a human reading a Herdr plugin log and the
+// extension parsing stdout see the same result.
 package main
 
 import (
@@ -20,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"herdr-omp-orchestrator/internal/board"
 	"herdr-omp-orchestrator/internal/bridge"
 	"herdr-omp-orchestrator/internal/coord"
 	"herdr-omp-orchestrator/internal/herdr"
@@ -46,6 +45,18 @@ const startupTimeout = 2 * time.Minute
 // prompt a verified idle primary, which is one bounded Herdr call.
 const eventTimeout = 60 * time.Second
 
+// openBoardTimeout bounds one `open-board` action: it resolves the project and
+// asks Herdr to open the board pane. The interactive board itself is not
+// bounded: the reader closes it.
+const openBoardTimeout = 30 * time.Second
+
+// pluginID and boardEntrypoint are the manifest's own names
+// (herdr-plugin.toml): the action opens the pane the plugin declares.
+const (
+	pluginID        = "user.omp-orchestrator"
+	boardEntrypoint = "board"
+)
+
 // contextLimit bounds the plugin invocation context this executable accepts.
 const contextLimit = 1 << 20
 
@@ -56,6 +67,9 @@ const (
 	envContextJSON   = "HERDR_PLUGIN_CONTEXT_JSON"
 	envHerdrBinary   = "HERDR_BIN_PATH"
 	envHerdrBinaryAt = "HERDR_ORCH_HERDR_BIN_PATH"
+	// envWorkspaceID is the workspace a plugin command was invoked in; the board
+	// pane route uses it even when the JSON context is unavailable.
+	envWorkspaceID = "HERDR_WORKSPACE_ID"
 	// envPluginEvent and envPluginEventJSON are what Herdr injects into every
 	// hook: the hook name and the event payload. Both are read as-is, never
 	// reconstructed from argv.
@@ -63,7 +77,7 @@ const (
 	envPluginEventJSON = "HERDR_PLUGIN_EVENT_JSON"
 )
 
-const usage = "usage: herdr-omp-orchestrator <setup|bind|bridge <method>|startup|event>"
+const usage = "usage: herdr-omp-orchestrator <setup|bind|startup|event|board|open-board|bridge <method>>"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -80,6 +94,10 @@ func main() {
 		os.Exit(runStartup(env, os.Stdout, os.Stderr))
 	case "event":
 		os.Exit(runEvent(env, os.Stdout, os.Stderr))
+	case "board":
+		os.Exit(runBoard(env, os.Stdout, os.Stderr))
+	case "open-board":
+		os.Exit(runOpenBoard(env, os.Stdout, os.Stderr))
 	case "bridge":
 		os.Exit(runBridge(env, os.Stdin, os.Stdout, os.Stderr, os.Args[2:]))
 	default:
@@ -207,6 +225,118 @@ func runEvent(env map[string]string, stdout, stderr io.Writer) int {
 		return emit(stdout, stderr, failureBody(coordCode(err), err.Error()))
 	}
 	return emit(stdout, stderr, map[string]any{"ok": true, "event": eventName})
+}
+
+// runBoard is the `[[panes]]` route: the read-only board for the project the
+// pane was opened in, running in this terminal until the reader closes it.
+//
+// The pane route reads the state store and the Herdr binary the invocation was
+// started with; it resolves its own project from the injected workspace or
+// working directory and refuses rather than guessing. Nothing is written on
+// stdout on success: this terminal belongs to the board, not to a JSON envelope.
+func runBoard(env map[string]string, stdout, stderr io.Writer) int {
+	stateDir := strings.TrimSpace(env[envStateDir])
+	if stateDir == "" {
+		return emit(stdout, stderr, failureBody("state_dir_unavailable", envStateDir+" is not set"))
+	}
+	store, err := state.Open(stateDir)
+	if err != nil {
+		return emit(stdout, stderr, failureBody("state_write_failed", fmt.Sprintf("open the orchestrator state: %v", err)))
+	}
+	defer func() { _ = store.Close() }()
+	client, err := herdr.NewClient(herdrBinary(env))
+	if err != nil {
+		return emit(stdout, stderr, failureBody("herdr_unavailable", err.Error()))
+	}
+
+	invocation := invocationContext(env)
+	project, err := board.ProjectFor(context.Background(), store,
+		firstNonEmpty(invocation.WorkspaceID, env[envWorkspaceID]), invocationDir(invocation))
+	if err != nil {
+		return emit(stdout, stderr, failureBody("project_unknown", err.Error()))
+	}
+	// The board owns the terminal until it is closed; no timeout applies, and
+	// Bubble Tea is left with the process's own stdio.
+	if err := board.Run(context.Background(), store, client, project.Key, board.Options{}); err != nil {
+		return emit(stdout, stderr, failureBody("internal", err.Error()))
+	}
+	return 0
+}
+
+// runOpenBoard is the `[[actions]]` route: it opens the board pane for the bound
+// project the action was invoked from. Herdr owns pane topology, so this route
+// calls `plugin pane open` through the Herdr binary the action was started with;
+// the plugin id and entrypoint are the ones herdr-plugin.toml declares.
+func runOpenBoard(env map[string]string, stdout, stderr io.Writer) int {
+	stateDir := strings.TrimSpace(env[envStateDir])
+	if stateDir == "" {
+		return emit(stdout, stderr, failureBody("state_dir_unavailable", envStateDir+" is not set"))
+	}
+	binary := herdrBinary(env)
+	if binary == "" {
+		return emit(stdout, stderr, failureBody("herdr_unavailable", envHerdrBinary+" is not set"))
+	}
+	store, err := state.Open(stateDir)
+	if err != nil {
+		return emit(stdout, stderr, failureBody("state_write_failed", fmt.Sprintf("open the orchestrator state: %v", err)))
+	}
+	defer func() { _ = store.Close() }()
+	client, err := herdr.NewClient(binary)
+	if err != nil {
+		return emit(stdout, stderr, failureBody("herdr_unavailable", err.Error()))
+	}
+
+	invocation := invocationContext(env)
+	project, err := board.ProjectFor(context.Background(), store,
+		firstNonEmpty(invocation.WorkspaceID, env[envWorkspaceID]), invocationDir(invocation))
+	if err != nil {
+		return emit(stdout, stderr, failureBody("project_unknown", err.Error()))
+	}
+	workspace := firstNonEmpty(project.RepoWorkspaceID, project.CurrentWorkspaceID)
+	if workspace == "" {
+		return emit(stdout, stderr, failureBody("project_unknown",
+			fmt.Sprintf("the bound project %s records no workspace to open the board in", project.Key)))
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), openBoardTimeout)
+	defer cancel()
+	opened, err := client.Call(ctx, "plugin", "pane", "open",
+		"--plugin", pluginID, "--entrypoint", boardEntrypoint, "--workspace", workspace)
+	if err != nil {
+		return emit(stdout, stderr, failureBody(coordCode(err), err.Error()))
+	}
+	return emit(stdout, stderr, map[string]any{"ok": true, "project": project.Key, "workspace": workspace, "pane": opened})
+}
+
+// invocationContext reads the JSON object Herdr injects into a plugin command.
+// A missing or unreadable context is never fatal here: the board resolves its
+// project from the identities it does have, and refuses rather than guessing.
+func invocationContext(env map[string]string) pluginContext {
+	raw := strings.TrimSpace(env[envContextJSON])
+	if raw == "" || len(raw) > contextLimit {
+		return pluginContext{}
+	}
+	var invocation pluginContext
+	if err := json.Unmarshal([]byte(raw), &invocation); err != nil {
+		return pluginContext{}
+	}
+	return invocation
+}
+
+// invocationDir is the working directory the invocation named: the focused
+// pane's if it has one, otherwise the workspace's.
+func invocationDir(invocation pluginContext) string {
+	return firstNonEmpty(invocation.FocusedPaneCwd, invocation.WorkspaceCwd)
+}
+
+// firstNonEmpty returns the first value that is not blank.
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 // runBridge answers one extension call. The request is read from stdin with a
