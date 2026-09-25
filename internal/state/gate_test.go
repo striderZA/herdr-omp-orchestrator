@@ -402,22 +402,28 @@ func TestStoreRecordStepFailureReleasesOnlyItsOwnClaim(t *testing.T) {
 		return nil
 	}
 
-	// Another owner's release attempt does not touch this claim, even in the same
-	// transaction that records a failure.
-	if _, released, err := s.RecordStepFailure(ctx, "t1", current.Revision, note, "owner-b", task.Intent, true); err != nil || released {
-		t.Fatalf("RecordStepFailure(other owner) = (%v, %v), want no release", released, err)
+	// Another owner's late failure is refused outright: it does not hold this step, so
+	// its outcome describes state this task does not have.
+	if _, released, err := s.RecordStepFailure(ctx, "t1", current.Revision, note, "owner-b", task.Intent, true); !errors.Is(err, state.ErrStepNotHeld) || released {
+		t.Fatalf("RecordStepFailure(other owner) = (%v, %v), want ErrStepNotHeld", released, err)
 	}
-	if took, err := other.ClaimStep(ctx, "t1", task.Intent, "owner-b", time.Minute); err != nil || took {
-		t.Fatalf("ClaimStep after a foreign release = (%v, %v), want the claim still held", took, err)
-	}
-	// Nor does the right owner on the wrong phase: the claim belongs to the phase it
-	// was taken for.
+	// The right owner may resolve the step it claimed even when the task has moved on
+	// to the next phase: starting the worker records agent_started while the step that
+	// started it is still the one running. The release, though, is phase-gated, so this
+	// does not free the claim that belongs to the phase the task now stands on.
 	recorded, err := s.Task(ctx, "t1")
 	if err != nil {
 		t.Fatalf("Task: %v", err)
 	}
-	if _, released, err := s.RecordStepFailure(ctx, "t1", recorded.Revision, note, "owner-a", task.WorktreeCreated, true); err != nil || released {
-		t.Fatalf("RecordStepFailure(wrong phase) = (%v, %v), want no release", released, err)
+	written, released, err := s.RecordStepFailure(ctx, "t1", recorded.Revision, note, "owner-a", task.WorktreeCreated, true)
+	if err != nil {
+		t.Fatalf("RecordStepFailure(own step, next phase) = (%v, %v), want the failure stored", released, err)
+	}
+	if released {
+		t.Errorf("released = true, want a claim for another phase left alone")
+	}
+	if written.Attention == "" || written.Revision != recorded.Revision+1 {
+		t.Errorf("task = %+v, want the failure stored once", written)
 	}
 
 	// A write that does not land releases nothing: a stale revision is refused and
@@ -430,26 +436,26 @@ func TestStoreRecordStepFailureReleasesOnlyItsOwnClaim(t *testing.T) {
 		next.Attention = "stale"
 		return errors.New("the task moved on")
 	}
-	if _, released, err := s.RecordStepFailure(ctx, "t1", recorded.Revision, refuse, "owner-a", task.Intent, true); err == nil || released {
+	if _, released, err := s.RecordStepFailure(ctx, "t1", written.Revision, refuse, "owner-a", task.Intent, true); err == nil || released {
 		t.Fatalf("RecordStepFailure(refused mutation) = (%v, %v), want an error and no release", released, err)
 	}
-	if _, released, err := s.RecordStepFailure(ctx, "t1", recorded.Revision+9, note, "owner-a", task.Intent, true); !errors.Is(err, state.ErrConflict) || released {
+	if _, released, err := s.RecordStepFailure(ctx, "t1", written.Revision+9, note, "owner-a", task.Intent, true); !errors.Is(err, state.ErrConflict) || released {
 		t.Fatalf("RecordStepFailure(stale revision) = (%v, %v), want ErrConflict and no release", released, err)
 	}
 	failed2, err := s.Task(ctx, "t1")
 	if err != nil {
 		t.Fatalf("Task: %v", err)
 	}
-	if failed2.Revision != recorded.Revision || failed2.Attention != "the create failed" {
+	if failed2.Revision != written.Revision {
 		t.Fatalf("task after refused failures = %+v, want nothing further stored", failed2)
 	}
 
 	// The matching owner and phase release it, and the failure is stored with it.
-	failed, released, err := s.RecordStepFailure(ctx, "t1", recorded.Revision, note, "owner-a", task.Intent, true)
+	failed, released, err := s.RecordStepFailure(ctx, "t1", written.Revision, note, "owner-a", task.Intent, true)
 	if err != nil || !released {
 		t.Fatalf("RecordStepFailure = (%v, %v), want the release", released, err)
 	}
-	if failed.Attention != "the create failed" || failed.Revision != recorded.Revision+1 {
+	if failed.Revision != written.Revision+1 {
 		t.Fatalf("failed task = %+v, want the failure stored", failed)
 	}
 	if took, err := other.ClaimStep(ctx, "t1", task.Intent, "owner-b", time.Minute); err != nil || !took {
@@ -519,5 +525,89 @@ func TestStoreRecordStepFailureFailsClosedWhenTheReleaseCannotBeWritten(t *testi
 	}
 	if took, err := other.ClaimStep(ctx, "t1", task.Intent, "owner-b", time.Minute); err != nil || took {
 		t.Fatalf("ClaimStep after an undecided failure = (%v, %v), want the claim kept", took, err)
+	}
+}
+
+// TestStoreRecordStepFailureKeepsAnUndecidedOutcomeWithoutALiveOwner pins the other
+// half of the fence: a step nobody holds is still the phase this caller ran, so an
+// undecided outcome keeps its blocker — refusing it would leave the task resumable
+// with nobody allowed to retry it safely. Only another owner's step is refused, and
+// the release stays lease-gated so an expired claim is never freed from under one.
+func TestStoreRecordStepFailureKeepsAnUndecidedOutcomeWithoutALiveOwner(t *testing.T) {
+	ctx := context.Background()
+	s := open(t, t.TempDir())
+
+	st := gateTask(t, "t1", "repo-a", nil)
+	if err := s.CreateTask(ctx, st); err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	current, err := s.Task(ctx, "t1")
+	if err != nil {
+		t.Fatalf("Task: %v", err)
+	}
+	blocker := func(next *task.Task) error {
+		next.Blocker = "the outcome is unknown"
+		return nil
+	}
+	attention := func(next *task.Task) error {
+		next.Attention = "the create failed"
+		return nil
+	}
+
+	// Nobody holds the step at all: the undecided outcome is still recorded.
+	if _, released, err := s.RecordStepFailure(ctx, "t1", current.Revision, blocker, "owner-a", task.Intent, false); err != nil || released {
+		t.Fatalf("RecordStepFailure(no claim) = (%v, %v), want the failure recorded", released, err)
+	}
+	blocked, err := s.Task(ctx, "t1")
+	if err != nil {
+		t.Fatalf("Task: %v", err)
+	}
+	if blocked.Blocker != "the outcome is unknown" {
+		t.Fatalf("blocker = %q, want the undecided outcome recorded", blocked.Blocker)
+	}
+
+	// The caller's own claim expired while its step ran: its outcome is recorded, and
+	// the expired claim is left alone (the takeover that follows needs no release).
+	if took, err := s.ClaimStep(ctx, "t1", task.Intent, "owner-a", 20*time.Millisecond); err != nil || !took {
+		t.Fatalf("ClaimStep = (%v, %v), want the claim", took, err)
+	}
+	time.Sleep(40 * time.Millisecond)
+	decided, err := s.Task(ctx, "t1")
+	if err != nil {
+		t.Fatalf("Task: %v", err)
+	}
+	recorded, released, err := s.RecordStepFailure(ctx, "t1", decided.Revision, attention, "owner-a", task.Intent, true)
+	if err != nil {
+		t.Fatalf("RecordStepFailure(expired own claim) = (%v, %v), want the failure recorded", released, err)
+	}
+	if released {
+		t.Errorf("released = true, want an expired claim left to be taken over")
+	}
+	if recorded.Attention != "the create failed" {
+		t.Errorf("attention = %q, want the definite failure recorded", recorded.Attention)
+	}
+	// The step can still be taken over at once, so a definite failure never leaves the
+	// task behind a lease.
+	if took, err := s.ClaimStep(ctx, "t1", task.Intent, "owner-b", time.Minute); err != nil || !took {
+		t.Fatalf("ClaimStep after the expired failure = (%v, %v), want the takeover", took, err)
+	}
+	// And the expired owner can no longer release what is now somebody else's.
+	if err := s.ReleaseStep(ctx, "t1", "owner-a"); !errors.Is(err, state.ErrConflict) {
+		t.Errorf("ReleaseStep(expired owner) err = %v, want ErrConflict", err)
+	}
+	// The live owner's step is not this caller's to resolve.
+	live, err := s.Task(ctx, "t1")
+	if err != nil {
+		t.Fatalf("Task: %v", err)
+	}
+	if _, _, err := s.RecordStepFailure(ctx, "t1", live.Revision, blocker, "owner-a", task.Intent, false); !errors.Is(err, state.ErrStepNotHeld) {
+		t.Fatalf("RecordStepFailure(another live owner) err = %v, want ErrStepNotHeld", err)
+	}
+	after, err := s.Task(ctx, "t1")
+	if err != nil {
+		t.Fatalf("Task: %v", err)
+	}
+	if after.Blocker != blocked.Blocker || after.Revision != live.Revision {
+		t.Errorf("task after a refused failure = %+v, want the live owner's state", after)
 	}
 }

@@ -1350,6 +1350,11 @@ func (c *Coordinator) recordStepFailure(
 		if err == nil {
 			return updated, nil
 		}
+		if errors.Is(err, state.ErrStepNotHeld) {
+			// The step is another caller's now, so retrying this write can only put a
+			// failure onto state that caller owns.
+			return st, fmt.Errorf("task %s: %s: %w", st.ID, what, err)
+		}
 		if !errors.Is(err, state.ErrConflict) {
 			return st, fmt.Errorf("task %s: %s: %w", st.ID, what, err)
 		}

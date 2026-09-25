@@ -3532,6 +3532,111 @@ func TestStaleFailureIsNotRecordedOntoThePhaseThatAdvanced(t *testing.T) {
 	_ = sibling
 }
 
+func TestStaleFailuresAreRefusedWhenAnotherOwnerHoldsTheStep(t *testing.T) {
+	// The other half of the stale-failure race: the owner of the step changed before
+	// the failure was recorded (the lease expired and another caller took the step).
+	// The late writer must write nothing at all — neither an attention nor a blocker —
+	// because the outcome it carries describes a step another caller now owns.
+	for _, tc := range []struct {
+		name     string
+		cause    error
+		terminal bool
+	}{
+		{name: "definite", cause: herdr.ErrCLI, terminal: false},
+		{name: "ambiguous", cause: herdr.ErrAmbiguous, terminal: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newCoordFixture(t, fixturePlan{})
+			ctx := context.Background()
+			st, err := f.dispatchSpec(f.coord, spec{title: "one", checks: []string{"go test ./... ok"}})
+			if err != nil {
+				t.Fatalf("dispatch: %v", err)
+			}
+			before := f.countCalls("agent prompt")
+			// The task's current step belongs to another caller now.
+			if took, err := f.store.ClaimStep(ctx, st.ID, st.Phase, "another-caller", time.Minute); err != nil || !took {
+				t.Fatalf("ClaimStep as another caller = (%v, %v), want the claim", took, err)
+			}
+
+			_, err = f.coord.failTask(ctx, st, "submit the brief", tc.terminal,
+				fmt.Errorf("submit the brief for task %s failed: %w", st.ID, tc.cause))
+			var persistence *PersistenceError
+			if !errors.As(err, &persistence) {
+				t.Fatalf("late %s failure err = %v, want a PersistenceError", tc.name, err)
+			}
+			if !errors.Is(err, state.ErrStepNotHeld) {
+				t.Errorf("late %s failure err = %v, want it to report the lost step", tc.name, err)
+			}
+			after, err := f.store.Task(ctx, st.ID)
+			if err != nil {
+				t.Fatalf("Task: %v", err)
+			}
+			if after.Attention != "" || after.Blocker != "" {
+				t.Errorf("late %s failure wrote %q/%q onto the task, want nothing", tc.name, after.Attention, after.Blocker)
+			}
+			if after.Phase != st.Phase || after.Revision != st.Revision {
+				t.Errorf("late %s failure changed the task: %+v, want it untouched", tc.name, after)
+			}
+			// The other caller's claim is still exactly theirs, and no brief went out.
+			if took, err := f.store.ClaimStep(ctx, st.ID, st.Phase, "probe", time.Minute); err != nil || took {
+				t.Errorf("ClaimStep after the late %s failure = (%v, %v), want the other caller's claim kept", tc.name, took, err)
+			}
+			if got := f.countCalls("agent prompt"); got != before {
+				t.Errorf("agent prompt calls = %d, want %d: a refused failure sent a brief", got, before)
+			}
+		})
+	}
+}
+
+func TestAnUndecidedFailureWithoutALiveOwnerStillBlocksTheRetry(t *testing.T) {
+	// The brief's fate is unknown and the lease that carried the step has expired
+	// without anyone taking it over. The failure must still be recorded as a blocker:
+	// the alternative is a task that looks resumable and would resubmit a brief whose
+	// fate nobody established.
+	f := newCoordFixture(t, fixturePlan{})
+	ctx := context.Background()
+	st := f.ambiguousBrief("one")
+	// Back to the state before the ambiguity was recorded: the worker's pane is live
+	// and the task stands at the step that submits the brief, with nothing recorded.
+	clear := f.block(st, func(next *task.Task) {
+		next.Blocker = ""
+		next.Attention = ""
+	})
+	before := f.countCalls("agent prompt")
+	// The recorded claim is this coordinator's, and its lease has run out.
+	f.coord.releaseStep(ctx, clear)
+	if took, err := f.store.ClaimStep(ctx, clear.ID, clear.Phase, f.coord.owner, 20*time.Millisecond); err != nil || !took {
+		t.Fatalf("ClaimStep = (%v, %v), want the claim", took, err)
+	}
+	time.Sleep(40 * time.Millisecond)
+
+	_, err := f.coord.failTask(ctx, clear, "submit the brief", true,
+		fmt.Errorf("submit the brief for task %s: %w", clear.ID, herdr.ErrAmbiguous))
+	if !errors.Is(err, herdr.ErrAmbiguous) {
+		t.Fatalf("failure err = %v, want the ambiguous cause reported", err)
+	}
+	blocked, err := f.store.Task(ctx, clear.ID)
+	if err != nil {
+		t.Fatalf("Task: %v", err)
+	}
+	if blocked.Blocker == "" || blocked.Attention != "" {
+		t.Fatalf("task = blocker %q attention %q, want a blocker for the undecided outcome", blocked.Blocker, blocked.Attention)
+	}
+	if blocked.Phase != task.AgentStarted {
+		t.Fatalf("phase = %q, want %q", blocked.Phase, task.AgentStarted)
+	}
+	if got := task.StageOf(blocked); got != task.NeedsInput {
+		t.Errorf("stage = %q, want needs_input", got)
+	}
+	// And the retry is refused: this task needs an inspection, not a resubmission.
+	if _, err := f.resume(clear.ID); !errors.Is(err, ErrBlocked) {
+		t.Fatalf("resume of the blocked task err = %v, want ErrBlocked", err)
+	}
+	if got := f.countCalls("agent prompt"); got != before {
+		t.Errorf("agent prompt calls = %d, want %d: the brief was blindly resubmitted", got, before)
+	}
+}
+
 func TestStepClaimLeaseKeepsCrashRecovery(t *testing.T) {
 	f := newCoordFixture(t, fixturePlan{})
 	ctx := context.Background()

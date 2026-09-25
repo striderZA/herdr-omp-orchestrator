@@ -1266,9 +1266,23 @@ func (s *Store) RetireStepWithNote(
 	return next, nil
 }
 
+// ErrStepNotHeld reports that a caller no longer holds the step it is trying to
+// resolve, so its outcome describes state another caller owns. It is an ErrConflict:
+// the caller's read is stale and the safe answer is to write nothing.
+var ErrStepNotHeld = fmt.Errorf("%w: the step is not held by this caller", ErrConflict)
+
 // RecordStepFailure records a failed step on its own task and releases this owner's
 // step claim for that exact phase, in one transaction. It reports whether the claim
 // was released.
+//
+// The fence for the whole write is the claim row: the step must not be in another
+// caller's hands, or a late failure from a caller whose lease expired — a slow step, a
+// paused process — would come back after another coordinator had taken the same step
+// and overwrite the newer state with a failure that describes the one it ran. A step
+// claimed by another owner for another phase is ErrStepNotHeld, which writes nothing
+// and leaves the task and that claim exactly as they were; a step nobody holds is still
+// this caller's to report on, so an undecided outcome keeps its blocker instead of
+// going missing.
 //
 // Persisting the failure and releasing the claim cannot be separate writes: a claim
 // released before the failure is stored lets a concurrent resume take the step and
@@ -1298,6 +1312,9 @@ func (s *Store) RecordStepFailure(
 	}
 	defer tx.rollback()
 
+	if err := requireOwnStep(ctx, tx, id, owner); err != nil {
+		return task.Task{}, false, err
+	}
 	next, err := updateTask(ctx, tx, id, expectedRevision, mutate)
 	if err != nil {
 		return task.Task{}, false, err
@@ -1315,6 +1332,38 @@ func (s *Store) RecordStepFailure(
 	return next, released, nil
 }
 
+// requireOwnStep reports whether this step is still the caller's to resolve: either
+// the claim row is empty (nobody is running the step) or it names the caller. The read
+// happens inside the same transaction as the write it guards, so a takeover cannot
+// slip between the fence and the mutation.
+//
+// The claim's own phase is deliberately not compared: a step may record the next phase
+// itself while it is still running (starting the worker records agent_started before
+// the worker has been confirmed ready), so the claim is for the step, not for whatever
+// phase the task currently stands on. What matters is whose hand the step is in.
+//
+// An expired lease is deliberately NOT a refusal on its own either. The hazard is
+// another owner running the step — a late failure must not overwrite what that owner
+// records — but a step nobody holds is still described by the phase this caller ran,
+// and dropping an undecided outcome there would leave the task resumable with no
+// blocker and nobody allowed to retry it safely. The release that follows is separate
+// and stays lease- and phase-gated, so an expired claim is never freed from under a
+// live holder.
+func requireOwnStep(ctx context.Context, tx *tx, id, owner string) error {
+	var holder, heldPhase string
+	var heldUntil int64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT step_claim_owner, step_claim_phase, step_claim_until FROM tasks WHERE id = ?`, id).
+		Scan(&holder, &heldPhase, &heldUntil); err != nil {
+		return fmt.Errorf("read the step claim of %s: %w", id, err)
+	}
+	if holder != "" && holder != owner {
+		return fmt.Errorf("%w: task %s is claimed by %q for step %s until %d, not by %q",
+			ErrStepNotHeld, id, holder, heldPhase, heldUntil, owner)
+	}
+	return nil
+}
+
 // clearStepClaim drops the step claim of one task through q. An empty owner clears
 // whatever claim is there (a user's decision); otherwise only the claim that the
 // owner and phase still match is cleared, so a caller can never take a step away
@@ -1323,8 +1372,8 @@ func clearStepClaim(ctx context.Context, q execer, id, owner string, phase task.
 	query := `UPDATE tasks SET step_claim_owner = '', step_claim_phase = '', step_claim_until = 0 WHERE id = ?`
 	args := []any{id}
 	if owner != "" || phase != "" {
-		query += ` AND step_claim_owner = ? AND step_claim_phase = ?`
-		args = append(args, owner, phase)
+		query += ` AND step_claim_owner = ? AND step_claim_phase = ? AND step_claim_until > ?`
+		args = append(args, owner, phase, time.Now().UnixMilli())
 	}
 	res, err := q.ExecContext(ctx, query, args...)
 	if err != nil {
