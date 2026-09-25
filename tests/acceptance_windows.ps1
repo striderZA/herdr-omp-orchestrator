@@ -1189,6 +1189,49 @@ function Get-JsonField {
     return (Get-Field (Get-Field $Json 'Result' $null) $Name $Default)
 }
 
+function Test-JsonBool {
+    <#
+        $true/$false only when the named property holds a REAL JSON boolean, and
+        $null otherwise (absent, null, a string like "false", a number). Used by
+        every assertion that must prove a value is true or false, so a malformed
+        answer can never satisfy one through PowerShell's string coercion.
+    #>
+    param($Object, [string]$Name)
+    if ($null -eq $Object) { return $null }
+    $prop = $Object.PSObject.Properties[$Name]
+    if ($null -eq $prop) { return $null }
+    if ($prop.Value -isnot [bool]) { return $null }
+    return [bool]$prop.Value
+}
+
+function Assert-JsonTrue {
+    param(
+        [Parameter(Mandatory)][string]$Id,
+        [Parameter(Mandatory)][string]$What,
+        $Object,
+        [Parameter(Mandatory)][string]$Name,
+        [string]$TaskId = '',
+        [string]$Command = ''
+    )
+    $value = Test-JsonBool -Object $Object -Name $Name
+    return Assert-True -Id $Id -What $What -Condition ($value -eq $true) -TaskId $TaskId -Command $Command `
+        -Evidence ("$Name=[$(Get-Field $Object $Name 'absent')] (a real JSON boolean is required; null, string or number is a failure)")
+}
+
+function Assert-JsonFalse {
+    param(
+        [Parameter(Mandatory)][string]$Id,
+        [Parameter(Mandatory)][string]$What,
+        $Object,
+        [Parameter(Mandatory)][string]$Name,
+        [string]$TaskId = '',
+        [string]$Command = ''
+    )
+    $value = Test-JsonBool -Object $Object -Name $Name
+    return Assert-True -Id $Id -What $What -Condition ($value -eq $false) -TaskId $TaskId -Command $Command `
+        -Evidence ("$Name=[$(Get-Field $Object $Name 'absent')] (a real JSON boolean is required; null, string or number is a failure)")
+}
+
 function Get-Json {
     param($Object)
     return ($Object | ConvertTo-Json -Depth 12 -Compress)
@@ -1669,7 +1712,7 @@ function Invoke-SetupAction {
     Assert-Equal -Id 'U1.4' -What 'the setup command exited 0' -Expected 0 -Actual (Get-Field $output.Entry 'exit_code')
     Assert-Equal -Id 'U1.5' -What 'the setup command reports success' -Expected 'succeeded' -Actual (Get-Field $output.Entry 'status')
     $payload = $output.Payload
-    Assert-True -Id 'U1.6' -What 'setup answered with ok=true' -Condition (Get-Flag $payload 'ok') -Evidence (Protect-Text (Get-Json $payload) 400)
+    Assert-JsonTrue -Id 'U1.6' -What 'setup answered with ok=true (a real boolean)' -Object $payload -Name 'ok'
     Assert-Equal -Id 'U1.7' -What 'setup reports the bridge protocol version' -Expected 1 -Actual (Get-Field $payload 'protocol')
 
     $reported = [string](Get-Field $payload 'extension')
@@ -1705,7 +1748,7 @@ function Invoke-SetupAction {
             -Condition ($second.Invocation.CommandLine -notmatch '(?i)--session') -Evidence $second.Invocation.CommandLine
         $secondOut = Get-ActionOutput -LogId ([string](Get-Field (Get-Field (Get-Field $second 'Result') 'log') 'log_id')) -TimeoutSeconds 90 -NoSessionScope
         Assert-Equal -Id 'U4.2c' -What 'the repeated setup exits 0 and reports success' -Expected 0 -Actual (Get-Field $secondOut.Entry 'exit_code')
-        Assert-True -Id 'U4.2d' -What 'the repeated setup answered ok=true' -Condition (Get-Flag $secondOut.Payload 'ok') -Evidence (Protect-Text (Get-Json $secondOut.Payload) 300)
+        Assert-JsonTrue -Id 'U4.2d' -What 'the repeated setup answered ok=true (a real boolean)' -Object $secondOut.Payload -Name 'ok'
     }
     Assert-Equal -Id 'U4.2e' -What 'setup is idempotent: a second run leaves the extension byte-identical' -Expected $firstHash -Actual (Get-FileHashSafe $reported)
     # Currentness: the installed bytes must equal what this build renders from its
@@ -1766,8 +1809,8 @@ function Invoke-Bind {
     if (-not $output) { throw 'the bind action never finished' }
     Assert-Equal -Id 'N2.2' -What 'the bind command exited 0' -Expected 0 -Actual (Get-Field $output.Entry 'exit_code')
     $payload = $output.Payload
-    Assert-True -Id 'N2.3' -What 'bind answered with ok=true' -Condition (Get-Flag $payload 'ok') -Evidence (Protect-Text (Get-Json $payload) 500)
-    if (-not (Get-Flag $payload 'ok')) { throw 'bind failed; the rest of the workflow cannot be driven' }
+    Assert-JsonTrue -Id 'N2.3' -What 'bind answered with ok=true (a real boolean)' -Object $payload -Name 'ok'
+    if ((Test-JsonBool -Object $payload -Name 'ok') -ne $true) { throw 'bind failed; the rest of the workflow cannot be driven' }
 
     $project = Get-Field $payload 'project'
     $script:Project = $project
@@ -1836,7 +1879,8 @@ function Invoke-Bind {
     Add-Assertion -Id 'N6.1' -What 'bind reported a session hint' -Status $(if ($null -ne $hint) { 'PASS' } else { 'FAIL' }) -Evidence (Protect-Text (Get-Json $hint) 400)
     $resume = [string](Get-Field $hint 'resume')
     $unavailable = [string](Get-Field $hint 'resumeUnavailable')
-    $onDiskHint = Get-Flag $hint 'onDisk'
+    # Read strictly: a malformed value takes the stricter branch (no resume offered).
+    $onDiskHint = ((Test-JsonBool -Object $hint -Name 'onDisk') -eq $true)
     Assert-True -Id 'N6.2' -What 'the hint either offers a resume command or states why it cannot' `
         -Condition (($resume -ne '') -xor ($unavailable -eq '')) -Evidence "resume=[$resume] unavailable=[$unavailable]"
     Assert-True -Id 'N6.3' -What 'a resume hint is only offered for a session that is on disk (materialization gate)' `
@@ -1892,7 +1936,7 @@ function Invoke-PrimaryTurn {
     $output = if ($invoke) { Get-BindPayload -Result (Get-Field $invoke 'Result') } else { $null }
     Assert-Equal -Id 'N8.1' -What 're-binding an existing project exits 0 (reopen path)' -Expected 0 -Actual $(if ($output) { Get-Field $output.Entry 'exit_code' } else { 'no invocation' })
     $payload = if ($output) { $output.Payload } else { $null }
-    Assert-True -Id 'N8.2' -What 're-bind answered ok=true' -Condition (Get-Flag $payload 'ok') -Evidence (Protect-Text (Get-Json $payload) 500)
+    Assert-JsonTrue -Id 'N8.2' -What 're-bind answered ok=true (a real boolean)' -Object $payload -Name 'ok'
     $project2 = Get-Field $payload 'project'
     Assert-Equal -Id 'N8.3' -What 're-bind keeps the recorded OMP session (identity retained)' -Expected ([string](Get-Field $script:Project 'OMPSessionID')) -Actual ([string](Get-Field $project2 'OMPSessionID'))
     Assert-Equal -Id 'N8.4' -What 're-bind keeps the primary agent name' -Expected ([string](Get-Field $script:Project 'AgentName')) -Actual ([string](Get-Field $project2 'AgentName'))
@@ -1900,7 +1944,7 @@ function Invoke-PrimaryTurn {
 
     $hint = Get-Field $payload 'session'
     $script:ResumeHintAfterTurn = $hint
-    Assert-True -Id 'N8.6' -What 'the materialized session now advertises a resume command' -Condition (Get-Flag $hint 'onDisk') -Evidence (Protect-Text (Get-Json $hint) 400)
+    Assert-JsonTrue -Id 'N8.6' -What 'the materialized session now advertises a resume command (a real boolean)' -Object $hint -Name 'onDisk'
     $handshake = Get-ReadySession -LaunchPaneId $script:PrimaryPane
     $expectedResume = 'omp --resume=' + [string](Get-Field $handshake 'omp_session_id')
     Assert-Equal -Id 'N8.7' -What 'the resume hint names the exact announced session id' -Expected $expectedResume -Actual ([string](Get-Field $hint 'resume'))
@@ -1908,7 +1952,7 @@ function Invoke-PrimaryTurn {
     $fileAfter = Test-HandshakeMaterialized -Handshake $handshakeAfter
     if ($null -eq $fileAfter) {
         Assert-True -Id 'N8.8' -What 'a resume command is only offered together with a materialized session (reference form checkable only when Herdr reports a path)' `
-            -Condition (Get-Flag $hint 'onDisk') -Evidence ("file=[$(Get-Field $handshakeAfter 'omp_session_file')] onDisk=[$(Get-Field $hint 'onDisk')]")
+            -Condition ((Test-JsonBool -Object $hint -Name 'onDisk') -eq $true) -Evidence ("file=[$(Get-Field $handshakeAfter 'omp_session_file')] onDisk=[$(Get-Field $hint 'onDisk')]")
     } else {
         Assert-True -Id 'N8.8' -What 'the resume hint is only offered because the session file exists' -Condition $fileAfter -Evidence ([string](Get-Field $handshakeAfter 'omp_session_file'))
     }
@@ -2132,7 +2176,7 @@ function Invoke-PartialReportRejection {
     $preview = Invoke-BridgeAs -LaunchPaneId $caller.LaunchPane -Method 'cleanup_preview' -Params @{ taskId = $id }
     Assert-True -Id 'PR5.1' -What 'cleanup_preview answers for a running task' -Condition $preview.Ok -TaskId $id -Evidence (Protect-Text (Get-Json $preview.Error) 300)
     if ($preview.Ok) {
-        Assert-True -Id 'PR5.2' -What 'a running task is not removable' -Condition (-not (Get-Flag $preview.Result 'removable')) -TaskId $id -Evidence (Protect-Text (Get-Json $preview.Result) 400)
+        Assert-JsonFalse -Id 'PR5.2' -What 'a running task is not removable (a real boolean)' -Object $preview.Result -Name 'removable' -TaskId $id
         Assert-True -Id 'PR5.3' -What 'the preview names the exact recorded checkout path' -Condition (Test-SamePath -A (Get-Field $preview.Result 'path') -B ([string](Get-Field $fact 'WorktreePath'))) -TaskId $id
     }
     $cleanup = Invoke-BridgeAs -LaunchPaneId $caller.LaunchPane -Method 'cleanup' -Params @{ taskId = $id }
@@ -2321,7 +2365,7 @@ function Invoke-BlockedDialog {
         -Evidence (Protect-Text $preview.Raw 400)
     Assert-True -Id 'K3.1' -What 'the primary-side dialog preview answers' -Condition $preview.Ok -TaskId $idB -Evidence (Protect-Text (Get-Json $preview.Error) 300)
     if ($preview.Ok) {
-        Assert-True -Id 'K3.2' -What 'the preview reports the worker blocked' -Condition (Get-Flag $preview.Result 'blocked') -TaskId $idB
+        Assert-JsonTrue -Id 'K3.2' -What 'the preview reports the worker blocked (a real boolean)' -Object $preview.Result -Name 'blocked' -TaskId $idB
         Assert-Match -Id 'K3.3' -What 'the preview carries the on-screen dialog text' -Pattern 'ACCEPT-Q-DIALOG' -Actual ([string](Get-Field $preview.Result 'dialog')) -TaskId $idB
         Assert-NonEmpty -Id 'K3.4' -What 'the preview carries a digest that ties an approval to this dialog' -Value ([string](Get-Field $preview.Result 'digest')) -TaskId $idB
         Assert-Equal -Id 'K3.5' -What 'the preview names the exact current public pane' -Expected $paneB -Actual ([string](Get-Field $preview.Result 'publicPaneId')) -TaskId $idB
@@ -2447,7 +2491,8 @@ function Invoke-PaneMove {
         -Evidence (Protect-Text $resolve.Raw 400)
     Assert-True -Id 'M6.1' -What 'reporting still resolves for the moved worker through its launch pane' -Condition $resolve.Ok -TaskId $idB -Evidence (Protect-Text (Get-Json $resolve.Error) 300)
     if ($resolve.Ok) {
-        Assert-True -Id 'M6.2' -What 'resolve still binds the task to the worker role' -Condition ((Get-Flag $resolve.Result 'bound') -and ([string](Get-Field $resolve.Result 'role')) -eq 'worker') -TaskId $idB -Evidence (Protect-Text (Get-Json $resolve.Result) 400)
+        Assert-JsonTrue -Id 'M6.2' -What 'resolve still binds the task to the worker role (a real boolean)' -Object $resolve.Result -Name 'bound' -TaskId $idB
+        Assert-Equal -Id 'M6.2b' -What 'resolve reports the worker role' -Expected 'worker' -Actual ([string](Get-Field $resolve.Result 'role')) -TaskId $idB
         Assert-Equal -Id 'M6.3' -What 'resolve names the exact task id' -Expected $idB -Actual ([string](Get-Field $resolve.Result 'taskId')) -TaskId $idB
         Assert-Equal -Id 'M6.4' -What 'resolve still reports the recorded worktree workspace as provenance (not the closed source)' `
             -Expected ([string](Get-Field $fact 'WorktreeWorkspaceID')) -Actual ([string](Get-Field $resolve.Result 'worktreeId')) -TaskId $idB
@@ -2560,7 +2605,7 @@ function Invoke-Board {
     if (-not $output) { Block-Item -Id 'A1.2' -What 'board pane' -Evidence 'the board action never finished'; return }
     Assert-Equal -Id 'A1.1b' -What 'the board action exits 0' -Expected 0 -Actual (Get-Field $output.Entry 'exit_code') -Evidence (Protect-Text (Get-Json $output.Entry) 400)
     $payload = $output.Payload
-    Assert-True -Id 'A1.1c' -What 'the board action answered ok=true' -Condition (Get-Flag $payload 'ok') -Evidence (Protect-Text (Get-Json $payload) 400)
+    Assert-JsonTrue -Id 'A1.1c' -What 'the board action answered ok=true (a real boolean)' -Object $payload -Name 'ok'
     Assert-SamePath -Id 'A1.1d' -What 'the board action opened the board for the bound project' -Expected ([string](Get-Field $script:Project 'Key')) -Actual ([string](Get-Field $payload 'project'))
     Assert-Equal -Id 'A1.1e' -What 'the board action opened the board in the bound workspace' -Expected $script:PrimaryWorkspace -Actual ([string](Get-Field $payload 'workspace'))
     # `plugin pane open` answers a PluginPaneInfo ({plugin_id, entrypoint, pane}).
@@ -2698,9 +2743,9 @@ function Invoke-CleanupRefusals {
         -Evidence (Protect-Text $preview.Raw 400)
     Assert-True -Id 'C2.1' -What 'cleanup_preview answers for the reviewed done task' -Condition $preview.Ok -TaskId $idB -Evidence (Protect-Text (Get-Json $preview.Error) 300)
     if ($preview.Ok) {
-        Assert-True -Id 'C2.2' -What 'the preview recognises the task as reviewed and decided' -Condition (Get-Flag $preview.Result 'reviewed') -TaskId $idB
-        Assert-True -Id 'C2.3' -What 'the preview reports the checkout as not clean' -Condition (-not (Get-Flag $preview.Result 'clean')) -TaskId $idB
-        Assert-True -Id 'C2.4' -What 'the preview refuses removal' -Condition (-not (Get-Flag $preview.Result 'removable')) -TaskId $idB
+        Assert-JsonTrue -Id 'C2.2' -What 'the preview recognises the task as reviewed and decided (a real boolean)' -Object $preview.Result -Name 'reviewed' -TaskId $idB
+        Assert-JsonFalse -Id 'C2.3' -What 'the preview reports the checkout as not clean (a real boolean)' -Object $preview.Result -Name 'clean' -TaskId $idB
+        Assert-JsonFalse -Id 'C2.4' -What 'the preview refuses removal (a real boolean)' -Object $preview.Result -Name 'removable' -TaskId $idB
         Assert-True -Id 'C2.5' -What 'the preview names the exact recorded checkout path' -Condition (Test-SamePath -A (Get-Field $preview.Result 'path') -B $path) -TaskId $idB
         Assert-Equal -Id 'C2.6' -What 'the preview names the exact recorded branch' -Expected $branch -Actual ([string](Get-Field $preview.Result 'branch')) -TaskId $idB
         Assert-True -Id 'C2.7' -What 'the preview resolves a workspace from the recorded provenance (not the closed source workspace)' `
@@ -2783,13 +2828,13 @@ function Invoke-CleanupRefusals {
         -Condition ($cleanup3.Ok -and ($null -ne $forcedProperty)) -TaskId $idB `
         -Evidence (Protect-Text (Get-Json $cleanup3.Result) 400)
     Assert-True -Id 'C7.2d' -What 'the removal was not forced' `
-        -Condition ($cleanup3.Ok -and ($null -ne $forcedProperty) -and (-not (Get-Flag $cleanup3.Result 'forced'))) -TaskId $idB `
+        -Condition ($cleanup3.Ok -and ((Test-JsonBool -Object $cleanup3.Result -Name 'forced') -eq $false)) -TaskId $idB `
         -Evidence ("forced=[$(Get-Field $cleanup3.Result 'forced' 'absent')]")
 
     Assert-True -Id 'C7.3' -What 'the branch survives the removal (the plugin never deletes it)' `
         -Condition ((Invoke-Git -Arguments @('branch', '--format=%(refname:short)') -Directory $script:RepoPath).Stdout -match [regex]::Escape($branch)) -TaskId $idB
     Assert-True -Id 'C7.4' -What 'the removal reports the exact recorded checkout as removed' `
-        -Condition ($cleanup3.Ok -and (Get-Flag $cleanup3.Result 'removed') -and (Test-SamePath -A (Get-Field $cleanup3.Result 'path') -B $path)) -TaskId $idB `
+        -Condition ($cleanup3.Ok -and ((Test-JsonBool -Object $cleanup3.Result -Name 'removed') -eq $true) -and (Test-SamePath -A (Get-Field $cleanup3.Result 'path') -B $path)) -TaskId $idB `
         -Evidence (Protect-Text (Get-Json $cleanup3.Result) 400)
     Assert-True -Id 'C7.5' -What 'the removed checkout is gone from disk' `
         -Condition ($cleanup3.Ok -and (-not (Test-Path -LiteralPath $path))) -TaskId $idB
@@ -3051,7 +3096,7 @@ function Invoke-Restart {
         $hint = Get-Field $output.Payload 'session'
         $resume = [string](Get-Field $hint 'resume')
         Assert-True -Id 'T10.1' -What 'the resume hint after the restart is still gated on a materialized session' `
-            -Condition ((-not (Get-Flag $hint 'onDisk')) -or ($resume -ne '')) -Evidence (Protect-Text (Get-Json $hint) 400)
+            -Condition (((Test-JsonBool -Object $hint -Name 'onDisk') -eq $false) -and ($resume -eq '')) -Evidence (Protect-Text (Get-Json $hint) 400)
         if ($resume -ne '') {
             $restoredHandshake = Get-ReadySession -LaunchPaneId ([string](Get-Field $p 'LaunchPaneID'))
             if (-not $restoredHandshake) { $restoredHandshake = Get-ReadySession -LaunchPaneId ([string](Get-Field $before.Project 'LaunchPaneID')) }
@@ -3191,8 +3236,8 @@ function Invoke-Cleanup {
                 -Evidence (Protect-Text (Get-Json $plan.foreign) 400)
             if (@($plan.foreign).Count -eq 0) {
                 $deleted = Invoke-State -Operation 'delete-scoped' -Arguments @([string](Get-Field $script:Project 'Key'), ($panes -join ','))
-                Assert-True -Id 'Z4.2' -What 'the state cleanup deleted rows only for this run project key' -Condition (Get-Flag $deleted 'ok') -Evidence (Protect-Text (Get-Json $deleted) 400)
-                Assert-True -Id 'Z4.3' -What 'every other row in the store is byte-identical after the delete' -Condition (Get-Flag $deleted 'others_identical') `
+                Assert-JsonTrue -Id 'Z4.2' -What 'the state cleanup deleted rows only for this run project key (a real boolean)' -Object $deleted -Name 'ok'
+                Assert-JsonTrue -Id 'Z4.3' -What 'every other row in the store is byte-identical after the delete (a real boolean)' -Object $deleted -Name 'others_identical' `
                     -Evidence ("others_before={0} others_after={1}" -f (Get-Field $deleted 'others_before'), (Get-Field $deleted 'others_after'))
                 Assert-Equal -Id 'Z4.4' -What 'no row of this run is left behind' -Expected 0 -Actual ([int](Get-Field $deleted 'ours_remaining'))
                 Add-Assertion -Id 'Z4.5' -What 'rows deleted for this run' -Status 'INFO' -Evidence (Protect-Text (Get-Json (Get-Field $deleted 'deleted')) 300)
