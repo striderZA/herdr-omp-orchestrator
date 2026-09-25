@@ -1204,6 +1204,22 @@ function Test-JsonBool {
     return [bool]$prop.Value
 }
 
+function Test-ResumeHintImplication {
+    <#
+        The materialization gate as an implication that a malformed flag cannot
+        satisfy: the hint must carry a REAL boolean, and then either it is not on
+        disk (so it must offer no resume command) or it is on disk and offers one.
+        The original condition was `!onDisk -or resume != ''`; this keeps that
+        meaning while replacing the coercion.
+    #>
+    param($Hint)
+    $onDisk = Test-JsonBool -Object $Hint -Name 'onDisk'
+    if ($null -eq $onDisk) { return $false }
+    $resume = [string](Get-Field $Hint 'resume')
+    if (-not $onDisk) { return ($resume -eq '') }
+    return ($resume -ne '')
+}
+
 function Assert-JsonTrue {
     param(
         [Parameter(Mandatory)][string]$Id,
@@ -3096,7 +3112,7 @@ function Invoke-Restart {
         $hint = Get-Field $output.Payload 'session'
         $resume = [string](Get-Field $hint 'resume')
         Assert-True -Id 'T10.1' -What 'the resume hint after the restart is still gated on a materialized session' `
-            -Condition (((Test-JsonBool -Object $hint -Name 'onDisk') -eq $false) -and ($resume -eq '')) -Evidence (Protect-Text (Get-Json $hint) 400)
+            -Condition (Test-ResumeHintImplication -Hint $hint) -Evidence (Protect-Text (Get-Json $hint) 400)
         if ($resume -ne '') {
             $restoredHandshake = Get-ReadySession -LaunchPaneId ([string](Get-Field $p 'LaunchPaneID'))
             if (-not $restoredHandshake) { $restoredHandshake = Get-ReadySession -LaunchPaneId ([string](Get-Field $before.Project 'LaunchPaneID')) }
