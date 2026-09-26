@@ -2384,6 +2384,42 @@ func TestResumeProvedStepsIgnoresAnExpectedStepInFlight(t *testing.T) {
 	}
 }
 
+func TestReconcileDoesNotProvisionWhenPrimaryReconciliationFails(t *testing.T) {
+	ctx := context.Background()
+	f := newCoordFixture(t, fixturePlan{})
+	project := f.mustBind()
+	queued := task.Task{
+		ID:           "orch_waiting_for_primary",
+		ProjectKey:   project.Key,
+		Title:        "waiting",
+		Brief:        "wait for the primary",
+		Checks:       []string{"go test ./... ok"},
+		BaseRevision: f.base,
+		Branch:       "orch/waiting-for-primary",
+		Phase:        task.Intent,
+	}
+	if err := f.store.CreateTask(ctx, queued); err != nil {
+		t.Fatalf("CreateTask(queued): %v", err)
+	}
+	before := f.countCalls("worktree create")
+	f.updatePlan(func(plan *fixturePlan) { plan.RestartBeforeReady = true })
+
+	if err := f.coord.Reconcile(ctx); err == nil {
+		t.Fatal("Reconcile returned nil after the primary session changed")
+	}
+	if got := f.countCalls("worktree create"); got != before {
+		t.Fatalf("worktree create calls after an unverified primary = %d, want unchanged at %d",
+			got, before)
+	}
+	after, err := f.store.Task(ctx, queued.ID)
+	if err != nil {
+		t.Fatalf("read queued task after failed primary reconciliation: %v", err)
+	}
+	if after.Phase != task.Intent || after.WorktreePath != "" || after.LaunchPaneID != "" {
+		t.Fatalf("queued task after failed primary reconciliation = %+v, want untouched intent", after)
+	}
+}
+
 // shortLeaseCoordinator builds a second coordinator over the fixture's store and
 // Herdr stand-in with a short step lease. A step that failed with an undecided
 // outcome keeps its durable step claim (a definite failure gives it back in

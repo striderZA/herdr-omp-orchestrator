@@ -1015,7 +1015,9 @@ func (c *Coordinator) Reconcile(ctx context.Context) error {
 // reconcileProject reconciles one project's primary and workers.
 func (c *Coordinator) reconcileProject(ctx context.Context, project task.Project, snapshot *snapshotView) error {
 	var failures []error
+	primaryFailed := false
 	if err := c.reconcilePrimary(ctx, project, snapshot); err != nil {
+		primaryFailed = true
 		failures = append(failures, err)
 	}
 	tasks, err := c.store.Tasks(ctx, project.Key)
@@ -1053,7 +1055,7 @@ func (c *Coordinator) reconcileProject(ctx context.Context, project task.Project
 	// trustworthy yet, and provisioning on top of it would create resources for a
 	// binding nobody has verified. The findings are already recorded (and returned)
 	// for a human; the queue simply waits for the next pass.
-	if len(failures) > identityFailures {
+	if primaryFailed || len(failures) > identityFailures {
 		return errors.Join(failures...)
 	}
 	// The identities are repaired and proved, so the work a restart interrupted may
