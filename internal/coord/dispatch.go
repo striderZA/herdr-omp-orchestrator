@@ -137,7 +137,9 @@ func (c *Coordinator) Dispatch(
 	if ok, _ := c.dispatchable(existing, st); !ok {
 		// Gated by a dependency that a concurrent writer has not reviewed yet:
 		// give the slot back so another queued task can use it.
-		c.releaseSlot(ctx, st)
+		if err := c.releaseSlot(ctx, st); err != nil {
+			return st, fmt.Errorf("release provisioning slot for dependency-gated task %s: %w", st.ID, err)
+		}
 		return st, nil
 	}
 	return c.provision(ctx, st)
@@ -411,12 +413,11 @@ func (c *Coordinator) createTask(ctx context.Context, projectKey string, request
 	return task.Task{}, false, fmt.Errorf("record task intent for %q: %w", projectKey, lastErr)
 }
 
-// releaseSlot gives a claimed provisioning slot back after a step failed before
-// recording any resource. A failure here is not fatal: the slot stays with this
-// task, which can hold at most one, so nothing is over-provisioned and the next
-// resume of this task uses it.
-func (c *Coordinator) releaseSlot(ctx context.Context, st task.Task) {
-	_ = c.store.ReleaseProvisioningSlot(ctx, st.ID)
+// releaseSlot gives back a claimed slot after a step failed before recording any
+// resource. A failure is returned: the task still consumes capacity, so hiding the
+// error would leave queued work stalled without an actionable cause.
+func (c *Coordinator) releaseSlot(ctx context.Context, st task.Task) error {
+	return c.store.ReleaseProvisioningSlot(ctx, st.ID)
 }
 
 // DrainQueued provisions the project's queued tasks that a freed slot or a
@@ -696,7 +697,10 @@ func (c *Coordinator) createWorktree(ctx context.Context, st task.Task) (task.Ta
 		// store must not free the slot of the task it belongs to.
 		var unrecorded *PersistenceError
 		if !errors.As(failureErr, &unrecorded) {
-			c.releaseSlot(ctx, failed)
+			if releaseErr := c.releaseSlot(ctx, failed); releaseErr != nil {
+				return failed, fmt.Errorf("%w; release provisioning slot for task %s: %w",
+					failureErr, failed.ID, releaseErr)
+			}
 		}
 		return failed, failureErr
 	}

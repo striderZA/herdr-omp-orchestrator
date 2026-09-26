@@ -1797,6 +1797,9 @@ func TestDispatchLeavesAnActionableTaskWhenTheWorktreeCreateFails(t *testing.T) 
 	if st.WorktreePath != "" || st.LaunchPaneID != "" {
 		t.Errorf("a failed create recorded resources: %+v", st)
 	}
+	if slots, err := f.store.ProvisioningSlots(context.Background(), f.project); err != nil || slots != 0 {
+		t.Errorf("provisioning slots after definite worktree refusal = (%d, %v), want the released slot to be free", slots, err)
+	}
 	// Retrying a definite failure is allowed and must not double-create.
 	f.updatePlan(func(p *fixturePlan) { p.WorktreeCreateError = "" })
 	resumed, err := f.resume(st.ID)
@@ -1808,6 +1811,40 @@ func TestDispatchLeavesAnActionableTaskWhenTheWorktreeCreateFails(t *testing.T) 
 	}
 	if f.countCalls("worktree create") != 2 {
 		t.Errorf("worktree create calls = %d, want 2 (failed attempt plus retry)", f.countCalls("worktree create"))
+	}
+}
+
+func TestWorktreeFailureSurfacesProvisioningSlotReleaseError(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{WorktreeCreateError: "not_git_worktree"})
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(f.stateDir, "orchestrator.sqlite")))
+	if err != nil {
+		t.Fatalf("open state database: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if _, err := db.ExecContext(context.Background(), `CREATE TRIGGER refuse_slot_release
+		BEFORE UPDATE OF slot_claimed_at ON tasks
+		WHEN NEW.slot_claimed_at = 0
+		BEGIN SELECT RAISE(ABORT, 'slot release is not writable'); END`); err != nil {
+		t.Fatalf("install slot-release trigger: %v", err)
+	}
+
+	st, dispatchErr := f.dispatch("one", "brief one", []string{"check"}, nil, nil, f.base)
+	if dispatchErr == nil {
+		t.Fatal("dispatch returned nil, want the injected slot-release failure")
+	}
+	if !errors.Is(dispatchErr, herdr.ErrCLI) {
+		t.Errorf("dispatch error %v lost the original Herdr worktree failure", dispatchErr)
+	}
+	for _, want := range []string{"worktree create", "slot release is not writable"} {
+		if !strings.Contains(dispatchErr.Error(), want) {
+			t.Errorf("dispatch error %q does not name %q", dispatchErr, want)
+		}
+	}
+	if st.Phase != task.Intent || st.Attention == "" {
+		t.Fatalf("failed task = phase %q attention %q, want an actionable Intent task", st.Phase, st.Attention)
+	}
+	if slots, err := f.store.ProvisioningSlots(context.Background(), f.project); err != nil || slots != 1 {
+		t.Errorf("provisioning slots = (%d, %v), want the unreleased slot to remain visible", slots, err)
 	}
 }
 
