@@ -323,6 +323,113 @@ func TestStoreInboxDeduplicates(t *testing.T) {
 	}
 }
 
+// TestAddInboxForTaskGuardsInsideTheNotesTransaction pins the store half of the
+// worker-write guard: the read that decides whether a note may land and the insert
+// are one transaction, the caller's own refusal survives it, and neither the task nor
+// its revision is touched — recording a note is not a task change, so a note-only
+// path cannot bump the revision the primary is watching.
+func TestAddInboxForTaskGuardsInsideTheNotesTransaction(t *testing.T) {
+	ctx := context.Background()
+	s := open(t, t.TempDir())
+	if err := s.CreateProject(ctx, task.Project{Key: "repo-a"}); err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+	if err := s.CreateTask(ctx, seedTask("t1")); err != nil {
+		t.Fatalf("CreateTask t1: %v", err)
+	}
+	open2 := seedTask("t2")
+	open2.LaunchPaneID, open2.PublicPaneID = "w2:p1", "w2:p1"
+	if err := s.CreateTask(ctx, open2); err != nil {
+		t.Fatalf("CreateTask t2: %v", err)
+	}
+
+	// The guard is handed the task the transaction reads, not the snapshot the
+	// caller took when it built the note, so a task that changed in between is
+	// judged as it is now.
+	stale := seedTask("t1") // what a caller read while t1 was open
+	closed, err := s.UpdateTask(ctx, "t1", 1, func(next *task.Task) error {
+		next.Disposition = "accepted: merged by hand"
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("UpdateTask: %v", err)
+	}
+	if stale.Disposition != "" || closed.Disposition == "" {
+		t.Fatalf("the fixture did not close t1: %+v", closed)
+	}
+	note := task.Inbox{ID: "i1", ProjectKey: "repo-a", TaskID: "t1", Kind: "progress", Summary: "halfway", Delivery: "worker progress"}
+
+	refused := errors.New("the task was closed")
+	var saw task.Task
+	inserted, err := s.AddInboxForTask(ctx, note, func(st task.Task) error {
+		saw = st
+		if st.Disposition != "" {
+			return refused
+		}
+		return nil
+	})
+	if !errors.Is(err, refused) || inserted {
+		t.Fatalf("guarded add = (%v, %v), want (false, the guard's refusal)", inserted, err)
+	}
+	if saw.ID != "t1" || saw.Revision != closed.Revision || saw.Disposition != closed.Disposition {
+		t.Errorf("the guard saw %+v, want t1 as the store holds it now: %+v", saw, closed)
+	}
+	if _, err := s.Inbox(ctx, "i1"); !errors.Is(err, state.ErrNotFound) {
+		t.Errorf("a refused note was inserted: %v", err)
+	}
+	if now, err := s.Task(ctx, "t1"); err != nil {
+		t.Fatalf("Task: %v", err)
+	} else if !reflect.DeepEqual(now, closed) {
+		t.Errorf("a refused note changed the task: %+v -> %+v", closed, now)
+	}
+
+	// An open task takes the note once, and stays byte for byte the record it was.
+	before, err := s.Task(ctx, "t2")
+	if err != nil {
+		t.Fatalf("Task: %v", err)
+	}
+	openNote := note
+	openNote.ID, openNote.TaskID = "i2", "t2"
+	if inserted, err := s.AddInboxForTask(ctx, openNote, func(task.Task) error { return nil }); err != nil || !inserted {
+		t.Fatalf("open add = (%v, %v), want (true, nil)", inserted, err)
+	}
+	if inserted, err := s.AddInboxForTask(ctx, openNote, func(task.Task) error { return nil }); err != nil || inserted {
+		t.Errorf("duplicate add = (%v, %v), want (false, nil)", inserted, err)
+	}
+	after, err := s.Task(ctx, "t2")
+	if err != nil {
+		t.Fatalf("Task: %v", err)
+	}
+	if !reflect.DeepEqual(after, before) {
+		t.Errorf("recording a note changed the task: %+v -> %+v", before, after)
+	}
+	if pending, err := s.PendingInbox(ctx, "repo-a"); err != nil {
+		t.Fatalf("PendingInbox: %v", err)
+	} else if len(pending) != 1 || pending[0].ID != "i2" {
+		t.Errorf("pending inbox = %+v, want exactly note i2", pending)
+	}
+
+	// The contract is checked before anything is written: an unguarded call is a
+	// programming error, not a way to bypass the read.
+	if inserted, err := s.AddInboxForTask(ctx, openNote, nil); !errors.Is(err, state.ErrInvalid) || inserted {
+		t.Errorf("nil guard = (%v, %v), want (false, ErrInvalid)", inserted, err)
+	}
+	untasked := openNote
+	untasked.ID, untasked.TaskID = "i3", ""
+	if inserted, err := s.AddInboxForTask(ctx, untasked, func(task.Task) error { return nil }); !errors.Is(err, state.ErrInvalid) || inserted {
+		t.Errorf("note without a task = (%v, %v), want (false, ErrInvalid)", inserted, err)
+	}
+	foreign := openNote
+	foreign.ID, foreign.TaskID = "i4", "t9"
+	guarded := false
+	if inserted, err := s.AddInboxForTask(ctx, foreign, func(task.Task) error {
+		guarded = true
+		return nil
+	}); !errors.Is(err, state.ErrNotFound) || inserted || guarded {
+		t.Errorf("note for an unknown task = (%v, %v, guarded=%v), want (false, ErrNotFound, false)", inserted, err, guarded)
+	}
+}
+
 // TestOpenMigratesAnInboxWrittenByAnEarlierRevision pins the upgrade path a
 // shipped installation takes. The inbox of an earlier revision has no delivery
 // state, so the index on that column cannot be created with the tables: doing so

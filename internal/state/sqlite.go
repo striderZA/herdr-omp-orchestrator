@@ -677,6 +677,59 @@ func (s *Store) AddInbox(ctx context.Context, in task.Inbox) (bool, error) {
 	return addInbox(ctx, s.db, in)
 }
 
+// AddInboxForTask stores a note once, but only after reading the task the note
+// belongs to and letting the caller decide whether the task may still be notified.
+//
+// Some notes may only exist while their task is in a state the caller owns: a
+// worker's progress, question or report note is refused once the primary has
+// disposed of the task. Checking that outside this call would leave the window
+// open — the primary's decision could commit between the read and the insert — so
+// the read, the guard and the insert are one transaction, and the store's
+// `_txlock=immediate` DSN takes the write lock when it begins. The task itself is
+// never written and its revision never moves: this is not a task change.
+//
+// The guard's error is returned as it is, so the caller's own refusal (for example
+// a closed-task error it classifies for the bridge) survives. The note keeps
+// AddInbox's deduplication: repeating an existing note reports false and writes
+// nothing.
+func (s *Store) AddInboxForTask(ctx context.Context, in task.Inbox, guard func(task.Task) error) (bool, error) {
+	if in.ID == "" {
+		return false, fmt.Errorf("%w: inbox id is required", ErrInvalid)
+	}
+	if strings.TrimSpace(in.TaskID) == "" {
+		return false, fmt.Errorf("%w: inbox task id is required", ErrInvalid)
+	}
+	if guard == nil {
+		return false, fmt.Errorf("%w: nil guard for note %q", ErrInvalid, in.ID)
+	}
+	tx, err := s.begin(ctx, "add note "+in.ID+" for task "+in.TaskID)
+	if err != nil {
+		return false, err
+	}
+	defer tx.rollback()
+
+	current, err := scanTask(tx.QueryRowContext(ctx, `SELECT data FROM tasks WHERE id = ?`, in.TaskID),
+		"task "+in.TaskID)
+	if err != nil {
+		return false, err
+	}
+	if err := guard(current); err != nil {
+		return false, err
+	}
+	if current.ProjectKey != in.ProjectKey {
+		return false, fmt.Errorf("%w: note %q names project %q, but task %s belongs to %q",
+			ErrInvalid, in.ID, in.ProjectKey, current.ID, current.ProjectKey)
+	}
+	inserted, err := addInbox(ctx, tx, in)
+	if err != nil {
+		return false, err
+	}
+	if err := tx.commit("add note " + in.ID + " for task " + in.TaskID); err != nil {
+		return false, err
+	}
+	return inserted, nil
+}
+
 // execer is the write surface shared by the database handle and one write
 // transaction, so a helper can be used on its own or as part of a larger
 // transaction without a second implementation of the same statement.

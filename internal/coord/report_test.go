@@ -1305,6 +1305,152 @@ func TestProgressQuestionAndReportAreRefusedAfterTheDisposition(t *testing.T) {
 	}
 }
 
+// TestStaleWorkerPreflightCannotCommitAfterADisposition pins the race the fast
+// workerTask precheck cannot close on its own.
+//
+// A worker call reads the task in workerTask, and the primary's Review can commit
+// before the write that follows. Every write therefore re-checks the disposition
+// where it lands, from the snapshot the preflight took: a task+note write does it in
+// its mutation callback, a note-only write in the note's own store transaction that
+// never moves the revision. The stale snapshot below is exactly what a call paused
+// between its preflight and its write holds, and every path must refuse it with
+// ErrOwnership (the bridge's forbidden) instead of writing over the decision.
+func TestStaleWorkerPreflightCannotCommitAfterADisposition(t *testing.T) {
+	f := newReportFixture(t)
+	project, worker := f.seed()
+	ctx := context.Background()
+
+	// The snapshot a worker's progress would have taken while the task was open.
+	staleProgress := f.reload(worker.ID)
+
+	// A question already on the task: the snapshot a repeated question would have
+	// taken, whose marker already matches, so its write is the note alone.
+	const asked = "Which branch should I keep?"
+	if _, err := f.coord.Question(ctx, worker.LaunchPaneID, asked); err != nil {
+		t.Fatalf("Question: %v", err)
+	}
+	staleDuplicateQuestion := f.reload(worker.ID)
+
+	// The worker's result, then the primary's decision about it.
+	if _, err := f.coord.FinalReport(ctx, worker.LaunchPaneID, f.completeReport(worker)); err != nil {
+		t.Fatalf("FinalReport: %v", err)
+	}
+	staleDuplicateReport := f.reload(worker.ID)
+	if _, err := f.coord.Review(ctx, project.LaunchPaneID, worker.ID, "accepted: merged by hand"); err != nil {
+		t.Fatalf("Review: %v", err)
+	}
+	closed := f.reload(worker.ID)
+	if !isClosed(closed) {
+		t.Fatalf("task after the disposition = %+v, want a closed task", closed)
+	}
+	notes := len(f.inbox())
+
+	// A question from the stale snapshot: the disposition is re-checked before the
+	// attention marker it would have set.
+	if _, err := f.coord.question(ctx, staleProgress, "Did the decision land?"); !errors.Is(err, ErrOwnership) {
+		t.Errorf("question from a stale snapshot err = %v, want ErrOwnership", err)
+	}
+	// The same question again, which would only (re)confirm its deduplicated note.
+	if _, err := f.coord.question(ctx, staleDuplicateQuestion, asked); !errors.Is(err, ErrOwnership) {
+		t.Errorf("duplicate question from a stale snapshot err = %v, want ErrOwnership", err)
+	}
+	// A report the snapshot never recorded: the task+note write.
+	changed := f.completeReport(staleProgress)
+	changed.Summary = "A result the user never decided on."
+	if _, err := f.coord.finalReport(ctx, staleProgress, changed); !errors.Is(err, ErrOwnership) {
+		t.Errorf("final report from a stale snapshot err = %v, want ErrOwnership", err)
+	}
+	// The identical report again, which would only (re)confirm its note.
+	if _, err := f.coord.finalReport(ctx, staleDuplicateReport, f.completeReport(worker)); !errors.Is(err, ErrOwnership) {
+		t.Errorf("duplicate final report from a stale snapshot err = %v, want ErrOwnership", err)
+	}
+	// Progress writes no task field and no revision, so its guard can live only in
+	// the note's own transaction.
+	if _, err := f.coord.progress(ctx, staleProgress, "still working on it"); !errors.Is(err, ErrOwnership) {
+		t.Errorf("progress from a stale snapshot err = %v, want ErrOwnership", err)
+	}
+
+	after := f.reload(worker.ID)
+	if after.Disposition != closed.Disposition {
+		t.Errorf("the disposition changed: %q, want %q", after.Disposition, closed.Disposition)
+	}
+	if after.Revision != closed.Revision {
+		t.Errorf("a refused stale write changed the revision: %d -> %d", closed.Revision, after.Revision)
+	}
+	if after.Attention != closed.Attention {
+		t.Errorf("a refused stale write changed the attention: %q, want %q", after.Attention, closed.Attention)
+	}
+	if after.Report == nil || closed.Report == nil || after.Report.Summary != closed.Report.Summary {
+		t.Errorf("a refused stale write replaced the decided report: %+v", after.Report)
+	}
+	if got := len(f.inbox()); got != notes {
+		t.Errorf("a refused stale write left %d new inbox notes", got-notes)
+	}
+}
+
+// TestDuplicateWorkerWritesStillLandWhileTheTaskIsOpen is the other half of the
+// guard: the disposition re-check must not be a blanket refusal. A task that is still
+// open keeps its deduplicated semantics — a repeated question and a repeated report
+// only re-confirm their note and never move the revision, and progress deduplicates
+// the same way.
+func TestDuplicateWorkerWritesStillLandWhileTheTaskIsOpen(t *testing.T) {
+	f := newReportFixture(t)
+	_, worker := f.seed()
+	ctx := context.Background()
+
+	// Progress twice: one durable entry, and the task is not touched at all.
+	if result, err := f.coord.Progress(ctx, worker.LaunchPaneID, "halfway"); err != nil {
+		t.Fatalf("Progress: %v", err)
+	} else if result.Duplicate {
+		t.Errorf("the first progress note was reported as a duplicate: %+v", result)
+	}
+	opened := f.reload(worker.ID)
+	if result, err := f.coord.Progress(ctx, worker.LaunchPaneID, "halfway"); err != nil {
+		t.Fatalf("Progress (repeat): %v", err)
+	} else if !result.Duplicate {
+		t.Errorf("a repeated progress note was not a duplicate: %+v", result)
+	}
+	if after := f.reload(worker.ID); after.Revision != opened.Revision {
+		t.Errorf("recording progress moved the revision: %d -> %d", opened.Revision, after.Revision)
+	}
+	if got := len(f.notes("progress")); got != 1 {
+		t.Errorf("progress notes = %d, want 1", got)
+	}
+
+	if result, err := f.coord.Question(ctx, worker.LaunchPaneID, "Which branch?"); err != nil {
+		t.Fatalf("Question: %v", err)
+	} else if result.Duplicate {
+		t.Errorf("the first question was reported as a duplicate: %+v", result)
+	}
+	asked := f.reload(worker.ID)
+	if result, err := f.coord.Question(ctx, worker.LaunchPaneID, "Which branch?"); err != nil {
+		t.Fatalf("Question (repeat): %v", err)
+	} else if !result.Duplicate {
+		t.Errorf("a repeated question was not a duplicate: %+v", result)
+	}
+	if after := f.reload(worker.ID); after.Revision != asked.Revision {
+		t.Errorf("a repeated question moved the revision: %d -> %d", asked.Revision, after.Revision)
+	}
+
+	if result, err := f.coord.FinalReport(ctx, worker.LaunchPaneID, f.completeReport(worker)); err != nil {
+		t.Fatalf("FinalReport: %v", err)
+	} else if result.Duplicate {
+		t.Errorf("the first report was reported as a duplicate: %+v", result)
+	}
+	reported := f.reload(worker.ID)
+	if result, err := f.coord.FinalReport(ctx, worker.LaunchPaneID, f.completeReport(worker)); err != nil {
+		t.Fatalf("FinalReport (repeat): %v", err)
+	} else if !result.Duplicate {
+		t.Errorf("a repeated report was not a duplicate: %+v", result)
+	}
+	if after := f.reload(worker.ID); after.Revision != reported.Revision {
+		t.Errorf("a repeated report moved the revision: %d -> %d", reported.Revision, after.Revision)
+	}
+	if got := len(f.notes("result")); got != 1 {
+		t.Errorf("result notes = %d, want 1", got)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // the drain's failure surface
 // ---------------------------------------------------------------------------

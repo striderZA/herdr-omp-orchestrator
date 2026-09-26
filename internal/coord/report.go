@@ -447,7 +447,18 @@ func (c *Coordinator) Progress(ctx context.Context, launchPaneID, summary string
 	if err != nil {
 		return ProgressResult{}, err
 	}
-	inserted, err := c.note(ctx, st, "progress", text, "worker progress")
+	return c.progress(ctx, st, text)
+}
+
+// progress records the note a preflighted worker pane's progress leaves. It is
+// separate from Progress so the guard can be exercised against the snapshot a
+// caller took before the primary decided.
+//
+// The note is the whole fact: no task field is written and the revision never
+// moves, so there is nothing to compare and swap. The check that the task is
+// still open and the insert are one store transaction instead (workerNote).
+func (c *Coordinator) progress(ctx context.Context, st task.Task, text string) (ProgressResult, error) {
+	inserted, err := c.workerNote(ctx, st, "progress", text, "worker progress")
 	if err != nil {
 		return ProgressResult{}, err
 	}
@@ -472,12 +483,28 @@ func (c *Coordinator) Question(ctx context.Context, launchPaneID, text string) (
 	if err != nil {
 		return QuestionResult{}, err
 	}
+	return c.question(ctx, st, question)
+}
 
+// question writes the question a preflighted worker pane asked. It is separate from
+// Question so a snapshot taken before the primary's disposition can be replayed
+// against the real write path.
+//
+// Both branches re-check the disposition where the write lands: the marker write
+// does it in its mutation callback, and the deduplicated note does it inside the
+// note's own transaction. A question asked before the task was closed is refused
+// with ErrOwnership rather than moving a done task back to needs input.
+func (c *Coordinator) question(ctx context.Context, st task.Task, question string) (QuestionResult, error) {
 	attention := questionAttention(question)
 	asked := st
 	inserted := false
 	if st.Attention != attention {
 		updated, insertedNote, err := c.recordWithNote(ctx, st, func(next *task.Task) error {
+			// Re-checked on every attempt: the disposition is final, and a
+			// Review can land between workerTask and this write.
+			if err := workerChannelOpen(*next); err != nil {
+				return err
+			}
 			next.Attention = attention
 			return nil
 		}, c.noteFor(st, "question", question, "worker question"), "record the worker question")
@@ -486,7 +513,8 @@ func (c *Coordinator) Question(ctx context.Context, launchPaneID, text string) (
 		}
 		asked, inserted = updated, insertedNote
 	} else {
-		inserted, err = c.note(ctx, asked, "question", question, "worker question")
+		var err error
+		inserted, err = c.workerNote(ctx, asked, "question", question, "worker question")
 		if err != nil {
 			return QuestionResult{}, err
 		}
@@ -512,7 +540,18 @@ func (c *Coordinator) FinalReport(ctx context.Context, launchPaneID string, repo
 	if err != nil {
 		return FinalReportResult{}, err
 	}
+	return c.finalReport(ctx, st, complete)
+}
 
+// finalReport records the validated report a preflighted worker pane submitted. It
+// is separate from FinalReport so a snapshot taken before the primary's disposition
+// can be replayed against the real write path.
+//
+// Both branches re-check the disposition where the write lands: the report write
+// does it in its mutation callback, and the deduplicated note does it inside the
+// note's own transaction. A report submitted before the task was closed is refused
+// with ErrOwnership, so a new result can never replace the one the user decided on.
+func (c *Coordinator) finalReport(ctx context.Context, st task.Task, complete task.Report) (FinalReportResult, error) {
 	// A worker path always has a bound project (workerTask re-reads it), which is
 	// what makes the note addressable.
 	note := c.noteFor(st, "result", reportNote(complete), "worker result")
@@ -520,8 +559,13 @@ func (c *Coordinator) FinalReport(ctx context.Context, launchPaneID string, repo
 	inserted := false
 	if st.Report == nil || !sameReport(*st.Report, complete) || isQuestionAttention(st.Attention) {
 		updated, insertedNote, err := c.recordWithNote(ctx, st, func(next *task.Task) error {
-			// Re-checked on every attempt: a report only ever describes the
-			// branch this task owns, whatever landed in between.
+			// Re-checked on every attempt: the disposition is final, and a
+			// Review can land between workerTask and this write.
+			if err := workerChannelOpen(*next); err != nil {
+				return err
+			}
+			// A report only ever describes the branch this task owns, whatever
+			// landed in between.
 			if !sameBranch(next.Branch, complete.Branch) {
 				return fmt.Errorf("%w: the task now owns branch %q, not the reported %q", ErrReportInvalid, next.Branch, complete.Branch)
 			}
@@ -539,7 +583,8 @@ func (c *Coordinator) FinalReport(ctx context.Context, launchPaneID string, repo
 		// The report is already durable, so only the deduplicated note is
 		// (re)confirmed; a note that never landed is repaired here without
 		// rewriting the task.
-		inserted, err = c.note(ctx, st, "result", reportNote(complete), "worker result")
+		var err error
+		inserted, err = c.workerNote(ctx, st, "result", reportNote(complete), "worker result")
 		if err != nil {
 			return FinalReportResult{}, err
 		}
@@ -1330,16 +1375,35 @@ func (c *Coordinator) workerTask(ctx context.Context, launchPaneID string) (task
 		return task.Task{}, fmt.Errorf("read the worker bound to pane %q: %w", pane, err)
 	case strings.TrimSpace(st.LaunchPaneID) != pane:
 		return task.Task{}, fmt.Errorf("%w: pane %q is not the recorded launch pane of task %s", ErrOwnership, pane, st.ID)
-	case strings.TrimSpace(st.Disposition) != "":
-		return task.Task{}, fmt.Errorf("%w: task %s was closed with the disposition %q, so its worker may not report, ask or progress it any more",
-			ErrOwnership, st.ID, st.Disposition)
-	case st.Phase != task.AgentStarted && st.Phase != task.PromptSubmitted:
+	}
+	// The disposition is checked first, and again inside the write that consumes
+	// this snapshot: it is final, and a primary's Review can land in between.
+	if err := workerChannelOpen(st); err != nil {
+		return task.Task{}, err
+	}
+	if st.Phase != task.AgentStarted && st.Phase != task.PromptSubmitted {
 		return task.Task{}, fmt.Errorf("%w: task %s is in phase %q, so no worker has been briefed for it yet", ErrOwnership, st.ID, st.Phase)
 	}
 	if _, err := c.project(ctx, st.ProjectKey); err != nil {
 		return task.Task{}, err
 	}
 	return st, nil
+}
+
+// workerChannelOpen refuses a worker write whose task the primary has closed.
+//
+// workerTask already refuses a closed task before a worker call builds anything,
+// but that read is a snapshot: the primary's Review can land between it and the
+// write, and the disposition is final. Every worker write therefore repeats this
+// check where it can still be atomic with the write — the mutation callback of a
+// task+note write, and the transaction of a note-only write — so an intervening
+// decision is refused instead of overwritten.
+func workerChannelOpen(st task.Task) error {
+	if disposition := strings.TrimSpace(st.Disposition); disposition != "" {
+		return fmt.Errorf("%w: task %s was closed with the disposition %q, so its worker may not report, ask or progress it any more",
+			ErrOwnership, st.ID, disposition)
+	}
+	return nil
 }
 
 // ownedTask reads one task and requires it to belong to the caller's project.
@@ -1695,6 +1759,35 @@ func (c *Coordinator) note(ctx context.Context, st task.Task, kind, summary, del
 		return false, nil
 	}
 	inserted, err := c.store.AddInbox(ctx, c.noteFor(st, kind, summary, delivery))
+	if err != nil {
+		return false, fmt.Errorf("record the %s note for task %s: %w", kind, st.ID, err)
+	}
+	// The note is durable; the primary is told now if it can be, and otherwise on
+	// its next safe turn. A duplicate note is re-attempted too: it may be waiting
+	// for exactly this.
+	c.flushAfterNote(ctx, st.ProjectKey)
+	return inserted, nil
+}
+
+// workerNote records one deduplicated note for a worker task, and only while the
+// task is still open.
+//
+// A worker's note carries no task fact, so it has no revision to compare and swap
+// — and it must not move the revision the primary is watching just to record
+// progress. The check that the disposition is still absent and the insert share one
+// store transaction instead (Store.AddInboxForTask), which is the atomic form of
+// the guard: a primary's Review can commit between a caller's preflight and this
+// write, and the disposition is final. A closed task is refused with ErrOwnership,
+// exactly as workerTask refuses one.
+//
+// The note stays deduplicated: repeating it while the task is open reports false
+// and writes nothing, which is what keeps a duplicate progress line or a
+// re-confirmed question or report from notifying the primary twice.
+func (c *Coordinator) workerNote(ctx context.Context, st task.Task, kind, summary, delivery string) (bool, error) {
+	if strings.TrimSpace(st.ProjectKey) == "" {
+		return false, nil
+	}
+	inserted, err := c.store.AddInboxForTask(ctx, c.noteFor(st, kind, summary, delivery), workerChannelOpen)
 	if err != nil {
 		return false, fmt.Errorf("record the %s note for task %s: %w", kind, st.ID, err)
 	}
