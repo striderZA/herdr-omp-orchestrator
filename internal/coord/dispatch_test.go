@@ -2,6 +2,7 @@ package coord
 
 import (
 	"context"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -18,6 +19,7 @@ import (
 	"herdr-omp-orchestrator/internal/herdr"
 	"herdr-omp-orchestrator/internal/state"
 	"herdr-omp-orchestrator/internal/task"
+	_ "modernc.org/sqlite"
 )
 
 // This file tests the coordinator against two kinds of real evidence:
@@ -103,6 +105,9 @@ type fixturePlan struct {
 	// PromptError makes `agent prompt` refuse with that Herdr code before any
 	// input is written, the way a blocked or vanished agent is refused.
 	PromptError string `json:"prompt_error"`
+	// PromptDelayMillis delays agent prompts after the subprocess starts, so
+	// tests can exercise adjudication while an external write is still live.
+	PromptDelayMillis int `json:"prompt_delay_millis"`
 	// BlankCwdFor makes `agent get` report an empty working directory for one
 	// pane, which is how a test asks what happens when the pane's checkout
 	// cannot be read back.
@@ -472,6 +477,12 @@ func fixtureAgentPrompt(dir string, plan fixturePlan, state *fixtureState, argv 
 		// Refused before anything was written: Herdr rejects a prompt to a
 		// blocked or vanished agent without sending input.
 		return fixtureError(plan.PromptError, "the prompt was refused before any input was written")
+	}
+	if plan.PromptDelayMillis > 0 {
+		if err := os.WriteFile(filepath.Join(dir, "prompt_started"), []byte("waiting"), 0o600); err != nil {
+			return 31
+		}
+		time.Sleep(time.Duration(plan.PromptDelayMillis) * time.Millisecond)
 	}
 	// The submission is recorded before the answer: a timeout here means the
 	// brief may already have been delivered.
@@ -1858,6 +1869,9 @@ func TestRetryAmbiguousPromptIsNeverResent(t *testing.T) {
 	if st.Blocker == "" {
 		t.Fatal("an ambiguous submission left no actionable blocker")
 	}
+	if !IsAmbiguousBriefTask(st) {
+		t.Errorf("ambiguous brief blocker %q is not adjudicable", st.Blocker)
+	}
 	if st.Phase == task.PromptSubmitted {
 		t.Error("an ambiguous submission was recorded as delivered")
 	}
@@ -1872,6 +1886,298 @@ func TestRetryAmbiguousPromptIsNeverResent(t *testing.T) {
 	}
 	if f.countCalls("agent prompt") != 1 {
 		t.Errorf("agent prompt calls = %d, want 1", f.countCalls("agent prompt"))
+	}
+}
+
+func TestUnknownPromptFailureRemainsAdjudicable(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{PromptError: "unclassified_prompt_error"})
+	st, err := f.dispatch("one", "brief one", []string{"check"}, nil, nil, f.base)
+	if err == nil {
+		t.Fatal("dispatch returned nil, want the unclassified prompt error")
+	}
+	if errors.Is(err, herdr.ErrAmbiguous) {
+		t.Fatalf("dispatch err %v is already classified as ambiguous; want the generic uncertain-failure path", err)
+	}
+	if !IsAmbiguousBriefTask(st) {
+		t.Fatalf("unclassified prompt failure blocker %q is not adjudicable", st.Blocker)
+	}
+	if _, _, err := f.coord.BriefInspection(context.Background(), st.ID); err != nil {
+		t.Fatalf("BriefInspection after unclassified prompt failure: %v", err)
+	}
+}
+
+func TestPendingBriefCannotBeAdjudicatedWhileStepClaimIsLive(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	st := f.ambiguousBrief("one")
+	marker, err := f.coord.newBriefSubmissionMarker(st.Brief)
+	if err != nil {
+		t.Fatalf("newBriefSubmissionMarker: %v", err)
+	}
+	st = f.block(st, func(next *task.Task) { next.Blocker = marker })
+	before := f.countCalls("agent prompt")
+
+	evidence, _, err := f.coord.BriefInspection(context.Background(), st.ID)
+	if err != nil {
+		t.Fatalf("BriefInspection with a live step claim: %v", err)
+	}
+	if _, err := f.coord.AdjudicateBrief(context.Background(), st.ID, st.Revision, BriefNotDelivered, evidence); !errors.Is(err, ErrStepInFlight) {
+		t.Fatalf("AdjudicateBrief while the submission claim is live = %v, want ErrStepInFlight", err)
+	}
+	current, err := f.store.Task(context.Background(), st.ID)
+	if err != nil {
+		t.Fatalf("read task after refused adjudication: %v", err)
+	}
+	if current.Phase != task.AgentStarted || current.Blocker != marker {
+		t.Fatalf("task after refused adjudication = phase %q blocker %q, want the pending marker unchanged",
+			current.Phase, current.Blocker)
+	}
+	if got := f.countCalls("agent prompt"); got != before {
+		t.Fatalf("agent prompt calls after refused adjudication = %d, want unchanged at %d", got, before)
+	}
+}
+
+func TestPendingBriefClaimOutlivesInFlightPrompt(t *testing.T) {
+	const (
+		lease        = 50 * time.Millisecond
+		promptDelay  = 3 * time.Second
+		callTimeout  = 5 * time.Second
+		readyTimeout = 2 * time.Second
+	)
+	f := newCoordFixture(t, fixturePlan{PromptDelayMillis: int(promptDelay / time.Millisecond)})
+	projectKey := f.projectKey()
+	coordinator, err := New(f.store, f.client, Options{
+		Concurrency:      3,
+		CallTimeout:      callTimeout,
+		ReadinessTimeout: readyTimeout,
+		PollInterval:     10 * time.Millisecond,
+		StepLease:        lease,
+	})
+	if err != nil {
+		t.Fatalf("New short-lease coordinator: %v", err)
+	}
+	f.coord = coordinator
+
+	type dispatchResult struct {
+		task task.Task
+		err  error
+	}
+	done := make(chan dispatchResult, 1)
+	go func() {
+		st, err := f.dispatch("one", "brief one", []string{"check"}, nil, nil, f.base)
+		done <- dispatchResult{task: st, err: err}
+	}()
+	waitForFixtureFile(t, filepath.Join(f.dir, "prompt_started"), 10*time.Second)
+
+	tasks, err := f.store.Tasks(context.Background(), projectKey)
+	if err != nil {
+		t.Fatalf("read tasks while prompt is in flight: %v", err)
+	}
+	var st task.Task
+	for _, candidate := range tasks {
+		if isBriefSubmissionPending(candidate.Blocker) {
+			st = candidate
+			break
+		}
+	}
+	if st.ID == "" {
+		t.Fatal("no pending brief marker while Herdr's prompt call is in flight")
+	}
+	time.Sleep(lease + 20*time.Millisecond)
+	evidence, _, err := f.coord.BriefInspection(context.Background(), st.ID)
+	if err != nil {
+		t.Fatalf("BriefInspection during prompt call: %v", err)
+	}
+	if _, err := f.coord.AdjudicateBrief(context.Background(), st.ID, st.Revision, BriefNotDelivered, evidence); !errors.Is(err, ErrStepInFlight) {
+		t.Fatalf("AdjudicateBrief after the configured lease elapsed = %v, want ErrStepInFlight", err)
+	}
+	result := <-done
+	if result.err != nil {
+		t.Errorf("dispatch after the prompt completed: %v", result.err)
+	}
+	if result.task.Phase != task.PromptSubmitted {
+		t.Errorf("dispatch phase = %q, want %q", result.task.Phase, task.PromptSubmitted)
+	}
+	if got := f.countCalls("agent prompt"); got != 1 {
+		t.Errorf("agent prompt calls = %d, want one while adjudication was refused", got)
+	}
+}
+
+func waitForFixtureFile(t *testing.T, path string, timeout time.Duration) {
+	t.Helper()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		_, err := os.Stat(path)
+		if err == nil {
+			return
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("stat fixture signal %q: %v", path, err)
+		}
+		select {
+		case <-timer.C:
+			t.Fatalf("timed out waiting for fixture signal %q", path)
+		case <-ticker.C:
+		}
+	}
+}
+
+func TestDefiniteBriefRefusalClearsAttemptMarkerAndCanRetry(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{PromptError: "agent_blocked"})
+	st, err := f.dispatch("one", "brief one", []string{"check"}, nil, nil, f.base)
+	if err == nil {
+		t.Fatal("dispatch returned nil, want the definite prompt refusal")
+	}
+	st, err = f.store.Task(context.Background(), st.ID)
+	if err != nil {
+		t.Fatalf("read task after refusal: %v", err)
+	}
+	if st.Attention == "" || st.Blocker != "" {
+		t.Fatalf("task after definite refusal = attention %q blocker %q, want retryable attention without pending marker",
+			st.Attention, st.Blocker)
+	}
+	if got := f.countCalls("agent prompt"); got != 1 {
+		t.Fatalf("agent prompt calls after refusal = %d, want the one refused call", got)
+	}
+
+	f.updatePlan(func(plan *fixturePlan) { plan.PromptError = "" })
+	retried, err := f.resume(st.ID)
+	if err != nil {
+		t.Fatalf("ResumeDispatch after definite refusal: %v", err)
+	}
+	if retried.Phase != task.PromptSubmitted || retried.Blocker != "" {
+		t.Fatalf("retried task = phase %q blocker %q, want submitted without blocker",
+			retried.Phase, retried.Blocker)
+	}
+	if got := f.countCalls("agent prompt"); got != 2 {
+		t.Fatalf("agent prompt calls after retry = %d, want one refused attempt and one successful retry", got)
+	}
+}
+
+func TestPromptRecordFailureLeavesBriefAdjudicableWithoutResending(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	const lease = 30 * time.Millisecond
+	coordinator, err := New(f.store, f.client, Options{
+		Concurrency:      3,
+		CallTimeout:      5 * time.Second,
+		ReadinessTimeout: 2 * time.Second,
+		PollInterval:     10 * time.Millisecond,
+		StepLease:        lease,
+	})
+	if err != nil {
+		t.Fatalf("New short-lease coordinator: %v", err)
+	}
+	f.coord = coordinator
+
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(f.stateDir, "orchestrator.sqlite")))
+	if err != nil {
+		t.Fatalf("open state database: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if _, err := db.ExecContext(context.Background(), `CREATE TRIGGER refuse_prompt_phase
+		BEFORE UPDATE OF data ON tasks
+		WHEN json_extract(NEW.data, '$.Phase') = 'prompt_submitted'
+		BEGIN SELECT RAISE(ABORT, 'prompt phase is not writable'); END`); err != nil {
+		t.Fatalf("install prompt-phase trigger: %v", err)
+	}
+
+	st, dispatchErr := f.dispatch("one", "brief one", []string{"check"}, nil, nil, f.base)
+	if dispatchErr == nil {
+		t.Fatal("dispatch returned nil, want the injected phase-write failure")
+	}
+	if !strings.Contains(dispatchErr.Error(), "orch_adjudicate_dispatch") || !strings.Contains(dispatchErr.Error(), st.ID) {
+		t.Fatalf("dispatch error %q must name the task and orch_adjudicate_dispatch", dispatchErr)
+	}
+	st, err = f.store.Task(context.Background(), st.ID)
+	if err != nil {
+		t.Fatalf("read task after phase-write failure: %v", err)
+	}
+	if st.Phase != task.AgentStarted || !IsAmbiguousBriefTask(st) {
+		t.Fatalf("task after accepted prompt and failed phase write = phase %q, blocker %q; want an adjudicable pending brief",
+			st.Phase, st.Blocker)
+	}
+	if got := f.countCalls("agent prompt"); got != 1 {
+		t.Fatalf("agent prompt calls = %d, want exactly one", got)
+	}
+
+	time.Sleep(lease + 20*time.Millisecond)
+	retry, err := New(f.store, f.client, Options{
+		Concurrency:      3,
+		CallTimeout:      5 * time.Second,
+		ReadinessTimeout: 2 * time.Second,
+		PollInterval:     10 * time.Millisecond,
+		StepLease:        lease,
+	})
+	if err != nil {
+		t.Fatalf("New retry coordinator: %v", err)
+	}
+	if _, err := retry.ResumeDispatch(context.Background(), st.ID); !errors.Is(err, ErrBlocked) {
+		t.Fatalf("ResumeDispatch after the claim expired = %v, want ErrBlocked", err)
+	}
+	if got := f.countCalls("agent prompt"); got != 1 {
+		t.Fatalf("agent prompt calls after resume = %d, want no resubmission", got)
+	}
+
+	if _, err := db.ExecContext(context.Background(), `DROP TRIGGER refuse_prompt_phase`); err != nil {
+		t.Fatalf("remove prompt-phase trigger: %v", err)
+	}
+	evidence, _, err := f.coord.BriefInspection(context.Background(), st.ID)
+	if err != nil {
+		t.Fatalf("BriefInspection(pending successful prompt): %v", err)
+	}
+	decided, err := f.coord.AdjudicateBrief(context.Background(), st.ID, st.Revision, BriefDelivered, evidence)
+	if err != nil {
+		t.Fatalf("AdjudicateBrief(delivered): %v", err)
+	}
+	if decided.Phase != task.PromptSubmitted || decided.Blocker != "" {
+		t.Fatalf("adjudicated task = phase %q blocker %q, want prompt_submitted without blocker",
+			decided.Phase, decided.Blocker)
+	}
+	if got := f.countCalls("agent prompt"); got != 1 {
+		t.Fatalf("agent prompt calls after adjudication = %d, want no resubmission", got)
+	}
+}
+
+func TestBriefAttemptWriteFailurePreventsPrompt(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(f.stateDir, "orchestrator.sqlite")))
+	if err != nil {
+		t.Fatalf("open state database: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if _, err := db.ExecContext(context.Background(), `CREATE TRIGGER refuse_brief_attempt
+		BEFORE UPDATE OF data ON tasks
+		WHEN json_extract(NEW.data, '$.Blocker') LIKE 'brief submission pending:%'
+		BEGIN SELECT RAISE(ABORT, 'brief attempt is not writable'); END`); err != nil {
+		t.Fatalf("install brief-attempt trigger: %v", err)
+	}
+
+	st, dispatchErr := f.dispatch("one", "brief one", []string{"check"}, nil, nil, f.base)
+	if dispatchErr == nil {
+		t.Fatal("dispatch returned nil, want the injected attempt-write failure")
+	}
+	if got := f.countCalls("agent prompt"); got != 0 {
+		t.Fatalf("agent prompt calls = %d, want none until the attempt is durable", got)
+	}
+	st, err = f.store.Task(context.Background(), st.ID)
+	if err != nil {
+		t.Fatalf("read task after attempt-write failure: %v", err)
+	}
+	if st.Phase != task.AgentStarted || st.Blocker != "" {
+		t.Fatalf("task after attempt-write failure = phase %q blocker %q, want unchanged AgentStarted state",
+			st.Phase, st.Blocker)
+	}
+
+	retry := f.sibling()
+	if _, err := retry.ResumeDispatch(context.Background(), st.ID); err == nil {
+		t.Fatal("retry unexpectedly succeeded while the attempt-write trigger remains")
+	} else if errors.Is(err, ErrStepInFlight) {
+		t.Fatalf("retry was blocked by a stale step claim after no prompt was sent: %v", err)
+	}
+	if got := f.countCalls("agent prompt"); got != 0 {
+		t.Fatalf("agent prompt calls after safe retry failure = %d, want none", got)
 	}
 }
 
@@ -1898,8 +2204,13 @@ func TestRetryRestartedWorkerSessionIsNotPrompted(t *testing.T) {
 func TestDispatchRecordsTheBriefAsOneArgvElement(t *testing.T) {
 	f := newCoordFixture(t, fixturePlan{})
 	brief := "Say \"hi\"\nand then run `git status`;\nrm -rf nothing"
-	if _, err := f.dispatch("quoted", brief, []string{"go test ./... ok"}, nil, nil, f.base); err != nil {
+	st, err := f.dispatch("quoted", brief, []string{"go test ./... ok"}, nil, nil, f.base)
+	if err != nil {
 		t.Fatalf("dispatch: %v", err)
+	}
+	if st.Phase != task.PromptSubmitted || st.Blocker != "" {
+		t.Fatalf("successful dispatch = phase %q blocker %q, want submitted without pending marker",
+			st.Phase, st.Blocker)
 	}
 	for _, call := range f.calls() {
 		if len(call.Argv) >= 2 && call.Argv[0] == "agent" && call.Argv[1] == "prompt" {

@@ -934,7 +934,7 @@ export default function (pi: ExtensionAPI) {
     label: "Decide an uncertain dispatch",
     defaultInactive: true,
     description:
-      "Decide what happened to a brief whose submission was left uncertain, after the user inspects the worker's pane: whether it arrived. \"delivered\" records the submission without sending it again; \"not_delivered\" clears that blocker and sends it once more. Nothing else can clear that blocker.",
+      "Resolve a brief whose outcome is uncertain: after you inspect the worker's pane, record whether it arrived. This also covers a prompt accepted by Herdr when the task could not persist its submitted phase. \"delivered\" records the submission without sending it again; \"not_delivered\" clears that blocker and retries once. Nothing else can clear that blocker.",
     parameters: z.object({
       taskId: z.string().min(1),
       decision: z.enum(["delivered", "not_delivered"]),

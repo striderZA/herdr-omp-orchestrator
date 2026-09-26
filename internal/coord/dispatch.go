@@ -542,7 +542,17 @@ func (c *Coordinator) provision(ctx context.Context, st task.Task) (task.Task, e
 		if st.Phase == task.PromptSubmitted {
 			return st, nil
 		}
-		took, err := c.store.ClaimStep(ctx, st.ID, st.Phase, c.owner, c.opts.StepLease)
+		lease := c.opts.StepLease
+		if st.Phase == task.AgentStarted {
+			// A brief prompt can remain in flight until CallTimeout. Give the
+			// pre-send record and the whole external call time before a user
+			// adjudication is allowed to take over this claim.
+			minimum := 2 * c.opts.CallTimeout
+			if lease < minimum {
+				lease = minimum
+			}
+		}
+		took, err := c.store.ClaimStep(ctx, st.ID, st.Phase, c.owner, lease)
 		if err != nil {
 			return st, err
 		}
@@ -879,9 +889,9 @@ func (c *Coordinator) paneForTask(ctx context.Context, st task.Task) (string, er
 	return candidates[0], nil
 }
 
-// submitBrief submits the brief once, as a single argv element. An ambiguous
-// answer becomes a blocker: the brief may already be the worker's turn, so it
-// is never sent again.
+// submitBrief persists an inspection marker before submitting the brief. If
+// Herdr accepts the prompt but the phase write fails, the marker is the durable
+// reason a later resume must inspect and adjudicate rather than submit again.
 func (c *Coordinator) submitBrief(ctx context.Context, st task.Task) (task.Task, error) {
 	paneID := st.PublicPaneID
 	if strings.TrimSpace(paneID) == "" {
@@ -891,26 +901,71 @@ func (c *Coordinator) submitBrief(ctx context.Context, st task.Task) (task.Task,
 		return c.failTask(ctx, st, "submit the brief", true,
 			fmt.Errorf("no pane is recorded for the worker, so the brief cannot be addressed"))
 	}
+	marker, err := c.newBriefSubmissionMarker(st.Brief)
+	if err != nil {
+		return c.refuseBriefBeforeSend(ctx, st, "prepare a durable brief attempt before sending it", err)
+	}
+	pending, err := c.record(ctx, st, func(next *task.Task) error {
+		if next.Phase != task.AgentStarted {
+			return fmt.Errorf("%w: task %s moved to %s before its brief was submitted",
+				state.ErrConflict, next.ID, next.Phase)
+		}
+		if next.Blocker != "" {
+			return fmt.Errorf("%w: task %s already has a blocker", ErrBlocked, next.ID)
+		}
+		next.Blocker = marker
+		return nil
+	}, "record the brief attempt before submission")
+	if err != nil {
+		return c.refuseBriefBeforeSend(ctx, st, "record the durable brief attempt before sending it", err)
+	}
+
 	callCtx, cancel := c.callContext(ctx)
-	_, err := c.herdr.AgentPrompt(callCtx, paneID, st.Brief)
+	_, err = c.herdr.AgentPrompt(callCtx, paneID, st.Brief)
 	cancel()
 	if err == nil {
-		return c.record(ctx, st, func(next *task.Task) error {
+		submitted, recordErr := c.record(ctx, pending, func(next *task.Task) error {
+			if next.Phase != task.AgentStarted || next.Blocker != marker {
+				return fmt.Errorf("%w: task %s no longer carries the brief attempt being recorded",
+					state.ErrConflict, next.ID)
+			}
 			next.Phase = task.PromptSubmitted
+			next.Blocker = ""
 			return nil
 		}, "record the submitted brief")
+		if recordErr != nil {
+			releaseErr := c.store.ReleaseStep(ctx, pending.ID, c.owner)
+			message := fmt.Sprintf("Herdr accepted the brief on pane %s, but task %s could not record prompt_submitted; inspect the durable attempt and use orch_adjudicate_dispatch before retrying",
+				paneID, pending.ID)
+			if releaseErr != nil {
+				return pending, fmt.Errorf("%s; releasing the completed prompt claim also failed: %v: %w",
+					message, releaseErr, recordErr)
+			}
+			return pending, fmt.Errorf("%s: %w", message, recordErr)
+		}
+		return submitted, nil
 	}
 	if errors.Is(err, herdr.ErrAmbiguous) {
-		return c.failTask(ctx, st, "submit the brief", true,
+		return c.failTask(ctx, pending, "submit the brief", true,
 			fmt.Errorf("%w: the brief on pane %s may already have been delivered; inspect `agent read %s` before deciding: %w",
 				ErrAmbiguousStep, paneID, paneID, err))
 	}
 	if isNonDelivery(err) {
-		return c.failTask(ctx, st, "submit the brief", false,
+		return c.failTask(ctx, pending, "submit the brief", false,
 			fmt.Errorf("agent prompt on pane %s was refused before any input was written: %w", paneID, err))
 	}
-	return c.failTask(ctx, st, "submit the brief", true,
-		fmt.Errorf("agent prompt on pane %s failed without proof that nothing was delivered: %w", paneID, err))
+	return c.failTask(ctx, pending, "submit the brief", true,
+		fmt.Errorf("%w: agent prompt on pane %s failed without proof that nothing was delivered: %w",
+			ErrAmbiguousStep, paneID, err))
+}
+
+func (c *Coordinator) refuseBriefBeforeSend(ctx context.Context, st task.Task, operation string, cause error) (task.Task, error) {
+	releaseErr := c.store.ReleaseStep(ctx, st.ID, c.owner)
+	if releaseErr != nil {
+		return st, fmt.Errorf("%s (no Herdr prompt was sent); releasing the step claim also failed: %v: %w",
+			operation, releaseErr, cause)
+	}
+	return st, fmt.Errorf("%s (no Herdr prompt was sent): %w", operation, cause)
 }
 
 // isNonDelivery reports a Herdr refusal that provably wrote no input: a blocked
@@ -929,15 +984,15 @@ func isNonDelivery(err error) bool {
 }
 
 // ---------------------------------------------------------------------------
-// adjudicating an ambiguous brief submission
+// resolving an unresolved brief submission
 // ---------------------------------------------------------------------------
 
 // Errors specific to the brief adjudication. They live here rather than with the
 // other sentinels because this surface owns them.
 var (
-	// ErrNotAdjudicable reports a task that carries no ambiguous brief submission
+	// ErrNotAdjudicable reports a task that carries no unresolved brief submission
 	// to decide, so nothing may be recorded for it.
-	ErrNotAdjudicable = errors.New("coord: the task has no ambiguous brief submission")
+	ErrNotAdjudicable = errors.New("coord: the task has no unresolved brief submission")
 	// ErrEvidenceChanged reports that what a user inspected is not what the task
 	// records now, so the decision cannot be applied to it.
 	ErrEvidenceChanged = errors.New("coord: the inspected evidence no longer matches")
@@ -946,19 +1001,20 @@ var (
 	ErrStepInFlight = errors.New("coord: another caller is running this task's step")
 )
 
-// BriefDecision is a user's adjudication of an ambiguous brief submission: the
-// one state an ambiguous submission leaves which nothing else can resolve.
+// BriefDecision is a user's adjudication of an unresolved brief submission: the
+// one state a submission leaves which nothing else can resolve.
 type BriefDecision string
 
 const (
 	// BriefDelivered records that the brief did reach the worker. The task moves to
 	// prompt_submitted without another submission.
 	BriefDelivered BriefDecision = "delivered"
-	// BriefNotDelivered records that the brief never reached the worker. The
-	// ambiguity blocker is cleared and the recorded phase resumes once, which
-	// submits the brief again.
+	// BriefNotDelivered records that the user confirmed the brief never reached the
+	// worker. The blocker is cleared and the recorded phase resumes once.
 	BriefNotDelivered BriefDecision = "not_delivered"
 )
+
+const briefSubmissionPendingPrefix = "brief submission pending: "
 
 // BriefEvidence is what a user was shown and answered about: the worker's pane and
 // the digest of the terminal text the primary displayed for that pane. The
@@ -987,7 +1043,7 @@ type AdjudicateBriefParams struct {
 }
 
 // BriefInspectionResult is the evidence a primary shows a user before deciding
-// about an ambiguous brief submission. It is an additive wire result: the task,
+// about an unresolved brief submission. It is an additive wire result: the task,
 // the pane it read, the revision the decision must be tied to, the digest of the
 // text shown, the text itself, and the two outcomes the coordinator accepts.
 type BriefInspectionResult struct {
@@ -1057,7 +1113,7 @@ func (c *Coordinator) AdjudicateBriefFor(
 }
 
 // adjudicableTask reads one task and requires it to belong to the given project
-// and to carry the ambiguous brief blocker.
+// and to carry the unresolved brief blocker.
 func (c *Coordinator) adjudicableTask(ctx context.Context, projectKey, taskID string) (task.Task, error) {
 	st, err := c.store.Task(ctx, strings.TrimSpace(taskID))
 	if err != nil {
@@ -1068,45 +1124,71 @@ func (c *Coordinator) adjudicableTask(ctx context.Context, projectKey, taskID st
 			ErrNotAdjudicable, st.ID, st.ProjectKey, key)
 	}
 	if !IsAmbiguousBriefTask(st) {
-		return task.Task{}, fmt.Errorf("%w: task %s is at phase %s with no ambiguous brief submission",
+		return task.Task{}, fmt.Errorf("%w: task %s is at phase %s with no unresolved brief submission",
 			ErrNotAdjudicable, st.ID, st.Phase)
 	}
 	return st, nil
 }
 
-// IsAmbiguousBriefTask reports whether a task carries exactly the blocker an
-// ambiguous brief submission leaves: the task is at AgentStarted, the blocker is
-// this task's own submission failure, and it is the ambiguity kind.
-//
-// It is deliberately exact. Another step's ambiguity, Task 5's `input attempt:`
-// marker, a question's attention and an empty blocker all report false, so an
-// adjudication can never clear a fact it does not own.
+// IsAmbiguousBriefTask reports whether a task carries the exact blocker that
+// requires inspection before its brief can be retried. It accepts only this task's
+// well-formed pre-send marker or its own ambiguity failure, never another blocker.
 func IsAmbiguousBriefTask(st task.Task) bool {
 	if st.Phase != task.AgentStarted || strings.TrimSpace(st.Blocker) == "" {
 		return false
+	}
+	if isBriefSubmissionPending(st.Blocker) {
+		return true
 	}
 	prefix := fmt.Sprintf("task %s could not submit the brief: ", st.ID)
 	return strings.HasPrefix(st.Blocker, prefix) && strings.Contains(st.Blocker, ErrAmbiguousStep.Error())
 }
 
+func (c *Coordinator) newBriefSubmissionMarker(brief string) (string, error) {
+	nonce, err := c.attemptNonce()
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256([]byte("brief\x00" + brief))
+	return briefSubmissionPendingPrefix + hex.EncodeToString(digest[:8]) + " " + nonce, nil
+}
+
+func isBriefSubmissionPending(marker string) bool {
+	marker = strings.TrimSpace(marker)
+	if !strings.HasPrefix(marker, briefSubmissionPendingPrefix) {
+		return false
+	}
+	fields := strings.Fields(strings.TrimPrefix(marker, briefSubmissionPendingPrefix))
+	if len(fields) != 2 {
+		return false
+	}
+	for _, field := range fields {
+		raw, err := hex.DecodeString(field)
+		if err != nil || len(raw) != 8 {
+			return false
+		}
+	}
+	return true
+}
+
 // BriefInspection reads the evidence a user has to see before deciding: the
 // text of the task's current worker pane, exactly as the primary will show it,
 // together with the handle the decision must be made with. It is read-only, and it
-// refuses anything that is not an ambiguous brief submission.
+// refuses anything that is not an unresolved brief submission.
 func (c *Coordinator) BriefInspection(ctx context.Context, taskID string) (BriefEvidence, string, error) {
 	st, err := c.store.Task(ctx, taskID)
 	if err != nil {
 		return BriefEvidence{}, "", err
 	}
 	if !IsAmbiguousBriefTask(st) {
-		return BriefEvidence{}, "", fmt.Errorf("%w: task %s is at phase %s with no ambiguous brief submission",
+		return BriefEvidence{}, "", fmt.Errorf("%w: task %s is at phase %s with no unresolved brief submission",
 			ErrNotAdjudicable, st.ID, st.Phase)
 	}
 	return c.inspectAmbiguousBrief(ctx, st)
 }
 
 // inspectAmbiguousBrief reads the evidence for a task already known to carry the
-// ambiguous brief blocker.
+// unresolved brief blocker.
 func (c *Coordinator) inspectAmbiguousBrief(ctx context.Context, st task.Task) (BriefEvidence, string, error) {
 	paneID := strings.TrimSpace(st.PublicPaneID)
 	if paneID == "" {
@@ -1122,7 +1204,7 @@ func (c *Coordinator) inspectAmbiguousBrief(ctx context.Context, st task.Task) (
 	return BriefEvidence{PaneID: paneID, Digest: digestDialog(text)}, text, nil
 }
 
-// AdjudicateBrief records a user's decision about an ambiguous brief submission.
+// AdjudicateBrief records a user's decision about an unresolved brief submission.
 //
 // It is the only way out of that state, so it is narrow on purpose:
 //
@@ -1152,14 +1234,15 @@ func (c *Coordinator) AdjudicateBrief(
 		return task.Task{}, err
 	}
 	if !IsAmbiguousBriefTask(st) {
-		return task.Task{}, fmt.Errorf("%w: task %s is at phase %s with no ambiguous brief submission",
+		return task.Task{}, fmt.Errorf("%w: task %s is at phase %s with no unresolved brief submission",
 			ErrNotAdjudicable, st.ID, st.Phase)
 	}
 	return c.adjudicate(ctx, st, expectedRevision, decision, observed)
 }
 
-// adjudicate applies one decision to a task already known to carry the ambiguous
+// adjudicate applies one decision to a task already known to carry the unresolved
 // brief blocker.
+// It is the only way out of that state, so it is narrow on purpose:
 func (c *Coordinator) adjudicate(
 	ctx context.Context,
 	st task.Task,
@@ -1201,6 +1284,17 @@ func (c *Coordinator) adjudicate(
 	// so they are one transaction: a note that cannot be stored must leave the task
 	// exactly as adjudicable as it was, not decided with a silent hole where the
 	// audit trail and the resume should be.
+	claimedPending := isBriefSubmissionPending(st.Blocker)
+	if claimedPending {
+		took, err := c.store.ClaimStep(ctx, st.ID, st.Phase, c.owner, c.opts.StepLease)
+		if err != nil {
+			return st, err
+		}
+		if !took {
+			return st, fmt.Errorf("%w: task %s still has an active brief-submission claim; wait for it to finish before deciding",
+				ErrStepInFlight, st.ID)
+		}
+	}
 	summary := fmt.Sprintf("the user decided the brief for task %s was %s after inspecting pane %s",
 		st.ID, decision, paneID)
 	decided, err := c.store.RetireStepWithNote(ctx, st.ID, expectedRevision, func(next *task.Task) error {
@@ -1214,6 +1308,11 @@ func (c *Coordinator) adjudicate(
 		return nil
 	}, inboxNote(st.ProjectKey, st.ID, "adjudication", summary, "recorded by the user"))
 	if err != nil {
+		if claimedPending {
+			if releaseErr := c.store.ReleaseStep(ctx, st.ID, c.owner); releaseErr != nil {
+				return st, fmt.Errorf("record the brief decision: %w; release the step claim: %v", err, releaseErr)
+			}
+		}
 		return st, err
 	}
 	if decision == BriefDelivered {
@@ -1495,6 +1594,9 @@ func (c *Coordinator) failTask(ctx context.Context, st task.Task, step string, t
 	// phase it reached. A definite failure releases the claim (a retry does not have
 	// to wait out the lease); an undecided one keeps it until the lease expires.
 	updated, err := c.recordStepFailure(ctx, st, failure, definiteFailure(cause), func(next *task.Task) error {
+		if isBriefSubmissionPending(st.Blocker) && next.Blocker == st.Blocker {
+			next.Blocker = ""
+		}
 		if terminal {
 			next.Blocker = failure.Error()
 			return nil
