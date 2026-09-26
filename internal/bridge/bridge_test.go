@@ -43,6 +43,11 @@ const (
 	// with, so a test can assert the exact commands an operation made.
 	fixtureScriptFile = "BRIDGE_FIXTURE_SCRIPT_FILE"
 	fixtureCallsFile  = "BRIDGE_FIXTURE_CALLS_FILE"
+	// fixtureStateDir is the plugin state directory as the stand-in Herdr child can
+	// see it. A child inherits the test process's environment, not the bridge's own
+	// env map, so a scripted answer that has to write the store (a concurrent move)
+	// is told where that store is through the process environment.
+	fixtureStateDir = "BRIDGE_FIXTURE_STATE_DIR"
 )
 
 var (
@@ -134,6 +139,7 @@ func newBridgeFixture(t *testing.T) *bridgeFixture {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	worktree := t.TempDir()
+	t.Setenv(fixtureStateDir, stateDir)
 	return &bridgeFixture{
 		t:        t,
 		store:    store,
@@ -881,6 +887,37 @@ func TestBridgeAdjudicationRefusalsAreCoded(t *testing.T) {
 	}
 }
 
+// TestBridgeAmbiguousOperationsAreCodedExplicitly pins the code an answer or an
+// approved-keys operation carries when its outcome could not be identified.
+//
+// Herdr may already have written the input, so the caller must be told exactly
+// that and inspect the worker before anything else reaches it. Reporting the
+// ambiguity as `herdr_unavailable` would say the opposite — that the CLI could not
+// be used at all — and invite a blind retry of input that may already be there.
+func TestBridgeAmbiguousOperationsAreCodedExplicitly(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{"an answer that may already have landed", fmt.Errorf("answer the worker on pane %q: %w", workerPane, herdr.ErrAmbiguous)},
+		{"approved keys that may already have been written", fmt.Errorf("approve the dialog on pane %q: %w", workerPane, herdr.ErrAmbiguous)},
+		{"a timeout classified as an ambiguity", &herdr.AmbiguousError{Op: "agent prompt", Reason: "the answer never arrived", Err: &herdr.CLIError{
+			Op: "agent prompt", Code: herdr.CodeTimeout, Message: "the command timed out",
+		}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := coordErrorCode(tc.err)
+			if got == CodeHerdrUnavailable {
+				t.Errorf("coordErrorCode(%v) = %q: an ambiguous operation is not the same as an unusable CLI", tc.err, got)
+			}
+			if got != "ambiguous_operation" {
+				t.Errorf("coordErrorCode(%v) = %q, want %q", tc.err, got, "ambiguous_operation")
+			}
+		})
+	}
+}
+
 // ---------------------------------------------------------------------------
 // role authorization
 // ---------------------------------------------------------------------------
@@ -1149,6 +1186,65 @@ func TestBridgeResolveRebindsVerifiedRestore(t *testing.T) {
 	}
 	if again.Revision != after.Revision {
 		t.Errorf("idempotent resolve rewrote the task: %d -> %d", after.Revision, again.Revision)
+	}
+}
+
+// TestBridgeResolveKeepsARebindConflictRecoverable pins what happens when the
+// primary's binding changes while its restore is being verified. The verified
+// rebind is a compare-and-swap, so the change must reach resolve as a conflict it
+// recovers from: the tools stay inactive, the concurrent write stands, and the
+// primary is told — never an internal failure that hides the reason.
+func TestBridgeResolveKeepsARebindConflictRecoverable(t *testing.T) {
+	f := newBridgeFixture(t)
+	f.seedPrimary()
+
+	// Herdr restarted the primary in a new pane of the recorded workspace and
+	// checkout, and while that pane is verified another bridge call records a move
+	// of the same primary to a new public pane.
+	const newPane = "w7:p3"
+	f.useHerdrStub(stubScript{
+		RepoRoot: f.repoRoot,
+		Panes: map[string]stubPane{newPane: {
+			PaneID:      newPane,
+			TerminalID:  "term-restored",
+			WorkspaceID: "ws-repo-1",
+			Cwd:         f.repoRoot,
+			Agent:       "omp",
+		}},
+		ProjectMovedTo: "w9:p9",
+	})
+	f.env["HERDR_PANE_ID"] = newPane
+
+	resp := f.call("resolve", primarySession, "{}")
+	if !resp.OK {
+		t.Fatalf("resolve answered %+v, want the recoverable unverified-restore result", resp.Error)
+	}
+	var result ResolveResult
+	resp.decodeResult(t, &result)
+	if result.Bound {
+		t.Errorf("resolve = %+v, want the orchestrator tools to stay inactive", result)
+	}
+	if result.Reason != ReasonUnverifiedRestore {
+		t.Errorf("resolve reason = %q, want %q", result.Reason, ReasonUnverifiedRestore)
+	}
+	if strings.TrimSpace(result.Attention) == "" {
+		t.Error("a rebind that lost its compare-and-swap recorded no attention for the human")
+	}
+
+	// The concurrent move is the fact that stands: this resolve did not overwrite it
+	// with the pane it was verifying.
+	project, err := f.store.Project(context.Background(), f.repoRoot)
+	if err != nil {
+		t.Fatalf("read the project: %v", err)
+	}
+	if project.PublicPaneID != "w9:p9" {
+		t.Errorf("public pane = %q, want the concurrent move %q preserved", project.PublicPaneID, "w9:p9")
+	}
+	if project.LaunchPaneID != primaryPane {
+		t.Errorf("launch pane = %q, want the recorded %q untouched", project.LaunchPaneID, primaryPane)
+	}
+	if got := len(notesOf(t, f, "attention")); got != 1 {
+		t.Errorf("attention notes = %d, want the conflict reported exactly once", got)
 	}
 }
 
@@ -1728,6 +1824,10 @@ type stubScript struct {
 	// RemoveEchoesForced makes a successful `worktree remove` answer claim the
 	// removal was forced, which this plugin never asks for and must never accept.
 	RemoveEchoesForced bool `json:"removeEchoesForced"`
+	// ProjectMovedTo makes the stand-in record a move of the named repository's
+	// project to that public pane before it answers `pane get`: another bridge call
+	// writing the same binding while this restore is being verified.
+	ProjectMovedTo string `json:"projectMovedTo"`
 
 	Prompts  []stubPrompt   `json:"prompts"`
 	SentKeys []stubSendKeys `json:"sentKeys"`
@@ -1801,6 +1901,11 @@ func runHerdrScript(path string) int {
 		pane, ok := script.Panes[argv[2]]
 		if !ok {
 			return stubError("pane_not_found", "pane "+argv[2]+" not found")
+		}
+		if script.ProjectMovedTo != "" {
+			if code := stubMoveStoredProject(script); code != 0 {
+				return code
+			}
 		}
 		return stubResult(map[string]any{"type": "pane_info", "pane": stubPaneBody(pane)})
 	case "agent get":
@@ -1922,6 +2027,31 @@ func runHerdrScript(path string) int {
 		fmt.Fprintf(os.Stderr, "stub: unsupported command: argv %q\n", argv)
 		return 40
 	}
+}
+
+// stubMoveStoredProject records a move of the named repository's project, the way
+// another bridge call that rebound the primary would: it is the concurrent write a
+// resolve's compare-and-swap must refuse to overwrite. It runs in the stand-in
+// Herdr child, so the write lands between the caller's read of the binding and its
+// own.
+func stubMoveStoredProject(script stubScript) int {
+	dir := os.Getenv(fixtureStateDir)
+	if dir == "" {
+		return 46
+	}
+	store, err := state.Open(dir)
+	if err != nil {
+		return 47
+	}
+	defer func() { _ = store.Close() }()
+	err = store.UpdateProject(context.Background(), script.RepoRoot, func(next *task.Project) error {
+		next.PublicPaneID = script.ProjectMovedTo
+		return nil
+	})
+	if err != nil {
+		return 48
+	}
+	return 0
 }
 
 // stubWorktreeOpen answers `worktree open` the way Herdr does for a checkout it
@@ -2681,7 +2811,7 @@ func TestAnswerAttemptIsDurableAndBlocksARepeatedSend(t *testing.T) {
 
 	// The prompt may already have been written: the ambiguity is durable and names
 	// the attempt without storing the answer.
-	wantError(t, f.callWith("answer", primarySession, answer, ops), "herdr_unavailable")
+	wantError(t, f.callWith("answer", primarySession, answer, ops), "ambiguous_operation")
 	attempt := f.task(t, "t1").Blocker
 	if !strings.Contains(attempt, "input attempt") || !strings.Contains(attempt, "answer") {
 		t.Fatalf("the answer attempt was not recorded: blocker %q", attempt)
@@ -2761,7 +2891,7 @@ func TestSettleInputDeliveredClosesTheQuestionItAnswered(t *testing.T) {
 		t.Fatalf("question failed: %+v", resp.Error)
 	}
 	f.asPrimary()
-	wantError(t, f.callWith("answer", primarySession, `{"taskId":"t1","text":"Keep the old API."}`, ops), "herdr_unavailable")
+	wantError(t, f.callWith("answer", primarySession, `{"taskId":"t1","text":"Keep the old API."}`, ops), "ambiguous_operation")
 	pending := f.task(t, "t1")
 	if pending.Blocker == "" || !isQuestionAttentionForTest(pending.Attention) {
 		t.Fatalf("the ambiguous answer left the wrong state: blocker %q, attention %q", pending.Blocker, pending.Attention)
@@ -2835,7 +2965,7 @@ func TestDialogApprovalSettlesAnUnchangedDialogOnlyByInspection(t *testing.T) {
 	f.callWith("dialog_preview", primarySession, `{"taskId":"t1"}`, ops).decodeResult(t, &preview)
 
 	stub.queueReads(stubRead{Text: screen})
-	wantError(t, approve(preview.Digest, `["1"]`), "herdr_unavailable")
+	wantError(t, approve(preview.Digest, `["1"]`), "ambiguous_operation")
 	if got := len(stub.script().SentKeys); got != 1 {
 		t.Fatalf("send-keys calls = %d, want the one ambiguous attempt", got)
 	}
@@ -2885,7 +3015,7 @@ func TestAttemptsWithTheSamePayloadStayDistinguishable(t *testing.T) {
 	ops := CoordinatorOps(f.coordinator(t))
 	answer := `{"taskId":"t1","text":"Keep the old API."}`
 
-	wantError(t, f.callWith("answer", primarySession, answer, ops), "herdr_unavailable")
+	wantError(t, f.callWith("answer", primarySession, answer, ops), "ambiguous_operation")
 	first := f.task(t, "t1").Blocker
 	if !strings.Contains(first, "input attempt") {
 		t.Fatalf("the first attempt was not recorded: blocker %q", first)
@@ -2894,7 +3024,7 @@ func TestAttemptsWithTheSamePayloadStayDistinguishable(t *testing.T) {
 	// The user says the first one never arrived, so the same answer is sent again - and it
 	// is just as uncertain as the first was.
 	f.callWith("settle_input", primarySession, `{"taskId":"t1","decision":"not_delivered"}`, ops)
-	wantError(t, f.callWith("answer", primarySession, answer, ops), "herdr_unavailable")
+	wantError(t, f.callWith("answer", primarySession, answer, ops), "ambiguous_operation")
 	second := f.task(t, "t1").Blocker
 	if !strings.Contains(second, "input attempt") {
 		t.Fatalf("the second attempt was not recorded: blocker %q", second)
@@ -2972,7 +3102,7 @@ func TestDialogApprovalAttemptIsTiedToTheApprovedDigest(t *testing.T) {
 
 	// The keys may already have been written into that dialog.
 	stub.queueReads(stubRead{Text: approvedScreen})
-	wantError(t, approve(first.Digest, `["1"]`), "herdr_unavailable")
+	wantError(t, approve(first.Digest, `["1"]`), "ambiguous_operation")
 	attempt := f.task(t, "t1").Blocker
 	if !strings.Contains(attempt, "input attempt") || !strings.Contains(attempt, "dialog") {
 		t.Fatalf("the key attempt was not recorded: blocker %q", attempt)
@@ -3067,7 +3197,7 @@ func TestDialogApprovalSettlesAnAttemptWhenTheWorkerIsUnblocked(t *testing.T) {
 	stub.queueReads(stubRead{Text: screen})
 	f.callWith("dialog_preview", primarySession, `{"taskId":"t1"}`, ops).decodeResult(t, &preview)
 	stub.queueReads(stubRead{Text: screen})
-	wantError(t, approve(preview.Digest, `["1"]`), "herdr_unavailable")
+	wantError(t, approve(preview.Digest, `["1"]`), "ambiguous_operation")
 	if got := f.task(t, "t1").Blocker; got == "" {
 		t.Fatal("the ambiguous approval left no attempt recorded")
 	}

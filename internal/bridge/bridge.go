@@ -118,8 +118,15 @@ const (
 	CodeForbidden           = "forbidden"
 	CodeNotImplemented      = "not_implemented"
 	CodeHerdrUnavailable    = "herdr_unavailable"
-	CodeInternal            = "internal"
-	CodeResponseTooLarge    = "response_too_large"
+	// CodeAmbiguousOperation reports an operation whose outcome could not be
+	// identified: Herdr may already have written the input, so the caller must
+	// inspect the worker before anything else reaches it. It is deliberately not
+	// CodeHerdrUnavailable — that code says the CLI could not be used at all, and a
+	// caller that read an ambiguous answer or approved keys that way would retype
+	// input that may already be in the pane.
+	CodeAmbiguousOperation = "ambiguous_operation"
+	CodeInternal           = "internal"
+	CodeResponseTooLarge   = "response_too_large"
 )
 
 // Environment the bridge reads. HERDR_ORCH_HERDR_BIN_PATH is set by the
@@ -426,8 +433,13 @@ func coordErrorCode(err error) string {
 		return "ambiguous_step"
 	case errors.Is(err, coord.ErrPersistence):
 		return "state_write_failed"
+	case errors.Is(err, herdr.ErrAmbiguous):
+		// Herdr may already have taken this operation's side effect — an answer or
+		// approved keys written into the worker's pane — so the caller is told that
+		// exactly, instead of being told the CLI was unusable.
+		return CodeAmbiguousOperation
 	case errors.Is(err, coord.ErrHerdrUnavailable), errors.Is(err, herdr.ErrCLI),
-		errors.Is(err, herdr.ErrTimeout), errors.Is(err, herdr.ErrAmbiguous):
+		errors.Is(err, herdr.ErrTimeout):
 		return CodeHerdrUnavailable
 	default:
 		return CodeInternal
@@ -970,7 +982,12 @@ func (h *handler) rebind(binding state.Binding, pane *herdr.PaneInfo) (state.Bin
 		project := binding.Project
 		err := h.store.UpdateProject(h.ctx, project.Key, func(next *task.Project) error {
 			if next.LaunchPaneID != project.LaunchPaneID || next.PublicPaneID != project.PublicPaneID {
-				return fail(CodeInternal, "the primary binding changed while it was being verified")
+				// Another bridge call rebound this primary while this one verified its
+				// pane. The conflict is reported as the store's own conflict, not as an
+				// internal failure: resolve turns it into the recoverable unverified
+				// restore (the tools stay inactive, the concurrent write stands, and the
+				// failure is recorded for the next turn) instead of a dead end.
+				return fmt.Errorf("%w: the primary binding changed while it was being verified", state.ErrConflict)
 			}
 			next.LaunchPaneID = h.launchPaneID
 			next.PublicPaneID = pane.PaneID

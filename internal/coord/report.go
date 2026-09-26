@@ -1310,6 +1310,13 @@ func (c *Coordinator) primaryProject(ctx context.Context, launchPaneID string) (
 
 // workerTask reads the worker task a launch pane is bound to, and requires that
 // pane and its project to still be the recorded ones.
+//
+// A task the primary has closed is not a task its worker may report on any more:
+// the disposition is the end of that channel, so progress, questions and a second
+// report are all refused. Anything else would let a closed task change under the
+// decision the user made about it — a fresh report would replace the very result
+// that was reviewed, and a question or a progress note would move a done task back
+// into the working columns.
 func (c *Coordinator) workerTask(ctx context.Context, launchPaneID string) (task.Task, error) {
 	pane := strings.TrimSpace(launchPaneID)
 	if pane == "" {
@@ -1323,6 +1330,9 @@ func (c *Coordinator) workerTask(ctx context.Context, launchPaneID string) (task
 		return task.Task{}, fmt.Errorf("read the worker bound to pane %q: %w", pane, err)
 	case strings.TrimSpace(st.LaunchPaneID) != pane:
 		return task.Task{}, fmt.Errorf("%w: pane %q is not the recorded launch pane of task %s", ErrOwnership, pane, st.ID)
+	case strings.TrimSpace(st.Disposition) != "":
+		return task.Task{}, fmt.Errorf("%w: task %s was closed with the disposition %q, so its worker may not report, ask or progress it any more",
+			ErrOwnership, st.ID, st.Disposition)
 	case st.Phase != task.AgentStarted && st.Phase != task.PromptSubmitted:
 		return task.Task{}, fmt.Errorf("%w: task %s is in phase %q, so no worker has been briefed for it yet", ErrOwnership, st.ID, st.Phase)
 	}

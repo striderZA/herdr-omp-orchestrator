@@ -2215,9 +2215,10 @@ func TestAWorkerNoteReachesAnIdlePrimaryAcrossSessionForms(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestReconcileProvisionsAQueuedTaskWhoseGateOpened pins the startup caller the
-// spec's recheck contract needs: a task queued behind an unreviewed prerequisite
-// becomes reachable at the moment the prerequisite is recorded, without another
-// dispatch.
+// spec's recheck contract needs: a task queued behind a prerequisite becomes
+// reachable at the moment the primary's disposition closes that prerequisite,
+// without another dispatch. A worker's final report alone leaves the dependent
+// queued: ready for review is not a decision.
 func TestReconcileProvisionsAQueuedTaskWhoseGateOpened(t *testing.T) {
 	ctx := context.Background()
 	f := newCoordFixture(t, fixturePlan{})
@@ -2237,8 +2238,23 @@ func TestReconcileProvisionsAQueuedTaskWhoseGateOpened(t *testing.T) {
 	}
 	created := f.countCalls("worktree create")
 
-	// The prerequisite is reported, which opens the gate. Nothing dispatches again.
-	f.satisfyReview(first)
+	// The prerequisite reports, which is not yet a decision: the restart must leave
+	// the dependent where it is.
+	first = f.satisfyReview(first)
+	if err := f.coord.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile after the report: %v", err)
+	}
+	if still := f.taskByID(t, queued.ID); still.Phase != task.Intent {
+		t.Fatalf("phase = %q, want %q: a final report alone opened the gate", still.Phase, task.Intent)
+	}
+	if got := f.countCalls("worktree create"); got != created {
+		t.Fatalf("worktree create calls = %d, want %d: a report alone provisioned a worker", got, created)
+	}
+
+	// The disposition closes the prerequisite, and the restart admits the waiting
+	// task. Nothing dispatches again.
+	first = f.taskByID(t, first.ID)
+	f.recordDisposition(first, "accepted")
 	if err := f.coord.Reconcile(ctx); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}

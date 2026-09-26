@@ -72,6 +72,7 @@ CREATE TABLE IF NOT EXISTS tasks (
 	public_pane_id TEXT NOT NULL DEFAULT '',
 	revision INTEGER NOT NULL,
 	slot_claimed_at INTEGER NOT NULL DEFAULT 0,
+	slot_token INTEGER NOT NULL DEFAULT 0,
 	step_claim_owner TEXT NOT NULL DEFAULT '',
 	step_claim_phase TEXT NOT NULL DEFAULT '',
 	step_claim_until INTEGER NOT NULL DEFAULT 0,
@@ -127,6 +128,7 @@ var inboxColumns = []struct{ name, ddl string }{
 // recorded, which the gate reads as well.
 var taskColumns = []struct{ name, ddl string }{
 	{"slot_claimed_at", `ALTER TABLE tasks ADD COLUMN slot_claimed_at INTEGER NOT NULL DEFAULT 0`},
+	{"slot_token", `ALTER TABLE tasks ADD COLUMN slot_token INTEGER NOT NULL DEFAULT 0`},
 	{"step_claim_owner", `ALTER TABLE tasks ADD COLUMN step_claim_owner TEXT NOT NULL DEFAULT ''`},
 	{"step_claim_phase", `ALTER TABLE tasks ADD COLUMN step_claim_phase TEXT NOT NULL DEFAULT ''`},
 	{"step_claim_until", `ALTER TABLE tasks ADD COLUMN step_claim_until INTEGER NOT NULL DEFAULT 0`},
@@ -899,8 +901,25 @@ func (s *Store) RecoverInbox(ctx context.Context) (int, error) {
 // written before the claim existed has rows whose resources are visible only
 // through their phase, and a record that reached a resource-owning phase must
 // never stop counting as one.
-const slotHolder = `(slot_claimed_at > 0 OR COALESCE(json_extract(data, '$.Phase'), '') IN ('worktree_created', 'agent_started', 'prompt_submitted'))
+const slotHolder = `(slot_claimed_at > 0 OR ` + resourcePhaseSQL + `)
 	AND COALESCE(json_extract(data, '$.Disposition'), '') = ''`
+
+// resourcePhaseSQL selects the phases that own a checkout and a pane. Such a task
+// holds its slot by its phase, so its claim is never handed back: releasing it
+// would give away a slot whose worktree and worker still exist.
+const resourcePhaseSQL = `COALESCE(json_extract(data, '$.Phase'), '') IN ('worktree_created', 'agent_started', 'prompt_submitted')`
+
+// ownsResources reports whether one recorded phase already owns a checkout and a
+// pane. It is the Go-side twin of resourcePhaseSQL, used where the phase is read
+// as a value.
+func ownsResources(phase string) bool {
+	switch task.Phase(phase) {
+	case task.WorktreeCreated, task.AgentStarted, task.PromptSubmitted:
+		return true
+	default:
+		return false
+	}
+}
 
 // claimedSlots counts the provisioning slots a project holds, ignoring one task
 // (the task being claimed, which is judged by its own facts instead).
@@ -940,157 +959,289 @@ func taskHoldsSlot(ctx context.Context, q rowQueryer, id string) (bool, error) {
 // resource) and must be claimed again before it is provisioned, while a
 // reservation that another task holds refuses the whole request and records
 // nothing.
-func (s *Store) ClaimTask(ctx context.Context, t task.Task, budget int) (bool, task.Task, error) {
+//
+// The claim it took is returned as its token (the slot_token column), so the
+// caller that acquired the capacity is the one that can give it back. A refused
+// slot reports a zero token: this call took none.
+func (s *Store) ClaimTask(ctx context.Context, t task.Task, budget int) (bool, task.Task, int64, error) {
 	if t.ID == "" || t.ProjectKey == "" {
-		return false, task.Task{}, fmt.Errorf("%w: task id and project key are required", ErrInvalid)
+		return false, task.Task{}, 0, fmt.Errorf("%w: task id and project key are required", ErrInvalid)
 	}
 	if budget < 1 {
-		return false, task.Task{}, fmt.Errorf("%w: a provisioning budget of at least one is required", ErrInvalid)
+		return false, task.Task{}, 0, fmt.Errorf("%w: a provisioning budget of at least one is required", ErrInvalid)
 	}
 	now := time.Now().UnixMilli()
 	t.Revision = 1
 	t.CreatedAt, t.UpdatedAt = now, now
 	data, err := json.Marshal(t)
 	if err != nil {
-		return false, task.Task{}, fmt.Errorf("encode task %q: %w", t.ID, err)
+		return false, task.Task{}, 0, fmt.Errorf("encode task %q: %w", t.ID, err)
 	}
 
 	tx, err := s.begin(ctx, "claim task "+t.ID)
 	if err != nil {
-		return false, task.Task{}, err
+		return false, task.Task{}, 0, err
 	}
 	defer tx.rollback()
 
 	if taken, err := rowExists(ctx, tx, `SELECT 1 FROM tasks WHERE id = ?`, t.ID); err != nil {
-		return false, task.Task{}, err
+		return false, task.Task{}, 0, err
 	} else if taken {
-		return false, task.Task{}, fmt.Errorf("%w: task %q already exists", ErrConflict, t.ID)
+		return false, task.Task{}, 0, fmt.Errorf("%w: task %q already exists", ErrConflict, t.ID)
 	}
 	if err := checkPaneFree(ctx, tx, t.LaunchPaneID, t.ID); err != nil {
-		return false, task.Task{}, err
+		return false, task.Task{}, 0, err
 	}
 	if len(t.ReservedPaths) > 0 {
 		existing, err := queryFacts[task.Task](ctx, tx, `SELECT data FROM tasks WHERE project_key = ?`, t.ProjectKey)
 		if err != nil {
-			return false, task.Task{}, fmt.Errorf("read the tasks of %q: %w", t.ProjectKey, err)
+			return false, task.Task{}, 0, fmt.Errorf("read the tasks of %q: %w", t.ProjectKey, err)
 		}
 		if owner, mine, theirs, ok := reservedConflict(existing, t.ReservedPaths); ok {
-			return false, task.Task{}, fmt.Errorf("%w: task %s reserved %q (requested %q)",
+			return false, task.Task{}, 0, fmt.Errorf("%w: task %s reserved %q (requested %q)",
 				ErrReservedConflict, owner, theirs, mine)
 		}
 	}
 	count, err := claimedSlots(ctx, tx, t.ProjectKey, t.ID)
 	if err != nil {
-		return false, task.Task{}, err
+		return false, task.Task{}, 0, err
 	}
 	claimed := count < budget
-	claimValue := int64(0)
+	var token int64
 	if claimed {
-		claimValue = now
+		// A brand-new record has no previous claim, so the token is simply now.
+		token = nextSlotToken(0)
 	}
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO tasks (id, project_key, launch_pane_id, public_pane_id, revision, slot_claimed_at, data)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		t.ID, t.ProjectKey, nullablePane(t.LaunchPaneID), t.PublicPaneID, t.Revision, claimValue, string(data),
+		`INSERT INTO tasks (id, project_key, launch_pane_id, public_pane_id, revision, slot_claimed_at, slot_token, data)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		t.ID, t.ProjectKey, nullablePane(t.LaunchPaneID), t.PublicPaneID, t.Revision, token, token, string(data),
 	); err != nil {
-		return false, task.Task{}, fmt.Errorf("claim task %q: %w", t.ID, err)
+		return false, task.Task{}, 0, fmt.Errorf("claim task %q: %w", t.ID, err)
 	}
 	if err := tx.commit("claim task " + t.ID); err != nil {
-		return false, task.Task{}, err
+		return false, task.Task{}, 0, err
 	}
-	return claimed, t, nil
+	return claimed, t, token, nil
+}
+
+// nextSlotToken returns the next value of a task's slot claim identity. That value
+// is the token that says *which* claim a caller holds, so it must always increase:
+// the clock alone could repeat a millisecond, and a token that a released claim
+// already used would let a stale release match a fresh claim. The token column is
+// never reset, so previous is the greatest value the task has ever handed out.
+func nextSlotToken(previous int64) int64 {
+	if now := time.Now().UnixMilli(); now > previous {
+		return now
+	}
+	return previous + 1
 }
 
 // ClaimProvisioningSlot claims a slot for a task that is already recorded, before
-// any side effect touches Herdr. It reports whether *this call* took the claim:
+// any side effect touches Herdr. It reports whether *this call* took the claim and
+// the token of the claim it holds afterwards:
 //
 //   - true — the claim was free and this call now holds it, so this caller owns
-//     provisioning that task from here on;
+//     provisioning that task from here on; the token is the claim it just took.
 //   - false — the task already held the claim (another call is provisioning it,
 //     or it is the retry of an attempt that was interrupted), so this caller must
-//     not provision it. A deliberate resume is the one caller that may continue
-//     with a claim it did not take, because the recorded phase is what makes the
-//     retry idempotent.
+//     not provision it, and no token is reported: a deliberate resume is the one
+//     caller that may continue with a claim it did not take, and it does so by
+//     renewing it (RenewProvisioningSlot), which is what makes its ownership
+//     visible to the attempt that failed.
 //
 // A project that holds every slot its budget allows reports ErrBudgetExhausted
 // and changes nothing.
-func (s *Store) ClaimProvisioningSlot(ctx context.Context, id string, budget int) (bool, error) {
+func (s *Store) ClaimProvisioningSlot(ctx context.Context, id string, budget int) (bool, int64, error) {
 	if strings.TrimSpace(id) == "" {
-		return false, fmt.Errorf("%w: task id is required", ErrInvalid)
+		return false, 0, fmt.Errorf("%w: task id is required", ErrInvalid)
 	}
 	if budget < 1 {
-		return false, fmt.Errorf("%w: a provisioning budget of at least one is required", ErrInvalid)
+		return false, 0, fmt.Errorf("%w: a provisioning budget of at least one is required", ErrInvalid)
 	}
 	tx, err := s.begin(ctx, "claim provisioning slot for "+id)
 	if err != nil {
-		return false, err
+		return false, 0, err
 	}
 	defer tx.rollback()
 
 	t, err := scanTask(tx.QueryRowContext(ctx, `SELECT data FROM tasks WHERE id = ?`, id), "task "+id)
 	if err != nil {
-		return false, err
+		return false, 0, err
 	}
 	holds, err := taskHoldsSlot(ctx, tx, id)
 	if err != nil {
-		return false, err
+		return false, 0, err
 	}
 	if holds {
 		// Somebody already holds this task's claim: this call must not provision it.
-		return false, tx.commit("claim provisioning slot for " + id)
+		return false, 0, tx.commit("claim provisioning slot for " + id)
 	}
 	count, err := claimedSlots(ctx, tx, t.ProjectKey, id)
 	if err != nil {
-		return false, err
+		return false, 0, err
 	}
 	if count >= budget {
-		return false, fmt.Errorf("%w: %q already holds %d of %d provisioning slots",
+		return false, 0, fmt.Errorf("%w: %q already holds %d of %d provisioning slots",
 			ErrBudgetExhausted, t.ProjectKey, count, budget)
 	}
+	var previous int64
+	if err := tx.QueryRowContext(ctx, `SELECT slot_token FROM tasks WHERE id = ?`, id).Scan(&previous); err != nil {
+		return false, 0, fmt.Errorf("read the slot token of %s: %w", id, err)
+	}
+	token := nextSlotToken(previous)
 	res, err := tx.ExecContext(ctx,
-		`UPDATE tasks SET slot_claimed_at = ? WHERE id = ? AND slot_claimed_at = 0`,
-		time.Now().UnixMilli(), id)
+		`UPDATE tasks SET slot_claimed_at = ?, slot_token = ? WHERE id = ? AND slot_claimed_at = 0`,
+		token, token, id)
 	if err != nil {
-		return false, fmt.Errorf("claim provisioning slot for %s: %w", id, err)
+		return false, 0, fmt.Errorf("claim provisioning slot for %s: %w", id, err)
 	}
 	if err := requireOneRow(res, ErrConflict, "claim provisioning slot for "+id); err != nil {
-		return false, err
+		return false, 0, err
 	}
 	if err := tx.commit("claim provisioning slot for " + id); err != nil {
-		return false, err
+		return false, 0, err
 	}
-	return true, nil
+	return true, token, nil
+}
+
+// RenewProvisioningSlot makes the step owner's capacity claim its own, and returns
+// the fresh token.
+//
+// It exists for the one caller that deliberately continues with a claim it did not
+// take: a resume of an interrupted attempt. Between that decision and the step the
+// resume runs there is a window in which the claim is only *inferred* to be in use
+// (the row still says somebody holds it), and the attempt that failed may still be
+// on its way to giving the slot back. Writing the renewal closes that window: the
+// claim the resume relies on is now a token that no older attempt holds, so the late
+// release of the failed attempt (which presents the token it acquired) cannot clear
+// it.
+//
+// The renewal is fenced on owning the task's live step claim, and that fence is the
+// point of the ordering: renewing before the step were taken would let a resume that
+// then loses the step (ErrStepInFlight) leave the capacity held by nobody — the
+// attempt that failed cannot release a token that was renewed past it, and no drain
+// may provision a task whose claim somebody holds. So a caller that owns the step is
+// exactly the caller allowed to renew, and owner is the identity of that claim.
+//
+// The renewal is not a new claim: it changes no count, takes nothing from the
+// budget, and a task that holds no slot at all (neither a claim nor a
+// resource-owning phase) is refused with ErrConflict so the caller claims instead.
+func (s *Store) RenewProvisioningSlot(ctx context.Context, id, owner string) (int64, error) {
+	if strings.TrimSpace(id) == "" || strings.TrimSpace(owner) == "" {
+		return 0, fmt.Errorf("%w: task id and owner are required", ErrInvalid)
+	}
+	tx, err := s.begin(ctx, "renew the provisioning slot of "+id)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.rollback()
+
+	var claimedAt, current, heldUntil int64
+	var phase, holder string
+	err = tx.QueryRowContext(ctx,
+		`SELECT slot_claimed_at, slot_token, step_claim_owner, step_claim_until,
+		        COALESCE(json_extract(data, '$.Phase'), '')
+		 FROM tasks WHERE id = ?`, id).
+		Scan(&claimedAt, &current, &holder, &heldUntil, &phase)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, fmt.Errorf("%w: task %s", ErrNotFound, id)
+	}
+	if err != nil {
+		return 0, fmt.Errorf("read the slot of task %s: %w", id, err)
+	}
+	if holder != owner || heldUntil <= time.Now().UnixMilli() {
+		return 0, fmt.Errorf("%w: task %s is running its %s step for %q, not %q, so %q may not renew its slot claim",
+			ErrConflict, id, phase, holder, owner, owner)
+	}
+	if claimedAt == 0 && !ownsResources(phase) {
+		return 0, fmt.Errorf("%w: task %s holds no provisioning slot to renew", ErrConflict, id)
+	}
+	token := nextSlotToken(current)
+	res, err := tx.ExecContext(ctx,
+		`UPDATE tasks SET slot_token = ? WHERE id = ? AND slot_token = ?`,
+		token, id, current)
+	if err != nil {
+		return 0, fmt.Errorf("renew the provisioning slot of %s: %w", id, err)
+	}
+	if err := requireOneRow(res, ErrConflict, "renew the provisioning slot of "+id); err != nil {
+		return 0, err
+	}
+	if err := tx.commit("renew the provisioning slot of " + id); err != nil {
+		return 0, err
+	}
+	return token, nil
 }
 
 // ReleaseProvisioningSlot gives a claimed slot back, for a task whose
 // provisioning failed before it recorded any resource. The phase still decides
 // the slot for a task that reached one, so releasing a claim never frees a
 // checkout or a live worker.
-func (s *Store) ReleaseProvisioningSlot(ctx context.Context, id string) error {
+//
+// The release is atomic and fenced on the claim it belongs to, so it can only ever
+// give back the capacity this caller took:
+//
+//   - token must be the value this caller acquired (from ClaimTask or
+//     ClaimProvisioningSlot); a claim that has since been taken by somebody else,
+//     renewed by a deliberate resume, or already released no longer matches, and
+//     the release is refused as ErrConflict. That is what keeps a retry's capacity
+//     claim from being erased by the attempt that failed before it — including the
+//     window between the retry's decision to reuse the claim and its first step,
+//     where nothing else about the task would show the reuse. The token column is
+//     never reset (a released claim keeps its value), so a token is never reused by
+//     a later claim of the same task and can never match one;
+//   - a task whose step somebody holds right now is being provisioned by that
+//     owner, and the capacity is theirs: refused as ErrConflict as well;
+//   - the phase, the claim token and the release are read and written in one write
+//     transaction, so no retry can slip between the fence and the clear.
+func (s *Store) ReleaseProvisioningSlot(ctx context.Context, id string, token int64) error {
 	if strings.TrimSpace(id) == "" {
 		return fmt.Errorf("%w: task id is required", ErrInvalid)
 	}
-	var holds int
-	err := s.db.QueryRowContext(ctx,
-		`SELECT CASE WHEN COALESCE(json_extract(data, '$.Phase'), '') IN ('worktree_created', 'agent_started', 'prompt_submitted') THEN 1 ELSE 0 END
-		 FROM tasks WHERE id = ?`, id).Scan(&holds)
+	tx, err := s.begin(ctx, "release the provisioning slot of "+id)
+	if err != nil {
+		return err
+	}
+	defer tx.rollback()
+
+	var phase, holder string
+	var current, heldUntil int64
+	err = tx.QueryRowContext(ctx,
+		`SELECT COALESCE(json_extract(data, '$.Phase'), ''), slot_token, step_claim_owner, step_claim_until
+		 FROM tasks WHERE id = ?`, id).Scan(&phase, &current, &holder, &heldUntil)
 	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("%w: task %s", ErrNotFound, id)
 	}
 	if err != nil {
 		return fmt.Errorf("read the phase of task %s: %w", id, err)
 	}
-	if holds == 1 {
+	switch {
+	case ownsResources(phase):
 		return fmt.Errorf("%w: task %s recorded a phase that owns its resources", ErrInvalid, id)
+	case token == 0 || current != token:
+		return fmt.Errorf("%w: task %s holds the slot claim %d, not the %d this caller acquired",
+			ErrConflict, id, current, token)
+	case holder != "" && heldUntil > time.Now().UnixMilli():
+		return fmt.Errorf("%w: task %s is running its %s step for another owner, so its slot is not this caller's to release",
+			ErrConflict, id, phase)
 	}
-	res, err := s.db.ExecContext(ctx, `UPDATE tasks SET slot_claimed_at = 0 WHERE id = ?`, id)
+	// The same conditions are repeated in the statement: the fence and the clear are
+	// one write, so even a takeover between the read above and this update cannot be
+	// erased by it. The token column stays as it is: it is the identity of the claim
+	// that was given back, and a later claim takes a strictly greater one.
+	res, err := tx.ExecContext(ctx,
+		`UPDATE tasks SET slot_claimed_at = 0
+		  WHERE id = ? AND slot_token = ?
+		    AND COALESCE(json_extract(data, '$.Phase'), '') NOT IN ('worktree_created', 'agent_started', 'prompt_submitted')
+		    AND NOT (step_claim_owner <> '' AND step_claim_until > ?)`,
+		id, token, time.Now().UnixMilli())
 	if err != nil {
 		return fmt.Errorf("release the provisioning slot of %s: %w", id, err)
 	}
-	if err := requireOneRow(res, ErrNotFound, "release the provisioning slot of "+id); err != nil {
+	if err := requireOneRow(res, ErrConflict, "release the provisioning slot of "+id); err != nil {
 		return err
 	}
-	return nil
+	return tx.commit("release the provisioning slot of " + id)
 }
 
 // ProvisioningSlots counts the slots one project currently holds, so a caller can

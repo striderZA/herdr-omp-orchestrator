@@ -753,15 +753,17 @@ func TestDrainNeverProvisionsATaskAnotherCallerClaimed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dispatch the dependent task: %v", err)
 	}
-	f.satisfyReview(prereq) // the dependent task is now eligible to be drained
+	// The disposition closes the prerequisite, so the dependent task is eligible to
+	// be drained: what holds it here is the claim below, not its gate.
+	f.recordDisposition(f.satisfyReview(prereq), "accepted")
 
 	// Another caller claims it first, and the claim is exclusive: the same task cannot be
 	// claimed twice, so only one caller can ever provision it.
-	claimed, err := f.store.ClaimProvisioningSlot(ctx, dependent.ID, 3)
+	claimed, _, err := f.store.ClaimProvisioningSlot(ctx, dependent.ID, 3)
 	if err != nil || !claimed {
 		t.Fatalf("the first claim = (%v, %v), want the task claimed", claimed, err)
 	}
-	again, err := f.store.ClaimProvisioningSlot(ctx, dependent.ID, 3)
+	again, _, err := f.store.ClaimProvisioningSlot(ctx, dependent.ID, 3)
 	if err != nil {
 		t.Fatalf("the second claim: %v", err)
 	}
@@ -1238,4 +1240,176 @@ func TestCleanupRecoversOnlyFromRefusalsThatProveTheCheckoutMoved(t *testing.T) 
 			t.Errorf("%v is treated as a stale registration", err)
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// a closed task accepts no more worker writes
+// ---------------------------------------------------------------------------
+
+// TestProgressQuestionAndReportAreRefusedAfterTheDisposition pins that the
+// primary's disposition is final for the worker's channel: once the user has
+// closed a task, the worker that produced it may not add a progress note, ask a
+// question, or replace the report the decision was made about.
+func TestProgressQuestionAndReportAreRefusedAfterTheDisposition(t *testing.T) {
+	f := newReportFixture(t)
+	project, worker := f.seed()
+	ctx := context.Background()
+
+	if _, err := f.coord.FinalReport(ctx, worker.LaunchPaneID, f.completeReport(worker)); err != nil {
+		t.Fatalf("FinalReport: %v", err)
+	}
+	reviewed := f.reload(worker.ID)
+	if _, err := f.coord.Review(ctx, project.LaunchPaneID, worker.ID, "accepted: merged by hand"); err != nil {
+		t.Fatalf("Review: %v", err)
+	}
+	closed := f.reload(worker.ID)
+	if stage := task.StageOf(closed); stage != task.Done || closed.Disposition == "" {
+		t.Fatalf("task after the disposition = %q/%q, want a closed task", stage, closed.Disposition)
+	}
+	notes := len(f.inbox())
+
+	// The partial channel is refused: a closed task must not start reading as work
+	// in flight again.
+	if _, err := f.coord.Progress(ctx, worker.LaunchPaneID, "still working on it"); err == nil {
+		t.Error("Progress succeeded for a task the disposition closed")
+	}
+	// A question is refused too: it would move the closed task back to needs input.
+	if _, err := f.coord.Question(ctx, worker.LaunchPaneID, "One more decision?"); err == nil {
+		t.Error("Question succeeded for a task the disposition closed")
+	}
+	// And a new report may not replace the report the user decided on.
+	changed := f.completeReport(reviewed)
+	changed.Summary = "A second, different result."
+	if _, err := f.coord.FinalReport(ctx, worker.LaunchPaneID, changed); err == nil {
+		t.Error("FinalReport succeeded for a task the disposition closed")
+	}
+
+	after := f.reload(worker.ID)
+	if after.Disposition != closed.Disposition {
+		t.Errorf("the disposition changed: %q, want %q", after.Disposition, closed.Disposition)
+	}
+	if stage := task.StageOf(after); stage != task.Done {
+		t.Errorf("stage after the refused writes = %q, want %q", stage, task.Done)
+	}
+	if after.Attention != "" {
+		t.Errorf("a refused write recorded attention on a closed task: %q", after.Attention)
+	}
+	if after.Report == nil || after.Report.Summary == changed.Summary {
+		t.Errorf("a report written after the disposition replaced the decided one: %+v", after.Report)
+	}
+	if after.Revision != closed.Revision {
+		t.Errorf("a refused write changed the revision: %d -> %d", closed.Revision, after.Revision)
+	}
+	if got := len(f.inbox()); got != notes {
+		t.Errorf("a refused write left %d new inbox notes", got-notes)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the drain's failure surface
+// ---------------------------------------------------------------------------
+
+// seedQueued records one admitted, unprovisioned task: the shape a dispatch leaves
+// when the budget is full or a dependency is not closed yet.
+func (f *reportFixture) seedQueued(id, projectKey, attention string) task.Task {
+	f.t.Helper()
+	queued := task.Task{
+		ID:           id,
+		ProjectKey:   projectKey,
+		Title:        "Queued work",
+		Brief:        "Do the queued work.",
+		BaseRevision: "0123456",
+		Branch:       "orch/" + strings.TrimPrefix(id, "orch_"),
+		Checks:       []string{"go test ./... ok"},
+		Attention:    attention,
+		Phase:        task.Intent,
+	}
+	if err := f.store.CreateTask(context.Background(), queued); err != nil {
+		f.t.Fatalf("create queued task %s: %v", id, err)
+	}
+	return f.reload(id)
+}
+
+// TestDrainQueuedSurfacesStorageFailures pins the drain's error surface. A drain
+// is the surface that admits queued work at the moment a gate opens, so a storage
+// failure anywhere in its walk has to reach the caller: a swallowed failure looks
+// exactly like "nothing was eligible", and the queue would sit still with nobody
+// knowing why. A spent budget is the exception — that is the normal reason a
+// queued task waits, not a failure.
+func TestDrainQueuedSurfacesStorageFailures(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("a project task read that fails", func(t *testing.T) {
+		f := newReportFixture(t)
+		project, _ := f.seed()
+		f.seedQueued("orch_queued000001", project.Key, "")
+		raw := f.stateDB(t)
+		if _, err := raw.ExecContext(ctx, `ALTER TABLE tasks RENAME TO tasks_hidden`); err != nil {
+			t.Fatalf("hide the tasks table: %v", err)
+		}
+		if _, err := f.coord.DrainQueued(ctx, project.Key); err == nil {
+			t.Error("DrainQueued swallowed a failed project task read")
+		}
+		if _, err := raw.ExecContext(ctx, `ALTER TABLE tasks_hidden RENAME TO tasks`); err != nil {
+			t.Fatalf("restore the tasks table: %v", err)
+		}
+	})
+
+	t.Run("a slot claim that cannot be written", func(t *testing.T) {
+		f := newReportFixture(t)
+		project, _ := f.seed()
+		f.seedQueued("orch_queued000002", project.Key, "")
+		if _, err := f.stateDB(t).ExecContext(ctx, `CREATE TRIGGER refuse_slot_claim
+			BEFORE UPDATE OF slot_claimed_at ON tasks
+			WHEN NEW.slot_claimed_at > 0
+			BEGIN SELECT RAISE(ABORT, 'slot claim is not writable'); END`); err != nil {
+			t.Fatalf("install the slot-claim trigger: %v", err)
+		}
+		_, err := f.coord.DrainQueued(ctx, project.Key)
+		if err == nil {
+			t.Fatal("DrainQueued swallowed the storage failure of the slot claim")
+		}
+		if errors.Is(err, state.ErrBudgetExhausted) {
+			t.Errorf("a storage failure was reported as a spent budget: %v", err)
+		}
+	})
+
+	t.Run("a spent budget is not a failure", func(t *testing.T) {
+		f := newReportFixture(t)
+		project, _ := f.seed()
+		panes := []string{"w3:p1", "w4:p1"}
+		for i, id := range []string{"orch_bbbbbbbbbbbb", "orch_cccccccccccc"} {
+			f.seedWorker(id, project.Key, panes[i], "omp-worker-"+id, filepath.Join(f.root, "checkout-"+id))
+		}
+		queued := f.seedQueued("orch_queued000003", project.Key, "")
+		drained, err := f.coord.DrainQueued(ctx, project.Key)
+		if err != nil {
+			t.Fatalf("DrainQueued with a spent budget = %v, want the normal no-progress answer", err)
+		}
+		if len(drained) != 0 {
+			t.Fatalf("DrainQueued = %+v, want nothing provisioned past the budget", drained)
+		}
+		if still := f.reload(queued.ID); still.Phase != task.Intent || still.Attention != "" {
+			t.Errorf("a budget-refused task changed: %+v", still)
+		}
+	})
+
+	t.Run("an attention clear that cannot be written", func(t *testing.T) {
+		f := newReportFixture(t)
+		project, _ := f.seed()
+		queued := f.seedQueued("orch_queued000004", project.Key,
+			"task orch_queued000004 could not create the worktree: the checkout was refused")
+		if _, err := f.stateDB(t).ExecContext(ctx, `CREATE TRIGGER refuse_attention_clear
+			BEFORE UPDATE ON tasks
+			WHEN json_extract(OLD.data, '$.Attention') != '' AND json_extract(NEW.data, '$.Attention') = ''
+			BEGIN SELECT RAISE(ABORT, 'attention clear is not writable'); END`); err != nil {
+			t.Fatalf("install the attention trigger: %v", err)
+		}
+		if _, err := f.coord.DrainQueued(ctx, project.Key); err == nil {
+			t.Error("DrainQueued swallowed a failed attention write")
+		}
+		if still := f.reload(queued.ID); still.Attention == "" {
+			t.Errorf("the retryable attention vanished although its write failed: %+v", still)
+		}
+	})
 }

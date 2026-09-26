@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"herdr-omp-orchestrator/internal/coord"
+	"herdr-omp-orchestrator/internal/herdr"
 	"herdr-omp-orchestrator/internal/state"
 	"herdr-omp-orchestrator/internal/task"
 )
@@ -349,4 +350,9 @@ func readRouteCalls(t *testing.T, path string) [][]string {
 		calls = append(calls, call.Argv)
 	}
 	return calls
+}
+func TestCoordCodePreservesAmbiguousOperation(t *testing.T) {
+	if got := coordCode(herdr.ErrAmbiguous); got != "ambiguous_operation" {
+		t.Fatalf("coordCode(herdr.ErrAmbiguous) = %q, want ambiguous_operation", got)
+	}
 }

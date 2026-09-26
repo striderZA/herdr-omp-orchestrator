@@ -372,6 +372,54 @@ func TestOpenMigratesAnInboxWrittenByAnEarlierRevision(t *testing.T) {
 	}
 }
 
+func TestOpenMigratesSlotTokenForAnExistingProvisioningClaim(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	raw := rawState(t, dir)
+	if _, err := raw.Exec(`CREATE TABLE tasks (
+		id TEXT PRIMARY KEY,
+		project_key TEXT NOT NULL,
+		launch_pane_id TEXT NULL,
+		public_pane_id TEXT NOT NULL DEFAULT '',
+		revision INTEGER NOT NULL,
+		slot_claimed_at INTEGER NOT NULL DEFAULT 0,
+		data JSON NOT NULL
+	)`); err != nil {
+		t.Fatalf("create previous task schema: %v", err)
+	}
+	if _, err := raw.Exec(`INSERT INTO tasks
+		(id, project_key, launch_pane_id, public_pane_id, revision, slot_claimed_at, data)
+		VALUES ('t1', 'repo-a', NULL, '', 1, 123, '{"ID":"t1","ProjectKey":"repo-a","Phase":"intent"}')`); err != nil {
+		t.Fatalf("insert previous task row: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close legacy database handle: %v", err)
+	}
+
+	s := open(t, dir)
+	took, token, err := s.ClaimProvisioningSlot(ctx, "t1", 1)
+	if err != nil || took || token != 0 {
+		t.Fatalf("ClaimProvisioningSlot on the legacy held claim = (%v, %d, %v), want (false, 0, nil)", took, token, err)
+	}
+	stepTaken, err := s.ClaimStep(ctx, "t1", task.Intent, "legacy-resume", time.Minute)
+	if err != nil || !stepTaken {
+		t.Fatalf("ClaimStep on the migrated Intent task = (%v, %v), want (true, nil)", stepTaken, err)
+	}
+	token, err = s.RenewProvisioningSlot(ctx, "t1", "legacy-resume")
+	if err != nil || token == 0 {
+		t.Fatalf("RenewProvisioningSlot on the legacy claim = (%d, %v), want a fresh token", token, err)
+	}
+	if err := s.ReleaseStep(ctx, "t1", "legacy-resume"); err != nil {
+		t.Fatalf("ReleaseStep on the migrated task: %v", err)
+	}
+	if err := s.ReleaseProvisioningSlot(ctx, "t1", token); err != nil {
+		t.Fatalf("release the migrated legacy claim: %v", err)
+	}
+	if slots, err := s.ProvisioningSlots(ctx, "repo-a"); err != nil || slots != 0 {
+		t.Fatalf("ProvisioningSlots after migrated release = (%d, %v), want 0", slots, err)
+	}
+}
+
 // rawState opens the state database the way a migration or an operator tool
 // would: a second handle on the same file, which is what lets a test make one
 // table refuse a write while everything else stays usable.

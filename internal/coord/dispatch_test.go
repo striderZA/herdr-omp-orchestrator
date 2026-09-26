@@ -46,6 +46,9 @@ const (
 	fixturePlanName  = "plan.json"
 	fixtureStateName = "state.json"
 	fixtureCallsName = "calls.jsonl"
+	// fixtureCreateStartedName is the marker the stand-in writes while a delayed
+	// `worktree create` is still answering, so a test can act in that window.
+	fixtureCreateStartedName = "worktree_create_started"
 )
 
 // fixturePlan is what a test tells the stand-in CLI to do. Every knob exists to
@@ -115,6 +118,10 @@ type fixturePlan struct {
 	// WorktreeCreateError makes `worktree create` fail with that Herdr code
 	// before any checkout exists.
 	WorktreeCreateError string `json:"worktree_create_error"`
+	// WorktreeCreateDelayMillis delays that refusal: the stand-in records the call
+	// and then waits, so a test can act while the attempt that owns the step is
+	// still inside `worktree create`.
+	WorktreeCreateDelayMillis int `json:"worktree_create_delay_millis"`
 	// WorktreeCreateTimeout makes `worktree create` create the checkout and
 	// then answer with Herdr's own timeout code, the way a real CLI timeout
 	// arrives after the side effect.
@@ -234,6 +241,14 @@ func runFixture() int {
 
 func fixtureWorktreeCreate(dir string, plan fixturePlan, state *fixtureState, argv []string) int {
 	if plan.WorktreeCreateError != "" {
+		if plan.WorktreeCreateDelayMillis > 0 {
+			// The refusal is definite but slow to arrive: a test that wants to act
+			// while this attempt still owns its step waits for the marker.
+			if err := os.WriteFile(filepath.Join(dir, fixtureCreateStartedName), []byte("waiting"), 0o600); err != nil {
+				return 25
+			}
+			time.Sleep(time.Duration(plan.WorktreeCreateDelayMillis) * time.Millisecond)
+		}
 		return fixtureError(plan.WorktreeCreateError, "the checkout was refused")
 	}
 	root := fixtureFlag(argv, "--cwd")
@@ -1215,13 +1230,34 @@ func (f *coordFixture) worktreeFor(t *testing.T, branch string) fixtureWorktree 
 	return fixtureWorktree{}
 }
 
+// slotClaimToken reads the durable slot claim token of one task: the value the
+// attempt that acquired the claim holds. It is read straight from the store so a
+// test can present the claim an earlier attempt acquired, exactly as that attempt
+// would when it gives the slot back.
+func (f *coordFixture) slotClaimToken(id string) int64 {
+	f.t.Helper()
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(f.stateDir, "orchestrator.sqlite")))
+	if err != nil {
+		f.t.Fatalf("open state database: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	var token int64
+	if err := db.QueryRowContext(context.Background(),
+		`SELECT slot_token FROM tasks WHERE id = ?`, id).Scan(&token); err != nil {
+		f.t.Fatalf("read the slot claim of %s: %v", id, err)
+	}
+	return token
+}
+
 func (f *coordFixture) prompts(pane string) []string {
 	f.t.Helper()
 	return f.state().Prompts[pane]
 }
 
-// satisfyReview marks a task reviewed the way a worker's final report does, so a
-// dependency is no longer gating.
+// satisfyReview marks a task reviewed the way a worker's final report does. A
+// reviewed task is not closed yet: a dependent task stays queued until the primary
+// records the disposition that closes it (recordDisposition below), and the
+// worker's report alone is never the gate.
 func (f *coordFixture) satisfyReview(st task.Task) task.Task {
 	f.t.Helper()
 	updated, err := f.store.UpdateTask(context.Background(), st.ID, st.Revision, func(next *task.Task) error {
@@ -1239,6 +1275,16 @@ func (f *coordFixture) satisfyReview(st task.Task) task.Task {
 		f.t.Fatalf("mark %s reviewed: %v", st.ID, err)
 	}
 	return updated
+}
+
+// recordDisposition records the primary's decision for a task, the way Review
+// does. The disposition is the gate a dependent task waits for, and it is the
+// only thing that frees the reviewed task's slot.
+func (f *coordFixture) recordDisposition(st task.Task, disposition string) task.Task {
+	f.t.Helper()
+	return f.block(st, func(next *task.Task) {
+		next.Disposition = disposition
+	})
 }
 
 func (f *coordFixture) block(st task.Task, mutate func(*task.Task)) task.Task {
@@ -1567,7 +1613,7 @@ func TestConcurrencyCapsAtThreeAndQueuesTheFourth(t *testing.T) {
 	}
 }
 
-func TestDispatchWaitsForDependenciesUntilTheyAreReviewed(t *testing.T) {
+func TestDispatchWaitsForDependenciesUntilTheDispositionIsRecorded(t *testing.T) {
 	f := newCoordFixture(t, fixturePlan{})
 	first := f.mustDispatch("first", "First brief.")
 
@@ -1579,25 +1625,80 @@ func TestDispatchWaitsForDependenciesUntilTheyAreReviewed(t *testing.T) {
 		t.Fatalf("dependent task = %q/%q, want a queued intent", second.Phase, task.StageOf(second))
 	}
 	if f.countCalls("worktree create") != 1 {
-		t.Fatalf("dependent task started a worker before its dependency was reviewed: %v", f.calls())
+		t.Fatalf("dependent task started a worker before its dependency was closed: %v", f.calls())
 	}
-	if resumed, err := f.resume(second.ID); err != nil || resumed.Phase != task.Intent {
-		t.Fatalf("resume before review = (%q, %v), want still queued", resumed.Phase, err)
+	if resumed, resumeErr := f.resume(second.ID); resumed.Phase != task.Intent || resumed.Attention != "" {
+		t.Fatalf("resume before the disposition = (%q, attention %q, err %v), want still queued", resumed.Phase, resumed.Attention, resumeErr)
 	}
 
+	// A final report is not a decision. The dependency is ready for review, which
+	// says its worker stopped — not that the user accepted the work — so the task
+	// waiting on it must stay queued until the primary records a disposition.
 	first = f.satisfyReview(first)
 	if got := task.StageOf(first); got != task.ReadyForReview {
 		t.Fatalf("dependency stage = %q, want ready_for_review", got)
 	}
+	if resumed, resumeErr := f.resume(second.ID); resumed.Phase != task.Intent || resumed.Attention != "" {
+		t.Fatalf("resume after the report = (%q, attention %q, err %v), want still queued until the disposition", resumed.Phase, resumed.Attention, resumeErr)
+	}
+	if created := f.countCalls("worktree create"); created != 1 {
+		t.Fatalf("a final report unlocked its dependent: %d worktree create calls", created)
+	}
+
+	// The disposition is what opens the gate.
+	first = f.recordDisposition(first, "accepted")
+	if got := task.StageOf(first); got != task.Done {
+		t.Fatalf("dependency stage = %q, want done", got)
+	}
 	resumed, err := f.resume(second.ID)
 	if err != nil {
-		t.Fatalf("resume after review: %v", err)
+		t.Fatalf("resume after the disposition: %v", err)
 	}
 	if resumed.Phase != task.PromptSubmitted {
-		t.Errorf("resume after review phase = %q, want %q", resumed.Phase, task.PromptSubmitted)
+		t.Errorf("resume after the disposition phase = %q, want %q", resumed.Phase, task.PromptSubmitted)
 	}
 	if f.countCalls("worktree create") != 2 {
 		t.Errorf("worktree create calls = %d, want 2", f.countCalls("worktree create"))
+	}
+}
+
+func TestDispatchRechecksDependencyAfterCreatingTheIntent(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	prerequisite := f.mustDispatch("prerequisite", "Prerequisite result.")
+	prerequisite = f.satisfyReview(prerequisite)
+	if task.StageOf(prerequisite) != task.ReadyForReview {
+		t.Fatalf("prerequisite stage = %q, want ready_for_review before the concurrent disposition", task.StageOf(prerequisite))
+	}
+
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(f.stateDir, "orchestrator.sqlite")))
+	if err != nil {
+		t.Fatalf("open state database: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	trigger := fmt.Sprintf(`CREATE TRIGGER finish_prerequisite_after_intent
+		AFTER INSERT ON tasks
+		WHEN json_extract(NEW.data, '$.Title') = 'dependent'
+		BEGIN
+			UPDATE tasks
+			SET revision = revision + 1,
+			    data = json_set(data, '$.Revision', revision + 1, '$.Disposition', 'accepted')
+			WHERE id = '%s';
+		END`, prerequisite.ID)
+	if _, err := db.ExecContext(context.Background(), trigger); err != nil {
+		t.Fatalf("install concurrent-disposition trigger: %v", err)
+	}
+
+	dependent, err := f.dispatch("dependent", "Dependent brief.", []string{"go test ./... ok"},
+		[]string{prerequisite.ID}, nil, f.base)
+	if err != nil {
+		t.Fatalf("dispatch after concurrent prerequisite disposition: %v", err)
+	}
+	if dependent.Phase != task.PromptSubmitted {
+		t.Fatalf("dependent phase = %q, want prompt_submitted after the disposition committed during task creation",
+			dependent.Phase)
+	}
+	if got := f.countCalls("worktree create"); got != 2 {
+		t.Fatalf("worktree create calls = %d, want prerequisite plus dependent", got)
 	}
 }
 
@@ -1657,7 +1758,12 @@ func TestRetryAtEachPersistedPhaseRepeatsNoSideEffect(t *testing.T) {
 		if f.countCalls("worktree create") != 1 {
 			t.Fatalf("a gated task was provisioned: %d worktree create calls", f.countCalls("worktree create"))
 		}
+		// A worker's report is not the gate: the disposition is.
 		gate = f.satisfyReview(gate)
+		if resumed, resumeErr := f.resume(queued.ID); resumed.Phase != task.Intent || resumed.Attention != "" {
+			t.Fatalf("resume after the report = (%q, attention %q, err %v), want still queued", resumed.Phase, resumed.Attention, resumeErr)
+		}
+		gate = f.recordDisposition(gate, "accepted")
 		resumed, err := f.resume(queued.ID)
 		if err != nil {
 			t.Fatalf("resume from intent: %v", err)
@@ -3001,7 +3107,7 @@ func TestQueuedTasksDrainWhenASlotFrees(t *testing.T) {
 	}
 }
 
-func TestDependentTasksDrainWhenThePrerequisiteIsReviewed(t *testing.T) {
+func TestDependentTasksDrainWhenThePrerequisiteIsClosed(t *testing.T) {
 	f := newCoordFixture(t, fixturePlan{})
 	checks := []string{"go test ./... ok"}
 	prereq, err := f.dispatchSpec(f.coord, spec{title: "prereq", checks: checks})
@@ -3016,13 +3122,29 @@ func TestDependentTasksDrainWhenThePrerequisiteIsReviewed(t *testing.T) {
 		t.Fatalf("dependent phase = %q, want %q", dependent.Phase, task.Intent)
 	}
 
-	// The prerequisite is reviewed (the write Task 5's final report and review
-	// make); no one resumes the dependent explicitly.
+	// The prerequisite's final report is not a decision: it leaves the dependency
+	// ready for review, and the dependent task stays queued even though an ordinary
+	// dispatch carries the drain.
 	f.satisfyReview(prereq)
-	// A perfectly ordinary dispatch is what carries the drain: the queue is
-	// checked before a new request takes resources.
 	if _, err := f.dispatchSpec(f.coord, spec{title: "unrelated", checks: checks}); err != nil {
-		t.Fatalf("dispatch after the review: %v", err)
+		t.Fatalf("dispatch after the report: %v", err)
+	}
+	still, err := f.store.Task(context.Background(), dependent.ID)
+	if err != nil {
+		t.Fatalf("Task: %v", err)
+	}
+	if still.Phase != task.Intent || still.Attention != "" {
+		t.Fatalf("a final report opened the gate: the dependent task is %q (attention=%q)", still.Phase, still.Attention)
+	}
+
+	// The primary's disposition closes the prerequisite, and a perfectly ordinary
+	// dispatch is what carries the drain.
+	closed := f.recordDisposition(f.taskByID(t, prereq.ID), "integrated")
+	if got := task.StageOf(closed); got != task.Done {
+		t.Fatalf("prerequisite stage = %q, want done", got)
+	}
+	if _, err := f.dispatchSpec(f.coord, spec{title: "another", checks: checks}); err != nil {
+		t.Fatalf("dispatch after the disposition: %v", err)
 	}
 	provisioned, err := f.store.Task(context.Background(), dependent.ID)
 	if err != nil {
@@ -3031,6 +3153,89 @@ func TestDependentTasksDrainWhenThePrerequisiteIsReviewed(t *testing.T) {
 	if provisioned.Phase != task.PromptSubmitted {
 		t.Fatalf("the dependent task is still %q, want %q (attention=%q)",
 			provisioned.Phase, task.PromptSubmitted, provisioned.Attention)
+	}
+	if got := f.prompts(provisioned.PublicPaneID); len(got) != 1 {
+		t.Errorf("prompts for the dependent task = %v, want one brief", got)
+	}
+}
+
+// TestAFinalReportAloneDoesNotUnlockADependent pins the user's decision: a
+// dependency is gated on the primary's disposition, never on the worker's final
+// report. A report leaves the dependency ready for review, and ready for review
+// stays queued.
+func TestAFinalReportAloneDoesNotUnlockADependent(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	ctx := context.Background()
+	checks := []string{"go test ./... ok"}
+
+	prereq, err := f.dispatchSpec(f.coord, spec{title: "prereq", checks: checks})
+	if err != nil {
+		t.Fatalf("dispatch prereq: %v", err)
+	}
+	dependent, err := f.dispatchSpec(f.coord, spec{title: "dependent", checks: checks, deps: []string{prereq.ID}})
+	if err != nil {
+		t.Fatalf("dispatch dependent: %v", err)
+	}
+	prereq = f.satisfyReview(prereq)
+	if got := task.StageOf(prereq); got != task.ReadyForReview {
+		t.Fatalf("prerequisite stage = %q, want %q", got, task.ReadyForReview)
+	}
+	created := f.countCalls("worktree create") // only the prerequisite has a checkout
+
+	// Every surface that can admit queued work is asked, and none of them unlocks
+	// the dependent: a drain and a resume.
+	if _, err := f.coord.DrainQueued(ctx, f.projectKey()); err != nil {
+		t.Fatalf("DrainQueued after the report: %v", err)
+	}
+	if resumed, resumeErr := f.resume(dependent.ID); resumed.Phase != task.Intent || resumed.Attention != "" {
+		t.Fatalf("resume after the report = (%q, attention %q, err %v), want still queued", resumed.Phase, resumed.Attention, resumeErr)
+	}
+	if got := f.countCalls("worktree create"); got != created {
+		t.Errorf("a report alone provisioned a worker: worktree create calls = %d, want %d", got, created)
+	}
+
+	// An ordinary dispatch is the third surface: it carries the drain, and it is
+	// the one that must not let the gated task overtake it.
+	if _, err := f.dispatchSpec(f.coord, spec{title: "unrelated", checks: checks}); err != nil {
+		t.Fatalf("dispatch after the report: %v", err)
+	}
+	queued, err := f.store.Task(ctx, dependent.ID)
+	if err != nil {
+		t.Fatalf("read the dependent task: %v", err)
+	}
+	if queued.Phase != task.Intent || task.StageOf(queued) != task.Queued {
+		t.Fatalf("the dependent task left the queue on a report alone: %q/%q", queued.Phase, task.StageOf(queued))
+	}
+	if queued.Attention != "" || queued.Blocker != "" {
+		t.Errorf("the gated task recorded a reason it never ran: attention=%q blocker=%q", queued.Attention, queued.Blocker)
+	}
+	if got := f.prompts(queued.PublicPaneID); len(got) != 0 {
+		t.Errorf("a brief was submitted for a task that is still gated: %v", got)
+	}
+	if got := f.countCalls("worktree create"); got != created+1 {
+		t.Errorf("worktree create calls = %d, want %d: the gated task was provisioned instead of the new request",
+			got, created+1)
+	}
+
+	// The disposition is the gate-opening event: Review records it and then drains,
+	// so the task that was waiting starts without another dispatch or a restart.
+	project, err := f.store.Project(ctx, f.projectKey())
+	if err != nil {
+		t.Fatalf("read the bound project: %v", err)
+	}
+	result, err := f.coord.Review(ctx, project.LaunchPaneID, prereq.ID, "accepted: the user kept the branch")
+	if err != nil {
+		t.Fatalf("Review: %v", err)
+	}
+	if result.Stage != task.Done {
+		t.Fatalf("review stage = %q, want %q", result.Stage, task.Done)
+	}
+	provisioned, err := f.store.Task(ctx, dependent.ID)
+	if err != nil {
+		t.Fatalf("read the dependent task: %v", err)
+	}
+	if provisioned.Phase != task.PromptSubmitted {
+		t.Fatalf("the disposition did not admit the dependent task: %q (attention=%q)", provisioned.Phase, provisioned.Attention)
 	}
 	if got := f.prompts(provisioned.PublicPaneID); len(got) != 1 {
 		t.Errorf("prompts for the dependent task = %v, want one brief", got)
@@ -3306,7 +3511,7 @@ func TestDrainNeverProvisionsATaskAnotherCallerOwns(t *testing.T) {
 	if err != nil {
 		t.Fatalf("committedSHA: %v", err)
 	}
-	admitted, claimed, err := f.coord.createTask(context.Background(), f.root, request, base)
+	admitted, claimed, admittedToken, err := f.coord.createTask(context.Background(), f.root, request, base)
 	if err != nil || !claimed {
 		t.Fatalf("admit the task = (%+v, %v, %v), want a claim", admitted, claimed, err)
 	}
@@ -3333,8 +3538,9 @@ func TestDrainNeverProvisionsATaskAnotherCallerOwns(t *testing.T) {
 		t.Errorf("ProvisioningSlots = (%d, %v), want the claim A holds", slots, err)
 	}
 
-	// A finishes its own provisioning, and the claim it held is what counted.
-	finished, err := f.coord.provision(context.Background(), admitted)
+	// A finishes its own provisioning, and the claim it held is what counted. It
+	// presents that claim's token, which is the one it acquired at admission.
+	finished, err := f.coord.provision(context.Background(), admitted, slotClaim{token: admittedToken})
 	if err != nil {
 		t.Fatalf("the owner's provisioning failed: %v", err)
 	}
@@ -3346,6 +3552,294 @@ func TestDrainNeverProvisionsATaskAnotherCallerOwns(t *testing.T) {
 	}
 	if created := f.countCalls("worktree create"); created != 1 {
 		t.Errorf("worktree create calls = %d, want exactly 1", created)
+	}
+}
+
+// TestDefiniteWorktreeFailureImmediatelyDrainsEligibleQueuedWork pins what a
+// released slot is for: a definite worktree-create failure provably created
+// nothing, so the capacity it held goes back — and the task that was waiting for
+// that capacity starts at that moment, without another dispatch, a resume or a
+// restart.
+func TestDefiniteWorktreeFailureImmediatelyDrainsEligibleQueuedWork(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	checks := []string{"go test ./... ok"}
+
+	// The budget is full and one task is waiting for a slot.
+	workers := make([]task.Task, 0, 3)
+	for i, title := range []string{"one", "two", "three"} {
+		st, err := f.dispatchSpec(f.coord, spec{title: title, checks: checks, reserved: []string{fmt.Sprintf("src/%d.txt", i)}})
+		if err != nil {
+			t.Fatalf("dispatch %s: %v", title, err)
+		}
+		workers = append(workers, st)
+	}
+	queued, err := f.dispatchSpec(f.coord, spec{title: "queued", checks: checks, reserved: []string{"src/queued.txt"}})
+	if err != nil {
+		t.Fatalf("dispatch queued: %v", err)
+	}
+	if queued.Phase != task.Intent {
+		t.Fatalf("queued phase = %q, want a queued intent", queued.Phase)
+	}
+
+	// The waiting task's own checkout is prepared, so its provisioning succeeds
+	// while the failing attempt's `worktree create` is the one that is refused:
+	// what this test observes is the drain, not a second failure.
+	path := filepath.Join(f.dir, "worktrees", "queued")
+	if out, err := runGit(f.root, "worktree", "add", "-b", queued.Branch, path, f.base); err != nil {
+		t.Fatalf("git worktree add: %v: %s", err, out)
+	}
+	state := f.state()
+	state.ensure()
+	state.NextWorkspace++
+	pane := fmt.Sprintf("w%d:p1", state.NextWorkspace)
+	state.Workspaces[fmt.Sprintf("w%d", state.NextWorkspace)] = path
+	state.Worktrees = append(state.Worktrees, fixtureWorktree{
+		Path: path, Branch: queued.Branch, Base: f.base, WorkspaceID: fmt.Sprintf("w%d", state.NextWorkspace), PaneID: pane,
+	})
+	if err := writeJSONFile(filepath.Join(f.dir, fixtureStateName), state); err != nil {
+		t.Fatalf("write fixture state: %v", err)
+	}
+	queued = f.block(queued, func(next *task.Task) {
+		next.LaunchPaneID = pane
+		next.PublicPaneID = pane
+	})
+
+	// One worker is reworked onto a branch that has no checkout, and its create is
+	// refused: a definite failure, so its slot belongs to the queue.
+	f.updatePlan(func(p *fixturePlan) { p.WorktreeCreateError = "not_git_worktree" })
+	failed := f.block(workers[2], func(next *task.Task) {
+		next.Branch = "orch/refused-without-checkout"
+		next.Phase = task.Intent
+		next.WorktreePath, next.WorktreeWorkspaceID, next.CurrentWorkspaceID = "", "", ""
+		next.LaunchPaneID, next.PublicPaneID = "", ""
+		next.AgentName, next.OMPSessionID, next.TerminalID = "", "", ""
+	})
+	if _, err := f.resume(failed.ID); err == nil {
+		t.Fatal("the refused worktree create was reported as success")
+	}
+	if got := f.taskByID(t, failed.ID); got.Phase != task.Intent || got.Attention == "" {
+		t.Fatalf("the failed attempt = phase %q attention %q, want an actionable intent task", got.Phase, got.Attention)
+	}
+
+	drained := f.taskByID(t, queued.ID)
+	if drained.Phase != task.PromptSubmitted {
+		t.Fatalf("phase = %q, want %q: the released slot did not drain the queue (attention=%q)",
+			drained.Phase, task.PromptSubmitted, drained.Attention)
+	}
+	if got := f.prompts(drained.PublicPaneID); len(got) != 1 {
+		t.Errorf("prompts for the drained task = %v, want one brief", got)
+	}
+	if got := f.countCalls("worktree create"); got < 4 {
+		t.Errorf("worktree create calls = %d, want at least 4 (three workers plus the refused attempt): the drain adopted an existing checkout", got)
+	}
+}
+
+// TestWorktreeCreateFailureNeverClearsARetrysActiveSlot pins the atomicity of the
+// slot release a definite provisioning failure performs.
+//
+// The release only ever gives back the capacity of the attempt that failed. The
+// window this test pins is the one between that attempt recording its definite
+// failure and giving its slot back: another coordinator process may already have
+// resumed the same task, and from that moment the capacity claim is the retry's.
+// The retry here is a real ResumeDispatch — in a sibling coordinator, blocked
+// inside its own `worktree create` — so an old release that clears the claim lets
+// the project admit work past its budget while the retry is still provisioning.
+func TestWorktreeCreateFailureNeverClearsARetrysActiveSlot(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	ctx := context.Background()
+	checks := []string{"go test ./... ok"}
+
+	// The budget is full: two running workers and a task rewound to the state an
+	// interrupted attempt leaves — admitted, its claim still held, and the definite
+	// failure already recorded, with its slot release still outstanding.
+	for i, title := range []string{"one", "two"} {
+		if _, err := f.dispatchSpec(f.coord, spec{title: title, checks: checks, reserved: []string{fmt.Sprintf("src/%d.txt", i)}}); err != nil {
+			t.Fatalf("dispatch %s: %v", title, err)
+		}
+	}
+	stale, err := f.dispatchSpec(f.coord, spec{title: "three", checks: checks, reserved: []string{"src/three.txt"}})
+	if err != nil {
+		t.Fatalf("dispatch three: %v", err)
+	}
+	stale = f.block(stale, func(next *task.Task) {
+		// The task's checkout is gone, so its retry really calls `worktree create`.
+		next.Branch = "orch/retry-without-checkout"
+		next.Phase = task.Intent
+		next.WorktreePath, next.WorktreeWorkspaceID, next.CurrentWorkspaceID = "", "", ""
+		next.LaunchPaneID, next.PublicPaneID = "", ""
+		next.AgentName, next.OMPSessionID, next.TerminalID = "", "", ""
+		next.Attention = "task " + next.ID + " could not create the worktree: the checkout was refused"
+	})
+	if slots, err := f.store.ProvisioningSlots(ctx, f.projectKey()); err != nil || slots != 3 {
+		t.Fatalf("ProvisioningSlots before the retry = (%d, %v), want the full budget of 3", slots, err)
+	}
+	// The claim this attempt acquired. The retry renews the claim it reuses, so this
+	// token stops being the task's the moment the retry takes over.
+	staleToken := f.slotClaimToken(stale.ID)
+
+	// Another coordinator process resumes the task: it retires the recorded
+	// attention, takes the task's step, and stays inside `worktree create` — whose
+	// refusal this fixture delays — so the test can act in exactly that window.
+	f.updatePlan(func(p *fixturePlan) {
+		p.WorktreeCreateDelayMillis = 1500
+		p.WorktreeCreateError = "not_git_worktree"
+	})
+	sibling := f.sibling()
+	retried := make(chan error, 1)
+	go func() {
+		_, err := sibling.ResumeDispatch(ctx, stale.ID)
+		retried <- err
+	}()
+	marker := filepath.Join(f.dir, fixtureCreateStartedName)
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, err := os.Stat(marker); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the retry never reached its worktree create")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if resumed := f.taskByID(t, stale.ID); resumed.Phase != task.Intent || resumed.Attention != "" {
+		t.Fatalf("the retry did not take the task over: phase %q attention %q", resumed.Phase, resumed.Attention)
+	}
+
+	// The failed attempt's release runs here, presenting the claim it acquired. The
+	// retry renewed that claim when it took the task over, so the release must be
+	// refused: the capacity belongs to the retry, and clearing it would let the
+	// project admit work past its budget while the retry is still provisioning.
+	if err := f.store.ReleaseProvisioningSlot(ctx, stale.ID, staleToken); !errors.Is(err, state.ErrConflict) {
+		t.Errorf("the failed attempt's late release = %v, want ErrConflict: the retry's claim was not renewed", err)
+	}
+	if slots, err := f.store.ProvisioningSlots(ctx, f.projectKey()); err != nil || slots != 3 {
+		t.Errorf("ProvisioningSlots after the old release = (%d, %v), want 3: the retry's active capacity claim was cleared", slots, err)
+	}
+
+	// The retry runs its own recorded phase to its own conclusion, so the window
+	// closed on a task that was still owned by it.
+	if err := <-retried; err == nil {
+		t.Error("the retry's definite worktree failure was reported as success")
+	}
+	after := f.taskByID(t, stale.ID)
+	if after.Phase != task.Intent || after.Attention == "" {
+		t.Errorf("the retry ended at phase %q with attention %q, want its own definite failure recorded at intent", after.Phase, after.Attention)
+	}
+	if slots, err := f.store.ProvisioningSlots(ctx, f.projectKey()); err != nil || slots != 2 {
+		t.Errorf("ProvisioningSlots after the retry's own failure = (%d, %v), want the released slot counted once (2)", slots, err)
+	}
+}
+
+// TestResumeStepInFlightTouchesNothing pins the order a resume works in when it
+// loses the step: the durable step claim comes first, and only a caller that got it
+// takes capacity or retires the retryable reason.
+//
+// The interleaving it covers is the one where an older attempt still owns the
+// worktree step and is between recording its definite failure and giving its slot
+// back. A resume that renewed the claim (or cleared the attention) before learning
+// that the step is not its own would take the capacity past the failed attempt —
+// whose release then no longer matches — and erase the retry reason of a step it
+// never ran, leaving a slot charged and nobody provisioning.
+func TestResumeStepInFlightTouchesNothing(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	ctx := context.Background()
+
+	// A task admitted and then rewound to the state an interrupted attempt leaves:
+	// it holds its claim, carries the retryable reason, and has no resources.
+	admitted := f.mustDispatch("one", "brief one")
+	stale := f.block(admitted, func(next *task.Task) {
+		next.Branch = "orch/interrupted-without-checkout"
+		next.Phase = task.Intent
+		next.WorktreePath, next.WorktreeWorkspaceID, next.CurrentWorkspaceID = "", "", ""
+		next.LaunchPaneID, next.PublicPaneID = "", ""
+		next.AgentName, next.OMPSessionID, next.TerminalID = "", "", ""
+		next.Attention = "task " + next.ID + " could not create the worktree: the checkout was refused"
+	})
+	token := f.slotClaimToken(stale.ID)
+
+	// The older attempt owns the worktree step right now.
+	if took, err := f.store.ClaimStep(ctx, stale.ID, task.Intent, "attempt-a", time.Minute); err != nil || !took {
+		t.Fatalf("ClaimStep(attempt-a) = (%v, %v), want the live step claim", took, err)
+	}
+	before := f.countCalls("worktree create")
+
+	// The resume cannot take the step, so it must have changed nothing at all.
+	sibling := f.sibling()
+	if _, err := sibling.ResumeDispatch(ctx, stale.ID); !errors.Is(err, ErrStepInFlight) {
+		t.Fatalf("ResumeDispatch under a live step = %v, want ErrStepInFlight", err)
+	}
+	if got := f.slotClaimToken(stale.ID); got != token {
+		t.Errorf("the resume renewed the claim under a step it does not own: token %d -> %d", token, got)
+	}
+	if after := f.taskByID(t, stale.ID); after.Attention != stale.Attention {
+		t.Errorf("the resume retired the retryable reason of a step it never ran: %q", after.Attention)
+	}
+	if got := f.countCalls("worktree create"); got != before {
+		t.Errorf("the resume issued %d worktree creates although it never owned the step", got-before)
+	}
+	if slots, err := f.store.ProvisioningSlots(ctx, f.projectKey()); err != nil || slots != 1 {
+		t.Errorf("ProvisioningSlots after the refused resume = (%d, %v), want the claim the older attempt still holds", slots, err)
+	}
+
+	// The older attempt records its definite failure and gives its own slot back:
+	// because no renewal got in the way, that release matches and the capacity is
+	// free again.
+	if _, _, err := f.store.RecordStepFailure(ctx, stale.ID, f.taskByID(t, stale.ID).Revision, func(next *task.Task) error {
+		next.Attention = "task " + next.ID + " could not create the worktree: the checkout was refused"
+		return nil
+	}, "attempt-a", task.Intent, true); err != nil {
+		t.Fatalf("RecordStepFailure: %v", err)
+	}
+	if err := f.store.ReleaseProvisioningSlot(ctx, stale.ID, token); err != nil {
+		t.Fatalf("the older attempt's release = %v, want the capacity back", err)
+	}
+	if slots, err := f.store.ProvisioningSlots(ctx, f.projectKey()); err != nil || slots != 0 {
+		t.Errorf("ProvisioningSlots after the older attempt released = (%d, %v), want 0", slots, err)
+	}
+}
+
+// TestResumeWithoutCapacityReleasesTheStepItTook pins the other side of that order:
+// a resume takes the step claim before it looks for capacity, so when the budget is
+// spent it must give the step back and leave the task queued — no external call, and
+// no claim left for a later retry to wait out.
+func TestResumeWithoutCapacityReleasesTheStepItTook(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	ctx := context.Background()
+	checks := []string{"go test ./... ok"}
+
+	// Three workers hold the whole budget; the fourth task is queued and holds no
+	// claim at all, which is the state a resume finds after its attempt gave the slot
+	// back.
+	for i, title := range []string{"one", "two", "three"} {
+		if _, err := f.dispatchSpec(f.coord, spec{title: title, checks: checks, reserved: []string{fmt.Sprintf("src/%d.txt", i)}}); err != nil {
+			t.Fatalf("dispatch %s: %v", title, err)
+		}
+	}
+	queued, err := f.dispatchSpec(f.coord, spec{title: "queued", checks: checks})
+	if err != nil {
+		t.Fatalf("dispatch queued: %v", err)
+	}
+	if queued.Phase != task.Intent || f.slotClaimToken(queued.ID) != 0 {
+		t.Fatalf("the queued task = phase %q token %d, want an unclaimed intent", queued.Phase, f.slotClaimToken(queued.ID))
+	}
+	before := f.countCalls("worktree create")
+
+	resumed, err := f.coord.provision(ctx, queued, slotClaim{renew: true})
+	if err != nil {
+		t.Fatalf("provision(renew without capacity) = %v, want the task left queued", err)
+	}
+	if resumed.Phase != task.Intent {
+		t.Errorf("phase = %q, want %q: nothing may be provisioned without a slot", resumed.Phase, task.Intent)
+	}
+	if got := f.countCalls("worktree create"); got != before {
+		t.Errorf("worktree create calls = %d, want %d: a task without capacity issued a side effect", got, before)
+	}
+	if slots, err := f.store.ProvisioningSlots(ctx, f.projectKey()); err != nil || slots != 3 {
+		t.Errorf("ProvisioningSlots = (%d, %v), want the three workers' claims and nothing else", slots, err)
+	}
+	// The step it took was given back, so the next retry is not stuck behind a lease.
+	if took, err := f.store.ClaimStep(ctx, queued.ID, task.Intent, "probe-owner", time.Minute); err != nil || !took {
+		t.Errorf("ClaimStep after the refused resume = (%v, %v), want the step free again", took, err)
 	}
 }
 

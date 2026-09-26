@@ -445,8 +445,13 @@ func coordCode(err error) string {
 		return "ambiguous_step"
 	case errors.Is(err, coord.ErrPersistence):
 		return "state_write_failed"
+	case errors.Is(err, herdr.ErrAmbiguous):
+		// The step's outcome could not be identified: it mirrors the bridge's own
+		// code for the same failure class, so an ambiguous operation never reads as
+		// an unusable CLI wherever the caller saw it.
+		return "ambiguous_operation"
 	case errors.Is(err, coord.ErrHerdrUnavailable), errors.Is(err, herdr.ErrCLI),
-		errors.Is(err, herdr.ErrTimeout), errors.Is(err, herdr.ErrAmbiguous):
+		errors.Is(err, herdr.ErrTimeout):
 		return "herdr_unavailable"
 	default:
 		return "internal"

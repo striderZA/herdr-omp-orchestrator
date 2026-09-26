@@ -37,7 +37,7 @@ func TestStoreClaimTaskRespectsTheBudgetAndReservations(t *testing.T) {
 
 	// Two slots: the first two claims succeed, the third is recorded without one.
 	for _, id := range []string{"t1", "t2"} {
-		claimed, stored, err := s.ClaimTask(ctx, gateTask(t, id, "repo-a", nil), 2)
+		claimed, stored, _, err := s.ClaimTask(ctx, gateTask(t, id, "repo-a", nil), 2)
 		if err != nil {
 			t.Fatalf("ClaimTask(%s): %v", id, err)
 		}
@@ -48,7 +48,7 @@ func TestStoreClaimTaskRespectsTheBudgetAndReservations(t *testing.T) {
 			t.Errorf("stored task = %+v, want a fresh intent record", stored)
 		}
 	}
-	claimed, stored, err := s.ClaimTask(ctx, gateTask(t, "t3", "repo-a", nil), 2)
+	claimed, stored, _, err := s.ClaimTask(ctx, gateTask(t, "t3", "repo-a", nil), 2)
 	if err != nil {
 		t.Fatalf("ClaimTask(t3): %v", err)
 	}
@@ -64,10 +64,10 @@ func TestStoreClaimTaskRespectsTheBudgetAndReservations(t *testing.T) {
 	}
 
 	// A reservation another task holds refuses the whole request, and records it.
-	if _, _, err := s.ClaimTask(ctx, gateTask(t, "t4", "repo-a", []string{"notes.md"}), 2); err != nil {
+	if _, _, _, err := s.ClaimTask(ctx, gateTask(t, "t4", "repo-a", []string{"notes.md"}), 2); err != nil {
 		t.Fatalf("ClaimTask(t4): %v", err)
 	}
-	_, _, err = s.ClaimTask(ctx, gateTask(t, "t5", "repo-a", []string{"NOTES.md"}), 2)
+	_, _, _, err = s.ClaimTask(ctx, gateTask(t, "t5", "repo-a", []string{"NOTES.md"}), 2)
 	if !errors.Is(err, state.ErrReservedConflict) {
 		t.Fatalf("ClaimTask(t5) err = %v, want ErrReservedConflict", err)
 	}
@@ -78,7 +78,7 @@ func TestStoreClaimTaskRespectsTheBudgetAndReservations(t *testing.T) {
 		t.Errorf("a refused claim recorded a task: %v", err)
 	}
 	// The reservation rule covers a directory containing the requested file.
-	if _, _, err := s.ClaimTask(ctx, gateTask(t, "t6", "repo-a", []string{"notes.md/inner.txt"}), 2); !errors.Is(err, state.ErrReservedConflict) {
+	if _, _, _, err := s.ClaimTask(ctx, gateTask(t, "t6", "repo-a", []string{"notes.md/inner.txt"}), 2); !errors.Is(err, state.ErrReservedConflict) {
 		t.Errorf("ClaimTask(t6) err = %v, want ErrReservedConflict for a path inside the reservation", err)
 	}
 	// A closed task no longer holds its reservation.
@@ -88,7 +88,7 @@ func TestStoreClaimTaskRespectsTheBudgetAndReservations(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("close t4: %v", err)
 	}
-	if _, _, err := s.ClaimTask(ctx, gateTask(t, "t7", "repo-a", []string{"notes.md"}), 2); err != nil {
+	if _, _, _, err := s.ClaimTask(ctx, gateTask(t, "t7", "repo-a", []string{"notes.md"}), 2); err != nil {
 		t.Errorf("a closed task still holds its reservation: %v", err)
 	}
 }
@@ -98,31 +98,43 @@ func TestStoreProvisioningSlotClaimIsIdempotentAndReleasable(t *testing.T) {
 	s := open(t, t.TempDir())
 
 	st := gateTask(t, "t1", "repo-a", nil)
-	claimed, stored, err := s.ClaimTask(ctx, st, 1)
+	claimed, stored, token, err := s.ClaimTask(ctx, st, 1)
 	if err != nil || !claimed {
 		t.Fatalf("ClaimTask = (%v, %v), want a slot", claimed, err)
 	}
 	// A second task may not take the one slot, and neither may a re-claim.
-	if _, _, err := s.ClaimTask(ctx, gateTask(t, "t2", "repo-a", nil), 1); err != nil {
+	_, _, queuedToken, err := s.ClaimTask(ctx, gateTask(t, "t2", "repo-a", nil), 1)
+	if err != nil {
 		t.Fatalf("ClaimTask(t2): %v", err)
 	}
-	took, err := s.ClaimProvisioningSlot(ctx, stored.ID, 1)
+	if queuedToken != 0 {
+		t.Errorf("a task refused a slot reported the claim token %d, want none", queuedToken)
+	}
+	took, reused, err := s.ClaimProvisioningSlot(ctx, stored.ID, 1)
 	if err != nil {
 		t.Errorf("re-claiming a held slot = %v, want no error", err)
 	}
 	if took {
 		t.Error("re-claiming a held slot reported that this call took it: a second caller would provision the same task")
 	}
-	if _, err := s.ClaimProvisioningSlot(ctx, "t2", 1); !errors.Is(err, state.ErrBudgetExhausted) {
+	if reused != 0 {
+		t.Errorf("re-claiming a held slot reported the token %d, want none: it took nothing", reused)
+	}
+	if _, _, err := s.ClaimProvisioningSlot(ctx, "t2", 1); !errors.Is(err, state.ErrBudgetExhausted) {
 		t.Errorf("ClaimProvisioningSlot(t2) err = %v, want ErrBudgetExhausted", err)
 	}
 
-	// Releasing the claim frees the slot for the queued task.
-	if err := s.ReleaseProvisioningSlot(ctx, stored.ID); err != nil {
+	// Releasing the claim frees the slot for the queued task. The token is the one
+	// this call acquired; the queued task's claim never existed to release.
+	if err := s.ReleaseProvisioningSlot(ctx, stored.ID, token); err != nil {
 		t.Fatalf("ReleaseProvisioningSlot: %v", err)
 	}
-	if took, err := s.ClaimProvisioningSlot(ctx, "t2", 1); err != nil || !took {
+	took, claimedToken, err := s.ClaimProvisioningSlot(ctx, "t2", 1)
+	if err != nil || !took {
 		t.Fatalf("ClaimProvisioningSlot(t2) after the release = (%v, %v), want the free claim", took, err)
+	}
+	if claimedToken == 0 || claimedToken == token {
+		t.Errorf("the free claim's token = %d, want a fresh token (the released one was %d)", claimedToken, token)
 	}
 	if slots, err := s.ProvisioningSlots(ctx, "repo-a"); err != nil || slots != 1 {
 		t.Errorf("ProvisioningSlots = (%d, %v), want (1, nil)", slots, err)
@@ -137,7 +149,7 @@ func TestStoreProvisioningSlotClaimIsIdempotentAndReleasable(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("advance t2: %v", err)
 	}
-	if err := s.ReleaseProvisioningSlot(ctx, "t2"); !errors.Is(err, state.ErrInvalid) {
+	if err := s.ReleaseProvisioningSlot(ctx, "t2", claimedToken); !errors.Is(err, state.ErrInvalid) {
 		t.Errorf("ReleaseProvisioningSlot(advanced task) err = %v, want ErrInvalid", err)
 	}
 	if _, err := s.UpdateTask(ctx, stored.ID, 1, func(next *task.Task) error {
@@ -146,7 +158,7 @@ func TestStoreProvisioningSlotClaimIsIdempotentAndReleasable(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("advance t1: %v", err)
 	}
-	if err := s.ReleaseProvisioningSlot(ctx, stored.ID); !errors.Is(err, state.ErrInvalid) {
+	if err := s.ReleaseProvisioningSlot(ctx, stored.ID, token); !errors.Is(err, state.ErrInvalid) {
 		t.Errorf("ReleaseProvisioningSlot(advanced task) err = %v, want ErrInvalid", err)
 	}
 	if slots, err := s.ProvisioningSlots(ctx, "repo-a"); err != nil || slots != 2 {
@@ -175,7 +187,7 @@ func TestStoreConcurrentClaimsHaveExactlyTheBudgetWinners(t *testing.T) {
 			go func(i, j int, s *state.Store) {
 				defer wg.Done()
 				<-start
-				claimed, _, err := s.ClaimTask(ctx, gateTask(t, taskIDFor(i, j), "repo-a", nil), 2)
+				claimed, _, _, err := s.ClaimTask(ctx, gateTask(t, taskIDFor(i, j), "repo-a", nil), 2)
 				results <- result{claimed, err}
 			}(i, j, s)
 		}
@@ -220,7 +232,7 @@ func TestStoreClaimStepIsExclusivePerPhase(t *testing.T) {
 	first := open(t, dir)
 	second := open(t, dir)
 
-	if _, _, err := first.ClaimTask(ctx, gateTask(t, "t1", "repo-a", nil), 3); err != nil {
+	if _, _, _, err := first.ClaimTask(ctx, gateTask(t, "t1", "repo-a", nil), 3); err != nil {
 		t.Fatalf("ClaimTask: %v", err)
 	}
 	// Two connections claiming the same step of the same task: exactly one wins.
@@ -609,5 +621,266 @@ func TestStoreRecordStepFailureKeepsAnUndecidedOutcomeWithoutALiveOwner(t *testi
 	}
 	if after.Blocker != blocked.Blocker || after.Revision != live.Revision {
 		t.Errorf("task after a refused failure = %+v, want the live owner's state", after)
+	}
+}
+
+// TestStoreSlotReleaseLeavesAnActiveRetryItsCapacity pins the step half of the
+// release fence: while a retry owns the task's step, the failed attempt's release
+// must not clear the capacity the retry is provisioning with.
+func TestStoreSlotReleaseLeavesAnActiveRetryItsCapacity(t *testing.T) {
+	ctx := context.Background()
+	s := open(t, t.TempDir())
+
+	claimed, stored, token, err := s.ClaimTask(ctx, gateTask(t, "t1", "repo-a", nil), 1)
+	if err != nil || !claimed {
+		t.Fatalf("ClaimTask = (%v, %v), want the one slot", claimed, err)
+	}
+	// The retry takes the task's step for the phase the task still records. The
+	// task stays at that phase: the retry is provisioning it right now.
+	took, err := s.ClaimStep(ctx, stored.ID, task.Intent, "retry-owner", time.Minute)
+	if err != nil || !took {
+		t.Fatalf("ClaimStep of the retry = (%v, %v), want the retry's claim", took, err)
+	}
+
+	// The release presents the token the failed attempt acquired, so this is the
+	// legitimate give-back — and it is still refused, because a live step owns the
+	// task.
+	if err := s.ReleaseProvisioningSlot(ctx, stored.ID, token); !errors.Is(err, state.ErrConflict) {
+		t.Errorf("ReleaseProvisioningSlot during a live retry step = %v, want ErrConflict", err)
+	}
+
+	if slots, err := s.ProvisioningSlots(ctx, "repo-a"); err != nil || slots != 1 {
+		t.Errorf("ProvisioningSlots after the old release = (%d, %v), want 1: the retry's active capacity claim was cleared", slots, err)
+	}
+	// The retry still owns the claim, so no second caller may take it.
+	if took, _, err := s.ClaimProvisioningSlot(ctx, stored.ID, 1); err != nil || took {
+		t.Errorf("a second caller took the retry's claim = (%v, %v), want the retry's claim left alone", took, err)
+	}
+	if slots, err := s.ProvisioningSlots(ctx, "repo-a"); err != nil || slots != 1 {
+		t.Errorf("ProvisioningSlots after the second claim attempt = (%d, %v), want 1", slots, err)
+	}
+}
+
+// TestStoreRenewRefusesWithoutOwningTheStep pins the ordering the renewal depends
+// on: only the caller that owns the task's live step claim may renew its slot claim.
+//
+// Renewing before the step were taken is what makes a resume unsound: a resume that
+// then finds the step in flight (ErrStepInFlight) has already renewed the token past
+// the attempt that failed, so that attempt's legitimate release is refused and the
+// slot stays charged with nobody provisioning it. The first task shows the fence, the
+// second shows the consequence for a failed attempt that no renewal got in the way
+// of.
+func TestStoreRenewRefusesWithoutOwningTheStep(t *testing.T) {
+	ctx := context.Background()
+	s := open(t, t.TempDir())
+
+	claimed, stored, token, err := s.ClaimTask(ctx, gateTask(t, "t1", "repo-a", nil), 3)
+	if err != nil || !claimed {
+		t.Fatalf("ClaimTask = (%v, %v), want a slot", claimed, err)
+	}
+	// The older attempt owns the task's step right now, and its worktree create has
+	// not concluded.
+	if took, err := s.ClaimStep(ctx, stored.ID, task.Intent, "attempt-a", time.Minute); err != nil || !took {
+		t.Fatalf("ClaimStep(attempt-a) = (%v, %v), want the live step claim", took, err)
+	}
+
+	// A resume may not renew a claim under a step it does not own.
+	if renewed, err := s.RenewProvisioningSlot(ctx, stored.ID, "resume-b"); !errors.Is(err, state.ErrConflict) {
+		t.Errorf("RenewProvisioningSlot(resume-b) = (%d, %v), want ErrConflict", renewed, err)
+	}
+	// The step's owner may: the renewal is the act of the caller running the step.
+	renewed, err := s.RenewProvisioningSlot(ctx, stored.ID, "attempt-a")
+	if err != nil || renewed == token {
+		t.Fatalf("RenewProvisioningSlot(attempt-a) = (%d, %v), want the step owner's fresh token", renewed, err)
+	}
+
+	// The other task's failed attempt never had its claim renewed, so the release it
+	// makes still matches and the capacity comes back.
+	claimedOther, other, otherToken, err := s.ClaimTask(ctx, gateTask(t, "t2", "repo-a", nil), 3)
+	if err != nil || !claimedOther {
+		t.Fatalf("ClaimTask(t2) = (%v, %v), want a slot", claimedOther, err)
+	}
+	if took, err := s.ClaimStep(ctx, other.ID, task.Intent, "attempt-b", time.Minute); err != nil || !took {
+		t.Fatalf("ClaimStep(attempt-b) = (%v, %v), want the live step claim", took, err)
+	}
+	if _, _, err := s.RecordStepFailure(ctx, other.ID, other.Revision, func(next *task.Task) error {
+		next.Attention = "task t2 could not create the worktree: the checkout was refused"
+		return nil
+	}, "attempt-b", task.Intent, true); err != nil {
+		t.Fatalf("RecordStepFailure(t2): %v", err)
+	}
+	if err := s.ReleaseProvisioningSlot(ctx, other.ID, otherToken); err != nil {
+		t.Errorf("ReleaseProvisioningSlot(attempt-b's token) = %v, want the capacity back", err)
+	}
+	if slots, err := s.ProvisioningSlots(ctx, "repo-a"); err != nil || slots != 1 {
+		t.Errorf("ProvisioningSlots = (%d, %v), want only t1's renewed claim", slots, err)
+	}
+}
+
+// TestStoreSlotReleaseRefusesAClaimAnotherCallerTookOver pins the token half of the
+// release fence, in the window that has nothing else to show for it: a retry takes
+// the task's step over and renews the claim it continued on (took == false, so no
+// count changes). Between that renewal and the retry's own write there is nothing
+// else about the task to show the reuse, so only the renewed token records that the
+// capacity is the retry's — and the failed attempt's late release, which presents
+// the claim it acquired, must be refused with the capacity left charged.
+func TestStoreSlotReleaseRefusesAClaimAnotherCallerTookOver(t *testing.T) {
+	ctx := context.Background()
+	s := open(t, t.TempDir())
+
+	claimed, stored, token, err := s.ClaimTask(ctx, gateTask(t, "t1", "repo-a", nil), 1)
+	if err != nil || !claimed {
+		t.Fatalf("ClaimTask = (%v, %v), want the one slot", claimed, err)
+	}
+	// The definite failure the failed attempt records: the reason is durable and its
+	// own step claim goes back, while the slot claim stays for the retry.
+	failed, _, err := s.RecordStepFailure(ctx, stored.ID, stored.Revision, func(next *task.Task) error {
+		next.Attention = "task t1 could not create the worktree: the checkout was refused"
+		return nil
+	}, "failed-owner", task.Intent, true)
+	if err != nil {
+		t.Fatalf("RecordStepFailure: %v", err)
+	}
+	if failed.Attention == "" {
+		t.Fatal("the definite failure was not recorded")
+	}
+
+	// The retry reuses the held claim, takes the step (the only ordering the store
+	// allows a renewal in), and renews: this is the durable sign that the capacity is
+	// now the retry's.
+	took, reused, err := s.ClaimProvisioningSlot(ctx, stored.ID, 1)
+	if err != nil {
+		t.Fatalf("ClaimProvisioningSlot of the retry: %v", err)
+	}
+	if took {
+		t.Fatal("the retry took the claim although the failed attempt still holds it")
+	}
+	if reused != 0 {
+		t.Errorf("a reused claim reported the token %d, want none until the retry renews it", reused)
+	}
+	if took, err := s.ClaimStep(ctx, failed.ID, task.Intent, "retry-owner", time.Minute); err != nil || !took {
+		t.Fatalf("ClaimStep(retry-owner) = (%v, %v), want the retry's step claim", took, err)
+	}
+	renewed, err := s.RenewProvisioningSlot(ctx, stored.ID, "retry-owner")
+	if err != nil {
+		t.Fatalf("RenewProvisioningSlot: %v", err)
+	}
+	if renewed == token || renewed == 0 {
+		t.Errorf("renewed token = %d, want a new non-zero token (the failed attempt holds %d)", renewed, token)
+	}
+
+	// The failed attempt's release runs here, with the claim it acquired.
+	if err := s.ReleaseProvisioningSlot(ctx, stored.ID, token); !errors.Is(err, state.ErrConflict) {
+		t.Errorf("ReleaseProvisioningSlot(stale token) = %v, want ErrConflict", err)
+	}
+	if slots, err := s.ProvisioningSlots(ctx, "repo-a"); err != nil || slots != 1 {
+		t.Fatalf("ProvisioningSlots after the stale release = (%d, %v), want 1: the retry lost its capacity", slots, err)
+	}
+
+	// The retry's own give-back (its token) still works, so the fence is a fence and
+	// not a leak: it records its definite failure, which releases its step claim, and
+	// then gives the claim back.
+	if _, _, err := s.RecordStepFailure(ctx, failed.ID, failed.Revision, func(next *task.Task) error {
+		next.Attention = "task t1 could not create the worktree: still refused"
+		return nil
+	}, "retry-owner", task.Intent, true); err != nil {
+		t.Fatalf("RecordStepFailure(retry-owner): %v", err)
+	}
+	if err := s.ReleaseProvisioningSlot(ctx, failed.ID, renewed); err != nil {
+		t.Fatalf("ReleaseProvisioningSlot(renewed token): %v", err)
+	}
+	if slots, err := s.ProvisioningSlots(ctx, "repo-a"); err != nil || slots != 0 {
+		t.Errorf("ProvisioningSlots after the retry released = (%d, %v), want 0", slots, err)
+	}
+}
+
+// TestStoreSlotReleaseRefusesAClaimItDidNotTake pins the identity half of the fence:
+// a caller may only give back the claim it took. A claim another caller took fresh,
+// and a token this caller never acquired, are both refused.
+func TestStoreSlotReleaseRefusesAClaimItDidNotTake(t *testing.T) {
+	ctx := context.Background()
+	s := open(t, t.TempDir())
+
+	claimed, stored, token, err := s.ClaimTask(ctx, gateTask(t, "t1", "repo-a", nil), 1)
+	if err != nil || !claimed {
+		t.Fatalf("ClaimTask = (%v, %v), want the one slot", claimed, err)
+	}
+	// A zero token is "I acquired nothing": there is nothing to give back.
+	if err := s.ReleaseProvisioningSlot(ctx, stored.ID, 0); !errors.Is(err, state.ErrConflict) {
+		t.Errorf("ReleaseProvisioningSlot(0) = %v, want ErrConflict", err)
+	}
+	if slots, err := s.ProvisioningSlots(ctx, "repo-a"); err != nil || slots != 1 {
+		t.Fatalf("ProvisioningSlots after the empty release = (%d, %v), want 1", slots, err)
+	}
+
+	// Another caller takes the claim this one gave back: the released token is a
+	// claim nobody holds any more, so releasing it again is refused, and the fresh
+	// claim stays counted until the caller that took it gives it back.
+	if err := s.ReleaseProvisioningSlot(ctx, stored.ID, token); err != nil {
+		t.Fatalf("the owner's own release: %v", err)
+	}
+	fresh, freshToken, err := s.ClaimProvisioningSlot(ctx, stored.ID, 1)
+	if err != nil || !fresh {
+		t.Fatalf("ClaimProvisioningSlot = (%v, %v), want the fresh claim", fresh, err)
+	}
+	if freshToken == token {
+		t.Fatalf("the fresh claim reused the released token %d", token)
+	}
+	if err := s.ReleaseProvisioningSlot(ctx, stored.ID, token); !errors.Is(err, state.ErrConflict) {
+		t.Errorf("ReleaseProvisioningSlot(released token) = %v, want ErrConflict", err)
+	}
+	if slots, err := s.ProvisioningSlots(ctx, "repo-a"); err != nil || slots != 1 {
+		t.Errorf("ProvisioningSlots after the refused release = (%d, %v), want the fresh claim counted", slots, err)
+	}
+	// The claim that took it can give it back.
+	if err := s.ReleaseProvisioningSlot(ctx, stored.ID, freshToken); err != nil {
+		t.Fatalf("the fresh owner's release: %v", err)
+	}
+	if slots, err := s.ProvisioningSlots(ctx, "repo-a"); err != nil || slots != 0 {
+		t.Errorf("ProvisioningSlots after the fresh owner released = (%d, %v), want 0", slots, err)
+	}
+}
+
+// TestStoreSlotClaimDistinguishesASpentBudgetFromAStorageFailure pins the two
+// answers a caller of the gate has to tell apart: a full budget is a normal
+// outcome that queues the work, and a claim that could not be stored is a failure
+// the caller must see instead of reading it as capacity pressure.
+func TestStoreSlotClaimDistinguishesASpentBudgetFromAStorageFailure(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	s := open(t, dir)
+
+	claimed, _, token, err := s.ClaimTask(ctx, gateTask(t, "t1", "repo-a", nil), 1)
+	if err != nil || !claimed {
+		t.Fatalf("ClaimTask(t1) = (%v, %v), want the one slot", claimed, err)
+	}
+	// t2 is recorded without a slot: the budget is spent.
+	if _, _, _, err := s.ClaimTask(ctx, gateTask(t, "t2", "repo-a", nil), 1); err != nil {
+		t.Fatalf("ClaimTask(t2): %v", err)
+	}
+	if _, _, err := s.ClaimProvisioningSlot(ctx, "t2", 1); !errors.Is(err, state.ErrBudgetExhausted) {
+		t.Errorf("ClaimProvisioningSlot with a spent budget = %v, want ErrBudgetExhausted", err)
+	}
+
+	// A claim that cannot be written is not a spent budget.
+	raw := rawState(t, dir)
+	if _, err := raw.ExecContext(ctx, `CREATE TRIGGER refuse_slot_claim
+		BEFORE UPDATE OF slot_claimed_at ON tasks
+		WHEN NEW.slot_claimed_at > 0
+		BEGIN SELECT RAISE(ABORT, 'slot claim is not writable'); END`); err != nil {
+		t.Fatalf("install the slot-claim trigger: %v", err)
+	}
+	if err := s.ReleaseProvisioningSlot(ctx, "t1", token); err != nil {
+		t.Fatalf("ReleaseProvisioningSlot(t1): %v", err)
+	}
+	_, _, err = s.ClaimProvisioningSlot(ctx, "t1", 1)
+	if err == nil {
+		t.Fatal("ClaimProvisioningSlot succeeded although the claim could not be written")
+	}
+	if errors.Is(err, state.ErrBudgetExhausted) {
+		t.Errorf("a storage failure was reported as a spent budget: %v", err)
+	}
+	if slots, err := s.ProvisioningSlots(ctx, "repo-a"); err != nil || slots != 0 {
+		t.Errorf("ProvisioningSlots after the failed claim = (%d, %v), want nothing claimed", slots, err)
 	}
 }

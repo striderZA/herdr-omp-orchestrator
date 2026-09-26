@@ -79,8 +79,9 @@ func resultOf(st task.Task) DispatchResult {
 // task through worktree creation, agent start, the readiness handshake and the
 // brief submission.
 //
-// A request that is legal but gated — a dependency that is not reviewed yet, or
-// a full concurrency budget — returns the recorded task in its queued phase
+// A request that is legal but gated — a dependency whose disposition is not
+// recorded yet (a final report alone does not open it), or a full concurrency
+// budget — returns the recorded task in its queued phase
 // with no side effects, and ResumeDispatch provisions it later. A request that
 // cannot be honored at all (an unknown dependency, a base revision that is not
 // a committed SHA, reserved paths another active worker owns) is refused before
@@ -118,14 +119,18 @@ func (c *Coordinator) Dispatch(
 	// Queued work goes first: a free slot belongs to the tasks that have been
 	// waiting, not to the request that happens to arrive after them. The drain
 	// claims its slots durably, so a request that arrives when the queue takes the
-	// last slot is queued rather than provisioned past the budget.
-	c.drainQueued(ctx, project.Key, "")
+	// last slot is queued rather than provisioned past the budget. A drain that
+	// could not run is reported: it admitted nothing, and quietly taking
+	// resources for this request instead would hide a stalled queue.
+	if _, err := c.drainQueued(ctx, project.Key, ""); err != nil {
+		return task.Task{}, err
+	}
 
 	// The budget and the reserved paths are decided by the durable gate, in one
 	// transaction with the task's own creation: a second coordinator process
 	// cannot pass the same checks and provision past the limit or take paths this
 	// request holds.
-	st, claimed, err := c.createTask(ctx, project.Key, request, base)
+	st, claimed, token, err := c.createTask(ctx, project.Key, request, base)
 	if err != nil {
 		return task.Task{}, err
 	}
@@ -134,15 +139,27 @@ func (c *Coordinator) Dispatch(
 		// records no side effect.
 		return st, nil
 	}
-	if ok, _ := c.dispatchable(existing, st); !ok {
-		// Gated by a dependency that a concurrent writer has not reviewed yet:
-		// give the slot back so another queued task can use it.
-		if err := c.releaseSlot(ctx, st); err != nil {
+	// ClaimTask has committed the intent. Re-read dependencies at that point: a
+	// primary disposition may have landed after the earlier existence check but
+	// before the task was created, and a stale snapshot would leave this task
+	// queued after the Review drain had already run.
+	current, err := c.projectTasks(ctx, project.Key)
+	if err != nil {
+		if _, releaseErr := c.releaseSlot(ctx, st, token); releaseErr != nil {
+			return st, fmt.Errorf("recheck dependencies for task %s: %w; release its slot: %w",
+				st.ID, err, releaseErr)
+		}
+		return st, fmt.Errorf("recheck dependencies for task %s: %w", st.ID, err)
+	}
+	if ok, _ := c.dispatchable(current, st); !ok {
+		// A dependency is still open: give the slot this request took (its own token)
+		// back so another queued task can use it.
+		if _, err := c.releaseSlot(ctx, st, token); err != nil {
 			return st, fmt.Errorf("release provisioning slot for dependency-gated task %s: %w", st.ID, err)
 		}
 		return st, nil
 	}
-	return c.provision(ctx, st)
+	return c.provision(ctx, st, slotClaim{token: token})
 }
 
 // ResumeDispatch advances a recorded task from its persisted phase. It is
@@ -169,35 +186,29 @@ func (c *Coordinator) ResumeDispatch(ctx context.Context, taskID string) (task.T
 	if ok, _ := c.dispatchable(existing, st); !ok {
 		return st, nil
 	}
-	// A resume provisions, so it takes the same durable slot a dispatch takes:
-	// a project that already holds every slot its budget allows leaves the task
-	// queued instead of provisioning past the limit.
+	// A resume provisions, so it takes the same durable slot a dispatch takes. The
+	// order is provision's: the step claim comes first, then the capacity, then the
+	// retirement of the reason this retry is acting on, and only then any external
+	// call. Nothing here touches the task before that, so a resume that finds the step
+	// in flight changes nothing at all — not the retryable reason another attempt
+	// recorded, and not the claim that attempt still holds.
 	//
-	// A resume deliberately continues when the claim was already held: that claim
-	// is the record of an attempt this caller was asked to retry, and the recorded
-	// phase is what makes the retry idempotent (an existing checkout and an
-	// existing agent are adopted, a submitted brief is never sent again).
-	if _, err := c.store.ClaimProvisioningSlot(ctx, st.ID, c.opts.Concurrency); err != nil {
-		if errors.Is(err, state.ErrBudgetExhausted) {
-			return st, nil
-		}
-		return st, err
-	}
-	if st.Attention != "" {
-		cleared, err := c.record(ctx, st, func(next *task.Task) error {
-			next.Attention = ""
-			return nil
-		}, "clear the retryable attention")
-		if err != nil {
-			return st, err
-		}
-		st = cleared
-	}
-	provisioned, err := c.provision(ctx, st)
+	// A resume deliberately continues when the claim was already held: that claim is
+	// the record of an attempt this caller was asked to retry, and the recorded phase
+	// is what makes the retry idempotent (an existing checkout and an existing agent
+	// are adopted, a submitted brief is never sent again). The claim it did not take is
+	// renewed inside provision, once the durable step claim is this caller's — the only
+	// ordering in which a renewal cannot outlive a step this caller never got.
+	provisioned, err := c.provision(ctx, st, slotClaim{renew: true})
 	if err != nil {
 		return provisioned, err
 	}
-	c.drainQueued(ctx, st.ProjectKey, st.ID)
+	// The task was provisioned, so a drain that could not run is reported without
+	// pretending the step itself failed: a resume is idempotent from the recorded
+	// phase, and the queued work it could not admit must not stay silent.
+	if _, err := c.drainQueued(ctx, st.ProjectKey, st.ID); err != nil {
+		return provisioned, fmt.Errorf("task %s was dispatched, but %w", st.ID, err)
+	}
 	return provisioned, nil
 }
 
@@ -315,8 +326,8 @@ func normalizeReservedPath(path string) (string, error) {
 // durable gate (Store.ClaimTask / Store.ClaimProvisioningSlot), in the same
 // transaction that records the task or claims its slot, so two coordinator
 // processes cannot both pass this check and provision past the limit. Dependencies
-// are monotone — a dependency only ever becomes reviewed — so a stale read can
-// only queue a task that could have run, never the other way around.
+// are monotone — a dependency only ever reaches a disposition — so a stale read
+// can only queue a task that could have run, never the other way around.
 func (c *Coordinator) dispatchable(existing []task.Task, st task.Task) (bool, string) {
 	if reason := unsatisfiedDependency(existing, st); reason != "" {
 		return false, reason
@@ -324,17 +335,22 @@ func (c *Coordinator) dispatchable(existing []task.Task, st task.Task) (bool, st
 	return true, ""
 }
 
-// unsatisfiedDependency names the first dependency that is not reviewed yet.
+// unsatisfiedDependency names the first dependency that the primary has not closed
+// with a disposition.
+//
+// The gate is the disposition and nothing else: a worker's final report only says
+// its worker stopped and makes the dependency ready for review, which is not a
+// decision about the work. A dependent task therefore stays queued until the primary
+// records its review disposition (Review), which is the moment the work it depends
+// on is accepted — and the moment the reviewer has actually seen it.
 func unsatisfiedDependency(existing []task.Task, st task.Task) string {
 	for _, dependency := range st.Dependencies {
 		dep, ok := findTask(existing, dependency)
 		if !ok {
 			return fmt.Sprintf("dependency %s is not recorded in this project", dependency)
 		}
-		switch task.StageOf(dep) {
-		case task.ReadyForReview, task.Done:
-		default:
-			return fmt.Sprintf("dependency %s is %s, not reviewed yet", dependency, task.StageOf(dep))
+		if stage := task.StageOf(dep); stage != task.Done {
+			return fmt.Sprintf("dependency %s is %s, not closed by a disposition yet", dependency, stage)
 		}
 	}
 	return ""
@@ -376,12 +392,12 @@ func findTask(existing []task.Task, id string) (task.Task, bool) {
 // transaction. It reports whether the task also claimed a provisioning slot;
 // only the identity collision and the id-less insert are retried, because both
 // touch nothing.
-func (c *Coordinator) createTask(ctx context.Context, projectKey string, request dispatchRequest, base string) (task.Task, bool, error) {
+func (c *Coordinator) createTask(ctx context.Context, projectKey string, request dispatchRequest, base string) (task.Task, bool, int64, error) {
 	var lastErr error
 	for range idAttempts {
 		id, branch, err := c.newIdentity()
 		if err != nil {
-			return task.Task{}, false, err
+			return task.Task{}, false, 0, err
 		}
 		st := task.Task{
 			ID:            id,
@@ -395,73 +411,102 @@ func (c *Coordinator) createTask(ctx context.Context, projectKey string, request
 			Branch:        branch,
 			Phase:         task.Intent,
 		}
-		claimed, created, err := c.store.ClaimTask(ctx, st, c.opts.Concurrency)
+		claimed, created, token, err := c.store.ClaimTask(ctx, st, c.opts.Concurrency)
 		if err == nil {
-			return created, claimed, nil
+			return created, claimed, token, nil
 		}
 		lastErr = err
 		if errors.Is(err, state.ErrReservedConflict) {
 			// The reservation is held by another task: the request is refused and
 			// nothing was recorded. Report it as the coordinator's own refusal so
 			// callers classify it the same way as before.
-			return task.Task{}, false, fmt.Errorf("%w: %s", ErrReservedConflict, err)
+			return task.Task{}, false, 0, fmt.Errorf("%w: %s", ErrReservedConflict, err)
 		}
 		if !errors.Is(err, state.ErrConflict) {
-			return task.Task{}, false, fmt.Errorf("record task intent for %q: %w", projectKey, err)
+			return task.Task{}, false, 0, fmt.Errorf("record task intent for %q: %w", projectKey, err)
 		}
 	}
-	return task.Task{}, false, fmt.Errorf("record task intent for %q: %w", projectKey, lastErr)
+	return task.Task{}, false, 0, fmt.Errorf("record task intent for %q: %w", projectKey, lastErr)
 }
 
 // releaseSlot gives back a claimed slot after a step failed before recording any
-// resource. A failure is returned: the task still consumes capacity, so hiding the
-// error would leave queued work stalled without an actionable cause.
-func (c *Coordinator) releaseSlot(ctx context.Context, st task.Task) error {
-	return c.store.ReleaseProvisioningSlot(ctx, st.ID)
+// resource, and reports whether the capacity actually went back.
+//
+// The token is the claim this caller acquired: only that claim may be given back,
+// so a retry that took the task over keeps the capacity it is about to use. A
+// storage failure is returned — the task still consumes capacity, so hiding the
+// error would leave queued work stalled without an actionable cause — while a
+// store refusal (the claim is no longer this caller's, or a step owns it now) is
+// reported as "nothing was freed". That is the retry working, not this caller's
+// failure, and it is what keeps a dispatch that lost the race from reporting a task
+// as failed while its worker is starting.
+func (c *Coordinator) releaseSlot(ctx context.Context, st task.Task, token int64) (bool, error) {
+	err := c.store.ReleaseProvisioningSlot(ctx, st.ID, token)
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, state.ErrConflict):
+		return false, nil
+	default:
+		return false, err
+	}
 }
 
-// DrainQueued provisions the project's queued tasks that a freed slot or a
-// reviewed prerequisite now allows, oldest first, and returns what it
-// provisioned.
+// DrainQueued provisions the project's queued tasks that a disposition (or a
+// freed slot) now allows, oldest first, and returns what it provisioned.
 //
 // It is the surface that makes a queued task progress at the moment its gate
 // opens, instead of waiting for a future dispatch: a task becomes eligible when
-// the primary records a disposition for the worker that held a slot (Review) or
-// when a prerequisite reaches ready_for_review (a worker's final report), so
-// whoever records those facts calls this. It is idempotent, safe to call
+// the primary records a disposition for the worker that held a slot (Review), so
+// whoever records that fact calls this. It is idempotent, safe to call
 // concurrently (every candidate is re-gated and claims its slot through the
 // durable gate), and it never repeats a recorded step.
 //
 // Capacity semantics: a slot is held from the moment a task claims it until the
-// primary records a disposition for it. A worker's final report does not free a
-// slot — its pane and checkout still exist — so draining after a report only
-// helps a task whose *dependency* that report unblocked.
+// primary records a disposition for it. A worker's final report neither frees a
+// slot — its pane and checkout still exist — nor opens a dependency: a dependent
+// task waits for the disposition that closes its prerequisite.
+//
+// A storage failure is returned instead of being swallowed: a drain that could
+// not read the queue or claim a slot has admitted nothing, and a caller that
+// cannot tell that apart from "nothing was eligible" would leave the queue parked
+// with no reason recorded. A spent budget is not a failure — it is the normal
+// reason a queued task waits.
 func (c *Coordinator) DrainQueued(ctx context.Context, projectKey string) ([]task.Task, error) {
 	if strings.TrimSpace(projectKey) == "" {
 		return nil, fmt.Errorf("%w: project key is required", ErrInvalidRequest)
 	}
-	return c.drainQueued(ctx, projectKey, ""), nil
+	return c.drainQueued(ctx, projectKey, "")
 }
 
 // drainQueued provisions the project's queued tasks whose gates now allow it,
-// oldest first, bounded by the concurrency budget. It returns what it provisioned.
+// oldest first, bounded by the concurrency budget. It returns what it provisioned
+// and the storage failure that stopped it, if any.
 //
-// It is the automatic drain behind a freed slot or a reviewed prerequisite: a
-// task that was queued because the budget was full or a dependency was not
-// reviewed is re-read, re-gated and claimed through the same durable gate a
-// dispatch uses, so draining in two processes cannot provision past the budget
-// and cannot take a path another task holds. The queue is ordered, so a task the
-// gate still refuses stops the walk: a later task must not overtake it. excluded
-// is the task the caller has just handled itself. A task that fails while being
-// drained records its own attention or blocker, and the drain continues with the
-// next candidate.
-func (c *Coordinator) drainQueued(ctx context.Context, projectKey, excluded string) []task.Task {
+// It is the automatic drain behind a freed slot, a disposition or a restart: a
+// task that was queued because the budget was full or a dependency was not closed
+// is re-read, re-gated and claimed through the same durable gate a dispatch uses,
+// so draining in two processes cannot provision past the budget and cannot take a
+// path another task holds. The queue is ordered, so a task the gate still refuses
+// stops the walk: a later task must not overtake it. excluded is the task the
+// caller has just handled itself.
+//
+// A candidate's claim is handed to provision together with the step it takes next,
+// and provision follows the ordering every caller follows: the step claim first,
+// then the capacity, then the retirement of the retryable reason, then the step.
+// A candidate that turns out not to own the step gives that claim back (only its
+// own token), so the walk moves on with the capacity free; a candidate whose own
+// step fails records its attention or blocker and the walk continues — that is a
+// fact about one task, not a broken drain. What the drain does surface is its own
+// bookkeeping: a write it had to make about a candidate's retry (retiring a
+// retryable reason) that could not be stored.
+func (c *Coordinator) drainQueued(ctx context.Context, projectKey, excluded string) ([]task.Task, error) {
 	if strings.TrimSpace(projectKey) == "" {
-		return nil
+		return nil, fmt.Errorf("%w: project key is required", ErrInvalidRequest)
 	}
 	queued, err := c.projectTasks(ctx, projectKey)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("drain the queued tasks of %s: %w", projectKey, err)
 	}
 	var drained []task.Task
 	for _, cand := range queued {
@@ -470,43 +515,49 @@ func (c *Coordinator) drainQueued(ctx context.Context, projectKey, excluded stri
 			continue
 		}
 		if ok, _ := c.dispatchable(queued, cand); !ok {
-			return drained
+			return drained, nil
 		}
-		took, err := c.store.ClaimProvisioningSlot(ctx, cand.ID, c.opts.Concurrency)
-		if err != nil {
+		took, token, err := c.store.ClaimProvisioningSlot(ctx, cand.ID, c.opts.Concurrency)
+		switch {
+		case errors.Is(err, state.ErrBudgetExhausted):
 			// No slot is left: every later candidate would be refused for the same
 			// reason, and the ones before it were not eligible.
-			return drained
+			return drained, nil
+		case errors.Is(err, state.ErrConflict):
+			// The claim moved under this walk: another caller took it (the same fact
+			// as took == false), so this candidate is theirs and the walk goes on.
+			continue
+		case err != nil:
+			// A claim that could not be stored is not capacity pressure: the drain
+			// has not admitted anything and the caller has to know.
+			return drained, fmt.Errorf("claim the provisioning slot of task %s while draining %s: %w", cand.ID, projectKey, err)
 		}
 		if !took {
 			// Somebody already holds this task's claim: it is being provisioned right
 			// now, or it is waiting for a deliberate resume. A drain must never
 			// provision a task another caller owns — that would race the same branch,
-			// the same pane and the same brief.
+			// the same pane and the same brief — and it must not renew that caller's
+			// claim either: the renewal belongs to the caller that decided to use it.
 			continue
 		}
-		if cand.Attention != "" {
-			// Retrying a step retires the retryable reason it failed with: an
-			// attention that outlived its retry would leave a running task looking
-			// like it still needs a human. A blocker is never touched.
-			cleared, err := c.record(ctx, cand, func(next *task.Task) error {
-				next.Attention = ""
-				return nil
-			}, "clear the retryable attention")
-			if err != nil {
-				continue
-			}
-			cand = cleared
-		}
-		provisioned, err := c.provision(ctx, cand)
+		provisioned, err := c.provision(ctx, cand, slotClaim{token: token})
 		if err != nil {
+			// The claim this candidate took is given back by provision when it turns
+			// out not to own the step (only that token, never another caller's), so the
+			// walk moves on with the capacity free again.
+			var bookkeeping *retryBookkeepingError
+			if errors.As(err, &bookkeeping) {
+				// Not this task's fact: a write the drain itself had to make could not be
+				// stored, and swallowing that would stall the queue silently.
+				return drained, fmt.Errorf("drain the queued tasks of %s: %w", projectKey, bookkeeping.err)
+			}
 			// The task recorded its own attention or blocker; the next candidate can
 			// still use the slot if this one gave it back.
 			continue
 		}
 		drained = append(drained, provisioned)
 	}
-	return drained
+	return drained, nil
 }
 
 // newIdentity returns a fresh task id and its branch. Herdr labels are never
@@ -529,6 +580,93 @@ func fillRandom(buf []byte) error {
 // the persisted step machine
 // ---------------------------------------------------------------------------
 
+// slotClaim is the capacity claim one provisioning caller holds, and whether it
+// still has to be renewed.
+//
+// A caller that acquires the claim, or claims it fresh, owns the capacity from that
+// moment. A caller that continues on a claim another attempt left behind — the
+// deliberate resume — does not own it yet: it renews the claim once the step is its
+// own, so the attempt that failed can no longer give the slot back from under the
+// step. Renewing before the step were taken would be unsound in the other
+// direction: a resume that then loses the step (ErrStepInFlight) would leave the
+// capacity held by nobody, because the failed attempt's release can no longer match
+// a token that was renewed past it and no drain may provision a task whose claim
+// somebody holds.
+type slotClaim struct {
+	// token is the value this caller may present when it gives the capacity back.
+	token int64
+	// renew marks a claim this caller continued on without taking it: it becomes
+	// this caller's only once the durable step claim is.
+	renew bool
+}
+
+// assumeSlotClaim takes the capacity a task's step needs, with the step claim
+// already this caller's.
+//
+// It is the only place a slot claim is taken over, and the order it is called in is
+// what makes the take-over sound:
+//
+//   - a caller that already brought a claim (a dispatch or a drain that just claimed
+//     the task) keeps it — the capacity was decided in the durable gate's own
+//     transaction;
+//   - a resume that continued on an earlier attempt's claim renews it, which
+//     Store.RenewProvisioningSlot only allows the live step owner to do. If the
+//     earlier attempt gave the claim back in the meantime there is nothing to renew,
+//     so this caller claims the capacity like any other caller — and reports false
+//     when the budget is spent or somebody else took it, so the caller leaves the
+//     task queued instead of provisioning it without a slot;
+//   - a caller that brought neither (the brief resume inside a running task) takes
+//     nothing: the task's phase already owns its capacity.
+func (c *Coordinator) assumeSlotClaim(ctx context.Context, st task.Task, claim slotClaim) (slotClaim, bool, error) {
+	switch {
+	case claim.token != 0, !claim.renew:
+		return claim, true, nil
+	}
+	token, err := c.store.RenewProvisioningSlot(ctx, st.ID, c.owner)
+	switch {
+	case err == nil:
+		return slotClaim{token: token}, true, nil
+	case !errors.Is(err, state.ErrConflict):
+		return slotClaim{}, false, err
+	}
+	took, fresh, claimErr := c.store.ClaimProvisioningSlot(ctx, st.ID, c.opts.Concurrency)
+	switch {
+	case errors.Is(claimErr, state.ErrBudgetExhausted), claimErr == nil && !took:
+		return slotClaim{}, false, nil
+	case claimErr != nil:
+		return slotClaim{}, false, claimErr
+	}
+	return slotClaim{token: fresh}, true, nil
+}
+
+// abandonSlotClaim gives back the capacity a caller brought when it turns out not to
+// own the task's step, and returns cause.
+//
+// Only the token this caller acquired is released: a claim a concurrent caller renewed
+// in the meantime is refused by the store (it is not this caller's any more) instead
+// of being cleared, so the retry that owns it keeps its capacity. A caller that
+// brought no token (a resume) has nothing to give back.
+func (c *Coordinator) abandonSlotClaim(ctx context.Context, st task.Task, claim slotClaim, cause error) error {
+	if claim.token == 0 {
+		return cause
+	}
+	if _, err := c.releaseSlot(ctx, st, claim.token); err != nil {
+		return fmt.Errorf("%w; release provisioning slot for task %s: %w", cause, st.ID, err)
+	}
+	return cause
+}
+
+// retryBookkeepingError reports that the write a caller had to make about its own
+// retry — retiring the retryable reason it was acting on — could not be stored.
+// Nothing external ran, so it is not one task's provisioning failure: the task is
+// exactly as it was, and a drain surfaces this instead of walking on as though the
+// task had recorded its own reason.
+type retryBookkeepingError struct{ err error }
+
+func (e *retryBookkeepingError) Error() string { return e.err.Error() }
+
+func (e *retryBookkeepingError) Unwrap() error { return e.err }
+
 // provision advances a task as far as its recorded phase allows, one step at a
 // time. Each step is idempotent on its own (it inspects the recorded facts and
 // authoritative Herdr state before acting) and each step is taken exclusively
@@ -538,7 +676,25 @@ func fillRandom(buf []byte) error {
 // reports ErrStepInFlight; the recorded phase is what the other caller continues
 // from, and a claim left by a crashed caller can be taken over once its lease
 // expires, so crash recovery is not weakened.
-func (c *Coordinator) provision(ctx context.Context, st task.Task) (task.Task, error) {
+//
+// The order of what this caller takes is deliberate, and it is what keeps a lost
+// race from leaving traces:
+//
+//  1. the durable step claim — nothing else is touched until the step is this
+//     caller's, so a caller that finds the step in flight changes nothing at all;
+//  2. the capacity (see assumeSlotClaim) — again nothing external has run;
+//  3. the retirement of the retryable reason this attempt is acting on;
+//  4. the step's own external calls.
+//
+// A path that ends before (4) keeps neither claim: the step goes back, and so does
+// the capacity this caller took (a claim it brought) — a task waiting for a reason
+// that still holds is better than one holding capacity nobody is using.
+//
+// claim carries the slot claim this caller holds (or has to take over), and it is
+// threaded, never re-read: a step that fails before recording any resource may only
+// give that exact claim back, so a retry that took the task over keeps the capacity
+// it is provisioning with.
+func (c *Coordinator) provision(ctx context.Context, st task.Task, claim slotClaim) (task.Task, error) {
 	for {
 		if st.Phase == task.PromptSubmitted {
 			return st, nil
@@ -567,13 +723,59 @@ func (c *Coordinator) provision(ctx context.Context, st task.Task) (task.Task, e
 				return st, readErr
 			}
 			if current.Phase == st.Phase {
-				return current, fmt.Errorf("%w: task %s is already running its %s step elsewhere",
-					ErrStepInFlight, st.ID, phaseStep(st.Phase))
+				// Another attempt owns this step: this caller never took the task over,
+				// so it gives back the claim it brought and leaves the retryable reason
+				// this task carries untouched (it never ran the step that reason is
+				// about).
+				return current, c.abandonSlotClaim(ctx, st, claim, fmt.Errorf(
+					"%w: task %s is already running its %s step elsewhere",
+					ErrStepInFlight, st.ID, phaseStep(st.Phase)))
 			}
 			st = current
 			continue
 		}
-		next, err := c.provisionPhase(ctx, st)
+		// The step is this caller's. Only now does it take what the step needs: the
+		// capacity first, then the retirement of the retryable reason, both before any
+		// external call.
+		//
+		// The retryable reason belongs to the caller that is retrying the task — a
+		// dispatch, a drain, or a resume that took the capacity over. A brief
+		// adjudication resumes a running task on the capacity its phase already owns
+		// and deliberately leaves the task's attention to its owner.
+		retrying := claim.token != 0 || claim.renew
+		assumed, ok, err := c.assumeSlotClaim(ctx, st, claim)
+		if err != nil {
+			c.releaseStep(ctx, st)
+			return st, err
+		}
+		if !ok {
+			// No capacity to run this step: give the step back so a later retry does
+			// not have to wait out this lease, and leave the task queued.
+			c.releaseStep(ctx, st)
+			return st, nil
+		}
+		claim = assumed
+		if retrying && st.Attention != "" {
+			// Retrying a step retires the retryable reason it failed with: an
+			// attention that outlived its retry would leave a running task looking
+			// like it still needs a human. A blocker is never touched.
+			retried, err := c.record(ctx, st, func(next *task.Task) error {
+				next.Attention = ""
+				return nil
+			}, "clear the retryable attention")
+			if err != nil {
+				// Nothing external ran, so no claim is kept: the step goes back, and so
+				// does the capacity this caller took. The task keeps the reason it
+				// carried, because the retry that would have retired it did not happen.
+				c.releaseStep(ctx, st)
+				if _, releaseErr := c.releaseSlot(ctx, st, claim.token); releaseErr != nil {
+					return st, fmt.Errorf("%w; release provisioning slot for task %s: %w", err, st.ID, releaseErr)
+				}
+				return st, &retryBookkeepingError{err: fmt.Errorf("task %s: clear the retryable attention: %w", st.ID, err)}
+			}
+			st = retried
+		}
+		next, err := c.provisionPhase(ctx, st, claim.token)
 		if err != nil {
 			return next, err
 		}
@@ -582,10 +784,10 @@ func (c *Coordinator) provision(ctx context.Context, st task.Task) (task.Task, e
 }
 
 // provisionPhase runs the one step the task's recorded phase asks for.
-func (c *Coordinator) provisionPhase(ctx context.Context, st task.Task) (task.Task, error) {
+func (c *Coordinator) provisionPhase(ctx context.Context, st task.Task, token int64) (task.Task, error) {
 	switch st.Phase {
 	case task.Intent:
-		return c.createWorktree(ctx, st)
+		return c.createWorktree(ctx, st, token)
 	case task.WorktreeCreated:
 		return c.startWorker(ctx, st)
 	case task.AgentStarted:
@@ -643,7 +845,10 @@ func definiteFailure(cause error) bool {
 // a checkout for this task's unique branch can only be this task's, so a crash
 // between the CLI answering and the phase being recorded cannot produce a
 // second checkout.
-func (c *Coordinator) createWorktree(ctx context.Context, st task.Task) (task.Task, error) {
+//
+// token is the slot claim the caller acquired for this task; it is what a definite
+// failure gives back, and only that claim.
+func (c *Coordinator) createWorktree(ctx context.Context, st task.Task, token int64) (task.Task, error) {
 	if listed, err := c.findWorktree(ctx, st.ProjectKey, st.Branch); err != nil {
 		c.releaseStep(ctx, st)
 		return c.failTask(ctx, st, "read the repository's worktrees", isTerminal(err),
@@ -697,9 +902,22 @@ func (c *Coordinator) createWorktree(ctx context.Context, st task.Task) (task.Ta
 		// store must not free the slot of the task it belongs to.
 		var unrecorded *PersistenceError
 		if !errors.As(failureErr, &unrecorded) {
-			if releaseErr := c.releaseSlot(ctx, failed); releaseErr != nil {
+			freed, releaseErr := c.releaseSlot(ctx, failed, token)
+			if releaseErr != nil {
 				return failed, fmt.Errorf("%w; release provisioning slot for task %s: %w",
 					failureErr, failed.ID, releaseErr)
+			}
+			if freed {
+				// The capacity this attempt held is free now, so the work that was
+				// waiting for it starts here: nothing else consults the queue until
+				// something happens to run, and for a project whose queue is waiting on
+				// this slot that may be a long time. The failed task is excluded — its
+				// cause is not fixed by the drain, and an immediate retry would only
+				// fail again. A release that freed nothing (a retry already owns the
+				// claim) drains nothing either: the capacity is not free.
+				if _, drainErr := c.drainQueued(ctx, failed.ProjectKey, failed.ID); drainErr != nil {
+					return failed, fmt.Errorf("%w; %w", failureErr, drainErr)
+				}
 			}
 		}
 		return failed, failureErr
@@ -1325,8 +1543,11 @@ func (c *Coordinator) adjudicate(
 	// Not delivered: resume the recorded phase exactly once. The decision above
 	// already retired the step's claim in the same transaction that cleared the
 	// blocker, so no concurrent caller can take the step in between; the phase owns
-	// the task's provisioning slot, so nothing has to be claimed again.
-	provisioned, err := c.provision(ctx, decided)
+	// the task's provisioning slot, so nothing has to be claimed again — and no
+	// claim token is carried either: this path never reaches the worktree step that
+	// could give a claim back (a task at agent_started resumes with a brief), and a
+	// release would be refused by the phase fence in any case.
+	provisioned, err := c.provision(ctx, decided, slotClaim{})
 	if err != nil {
 		return provisioned, err
 	}
