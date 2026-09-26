@@ -1099,9 +1099,9 @@ func resumableStep(st task.Task) bool {
 // and resuming one directly could take a slot ahead of a task that has been
 // waiting longer.
 //
-// A step's own failure is recorded on the task by the step machine, exactly as
-// DrainQueued leaves a candidate's failure, so it is not this pass's error; only
-// a task the pass could not read is reported.
+// A step failure is recorded on its task by the step machine. A retry error still
+// matters to startup unless it is the expected ErrStepInFlight race with another
+// caller; storage and task failures must not be swallowed.
 func (c *Coordinator) resumeProvedSteps(ctx context.Context, unfinished []task.Task, continuable map[string]bool) error {
 	var failures []error
 	for _, st := range unfinished {
@@ -1121,7 +1121,9 @@ func (c *Coordinator) resumeProvedSteps(ctx context.Context, unfinished []task.T
 		// ResumeDispatch re-gates the task, clears a retryable attention and runs
 		// the recorded step; a step that fails again records its own attention or
 		// blocker on the task.
-		_, _ = c.ResumeDispatch(ctx, current.ID)
+		if _, err := c.ResumeDispatch(ctx, current.ID); err != nil && !errors.Is(err, ErrStepInFlight) {
+			failures = append(failures, fmt.Errorf("resume task %s from its recorded phase: %w", current.ID, err))
+		}
 	}
 	return errors.Join(failures...)
 }

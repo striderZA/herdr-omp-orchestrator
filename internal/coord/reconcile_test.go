@@ -2342,6 +2342,48 @@ func TestReconcileCompletesAnInterruptedProvisioningStep(t *testing.T) {
 	assertStepCompleted(t, f, worker.ID, 1, 1)
 }
 
+func TestResumeProvedStepsSurfacesAClaimStorageFailure(t *testing.T) {
+	ctx := context.Background()
+	f := newCoordFixture(t, fixturePlan{})
+	project := f.mustBind()
+	st := task.Task{ID: "orch_resume_error", ProjectKey: project.Key, Phase: task.WorktreeCreated}
+	if err := f.store.CreateTask(ctx, st); err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	raw, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(f.stateDir, "orchestrator.sqlite")))
+	if err != nil {
+		t.Fatalf("open state database: %v", err)
+	}
+	t.Cleanup(func() { _ = raw.Close() })
+	if _, err := raw.ExecContext(ctx, `CREATE TRIGGER refuse_resume_step_claim
+		BEFORE UPDATE OF step_claim_owner ON tasks
+		BEGIN SELECT RAISE(ABORT, 'resume step claim is not writable'); END`); err != nil {
+		t.Fatalf("install step-claim trigger: %v", err)
+	}
+
+	err = f.coord.resumeProvedSteps(ctx, []task.Task{st}, map[string]bool{st.ID: true})
+	if err == nil || !strings.Contains(err.Error(), "resume step claim is not writable") {
+		t.Fatalf("resumeProvedSteps error = %v, want the stored step-claim failure", err)
+	}
+}
+
+func TestResumeProvedStepsIgnoresAnExpectedStepInFlight(t *testing.T) {
+	ctx := context.Background()
+	f := newCoordFixture(t, fixturePlan{})
+	project := f.mustBind()
+	st := task.Task{ID: "orch_resume_busy", ProjectKey: project.Key, Phase: task.WorktreeCreated}
+	if err := f.store.CreateTask(ctx, st); err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	if took, err := f.store.ClaimStep(ctx, st.ID, task.WorktreeCreated, "other-owner", time.Minute); err != nil || !took {
+		t.Fatalf("ClaimStep(other owner) = (%v, %v), want the live claim", took, err)
+	}
+
+	if err := f.coord.resumeProvedSteps(ctx, []task.Task{st}, map[string]bool{st.ID: true}); err != nil {
+		t.Fatalf("resumeProvedSteps with a live step = %v, want expected contention ignored", err)
+	}
+}
+
 // shortLeaseCoordinator builds a second coordinator over the fixture's store and
 // Herdr stand-in with a short step lease. A step that failed with an undecided
 // outcome keeps its durable step claim (a definite failure gives it back in
