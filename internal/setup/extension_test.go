@@ -257,6 +257,29 @@ func TestInstallWritesOnlyItsOwnExtension(t *testing.T) {
 	}
 }
 
+func TestInstallEmbedsAbsoluteHerdrBinaryWhenConfiguredRelative(t *testing.T) {
+	f := newFixture(t)
+	f.installIntegration(t, "")
+	herdrBinary := f.env["HERDR_BIN_PATH"]
+	relative, err := filepath.Rel(f.home, herdrBinary)
+	if err != nil {
+		t.Fatalf("make Herdr path relative to the setup directory: %v", err)
+	}
+	t.Chdir(f.home)
+	f.env["HERDR_BIN_PATH"] = relative
+	if err := f.install(); err != nil {
+		t.Fatalf("Install with relative Herdr path: %v", err)
+	}
+	content, err := os.ReadFile(f.extensionPath(""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(f.root)
+	if !strings.Contains(string(content), "const HERDR_BINARY = "+jsQuote(t, herdrBinary)+";") {
+		t.Fatalf("installed extension kept a working-directory-relative Herdr binary: %s", content)
+	}
+}
+
 func TestInstallIsIdempotent(t *testing.T) {
 	f := newFixture(t)
 	f.installIntegration(t, "")

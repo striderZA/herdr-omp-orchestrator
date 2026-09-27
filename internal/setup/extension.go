@@ -190,7 +190,8 @@ func Install(env map[string]string, executable string) error {
 	if herdrBinary == "" {
 		return fail(ErrHerdrBinaryUnavailable, "HERDR_BIN_PATH is not set, so the extension would have no verified Herdr CLI to embed")
 	}
-	if _, err := checkExecutable(ErrHerdrBinaryUnavailable, "Herdr binary", herdrBinary); err != nil {
+	herdrBinary, err = checkExecutable(ErrHerdrBinaryUnavailable, "Herdr binary", herdrBinary)
+	if err != nil {
 		return err
 	}
 
