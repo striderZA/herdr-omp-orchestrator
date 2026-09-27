@@ -1092,27 +1092,62 @@ $interruptedRepo = Join-Path $interruptedRoot 'repo'
 New-Item -ItemType Directory -Path $interruptedRepo -Force | Out-Null
 $savedIdentity = [pscustomobject]@{
     RunId = $script:RunId; SessionName = $script:SessionName; RepoPath = $script:RepoPath
-    ReportJson = $script:ReportJson; Project = $script:Project
+    ReportJson = $script:ReportJson; ReportText = $script:ReportText; WorkRoot = $script:WorkRoot
+    Project = $script:Project; StartedAt = $script:StartedAt
+    PrimaryPane = $script:PrimaryPane; PrimaryWorkspace = $script:PrimaryWorkspace; PrimaryTab = $script:PrimaryTab
 }
 $script:RunId = $interruptedRunId
 $script:SessionName = "orch-acc-$interruptedRunId"
 $script:RepoPath = $interruptedRepo
+$script:WorkRoot = $interruptedRoot
 $script:ReportJson = Join-Path $interruptedRoot 'report.json'
+$script:ReportText = Join-Path $interruptedRoot 'report.txt'
+$script:StartedAt = '2026-01-01T00:00:00.0000000Z'
+$script:PrimaryPane = 'w9:p9'; $script:PrimaryWorkspace = 'w9'; $script:PrimaryTab = 'w9:t9'
 $script:Project = $null
-$interruptIdentityWritten = $false
+# The bind action is the run's first Herdr side effect, so the identity the next
+# preflight needs must already be on disk when it is invoked. The stub stands in
+# for Herdr and captures the report state at exactly that moment.
+$script:IdentityAtBindInvocation = $null
+function Invoke-PluginAction {
+    param(
+        [Parameter(Mandatory)][string]$ActionId,
+        [hashtable]$PaneContext = @{},
+        [double]$TimeoutSeconds = 180,
+        [switch]$NoSessionScope
+    )
+    $script:IdentityAtBindInvocation = if (Test-Path -LiteralPath $script:ReportJson) {
+        Get-Content -LiteralPath $script:ReportJson -Raw | ConvertFrom-Json
+    } else { $null }
+    throw 'stub: the helper harness never starts Herdr'
+}
+try { Invoke-Bind } catch { }
+$identityAtBind = $script:IdentityAtBindInvocation
+Check 'an interrupted run records a verifiable project identity before the bind action' `
+    ($null -ne $identityAtBind -and
+     (Get-Field $identityAtBind 'runId') -ceq $interruptedRunId -and
+     (Get-Field $identityAtBind 'session') -ceq "orch-acc-$interruptedRunId" -and
+     (Test-SamePath -A (Get-Field $identityAtBind 'projectKey') -B $interruptedRepo)) `
+    'report identity at the bind invocation'
+$finalFallbackKept = $false
 try {
-    Write-BindRunIdentity
-    $identity = Get-Content -LiteralPath $script:ReportJson -Raw | ConvertFrom-Json
-    $interruptIdentityWritten = ((Get-Field $identity 'runId') -ceq $interruptedRunId -and
-        (Get-Field $identity 'session') -ceq "orch-acc-$interruptedRunId" -and
-        (Test-SamePath -A (Get-Field $identity 'projectKey') -B $interruptedRepo))
+    [void](Write-Report)
+    $finalReport = Get-Content -LiteralPath $script:ReportJson -Raw | ConvertFrom-Json
+    $finalFallbackKept = ((Get-Field $finalReport 'runId') -ceq $interruptedRunId -and
+        (Test-SamePath -A (Get-Field $finalReport 'projectKey') -B $interruptedRepo))
 } catch { }
-Check 'an interrupted run records a verifiable project identity before bind' $interruptIdentityWritten 'report identity before action'
+Check 'the final report keeps the run repository key when bind returned no project' $finalFallbackKept 'final report project key'
 $script:RunId = $savedIdentity.RunId
 $script:SessionName = $savedIdentity.SessionName
 $script:RepoPath = $savedIdentity.RepoPath
 $script:ReportJson = $savedIdentity.ReportJson
+$script:ReportText = $savedIdentity.ReportText
+$script:WorkRoot = $savedIdentity.WorkRoot
 $script:Project = $savedIdentity.Project
+$script:StartedAt = $savedIdentity.StartedAt
+$script:PrimaryPane = $savedIdentity.PrimaryPane
+$script:PrimaryWorkspace = $savedIdentity.PrimaryWorkspace
+$script:PrimaryTab = $savedIdentity.PrimaryTab
 
 # Exercise the actual preflight path against a synthetic store and session list.
 $savedTemp = $env:TEMP
