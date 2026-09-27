@@ -1,0 +1,7 @@
+#!/bin/sh
+
+blocked=$(git diff --cached --name-only --diff-filter=ACMRTUXB -- 'docs/superpowers/')
+if [ -n "$blocked" ]; then
+    printf '%s\n' 'Commit rejected: Superpowers documentation is not allowed in this repository:' "$blocked" >&2
+    exit 1
+fi
