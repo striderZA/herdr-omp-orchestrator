@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -687,6 +688,49 @@ func TestReportOnlyAPrimaryDispositionMovesATaskToDone(t *testing.T) {
 	}
 	if done.Report == nil || done.Report.Kind != "result" {
 		t.Errorf("the disposition lost the reviewed report: %+v", done.Report)
+	}
+}
+func TestReviewPreviewShowsDurableReportAndRefusesStaleDecision(t *testing.T) {
+	f := newReportFixture(t)
+	project, worker := f.seed()
+	ctx := context.Background()
+	if _, err := f.coord.ReportPreview(ctx, project.LaunchPaneID, worker.ID); !errors.Is(err, ErrNotReviewed) {
+		t.Fatalf("preview without final report = %v, want ErrNotReviewed", err)
+	}
+	report := f.completeReport(worker)
+	if _, err := f.coord.FinalReport(ctx, worker.LaunchPaneID, report); err != nil {
+		t.Fatal(err)
+	}
+	preview, err := f.coord.ReportPreview(ctx, project.LaunchPaneID, worker.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preview.TaskID != worker.ID || preview.Revision != f.reload(worker.ID).Revision ||
+		preview.Summary != report.Summary || preview.Branch != report.Branch ||
+		preview.Risk != report.Risk || !slices.Equal(preview.Evidence, report.Evidence) ||
+		!slices.Equal(preview.Checks, report.Checks) {
+		t.Fatalf("preview did not return the persisted report: %+v", preview)
+	}
+	changed := report
+	changed.Summary = "A corrected result after the preview."
+	if _, err := f.coord.FinalReport(ctx, worker.LaunchPaneID, changed); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.coord.ReviewAtRevision(ctx, project.LaunchPaneID, worker.ID, preview.Revision, "accepted"); !errors.Is(err, ErrReportChanged) {
+		t.Fatalf("decision after report replacement = %v, want ErrReportChanged", err)
+	}
+	if actual := f.reload(worker.ID); actual.Disposition != "" {
+		t.Fatalf("stale decision changed the task: %+v", actual)
+	}
+	current, err := f.coord.ReportPreview(ctx, project.LaunchPaneID, worker.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Summary != changed.Summary || current.Revision == preview.Revision {
+		t.Fatalf("replacement was not visible in new preview: %+v", current)
+	}
+	if _, err := f.coord.ReviewAtRevision(ctx, project.LaunchPaneID, worker.ID, current.Revision, "accepted"); err != nil {
+		t.Fatalf("decision on the previewed revision: %v", err)
 	}
 }
 

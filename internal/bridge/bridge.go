@@ -73,11 +73,11 @@ const (
 	// The worker's own reports. They describe facts and never complete a task.
 	MethodProgress = "progress"
 	MethodQuestion = "question"
-	// The primary's decisions, and the two read-only previews they are shown
-	// before deciding.
+	// The primary's decisions and the read-only previews they are shown first.
 	MethodAnswer        = "answer"
 	MethodDialogPreview = "dialog_preview"
 	MethodApproveDialog = "approve_dialog"
+	MethodReportPreview = "report_preview"
 	MethodReview        = "review"
 	MethodSettleInput   = "settle_input"
 	// MethodBriefInspection reads the evidence a user decides an ambiguous brief
@@ -190,11 +190,11 @@ type Ops struct {
 	AdjudicateBrief func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
 	Progress        func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
 	Question        func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
-	// Primary role. The two previews are read-only; the bridge authorizes them
-	// exactly like a mutation and their operation performs none.
+	// Primary role. Previews are read-only but require the same identity proof.
 	Answer         func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
 	DialogPreview  func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
 	ApproveDialog  func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
+	ReportPreview  func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
 	Review         func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
 	SettleInput    func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
 	CleanupPreview func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
@@ -295,12 +295,20 @@ func CoordinatorOps(c *coord.Coordinator) Ops {
 				coord.BriefDecision(request.Decision), coord.BriefEvidence{PaneID: request.PaneID, Digest: request.Digest})
 			return result, coordError(err)
 		},
+		ReportPreview: func(ctx context.Context, p Principal, params json.RawMessage) (any, error) {
+			var request coord.CleanupParams
+			if err := decodeParams(params, &request); err != nil {
+				return nil, err
+			}
+			result, err := c.ReportPreview(ctx, p.LaunchPaneID, request.TaskID)
+			return result, coordError(err)
+		},
 		Review: func(ctx context.Context, p Principal, params json.RawMessage) (any, error) {
 			var request coord.ReviewParams
 			if err := decodeParams(params, &request); err != nil {
 				return nil, err
 			}
-			result, err := c.Review(ctx, p.LaunchPaneID, request.TaskID, request.Disposition)
+			result, err := c.ReviewAtRevision(ctx, p.LaunchPaneID, request.TaskID, request.ExpectedRevision, request.Disposition)
 			return result, coordError(err)
 		},
 		CleanupPreview: func(ctx context.Context, p Principal, params json.RawMessage) (any, error) {
@@ -351,6 +359,7 @@ func UnavailableOps(cause error) Ops {
 		BriefInspection: unavailable,
 		AdjudicateBrief: unavailable,
 		Review:          unavailable,
+		ReportPreview:   unavailable,
 		CleanupPreview:  unavailable,
 		SettleInput:     unavailable,
 		Cleanup:         unavailable,
@@ -389,6 +398,8 @@ func coordErrorCode(err error) string {
 		return "invalid_report"
 	case errors.Is(err, coord.ErrNotReviewed):
 		return "not_reviewed"
+	case errors.Is(err, coord.ErrReportChanged):
+		return "report_changed"
 	case errors.Is(err, coord.ErrWorkerLive):
 		return "worker_live"
 	case errors.Is(err, coord.ErrCheckoutDirty):
@@ -540,6 +551,8 @@ func run(ctx context.Context, env map[string]string, input io.Reader, opts Optio
 		return h.mutate(req, state.RolePrimary, announced, h.ops.DialogPreview)
 	case MethodApproveDialog:
 		return h.mutate(req, state.RolePrimary, announced, h.ops.ApproveDialog)
+	case MethodReportPreview:
+		return h.mutate(req, state.RolePrimary, announced, h.ops.ReportPreview)
 	case MethodReview:
 		return h.mutate(req, state.RolePrimary, announced, h.ops.Review)
 	case MethodCleanupPreview:

@@ -1129,6 +1129,38 @@ function Test-OmpApprovalToolCall {
     }
     return $false
 }
+function Test-OmpReviewToolCall {
+    param([string]$Path, [string]$TaskId, [string]$Disposition)
+    if ([string]::IsNullOrWhiteSpace($Path) -or [string]::IsNullOrWhiteSpace($TaskId) -or
+        [string]::IsNullOrWhiteSpace($Disposition) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    $stream = $null
+    $reader = $null
+    try {
+        $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        $reader = New-Object System.IO.StreamReader($stream)
+        while ($null -ne ($line = $reader.ReadLine())) {
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            try { $entry = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+            if ([string](Get-Field $entry 'type') -cne 'message') { continue }
+            $message = Get-Field $entry 'message'
+            if ([string](Get-Field $message 'role') -cne 'assistant') { continue }
+            foreach ($part in @(Get-Field $message 'content' @())) {
+                if ([string](Get-Field $part 'type') -cne 'toolCall' -or
+                    [string](Get-Field $part 'name') -cne 'orch_review') { continue }
+                $arguments = Get-Field $part 'arguments'
+                if ([string](Get-Field $arguments 'taskId') -ceq $TaskId -and
+                    [string](Get-Field $arguments 'disposition') -ceq $Disposition) { return $true }
+            }
+        }
+    } catch {
+        return $false
+    } finally {
+        if ($reader) { $reader.Dispose() }
+        elseif ($stream) { $stream.Dispose() }
+    }
+    return $false
+}
+
 
 
 
@@ -2715,6 +2747,32 @@ function Test-PrimaryWorkerQuestionAskForTask {
         (Test-PrimaryWorkerAnswerChoiceAskScreen -Screen $Screen -AskId $askId -QuestionText $QuestionText))
 }
 
+function Test-PrimaryReviewConfirmScreen {
+    param([string]$Screen, [string]$TaskId, [long]$Revision, [string]$Disposition)
+    if ([string]::IsNullOrWhiteSpace($Screen) -or [string]::IsNullOrWhiteSpace($TaskId) -or
+        [string]::IsNullOrWhiteSpace($Disposition) -or $Revision -le 0) { return $false }
+    $start = $Screen.LastIndexOf('Record review disposition', [System.StringComparison]::Ordinal)
+    if ($start -lt 0) { return $false }
+    $panel = $Screen.Substring($start)
+    $normalized = ($panel -replace '[\s\u2502\u00B3|]+', ' ').Trim()
+    $description = "Confirm that you reviewed the worker's final report for task $TaskId and chose this disposition:"
+    $descriptionIndex = $normalized.IndexOf($description, [System.StringComparison]::Ordinal)
+    if ($descriptionIndex -lt 0) { return $false }
+    $afterDescription = $normalized.Substring($descriptionIndex + $description.Length).TrimStart()
+    $expectedDecision = ($Disposition -replace '\s+', ' ').Trim() + " Stored report (revision ${Revision}):"
+    if (-not $afterDescription.StartsWith($expectedDecision, [System.StringComparison]::Ordinal) -or
+        $afterDescription.IndexOf('This closes the task and may start queued dependent work.', [System.StringComparison]::Ordinal) -lt 0) { return $false }
+    $choices = @()
+    $seenNo = $false
+    foreach ($line in ($panel -split "`r?`n")) {
+        $label = $line.Trim() -replace '^[^\p{L}]*', '' -replace '[^\p{L}]*$', ''
+        if ($seenNo -and $label -match '[\p{L}\p{N}]') { return $false }
+        if ($label -ceq 'Yes' -or $label -ceq 'No') { $choices += $label }
+        if ($label -ceq 'No') { $seenNo = $true }
+    }
+    return ($choices.Count -eq 2 -and $choices[0] -ceq 'Yes' -and $choices[1] -ceq 'No')
+}
+
 function Test-PrimaryApprovalConfirmScreen {
     param([string]$Screen, [string]$DialogMarker, [Parameter(Mandatory)][string]$ExpectedQuestion, [string[]]$Keys)
     if ([string]::IsNullOrWhiteSpace($Screen) -or [string]::IsNullOrWhiteSpace($DialogMarker) -or
@@ -2749,6 +2807,43 @@ function Test-PrimaryApprovalConfirmScreen {
     return ($noLabel -ceq 'No')
 }
 
+
+function Confirm-PrimaryReviewModal {
+    param(
+        [Parameter(Mandatory)][string]$PaneId,
+        [Parameter(Mandatory)][string]$LaunchPaneId,
+        [Parameter(Mandatory)][string]$TaskId,
+        [Parameter(Mandatory)][string]$Disposition
+    )
+    $wait = Wait-Until -TimeoutSeconds 120 -IntervalSeconds 2 -What "review confirmation for task $TaskId" -Probe {
+        $fact = Get-Field (Get-TaskById -Id $TaskId) 'fact'
+        $revision = [long](Get-Field $fact 'Revision' 0)
+        if ($null -eq (Get-Field $fact 'Report' $null) -or $revision -le 0) { return $null }
+        $live = Get-LiveAgent -Target $PaneId
+        if (-not $live.Found -or [string](Get-Field $live.Agent 'agent_status') -ne 'blocked') { return $null }
+        $screen = Get-PaneScreen -PaneId $PaneId -Source 'visible' -Lines 100
+        if (Test-PrimaryReviewConfirmScreen -Screen $screen -TaskId $TaskId -Revision $revision -Disposition $Disposition) {
+            return [pscustomobject]@{ Kind = 'modal'; Screen = $screen; Revision = $revision }
+        }
+        return $null
+    }
+    if (-not $wait.Ok) { return $false }
+    if ($wait.Value.Kind -ne 'modal') { return $false }
+    $revision = [long]$wait.Value.Revision
+    $ready = Get-ReadySession -LaunchPaneId $LaunchPaneId
+    $transcript = [string](Get-Field $ready 'omp_session_file')
+    if (-not (Test-OmpReviewToolCall -Path $transcript -TaskId $TaskId -Disposition $Disposition)) { return $false }
+    $screen = Get-PaneScreen -PaneId $PaneId -Source 'visible' -Lines 100
+    if (-not (Test-PrimaryReviewConfirmScreen -Screen $screen -TaskId $TaskId -Revision $revision -Disposition $Disposition)) { return $false }
+    $fact = Get-Field (Get-TaskById -Id $TaskId) 'fact'
+    if ([long](Get-Field $fact 'Revision' 0) -ne $revision -or $null -eq (Get-Field $fact 'Report' $null)) { return $false }
+    $screen = Get-PaneScreen -PaneId $PaneId -Source 'visible' -Lines 100
+    if (-not (Test-PrimaryReviewConfirmScreen -Screen $screen -TaskId $TaskId -Revision $revision -Disposition $Disposition)) { return $false }
+    if (-not (Test-OmpReviewToolCall -Path $transcript -TaskId $TaskId -Disposition $Disposition)) { return $false }
+    $sent = Send-AgentKeys -PaneId $PaneId -Keys @('enter')
+    [void]($script:PrimarySendKeysUsed += 'enter')
+    return ($sent.ExitCode -eq 0)
+}
 
 function Resolve-PrimaryDispositionAsk {
     param(
@@ -2823,6 +2918,15 @@ function Resolve-PrimaryDispositionAsk {
         if (-not (Test-PrimaryDispositionAskScreen -Screen $current -AskId $AskId -TaskId $TaskId)) { return $true }
         return $null
     }
+    $reviewConfirmed = $false
+    if ($sent.ExitCode -eq 0 -and $closed.Ok) {
+        $reviewConfirmed = Confirm-PrimaryReviewModal -PaneId $script:PrimaryPane `
+            -LaunchPaneId ([string](Get-Field $script:Project 'LaunchPaneID')) -TaskId $TaskId `
+            -Disposition 'Accepted the reported result.'
+    }
+    if (-not $reviewConfirmed) {
+        return [pscustomobject]@{ Observed = $true; Resolved = $false; Screen = (Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100) }
+    }
     $settled = Wait-Until -TimeoutSeconds 180 -IntervalSeconds 3 -What "primary recorded $Marker disposition" -Probe {
         $row = Get-TaskById -Id $TaskId
         $currentFact = Get-Field $row 'fact'
@@ -2831,9 +2935,9 @@ function Resolve-PrimaryDispositionAsk {
         if ($live.Found -and [string](Get-Field $live.Agent 'agent_status') -in @('idle', 'done')) { return 'idle' }
         return $null
     }
-    $resolved = ($sent.ExitCode -eq 0 -and $closed.Ok -and $settled.Ok -and $settled.Value -eq 'disposed')
-    [void](Assert-True -Id $AssertionId -What "the acceptance user selected Accept report for $Marker" -Condition $resolved `
-        -Command $sent.CommandLine -Evidence ("Ask=$AskId; selected the first option; closed=$($closed.Ok) settled=$($settled.Value) screen=" + (Protect-Text $screen 600)))
+    $resolved = ($sent.ExitCode -eq 0 -and $closed.Ok -and $reviewConfirmed -and $settled.Ok -and $settled.Value -eq 'disposed')
+    [void](Assert-True -Id $AssertionId -What "the acceptance user selected and confirmed Accept report for $Marker" -Condition $resolved `
+        -Command $sent.CommandLine -Evidence ("Ask=$AskId; selected the first option; confirmed=$reviewConfirmed closed=$($closed.Ok) settled=$($settled.Value) screen=" + (Protect-Text $screen 600)))
     [void]($script:PrimarySendKeysUsed += 'enter')
     return [pscustomobject]@{ Observed = $true; Resolved = $resolved; Screen = $screen }
 }
@@ -4131,9 +4235,18 @@ function Invoke-Restart {
     if ($script:RestoredPrimaryPane) {
         $idA = if ($script:TaskA) { [string](Get-Field $script:TaskA 'ID') } else { '' }
         if ($idA) {
-            $probe = 'ACCEPT-TOOLS-RESTORED. Call the orch_review tool with taskId "' + $idA + '" and disposition "ACCEPT-TOOLS-RESTORED-' + $script:RunId + '". If that tool is not available in this session, reply exactly NOTOOLHERE and do nothing else.'
-            $result = Invoke-PrimaryPrompt -PaneId $script:RestoredPrimaryPane -Text $probe -TimeoutSeconds 300
-            Assert-True -Id 'T8.1' -What 'the restored primary session accepts a prompt' -Condition ($result.ExitCode -eq 0) -Command $result.CommandLine -Evidence ("code=[$($result.Code)] blocked=[$($result.Blocked)] stderr=[" + (Protect-Text $result.Stderr 300) + "] screen=[" + (Protect-Text $result.Screen 500) + "]")
+            $restoredDisposition = 'ACCEPT-TOOLS-RESTORED-' + $script:RunId
+            $probe = 'ACCEPT-TOOLS-RESTORED. As the acceptance user, I reviewed task "' + $idA + '" and authorize recording disposition "' + $restoredDisposition + '" only if the review confirmation names that exact task and disposition. Call orch_review with these values. If that tool is not available in this session, reply exactly NOTOOLHERE and do nothing else.'
+            $result = Invoke-PrimaryPromptNoWaitAfterDispositionAsks -PaneId $script:RestoredPrimaryPane -Text $probe -TimeoutSeconds 300 -AssertionPrefix 'T8'
+            Assert-True -Id 'T8.1' -What 'the restored primary session accepts a prompt' -Condition ($result.Submitted -and ($result.ExitCode -eq 0 -or $result.Blocked)) -Command $result.CommandLine -Evidence ("code=[$($result.Code)] blocked=[$($result.Blocked)] stderr=[" + (Protect-Text $result.Stderr 300) + "] screen=[" + (Protect-Text $result.Screen 500) + "]")
+            $confirmed = $false
+            if ($result.Submitted) {
+                $confirmed = Confirm-PrimaryReviewModal -PaneId $script:RestoredPrimaryPane `
+                    -LaunchPaneId ([string](Get-Field $restoredProject 'LaunchPaneID')) -TaskId $idA -Disposition $restoredDisposition
+            }
+            Assert-True -Id 'T8.confirm' -What 'the acceptance user confirmed the exact restored review call' -Condition $confirmed -TaskId $idA `
+                -Evidence (Protect-Text (Get-PaneScreen -PaneId $script:RestoredPrimaryPane -Source 'visible' -Lines 100) 500)
+            if (-not $confirmed) { throw 'restored review confirmation was not verified' }
             $toolRan = Wait-Until -TimeoutSeconds 240 -IntervalSeconds 8 -What 'restored role tool' -Probe {
                 $fact = Get-Field (Get-TaskById -Id $idA) 'fact'
                 if ([string](Get-Field $fact 'Disposition') -match 'ACCEPT-TOOLS-RESTORED') { return $fact }

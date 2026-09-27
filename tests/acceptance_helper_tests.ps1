@@ -445,6 +445,38 @@ Check 'primary transcript refuses an approval tool call for another task' (-not 
 $wrongApprovalToolKeys = $true
 try { $wrongApprovalToolKeys = Test-OmpApprovalToolCall -Path $approvalTranscriptPath -TaskId 'orch_abc' -Keys @('escape') } catch { }
 Check 'primary transcript refuses a different approval key set' (-not $wrongApprovalToolKeys) 'wrong keys'
+$reviewTranscriptPath = Join-Path $script:HarnessRoot 'review-session.jsonl'
+Set-Content -LiteralPath $reviewTranscriptPath -Value '{"type":"message","message":{"role":"assistant","content":[{"type":"toolCall","name":"orch_review","arguments":{"taskId":"orch_abc","disposition":"Accepted the reported result."}}]}}' -Encoding UTF8
+Check 'review transcript ties confirmation to the exact tool call' (Test-OmpReviewToolCall -Path $reviewTranscriptPath -TaskId 'orch_abc' -Disposition 'Accepted the reported result.') 'task/decision'
+Check 'review transcript refuses a different disposition' (-not (Test-OmpReviewToolCall -Path $reviewTranscriptPath -TaskId 'orch_abc' -Disposition 'Rejected the result.')) 'wrong decision'
+
+$reviewScreen = @'
+Earlier confirmation: Record review disposition
+Task orch_old; Accepted the reported result.
+Record review disposition
+Confirm that you reviewed the worker's final report for task orch_abc and chose this disposition:
+Accepted the reported result.
+Stored report (revision 7):
+Summary: "Added subtract to a.js"
+Branch: "orch/abc"
+Evidence: ["commit 0123456789abcdef"]
+Checks: ["go test ./internal/coord ok"]
+Risk: "No known risk"
+This closes the task and may start queued dependent work. Decline if you have not reviewed the report.
+Yes
+No
+'@
+Check 'review modal matches the active task, revision and disposition' (Test-PrimaryReviewConfirmScreen -Screen $reviewScreen -TaskId 'orch_abc' -Revision 7 -Disposition 'Accepted the reported result.') 'review modal'
+Check 'review modal rejects a different task' (-not (Test-PrimaryReviewConfirmScreen -Screen $reviewScreen -TaskId 'orch_other' -Revision 7 -Disposition 'Accepted the reported result.')) 'wrong task'
+Check 'review modal rejects a different report revision' (-not (Test-PrimaryReviewConfirmScreen -Screen $reviewScreen -TaskId 'orch_abc' -Revision 8 -Disposition 'Accepted the reported result.')) 'wrong revision'
+Check 'review modal rejects a different decision' (-not (Test-PrimaryReviewConfirmScreen -Screen $reviewScreen -TaskId 'orch_abc' -Revision 7 -Disposition 'Rejected the result.')) 'wrong disposition'
+Check 'review modal rejects a longer different disposition that contains the expected text' (-not (Test-PrimaryReviewConfirmScreen -Screen ($reviewScreen -replace 'Accepted the reported result\.\r?\nStored report', "Accepted the reported result. but request changes`nStored report") -TaskId 'orch_abc' -Revision 7 -Disposition 'Accepted the reported result.')) 'substring decision'
+Check 'review modal accepts a stored report that mentions another modal title as data' (Test-PrimaryReviewConfirmScreen -Screen ($reviewScreen -replace 'Added subtract to a.js', 'Ask 1 questions was displayed') -TaskId 'orch_abc' -Revision 7 -Disposition 'Accepted the reported result.') 'report data'
+Check 'review modal ignores an old matching modal when another confirmation is active' (-not (Test-PrimaryReviewConfirmScreen -Screen ($reviewScreen + "`nRecord review disposition`nTask orch_other`nYes`nNo") -TaskId 'orch_abc' -Revision 7 -Disposition 'Accepted the reported result.')) 'stale modal'
+Check 'review modal refuses an old confirmation followed by an active Ask' (-not (Test-PrimaryReviewConfirmScreen -Screen ($reviewScreen + "`nAsk 1 questions`n[other] What now?`nAccept`nRequest changes") -TaskId 'orch_abc' -Revision 7 -Disposition 'Accepted the reported result.')) 'new Ask'
+Check 'review modal refuses an old confirmation followed by a different action modal' (-not (Test-PrimaryReviewConfirmScreen -Screen ($reviewScreen + "`nRemove worker checkout`nTask orch_other`nCancel") -TaskId 'orch_abc' -Revision 7 -Disposition 'Accepted the reported result.')) 'new action'
+Check 'review modal refuses unknown active panel after its old choices' (-not (Test-PrimaryReviewConfirmScreen -Screen ($reviewScreen + "`nSomething else is awaiting input") -TaskId 'orch_abc' -Revision 7 -Disposition 'Accepted the reported result.')) 'unknown action'
+
 $primaryAskScreen = @'
 Earlier conversation contained a completed task-A review:
 Ask 1 questions
@@ -682,7 +714,7 @@ function Send-AgentKeys {
 }
 function Get-TaskById {
     param([string]$Id)
-    return [pscustomobject]@{ fact = [pscustomobject]@{ Disposition = ''; Report = [pscustomobject]@{ Summary = 'result' } } }
+    return [pscustomobject]@{ fact = [pscustomobject]@{ Revision = 7; Disposition = ''; Report = [pscustomobject]@{ Summary = 'result' } } }
 }
 $script:WorkerDispositionAskTaskForTest = [pscustomobject]@{
     fact = [pscustomobject]@{
@@ -698,7 +730,7 @@ $script:WorkerDispositionAskTaskForTest = [pscustomobject]@{
 function Get-TaskById {
     param([string]$Id)
     if ($Id -eq 'task-a') { return $script:WorkerDispositionAskTaskForTest }
-    return [pscustomobject]@{ fact = [pscustomobject]@{ Disposition = ''; Report = [pscustomobject]@{ Summary = 'result' } } }
+    return [pscustomobject]@{ fact = [pscustomobject]@{ Revision = 7; Disposition = ''; Report = [pscustomobject]@{ Summary = 'result' } } }
 }
 $workerDispositionAskScreen = @'
 Ask 1 questions
@@ -721,8 +753,17 @@ $reversedWorkerDispositionAsk = $workerDispositionAskScreen -replace 'Accept', '
 $reversedWorkerDispositionMatches = $true
 try { $reversedWorkerDispositionMatches = Test-PrimaryDispositionAskScreen -Screen $reversedWorkerDispositionAsk -AskId 'worker_a_disposition' -TaskId 'task-a' } catch { }
 Check 'disposition matcher refuses when Accept is not the first choice' (-not $reversedWorkerDispositionMatches) 'reversed disposition choices'
+$script:PrimaryPane = 'w1:p1'
+$script:Project = [pscustomobject]@{ LaunchPaneID = 'w1:p1' }
+$savedReviewModal = (Get-Command Confirm-PrimaryReviewModal).ScriptBlock
+$script:ReviewModalTaskForTest = ''
+function Confirm-PrimaryReviewModal {
+    param([string]$PaneId, [string]$LaunchPaneId, [string]$TaskId, [string]$Disposition)
+    $script:ReviewModalTaskForTest = $TaskId
+    return $true
+}
 $resolverOutput = @(Resolve-PrimaryDispositionAsk -Marker 'ACCEPT-B' -AskId 'task_b_review' -TaskId 'task-b' -AssertionId 'TEST.askB')
-Check 'primary Ask resolver emits exactly one result object' ($resolverOutput.Count -eq 1 -and $null -ne $resolverOutput[0].PSObject.Properties['Resolved']) ("count=$($resolverOutput.Count)")
+Check 'primary Ask resolver emits exactly one result object after review confirmation' ($resolverOutput.Count -eq 1 -and $null -ne $resolverOutput[0].PSObject.Properties['Resolved'] -and $script:ReviewModalTaskForTest -eq 'task-b') ("count=$($resolverOutput.Count)")
 $script:ResolveWaitForTest = 0
 $script:PrimaryAgentStatusForTest = 'blocked'
 $script:PrimaryScreenForTest = $workerDispositionAskScreen
@@ -735,7 +776,7 @@ function Send-AgentKeys {
 $workerDispositionResolution = $null
 try { $workerDispositionResolution = Resolve-PrimaryDispositionAsk -Marker 'ACCEPT-A' -AskId 'worker_a_disposition' -TaskId 'task-a' -AssertionId 'TEST.workerDisposition' } catch { }
 Check 'disposition resolver selects Accept only for the exact active worker report Ask' ($null -ne $workerDispositionResolution -and $workerDispositionResolution.Resolved -and $workerDispositionResolution.Observed -and $script:WorkerDispositionKeysForTest.Count -eq 1 -and $script:WorkerDispositionKeysForTest[0] -eq 'enter') ("result=$(Get-Json $workerDispositionResolution); keys=$($script:WorkerDispositionKeysForTest -join ',')")
-$script:PrimaryPane = 'w1:p1'
+Set-Item -Path Function:\Confirm-PrimaryReviewModal -Value $savedReviewModal
 function Wait-Until {
     param([double]$TimeoutSeconds, [double]$IntervalSeconds, [string]$What, [scriptblock]$Probe)
     $value = & $Probe
@@ -815,6 +856,29 @@ $script:PrimarySendKeysUsed = @()
 $lateReplacementModal = $null
 try { $lateReplacementModal = Confirm-PrimaryModal -TaskId 'orch_abc' -DialogMarker 'ACCEPT-Q-DIALOG' -ExpectedQuestion 'ACCEPT-Q-DIALOG: which contract should b.js use?' -ExpectedKeys @('enter') -TranscriptPath $approvalTranscriptPath -TimeoutSeconds 1 } catch { }
 Check 'confirmation reads the pane after the final transcript check and refuses a replacement modal' ($null -ne $lateReplacementModal -and -not $lateReplacementModal.Observed -and $script:SentKeysCallsForTest.Count -eq 0 -and $script:ApprovalTranscriptReadsForTest -ge 2) 'screen changed during transcript verification'
+$savedReadySession = (Get-Command Get-ReadySession).ScriptBlock
+$savedProject = $script:Project
+$script:Project = [pscustomobject]@{ LaunchPaneID = 'w1:p1' }
+$script:RequestedReadyPaneForTest = ''
+function Get-ReadySession {
+    param([string]$LaunchPaneId)
+    $script:RequestedReadyPaneForTest = $LaunchPaneId
+    return [pscustomobject]@{ omp_session_file = $reviewTranscriptPath }
+}
+$script:PrimaryScreenForTest = $reviewScreen
+$script:PrimaryAgentStatusForTest = 'blocked'
+$script:SentKeysCallsForTest = @()
+$script:PrimarySendKeysUsed = @()
+$reviewConfirmed = Confirm-PrimaryReviewModal -PaneId 'w1:p1' -LaunchPaneId 'w9:p9' -TaskId 'orch_abc' -Disposition 'Accepted the reported result.'
+Check 'review resolver uses restored launch-pane handshake rather than stale project' ($script:RequestedReadyPaneForTest -eq 'w9:p9') $script:RequestedReadyPaneForTest
+Check 'review resolver sends Enter only for a transcript-linked exact modal' ($reviewConfirmed -and $script:SentKeysCallsForTest.Count -eq 1 -and $script:SentKeysCallsForTest[0] -eq 'enter') 'review confirmed'
+$script:PrimaryScreenForTest = $reviewScreen -replace 'orch_abc', 'orch_other'
+$script:SentKeysCallsForTest = @()
+$wrongReview = Confirm-PrimaryReviewModal -PaneId 'w1:p1' -LaunchPaneId 'w9:p9' -TaskId 'orch_abc' -Disposition 'Accepted the reported result.'
+Check 'review resolver refuses a modal for another task without sending keys' (-not $wrongReview -and $script:SentKeysCallsForTest.Count -eq 0) 'wrong review'
+Set-Item -Path Function:\Get-ReadySession -Value $savedReadySession
+$script:Project = $savedProject
+
 $script:DispositionWaitCallsForTest = 0
 $script:ReplacementDispositionScreen = $primaryAskScreen -replace 'task_b_review', 'task_a_review'
 function Wait-Until {

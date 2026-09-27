@@ -25,6 +25,8 @@ import extension, {
   confirmThen,
   dialogConfirmRequest,
   refreshIdentity,
+  readReportPreview,
+  recordReviewWithConsent,
   refreshReady,
   settleConfirmRequest,
   uiGate,
@@ -381,6 +383,88 @@ for (const call of toolCalls) {
     `${call.name} accepted an empty ${JSON.stringify(call.bad)}`,
   );
 }
+// A review is a user decision, not a model decision. Refusing the UI or
+// declining the exact task/disposition must stop before the bridge is spawned.
+async function checkReviewConsent(): Promise<void> {
+  const review = tools.find((tool) => tool.name === "orch_review") as
+    | (RegisteredTool & {
+        execute: (
+          callId: string,
+          params: { taskId: string; disposition: string },
+          signal: AbortSignal,
+          update: undefined,
+          ctx: unknown,
+        ) => Promise<{ isError?: boolean; content: Array<{ text: string }> }>;
+      })
+    | undefined;
+  if (!review) {
+    failures.push("orch_review was not registered");
+    return;
+  }
+  const identity = {
+    getSessionId: () => "sess-1",
+    getSessionFile: () => "C:/session.jsonl",
+    isSessionOnDisk: () => true,
+  };
+  const params = { taskId: "orch_abc", disposition: "Accepted the reported result." };
+  let prompts = 0;
+  try {
+    const noUI = await review.execute("review-no-ui", params, new AbortController().signal, undefined, {
+      hasUI: false,
+      ui: { confirm: async () => { prompts++; return true; } },
+      sessionManager: identity,
+    });
+    check(noUI.isError === true, "orch_review proceeded without an interactive UI");
+    check(prompts === 0, "orch_review asked for confirmation without an interactive UI");
+  } catch (error) {
+    failures.push(`orch_review reached the bridge without a UI: ${String(error)}`);
+  }
+  const preview = {
+    taskId: params.taskId,
+    revision: 7,
+    stage: "ready_for_review",
+    summary: "Added subtract to a.js",
+    branch: "orch/abc",
+    evidence: ["commit 0123456789abcdef"],
+    checks: ["go test ./internal/coord ok"],
+    risk: "No known risk",
+  };
+  check(readReportPreview(preview)?.revision === 7, "valid stored report preview was refused");
+  check(readReportPreview({ ...preview, evidence: null }) === null, "preview with missing evidence was trusted");
+  check(readReportPreview({ ...preview, revision: 0 }) === null, "preview with no revision was trusted");
+  let request = { title: "", message: "" };
+  const sent: Array<{ taskId: string; disposition: string; expectedRevision: number }> = [];
+  const send = async (confirmed: { taskId: string; disposition: string; expectedRevision: number }) => {
+    sent.push(confirmed);
+    return { stage: "Done" };
+  };
+  const declined = await recordReviewWithConsent(
+    { hasUI: true, confirm: async (title, message) => { request = { title, message }; return false; } },
+    preview,
+    params.disposition,
+    send,
+  );
+  check(!declined.ok && sent.length === 0, "declined report review reached the bridge mutation");
+  for (const fact of [preview.taskId, "revision 7", preview.summary, preview.branch,
+    preview.evidence[0], preview.checks[0], preview.risk, params.disposition]) {
+    check(request.message.includes(fact), `review confirmation did not show ${JSON.stringify(fact)}`);
+  }
+  const approved = await recordReviewWithConsent(
+    { hasUI: true, confirm: async () => true },
+    preview,
+    params.disposition,
+    send,
+  );
+  check(approved.ok && approved.value !== null, "an approved review did not return its bridge result");
+  check(
+    sent.length === 1 && sent[0]?.taskId === params.taskId &&
+      sent[0]?.disposition === params.disposition && sent[0]?.expectedRevision === preview.revision,
+    `the approved review sent ${JSON.stringify(sent)}, want the exact preview revision and decision`,
+  );
+}
+
+await checkReviewConsent();
+
 
 // --- the user-confirmed gates ----------------------------------------------
 

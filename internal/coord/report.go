@@ -61,6 +61,9 @@ var (
 	// ErrNotReviewed refuses an action that needs a reviewed done task: a final
 	// result the primary can decide on, and the disposition that decided it.
 	ErrNotReviewed = errors.New("coord: the task has no reviewed result to decide on")
+	// ErrReportChanged refuses a decision when the task changed since the
+	// primary displayed its persisted report for confirmation.
+	ErrReportChanged = errors.New("coord: the reviewed task changed after its preview")
 	// ErrWorkerLive refuses cleanup while the task's worker agent is running.
 	ErrWorkerLive = errors.New("coord: the worker agent is still live")
 	// ErrCheckoutDirty refuses cleanup of a checkout that still holds work.
@@ -307,11 +310,12 @@ type SettleInputParams struct {
 	Decision string `json:"decision"`
 }
 
-// ReviewParams is the orch_review body: the disposition the user recorded for a
-// reviewed result.
+// ReviewParams is the orch_review body: the disposition the user confirmed
+// after seeing this exact persisted report revision.
 type ReviewParams struct {
-	TaskID      string `json:"taskId"`
-	Disposition string `json:"disposition"`
+	TaskID           string `json:"taskId"`
+	Disposition      string `json:"disposition"`
+	ExpectedRevision int64  `json:"expectedRevision"`
 }
 
 // CleanupParams is the orch_cleanup body.
@@ -386,6 +390,20 @@ type SettleInputResult struct {
 	Channel  string     `json:"channel"`
 	Decision string     `json:"decision"`
 	Stage    task.Stage `json:"stage"`
+}
+
+// ReportPreview is the exact persisted worker report the primary confirms.
+// Revision binds that confirmation to the write, including any concurrent
+// replacement of the report or change to the task's review state.
+type ReportPreview struct {
+	TaskID   string     `json:"taskId"`
+	Revision int64      `json:"revision"`
+	Stage    task.Stage `json:"stage"`
+	Summary  string     `json:"summary"`
+	Branch   string     `json:"branch"`
+	Evidence []string   `json:"evidence"`
+	Checks   []string   `json:"checks"`
+	Risk     string     `json:"risk"`
 }
 
 // ReviewResult is the answer to one recorded disposition.
@@ -942,9 +960,44 @@ func (c *Coordinator) SettleInput(ctx context.Context, primaryLaunchPaneID, task
 	return SettleInputResult{TaskID: settled.ID, Channel: recorded.channel, Decision: choice, Stage: task.StageOf(settled)}, nil
 }
 
+// ReportPreview reads the durable final result owned by this primary. Inbox
+// summaries and model-supplied report text are never evidence for a decision.
+func (c *Coordinator) ReportPreview(ctx context.Context, primaryLaunchPaneID, taskID string) (ReportPreview, error) {
+	project, err := c.primaryProject(ctx, primaryLaunchPaneID)
+	if err != nil {
+		return ReportPreview{}, err
+	}
+	st, err := c.ownedTask(ctx, project, taskID)
+	if err != nil {
+		return ReportPreview{}, err
+	}
+	if !isReviewed(st) {
+		return ReportPreview{}, fmt.Errorf("%w: task %s has no final result to preview", ErrNotReviewed, st.ID)
+	}
+	report := st.Report
+	return ReportPreview{
+		TaskID: st.ID, Revision: st.Revision, Stage: task.StageOf(st),
+		Summary: report.Summary, Branch: report.Branch, Evidence: report.Evidence,
+		Checks: report.Checks, Risk: report.Risk,
+	}, nil
+}
+
+// ReviewAtRevision records only the report revision the primary just showed to
+// the user. An unrelated task update also invalidates the preview conservatively.
+func (c *Coordinator) ReviewAtRevision(ctx context.Context, primaryLaunchPaneID, taskID string, expectedRevision int64, disposition string) (ReviewResult, error) {
+	if expectedRevision <= 0 {
+		return ReviewResult{}, fmt.Errorf("%w: a positive report revision is required", ErrInvalidRequest)
+	}
+	return c.review(ctx, primaryLaunchPaneID, taskID, disposition, expectedRevision)
+}
+
 // Review records the user's disposition for a worker's reviewed result. This is
 // the only thing that moves a task to Done.
 func (c *Coordinator) Review(ctx context.Context, primaryLaunchPaneID, taskID, disposition string) (ReviewResult, error) {
+	return c.review(ctx, primaryLaunchPaneID, taskID, disposition, 0)
+}
+
+func (c *Coordinator) review(ctx context.Context, primaryLaunchPaneID, taskID, disposition string, expectedRevision int64) (ReviewResult, error) {
 	project, err := c.primaryProject(ctx, primaryLaunchPaneID)
 	if err != nil {
 		return ReviewResult{}, err
@@ -960,13 +1013,22 @@ func (c *Coordinator) Review(ctx context.Context, primaryLaunchPaneID, taskID, d
 	if !isReviewed(st) {
 		return ReviewResult{}, fmt.Errorf("%w: task %s has no final result to decide on, so it cannot be closed", ErrNotReviewed, st.ID)
 	}
-	updated, err := c.record(ctx, st, func(next *task.Task) error {
+	mutate := func(next *task.Task) error {
 		if !isReviewed(*next) {
 			return fmt.Errorf("%w: the task's final result was withdrawn while the decision was being recorded", ErrNotReviewed)
 		}
 		next.Disposition = decision
 		return nil
-	}, "record the user's disposition")
+	}
+	var updated task.Task
+	if expectedRevision > 0 {
+		updated, err = c.store.UpdateTask(ctx, st.ID, expectedRevision, mutate)
+		if errors.Is(err, state.ErrConflict) {
+			return ReviewResult{}, fmt.Errorf("%w: task %s is no longer at revision %d", ErrReportChanged, st.ID, expectedRevision)
+		}
+	} else {
+		updated, err = c.record(ctx, st, mutate, "record the user's disposition")
+	}
 	if err != nil {
 		return ReviewResult{}, err
 	}

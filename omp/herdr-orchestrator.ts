@@ -112,12 +112,10 @@ function sessionIdentity(sessionManager: {
 // user-confirmed gates
 // ---------------------------------------------------------------------------
 //
-// Two actions inject input or destroy a checkout, and neither may happen because
-// a model decided it should: the primary user confirms the exact keys of a
-// blocked worker's dialog, and confirms a specific checkout removal. Both go
-// through confirmThen, which checks the UI first and returns *before* invoking
-// the action when the confirmation is missing or declined — so a refusal can
-// never have a side effect to undo.
+// Recording a review, injecting input and removing a checkout all require the
+// primary user's confirmation. confirmThen checks for an interactive UI first
+// and returns before invoking the action when confirmation is unavailable or
+// declined, so a refusal has no side effect to undo.
 
 interface ConfirmRequest {
   title: string;
@@ -169,6 +167,19 @@ interface CleanupPreview {
   liveWorker: boolean;
   removable: boolean;
   detail: string;
+}
+
+// Persisted report and revision returned by the primary-only report_preview
+// bridge operation. No model-supplied report text is used for confirmation.
+interface ReportPreview {
+  taskId: string;
+  revision: number;
+  stage: "ready_for_review" | "done";
+  summary: string;
+  branch: string;
+  evidence: string[];
+  checks: string[];
+  risk: string;
 }
 
 // BriefInspection is the evidence a primary shows before deciding an ambiguous
@@ -233,6 +244,25 @@ function readCleanupPreview(value: unknown): CleanupPreview {
     removable: previewFlag(value, "removable"),
     detail: previewText(value, "detail"),
   };
+}
+
+export function readReportPreview(value: unknown): ReportPreview | null {
+  if (typeof value !== "object" || value === null) return null;
+  const taskId = previewText(value, "taskId");
+  const summary = previewText(value, "summary");
+  const branch = previewText(value, "branch");
+  const risk = previewText(value, "risk");
+  const revision = previewNumber(value, "revision");
+  const stage = previewText(value, "stage");
+  const evidence = "evidence" in value ? value.evidence : null;
+  const checks = "checks" in value ? value.checks : null;
+  if (!taskId || !summary || !branch || !risk || !Number.isSafeInteger(revision) || revision <= 0 ||
+    (stage !== "ready_for_review" && stage !== "done") ||
+    !Array.isArray(evidence) || evidence.length === 0 || !evidence.every((item) => typeof item === "string") ||
+    !Array.isArray(checks) || checks.length === 0 || !checks.every((item) => typeof item === "string")) {
+    return null;
+  }
+  return { taskId, revision, stage, summary, branch, evidence, checks, risk };
 }
 
 // dialogConfirmRequest is the confirmation one blocked worker's dialog needs: the
@@ -402,6 +432,29 @@ export async function confirmThen<T>(
   }
   return { ok: true, value: await act() };
 }
+// The review sends exactly the persisted report revision the user approved,
+// along with their disposition. A later report/task edit invalidates this token.
+export function recordReviewWithConsent<T>(
+  gate: UIGate,
+  preview: ReportPreview,
+  disposition: string,
+  send: (params: { taskId: string; disposition: string; expectedRevision: number }) => Promise<T>,
+): Promise<GateOutcome<T>> {
+  const request = {
+    title: "Record review disposition",
+    message:
+      `Confirm that you reviewed the worker's final report for task ${preview.taskId} and chose this disposition:\n` +
+      `${disposition}\nStored report (revision ${preview.revision}):\n` +
+      `Summary: ${JSON.stringify(preview.summary)}\nBranch: ${JSON.stringify(preview.branch)}\n` +
+      `Evidence: ${JSON.stringify(preview.evidence)}\nChecks: ${JSON.stringify(preview.checks)}\n` +
+      `Risk: ${JSON.stringify(preview.risk)}\n` +
+      "This closes the task and may start queued dependent work. Decline if you have not reviewed the report.",
+  };
+  return confirmThen(gate, request, () => send({
+    taskId: preview.taskId, disposition, expectedRevision: preview.revision,
+  }));
+}
+
 
 // ---------------------------------------------------------------------------
 // the post-turn session refresh
@@ -896,14 +949,22 @@ export default function (pi: ExtensionAPI) {
     label: "Record decision",
     defaultInactive: true,
     description:
-      "Record the user's disposition for a reviewed worker result. This is the only thing that moves a task to Done; a report alone does not.",
+      "Ask the user to confirm the task and proposed disposition after reviewing the worker result. A report alone never moves a task to Done.",
     parameters: z.object({
       taskId: z.string().min(1),
       disposition: z.string().min(1).max(200),
     }),
     async execute(_callId, params, signal, _update, ctx) {
-      const result = await callBridge("review", params, sessionIdentity(ctx.sessionManager), signal);
-      return toolResult(result);
+      const gate = uiGate(ctx);
+      if (!gate.hasUI) return toolRefusal("this session has no interactive UI, so the user could not confirm and nothing was done");
+      const identity = sessionIdentity(ctx.sessionManager);
+      const preview = readReportPreview(await callBridge("report_preview", { taskId: params.taskId }, identity, signal));
+      if (!preview || preview.taskId !== params.taskId) return toolRefusal("the persisted report could not be verified for this task");
+      const gated = await recordReviewWithConsent(gate, preview, params.disposition, (confirmed) =>
+        callBridge("review", confirmed, identity, signal),
+      );
+      if (!gated.ok) return toolRefusal(gated.reason);
+      return toolResult(gated.value);
     },
   });
 

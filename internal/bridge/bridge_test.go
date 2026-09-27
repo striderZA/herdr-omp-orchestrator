@@ -2537,6 +2537,20 @@ func (f *bridgeFixture) reportPayload(t *testing.T, id, kind string) string {
 	return string(payload)
 }
 
+// reviewPayload uses the durable report preview, never an assumed revision.
+func (f *bridgeFixture) reviewPayload(t *testing.T, ops Ops, id, disposition string) string {
+	t.Helper()
+	var preview coord.ReportPreview
+	f.callWith("report_preview", primarySession, fmt.Sprintf(`{"taskId":%q}`, id), ops).decodeResult(t, &preview)
+	payload, err := json.Marshal(map[string]any{
+		"taskId": id, "expectedRevision": preview.Revision, "disposition": disposition,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(payload)
+}
+
 // TestReportMethodsAreRoleGated pins which role each new method needs: a worker
 // that names its own work can never decide it, and a primary can never report as
 // one.
@@ -2560,6 +2574,7 @@ func TestReportMethodsAreRoleGated(t *testing.T) {
 		"answer":          &ops.Answer,
 		"dialog_preview":  &ops.DialogPreview,
 		"approve_dialog":  &ops.ApproveDialog,
+		"report_preview":  &ops.ReportPreview,
 		"review":          &ops.Review,
 		"cleanup_preview": &ops.CleanupPreview,
 		"cleanup":         &ops.Cleanup,
@@ -2567,7 +2582,7 @@ func TestReportMethodsAreRoleGated(t *testing.T) {
 		*field = record(name)
 	}
 
-	primaryMethods := []string{"answer", "dialog_preview", "approve_dialog", "review", "cleanup_preview", "cleanup"}
+	primaryMethods := []string{"answer", "dialog_preview", "approve_dialog", "report_preview", "review", "cleanup_preview", "cleanup"}
 	workerMethods := []string{"progress", "question", "report"}
 
 	t.Run("a worker cannot decide", func(t *testing.T) {
@@ -2712,8 +2727,28 @@ func TestReportRejectsAnIncompleteReportAndReadsTheResult(t *testing.T) {
 	// decision is what closes the task.
 	wantError(t, f.callWith("review", workerSession, `{"taskId":"t1","disposition":"accepted"}`, ops), CodeForbidden)
 	f.asPrimary()
-	wantError(t, f.callWith("review", primarySession, `{"taskId":"t1","disposition":"  "}`, ops), "bad_request")
-	resp := f.callWith("review", primarySession, `{"taskId":"t1","disposition":"accepted: merged by hand"}`, ops)
+	previewResp := f.callWith("report_preview", primarySession, `{"taskId":"t1"}`, ops)
+	var preview coord.ReportPreview
+	previewResp.decodeResult(t, &preview)
+	if preview.TaskID != "t1" || preview.Revision != reviewed.Revision ||
+		preview.Summary != reviewed.Report.Summary || preview.Risk != reviewed.Report.Risk ||
+		len(preview.Evidence) != len(reviewed.Report.Evidence) || len(preview.Checks) != len(reviewed.Report.Checks) {
+		t.Fatalf("preview did not show the stored report and revision: %+v", preview)
+	}
+	wantError(t, f.callWith("review", primarySession, `{"taskId":"t1","disposition":"accepted: merged by hand"}`, ops), "bad_request")
+	wantError(t, f.callWith("review", primarySession, fmt.Sprintf(`{"taskId":"t1","disposition":"  ","expectedRevision":%d}`, preview.Revision), ops), "bad_request")
+	if _, err := f.store.UpdateTask(context.Background(), reviewed.ID, preview.Revision, func(next *task.Task) error {
+		next.Activity = "Herdr activity changed after the report preview"
+		return nil
+	}); err != nil {
+		t.Fatalf("advance task after preview: %v", err)
+	}
+	wantError(t, f.callWith("review", primarySession, fmt.Sprintf(`{"taskId":"t1","disposition":"accepted","expectedRevision":%d}`, preview.Revision), ops), "report_changed")
+	if st := f.task(t, "t1"); st.Disposition != "" {
+		t.Fatalf("stale preview recorded a disposition: %+v", st)
+	}
+	f.callWith("report_preview", primarySession, `{"taskId":"t1"}`, ops).decodeResult(t, &preview)
+	resp := f.callWith("review", primarySession, fmt.Sprintf(`{"taskId":"t1","disposition":"accepted: merged by hand","expectedRevision":%d}`, preview.Revision), ops)
 	var result coord.ReviewResult
 	resp.decodeResult(t, &result)
 	if result.Stage != task.Done {
@@ -3537,7 +3572,7 @@ func TestCleanupRequiresReviewedDoneAndACleanProvenanceCheckout(t *testing.T) {
 		t.Fatalf("report failed: %+v", resp.Error)
 	}
 	f.asPrimary()
-	if resp := f.callWith("review", primarySession, `{"taskId":"t1","disposition":"accepted"}`, ops); !resp.OK {
+	if resp := f.callWith("review", primarySession, f.reviewPayload(t, ops, "t1", "accepted"), ops); !resp.OK {
 		t.Fatalf("review failed: %+v", resp.Error)
 	}
 
@@ -3823,7 +3858,7 @@ func (f *bridgeFixture) approve(t *testing.T, ops Ops) {
 		t.Fatalf("report failed: %+v", resp.Error)
 	}
 	f.asPrimary()
-	if resp := f.callWith("review", primarySession, `{"taskId":"t1","disposition":"accepted"}`, ops); !resp.OK {
+	if resp := f.callWith("review", primarySession, f.reviewPayload(t, ops, "t1", "accepted"), ops); !resp.OK {
 		t.Fatalf("review failed: %+v", resp.Error)
 	}
 }
@@ -4009,8 +4044,8 @@ func TestEveryMethodTheExtensionCallsIsDispatched(t *testing.T) {
 	}
 	for _, method := range []string{
 		MethodDispatch, MethodReport, MethodProgress, MethodQuestion,
-		MethodAnswer, MethodDialogPreview, MethodApproveDialog, MethodReview,
-		MethodCleanupPreview, MethodCleanup,
+		MethodAnswer, MethodDialogPreview, MethodApproveDialog, MethodReportPreview,
+		MethodReview, MethodCleanupPreview, MethodCleanup,
 	} {
 		if called[method] == 0 {
 			t.Errorf("no extension tool calls %q, so that capability is unreachable", method)
