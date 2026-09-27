@@ -734,6 +734,42 @@ func TestReviewPreviewShowsDurableReportAndRefusesStaleDecision(t *testing.T) {
 	}
 }
 
+func TestReviewRefusesToRewriteARecordedDecision(t *testing.T) {
+	f := newReportFixture(t)
+	project, worker := f.seed()
+	ctx := context.Background()
+	if _, err := f.coord.FinalReport(ctx, worker.LaunchPaneID, f.completeReport(worker)); err != nil {
+		t.Fatal(err)
+	}
+	preview, err := f.coord.ReportPreview(ctx, project.LaunchPaneID, worker.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.coord.ReviewAtRevision(ctx, project.LaunchPaneID, worker.ID, preview.Revision, "accepted"); err != nil {
+		t.Fatalf("first decision: %v", err)
+	}
+	closed := f.reload(worker.ID)
+	if retry, err := f.coord.ReviewAtRevision(ctx, project.LaunchPaneID, worker.ID, preview.Revision, "accepted"); err != nil || retry.Stage != task.Done {
+		t.Fatalf("retry after a recorded decision = (%+v, %v), want unchanged done task", retry, err)
+	}
+	if retry, err := f.coord.Review(ctx, project.LaunchPaneID, worker.ID, "accepted"); err != nil || retry.Stage != task.Done {
+		t.Fatalf("legacy retry of the same decision = (%+v, %v)", retry, err)
+	}
+	if _, err := f.coord.Review(ctx, project.LaunchPaneID, worker.ID, "rejected"); !errors.Is(err, ErrAlreadyDecided) {
+		t.Fatalf("legacy repeat review = %v, want ErrAlreadyDecided", err)
+	}
+	latest, err := f.coord.ReportPreview(ctx, project.LaunchPaneID, worker.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.coord.ReviewAtRevision(ctx, project.LaunchPaneID, worker.ID, latest.Revision, "rejected"); !errors.Is(err, ErrAlreadyDecided) {
+		t.Fatalf("freshly previewed repeat review = %v, want ErrAlreadyDecided", err)
+	}
+	if after := f.reload(worker.ID); after.Disposition != "accepted" || after.Revision != closed.Revision {
+		t.Fatalf("repeat review rewrote the durable decision: %+v", after)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // the disposition of a prerequisite starts the work waiting on it
 // ---------------------------------------------------------------------------

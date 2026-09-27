@@ -400,6 +400,8 @@ func coordErrorCode(err error) string {
 		return "not_reviewed"
 	case errors.Is(err, coord.ErrReportChanged):
 		return "report_changed"
+	case errors.Is(err, coord.ErrAlreadyDecided):
+		return "already_decided"
 	case errors.Is(err, coord.ErrWorkerLive):
 		return "worker_live"
 	case errors.Is(err, coord.ErrCheckoutDirty):

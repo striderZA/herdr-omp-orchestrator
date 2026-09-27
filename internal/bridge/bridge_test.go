@@ -2761,6 +2761,14 @@ func TestReportRejectsAnIncompleteReportAndReadsTheResult(t *testing.T) {
 	if stage := task.StageOf(closed); stage != task.Done {
 		t.Errorf("stage after the disposition = %q, want %q", stage, task.Done)
 	}
+	f.callWith("report_preview", primarySession, `{"taskId":"t1"}`, ops).decodeResult(t, &preview)
+	if retry := f.callWith("review", primarySession, fmt.Sprintf(`{"taskId":"t1","disposition":"accepted: merged by hand","expectedRevision":%d}`, reviewed.Revision), ops); !retry.OK {
+		t.Fatalf("identical decision retry could not resume queue draining: %+v", retry.Error)
+	}
+	wantError(t, f.callWith("review", primarySession, fmt.Sprintf(`{"taskId":"t1","disposition":"rejected","expectedRevision":%d}`, preview.Revision), ops), "already_decided")
+	if after := f.task(t, "t1"); after.Disposition != closed.Disposition || after.Revision != closed.Revision {
+		t.Fatalf("a second review rewrote the decision: %+v", after)
+	}
 }
 
 // TestAnswerRelaysToTheCurrentPublicPaneOnly pins the relay: an answer goes to

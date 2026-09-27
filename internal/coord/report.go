@@ -64,6 +64,8 @@ var (
 	// ErrReportChanged refuses a decision when the task changed since the
 	// primary displayed its persisted report for confirmation.
 	ErrReportChanged = errors.New("coord: the reviewed task changed after its preview")
+	// ErrAlreadyDecided preserves the user's first disposition as a durable fact.
+	ErrAlreadyDecided = errors.New("coord: the worker report already has a disposition")
 	// ErrWorkerLive refuses cleanup while the task's worker agent is running.
 	ErrWorkerLive = errors.New("coord: the worker agent is still live")
 	// ErrCheckoutDirty refuses cleanup of a checkout that still holds work.
@@ -1013,9 +1015,18 @@ func (c *Coordinator) review(ctx context.Context, primaryLaunchPaneID, taskID, d
 	if !isReviewed(st) {
 		return ReviewResult{}, fmt.Errorf("%w: task %s has no final result to decide on, so it cannot be closed", ErrNotReviewed, st.ID)
 	}
+	if st.Disposition != "" {
+		if st.Disposition == decision {
+			return c.finishReview(ctx, project.Key, st)
+		}
+		return ReviewResult{}, fmt.Errorf("%w: task %s already records %q", ErrAlreadyDecided, st.ID, st.Disposition)
+	}
 	mutate := func(next *task.Task) error {
 		if !isReviewed(*next) {
 			return fmt.Errorf("%w: the task's final result was withdrawn while the decision was being recorded", ErrNotReviewed)
+		}
+		if next.Disposition != "" {
+			return fmt.Errorf("%w: task %s already records %q", ErrAlreadyDecided, next.ID, next.Disposition)
 		}
 		next.Disposition = decision
 		return nil
@@ -1023,23 +1034,33 @@ func (c *Coordinator) review(ctx context.Context, primaryLaunchPaneID, taskID, d
 	var updated task.Task
 	if expectedRevision > 0 {
 		updated, err = c.store.UpdateTask(ctx, st.ID, expectedRevision, mutate)
-		if errors.Is(err, state.ErrConflict) {
-			return ReviewResult{}, fmt.Errorf("%w: task %s is no longer at revision %d", ErrReportChanged, st.ID, expectedRevision)
-		}
 	} else {
 		updated, err = c.record(ctx, st, mutate, "record the user's disposition")
 	}
 	if err != nil {
+		if errors.Is(err, state.ErrConflict) || errors.Is(err, ErrAlreadyDecided) {
+			current, readErr := c.store.Task(ctx, st.ID)
+			if readErr == nil && current.Disposition != "" {
+				if current.Disposition == decision {
+					return c.finishReview(ctx, project.Key, current)
+				}
+				return ReviewResult{}, fmt.Errorf("%w: task %s already records %q", ErrAlreadyDecided, st.ID, current.Disposition)
+			}
+			if errors.Is(err, state.ErrConflict) && expectedRevision > 0 {
+				return ReviewResult{}, fmt.Errorf("%w: task %s is no longer at revision %d", ErrReportChanged, st.ID, expectedRevision)
+			}
+		}
 		return ReviewResult{}, err
 	}
-	result := ReviewResult{TaskID: updated.ID, Disposition: updated.Disposition, Stage: task.StageOf(updated)}
+	return c.finishReview(ctx, project.Key, updated)
+}
 
-	// The disposition is what the tasks waiting on this one were gated on, and it is the
-	// only thing that frees this task's slot, so the queued work starts here — after the
-	// write that recorded it. The queue is otherwise only consulted when a new dispatch
-	// arrives, which for a reviewed-but-idle project may never happen.
-	if _, err := c.DrainQueued(ctx, project.Key); err != nil {
-		return result, fmt.Errorf("the disposition was recorded, but the queued tasks of %s could not be drained: %w", project.Key, err)
+// finishReview retries only the idempotent queue drain on an identical repeat
+// decision; the stored disposition and task revision are never rewritten.
+func (c *Coordinator) finishReview(ctx context.Context, projectKey string, updated task.Task) (ReviewResult, error) {
+	result := ReviewResult{TaskID: updated.ID, Disposition: updated.Disposition, Stage: task.StageOf(updated)}
+	if _, err := c.DrainQueued(ctx, projectKey); err != nil {
+		return result, fmt.Errorf("the disposition was recorded, but the queued tasks of %s could not be drained: %w", projectKey, err)
 	}
 	return result, nil
 }

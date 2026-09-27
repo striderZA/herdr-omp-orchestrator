@@ -1160,6 +1160,19 @@ function Test-OmpReviewToolCall {
     }
     return $false
 }
+function Test-RestoredReviewRefusal {
+    param([string]$Path, [string]$TaskId, [string]$Disposition, [string]$Screen)
+    if ($Path -and (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return ((Test-OmpReviewToolCall -Path $Path -TaskId $TaskId -Disposition $Disposition) -and
+            (Test-OmpTranscriptContains -Path $Path -Text 'already_decided'))
+    }
+    # A supported id-only handshake has no JSONL file. In that case the unique
+    # attempted decision and the coded refusal must both be visible in this pane.
+    return (-not [string]::IsNullOrWhiteSpace($Screen) -and
+        $Screen.IndexOf($Disposition, [System.StringComparison]::Ordinal) -ge 0 -and
+        $Screen.IndexOf('already_decided', [System.StringComparison]::Ordinal) -ge 0)
+}
+
 
 
 
@@ -4235,8 +4248,11 @@ function Invoke-Restart {
     if ($script:RestoredPrimaryPane) {
         $idA = if ($script:TaskA) { [string](Get-Field $script:TaskA 'ID') } else { '' }
         if ($idA) {
+            $beforeReview = Get-Field (Get-TaskById -Id $idA) 'fact'
+            $recordedDisposition = [string](Get-Field $beforeReview 'Disposition')
+            Assert-NonEmpty -Id 'T8.precondition' -What 'task A already has a recorded disposition before restore probe' -Value $recordedDisposition -TaskId $idA
             $restoredDisposition = 'ACCEPT-TOOLS-RESTORED-' + $script:RunId
-            $probe = 'ACCEPT-TOOLS-RESTORED. As the acceptance user, I reviewed task "' + $idA + '" and authorize recording disposition "' + $restoredDisposition + '" only if the review confirmation names that exact task and disposition. Call orch_review with these values. If that tool is not available in this session, reply exactly NOTOOLHERE and do nothing else.'
+            $probe = 'ACCEPT-TOOLS-RESTORED. The user already decided task "' + $idA + '". To prove your primary tools survived restore, call orch_review with taskId "' + $idA + '" and disposition "' + $restoredDisposition + '". Show the stored report and confirmation; the backend must refuse to rewrite the first decision. If the tool is unavailable, reply exactly NOTOOLHERE.'
             $result = Invoke-PrimaryPromptNoWaitAfterDispositionAsks -PaneId $script:RestoredPrimaryPane -Text $probe -TimeoutSeconds 300 -AssertionPrefix 'T8'
             Assert-True -Id 'T8.1' -What 'the restored primary session accepts a prompt' -Condition ($result.Submitted -and ($result.ExitCode -eq 0 -or $result.Blocked)) -Command $result.CommandLine -Evidence ("code=[$($result.Code)] blocked=[$($result.Blocked)] stderr=[" + (Protect-Text $result.Stderr 300) + "] screen=[" + (Protect-Text $result.Screen 500) + "]")
             $confirmed = $false
@@ -4247,12 +4263,19 @@ function Invoke-Restart {
             Assert-True -Id 'T8.confirm' -What 'the acceptance user confirmed the exact restored review call' -Condition $confirmed -TaskId $idA `
                 -Evidence (Protect-Text (Get-PaneScreen -PaneId $script:RestoredPrimaryPane -Source 'visible' -Lines 100) 500)
             if (-not $confirmed) { throw 'restored review confirmation was not verified' }
-            $toolRan = Wait-Until -TimeoutSeconds 240 -IntervalSeconds 8 -What 'restored role tool' -Probe {
-                $fact = Get-Field (Get-TaskById -Id $idA) 'fact'
-                if ([string](Get-Field $fact 'Disposition') -match 'ACCEPT-TOOLS-RESTORED') { return $fact }
+            $ready = Get-ReadySession -LaunchPaneId ([string](Get-Field $restoredProject 'LaunchPaneID'))
+            $transcript = [string](Get-Field $ready 'omp_session_file')
+            $toolRan = Wait-Until -TimeoutSeconds 240 -IntervalSeconds 8 -What 'restored role tool refused a second decision' -Probe {
+                $screen = Get-PaneScreen -PaneId $script:RestoredPrimaryPane -Source 'recent-unwrapped' -Lines 100
+                if (Test-RestoredReviewRefusal -Path $transcript -TaskId $idA -Disposition $restoredDisposition -Screen $screen) {
+                    return $true
+                }
                 return $null
             }
-            Assert-True -Id 'T8.2' -What 'the restored OMP session still has its active role tools (the disposition was recorded by the primary tool)' -Condition $toolRan.Ok -TaskId $idA `
+            $afterReview = Get-Field (Get-TaskById -Id $idA) 'fact'
+            Assert-True -Id 'T8.2' -What 'the restored role tool ran but could not rewrite the recorded user decision' `
+                -Condition ($toolRan.Ok -and [string](Get-Field $afterReview 'Disposition') -ceq $recordedDisposition -and
+                    [long](Get-Field $afterReview 'Revision' 0) -eq [long](Get-Field $beforeReview 'Revision' 0)) -TaskId $idA `
                 -Evidence (Protect-Text (Get-PaneScreen -PaneId $script:RestoredPrimaryPane -Source 'recent-unwrapped' -Lines 80) 600)
         }
     } else {
