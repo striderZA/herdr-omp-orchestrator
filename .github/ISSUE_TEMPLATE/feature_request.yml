@@ -1,0 +1,58 @@
+name: Feature request
+description: Propose a user-facing capability or workflow improvement.
+title: "feat: "
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the user problem and the outcome you want. For coding agents, distinguish requirements from implementation ideas and call out unresolved assumptions.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: Who is affected, and what is difficult or impossible today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Desired behavior
+      description: Describe the workflow or observable outcome. Avoid prescribing implementation unless a constraint matters.
+    validations:
+      required: true
+  - type: textarea
+    id: criteria
+    attributes:
+      label: Acceptance criteria
+      description: List concrete outcomes that would make this request complete. Mark unknowns explicitly.
+      placeholder: |
+        - [ ] ...
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Likely area
+      options:
+        - Bridge / OMP extension
+        - Task lifecycle / coordinator
+        - Herdr CLI integration
+        - Persistence / SQLite
+        - Startup / events
+        - Task board
+        - Setup / installation
+        - Developer tooling / tests
+        - Other / unknown
+    validations:
+      required: true
+  - type: textarea
+    id: constraints
+    attributes:
+      label: Constraints, risks, or alternatives
+      description: Note compatibility, safety, identity, confirmation, or workflow constraints. Separate known requirements from suggestions.
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Examples, related issues, or evidence that helps evaluate the request.

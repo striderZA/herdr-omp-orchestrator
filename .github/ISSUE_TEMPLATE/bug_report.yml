@@ -1,0 +1,67 @@
+name: Bug report
+description: Report a reproducible defect in Herdr OMP Orchestrator.
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Help us reproduce and diagnose the problem. Separate observed facts from assumptions, and redact secrets or personal data from logs.
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: State the impact and the behavior you observed.
+      placeholder: When I ..., the orchestrator ...
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps or scenario
+      description: Include the relevant action sequence, task state, and pane/session context. Include exact commands when applicable.
+      placeholder: |
+        1. Start with ...
+        2. Run ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What should happen instead?
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence and diagnostics
+      description: Paste relevant error output, logs, or screenshots. Redact secrets and identify which details are assumptions.
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: Version and environment
+      description: Orchestrator revision/version, Herdr and OMP versions, and Windows version if known.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      options:
+        - Bridge / OMP extension
+        - Task lifecycle / coordinator
+        - Herdr CLI integration
+        - Persistence / SQLite
+        - Startup / events
+        - Task board
+        - Setup / installation
+        - Acceptance tests
+        - Other / unknown
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Fix acceptance criteria
+      description: If known, list observable outcomes that would demonstrate the bug is fixed. It is okay to leave this blank.
