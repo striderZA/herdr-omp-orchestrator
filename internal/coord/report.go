@@ -1581,7 +1581,54 @@ func (c *Coordinator) visibleDialog(ctx context.Context, paneID string) (string,
 		return "", fmt.Errorf("%w: the visible dialog on pane %q is %d bytes, larger than the %d byte bound a user can be shown and approve",
 			ErrDialogChanged, paneID, len(dialog), dialogPreviewLimit)
 	}
+	if panel, ok := extractDialogPanel(dialog); ok {
+		return panel, nil
+	}
 	return dialog, nil
+}
+
+// extractDialogPanel returns the last closed, boxed dialog in the visible screen.
+// OMP's live status/footer and earlier output change while a dialog is awaiting
+// input; hashing them would invalidate the user's preview even when the active
+// question and choices are unchanged. Unboxed dialogs retain the verbatim read.
+func extractDialogPanel(screen string) (string, bool) {
+	lines := strings.Split(strings.ReplaceAll(screen, "\r\n", "\n"), "\n")
+	start := -1
+	for i, line := range lines {
+		if strings.HasPrefix(stripDialogFrame(line), "╭") || strings.HasPrefix(stripDialogFrame(line), "┌") {
+			start = i
+		}
+	}
+	if start < 0 {
+		return "", false
+	}
+	end := -1
+	for i := start + 1; i < len(lines); i++ {
+		line := stripDialogFrame(lines[i])
+		if strings.HasPrefix(line, "╰") || strings.HasPrefix(line, "└") {
+			end = i
+			break
+		}
+	}
+	if end < 0 {
+		return "", false
+	}
+	panel := make([]string, end-start+1)
+	for i := start; i <= end; i++ {
+		panel[i-start] = strings.TrimRight(stripDialogFrame(lines[i]), " \t\r")
+	}
+	return strings.Join(panel, "\n"), true
+}
+
+func stripDialogFrame(line string) string {
+	line = strings.TrimSpace(line)
+	for strings.HasPrefix(line, "│") || strings.HasPrefix(line, "³") {
+		line = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(line, "│"), "³"))
+	}
+	for strings.HasSuffix(line, "│") || strings.HasSuffix(line, "³") {
+		line = strings.TrimSpace(strings.TrimSuffix(strings.TrimSuffix(line, "│"), "³"))
+	}
+	return line
 }
 
 // digestDialog is the stable identity of one rendered dialog.

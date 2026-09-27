@@ -154,9 +154,8 @@ func TestEventRouteChecksThePayloadBoundBeforeTrimming(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestOpenBoardRouteOpensTheDeclaredPane pins the action route: it resolves the
-// bound project from the workspace Herdr injected and opens exactly the pane
-// herdr-plugin.toml declares, through the Herdr binary the action was started
-// with.
+// bound project from Herdr's injected workspace and opens the declared overlay
+// in the active pane rather than passing the workspace as a pane target.
 func TestOpenBoardRouteOpensTheDeclaredPane(t *testing.T) {
 	calls := filepath.Join(t.TempDir(), "calls.jsonl")
 	exe, err := os.Executable()
@@ -190,7 +189,7 @@ func TestOpenBoardRouteOpensTheDeclaredPane(t *testing.T) {
 	if len(recorded) != 1 {
 		t.Fatalf("Herdr calls = %v, want exactly one", recorded)
 	}
-	want := []string{"plugin", "pane", "open", "--plugin", "user.omp-orchestrator", "--entrypoint", "board", "--workspace", "w1"}
+	want := []string{"plugin", "pane", "open", "--plugin", "user.omp-orchestrator", "--entrypoint", "board"}
 	if strings.Join(recorded[0], "\x00") != strings.Join(want, "\x00") {
 		t.Errorf("argv = %q, want %q", recorded[0], want)
 	}

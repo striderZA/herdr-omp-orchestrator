@@ -300,8 +300,10 @@ func runOpenBoard(env map[string]string, stdout, stderr io.Writer) int {
 
 	ctx, cancel := context.WithTimeout(context.Background(), openBoardTimeout)
 	defer cancel()
+	// The manifest declares this pane as an overlay, which Herdr anchors to the
+	// active pane. A --workspace argument is only valid for workspace placements.
 	opened, err := client.Call(ctx, "plugin", "pane", "open",
-		"--plugin", pluginID, "--entrypoint", boardEntrypoint, "--workspace", workspace)
+		"--plugin", pluginID, "--entrypoint", boardEntrypoint)
 	if err != nil {
 		return emit(stdout, stderr, failureBody(coordCode(err), err.Error()))
 	}

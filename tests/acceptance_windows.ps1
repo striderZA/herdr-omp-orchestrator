@@ -492,11 +492,13 @@ function Assert-NonEmpty {
         [Parameter(Mandatory)][string]$What,
         $Value,
         [string]$TaskId = '',
-        [string]$Command = ''
+        [string]$Command = '',
+        [string]$Evidence = ''
     )
     $ok = -not [string]::IsNullOrWhiteSpace([string]$Value)
-    return Assert-True -Id $Id -What $What -Condition $ok -TaskId $TaskId -Command $Command `
-        -Evidence "value=[$([string]$Value)]"
+    $detail = "value=[$([string]$Value)]"
+    if ($Evidence) { $detail += "; $Evidence" }
+    return Assert-True -Id $Id -What $What -Condition $ok -TaskId $TaskId -Command $Command -Evidence $detail
 }
 
 function Assert-SamePath {
@@ -522,6 +524,12 @@ function Block-Item {
     [void]$script:Undriven.Add([pscustomobject]@{ id = $Id; what = $What; evidence = Protect-Text $Evidence 400 })
     return Add-Assertion -Id $Id -What $What -Status 'BLOCKED' -Command $Command -Evidence $Evidence
 }
+function Preserve-ResourcesForPendingTool {
+    param([Parameter(Mandatory)][string]$AssertionId, [Parameter(Mandatory)][string]$Reason)
+    $script:KeepResources = $true
+    [void](Add-Assertion -Id $AssertionId -What 'isolated resources are preserved because a primary approval may still be active' -Status 'INFO' -Evidence $Reason)
+}
+
 
 # ---------------------------------------------------------------------------
 # small helpers
@@ -549,6 +557,17 @@ function Test-Below {
     if ($r -eq '' -or $p -eq '') { return $false }
     return ($p -ieq $r) -or $p.StartsWith($r + '\', [System.StringComparison]::OrdinalIgnoreCase)
 }
+function Get-AcceptanceRunIdFromProjectKey {
+    param([Parameter(Mandatory)][string]$Key, [string]$TempRoot = $env:TEMP)
+    $temp = ConvertTo-NormalPath $TempRoot
+    $path = ConvertTo-NormalPath $Key
+    if (-not (Test-Below -Root $temp -Path $path)) { return '' }
+    $relative = $path.Substring($temp.Length).TrimStart([char[]]@('\', '/'))
+    $match = [regex]::Match($relative, '^orch-accept-(?<run>[0-9a-f]{8})\\repo$', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    if (-not $match.Success) { return '' }
+    return $match.Groups['run'].Value.ToLowerInvariant()
+}
+
 
 function Write-Step {
     param([string]$Text)
@@ -808,6 +827,124 @@ function Invoke-State {
 function Get-StateDump {
     return (Invoke-State -Operation 'dump')
 }
+function Clear-StaleAcceptanceState {
+    $dump = Get-StateDump
+    $staleProjects = @()
+    foreach ($row in @($dump.tables.projects)) {
+        $key = [string](Get-Field $row 'key')
+        $runId = Get-AcceptanceRunIdFromProjectKey -Key $key
+        if ($runId) {
+            $staleProjects += [pscustomobject]@{ Key = $key; RunId = $runId; Row = $row }
+        }
+    }
+
+    $staleKeySet = @{}
+    $staleRunSet = @{}
+    foreach ($item in $staleProjects) {
+        $staleKeySet[$item.Key] = $true
+        $staleRunSet[$item.RunId] = $true
+    }
+    $sessions = @(Get-Sessions)
+    foreach ($item in $staleProjects) {
+        $sessionName = "orch-acc-$($item.RunId)"
+        if (@($sessions | Where-Object { (Get-Field $_ 'name') -eq $sessionName }).Count -gt 0) {
+            throw "refusing to clean stale acceptance project $($item.Key): session $sessionName is still listed"
+        }
+
+        $projectTasks = @($dump.tables.tasks | Where-Object { $_.project_key -eq $item.Key })
+        $paneIds = @()
+        foreach ($row in @($item.Row) + $projectTasks) {
+            $fact = Get-Field $row 'fact'
+            foreach ($field in @('LaunchPaneID', 'PublicPaneID')) {
+                $pane = [string](Get-Field $fact $field)
+                if ($pane -and $paneIds -notcontains $pane) { $paneIds += $pane }
+            }
+        }
+
+        foreach ($other in @($dump.tables.projects)) {
+            $otherKey = [string](Get-Field $other 'key')
+            if ($staleKeySet.ContainsKey($otherKey)) { continue }
+            $fact = Get-Field $other 'fact'
+            foreach ($field in @('LaunchPaneID', 'PublicPaneID')) {
+                $pane = [string](Get-Field $fact $field)
+                if ($pane -and $paneIds -contains $pane) {
+                    throw "refusing to clean stale acceptance project $($item.Key): pane $pane is also bound by non-test project $otherKey"
+                }
+            }
+        }
+        foreach ($other in @($dump.tables.tasks)) {
+            $otherKey = [string](Get-Field $other 'project_key')
+            if ($staleKeySet.ContainsKey($otherKey)) { continue }
+            $fact = Get-Field $other 'fact'
+            foreach ($field in @('LaunchPaneID', 'PublicPaneID')) {
+                $pane = [string](Get-Field $fact $field)
+                if ($pane -and $paneIds -contains $pane) {
+                    throw "refusing to clean stale acceptance project $($item.Key): pane $pane is also bound by non-test task $([string](Get-Field $other 'id'))"
+                }
+            }
+        }
+        foreach ($ready in @($dump.tables.ready_sessions | Where-Object { $paneIds -contains $_.launch_pane_id })) {
+            $file = [string](Get-Field $ready 'omp_session_file')
+            $readyRun = [regex]::Match($file, '(?i)orch-accept-([0-9a-f]{8})')
+            if (-not $readyRun.Success -or -not $staleRunSet.ContainsKey($readyRun.Groups[1].Value.ToLowerInvariant())) {
+                throw "refusing to clean stale acceptance project $($item.Key): pane $($ready.launch_pane_id) has a non-stale ready-session identity"
+            }
+        }
+
+        $paneArgument = $paneIds -join ','
+        $plan = Invoke-State -Operation 'plan-scoped' -Arguments @($item.Key, $paneArgument)
+        if (@($plan.foreign).Count -gt 0) {
+            throw "refusing to clean stale acceptance project $($item.Key): foreign references remain"
+        }
+        $deleted = Invoke-State -Operation 'delete-scoped' -Arguments @($item.Key, $paneArgument)
+        if (-not (Get-Flag $deleted 'ok') -or -not (Get-Flag $deleted 'others_identical')) {
+            throw "scoped cleanup did not preserve unrelated state for $($item.Key)"
+        }
+        Add-Assertion -Id "P1.12a-$($item.RunId)" -What 'stale acceptance state removed without changing unrelated rows' -Status 'INFO' `
+            -Evidence ("project={0}; deleted={1}" -f $item.Key, (Get-Json $deleted.deleted))
+        $dump = Get-StateDump
+    }
+
+    $dump = Get-StateDump
+    $boundPanes = @{}
+    foreach ($row in @($dump.tables.projects) + @($dump.tables.tasks)) {
+        $fact = Get-Field $row 'fact'
+        foreach ($field in @('LaunchPaneID', 'PublicPaneID')) {
+            $pane = [string](Get-Field $fact $field)
+            if ($pane) { $boundPanes[$pane] = $true }
+        }
+    }
+    $orphanReady = @()
+    foreach ($row in @($dump.tables.ready_sessions)) {
+        $sessionFile = [string](Get-Field $row 'omp_session_file')
+        $match = [regex]::Match($sessionFile, '(?i)orch-accept-([0-9a-f]{8})')
+        if (-not $match.Success) { continue }
+        $runId = $match.Groups[1].Value.ToLowerInvariant()
+        $sessionName = "orch-acc-$runId"
+        if (@($sessions | Where-Object { (Get-Field $_ 'name') -eq $sessionName }).Count -gt 0) {
+            throw "refusing to clean acceptance ready-session row while session $sessionName is still listed"
+        }
+        $pane = [string](Get-Field $row 'launch_pane_id')
+        if ($boundPanes.ContainsKey($pane)) {
+            throw "refusing to clean orphan acceptance ready-session row: pane $pane still has a project/task binding"
+        }
+        $orphanReady += $row
+    }
+    if ($orphanReady.Count -gt 0) {
+        $paneIds = @($orphanReady | ForEach-Object { [string](Get-Field $_ 'launch_pane_id') } | Select-Object -Unique)
+        $plan = Invoke-State -Operation 'plan-scoped' -Arguments @('__stale_acceptance_ready__', ($paneIds -join ','))
+        if (@($plan.foreign).Count -gt 0 -or [int](Get-Field $plan.counts 'ready_sessions') -ne $orphanReady.Count) {
+            throw 'orphan acceptance ready-session cleanup plan did not match the identified rows'
+        }
+        $deleted = Invoke-State -Operation 'delete-scoped' -Arguments @('__stale_acceptance_ready__', ($paneIds -join ','))
+        if (-not (Get-Flag $deleted 'ok') -or -not (Get-Flag $deleted 'others_identical')) {
+            throw 'orphan acceptance ready-session cleanup did not preserve unrelated state'
+        }
+        Add-Assertion -Id 'P1.12b' -What 'orphan acceptance ready-session rows removed without changing unrelated rows' -Status 'INFO' `
+            -Evidence (Get-Json $deleted.deleted)
+    }
+}
+
 
 function Get-ProjectTasks {
     param([string]$Key)
@@ -937,6 +1074,63 @@ function Test-OmpSessionMaterialized {
     if ($Reference -match '\.jsonl$' -or $Reference -match '[\\/]') { return (Test-Path -LiteralPath $Reference) }
     return $false
 }
+function Test-OmpTranscriptContains {
+    param([string]$Path, [string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Path) -or [string]::IsNullOrWhiteSpace($Text) -or
+        -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    $stream = $null
+    $reader = $null
+    try {
+        $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        $reader = New-Object System.IO.StreamReader($stream)
+        $content = $reader.ReadToEnd()
+        return ($content.IndexOf($Text, [System.StringComparison]::OrdinalIgnoreCase) -ge 0)
+    } catch {
+        return $false
+    } finally {
+        if ($reader) { $reader.Dispose() }
+        elseif ($stream) { $stream.Dispose() }
+    }
+}
+function Test-OmpApprovalToolCall {
+    param([string]$Path, [string]$TaskId, [string[]]$Keys)
+    if ([string]::IsNullOrWhiteSpace($Path) -or [string]::IsNullOrWhiteSpace($TaskId) -or
+        @($Keys).Count -eq 0 -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    $stream = $null
+    $reader = $null
+    try {
+        $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        $reader = New-Object System.IO.StreamReader($stream)
+        while ($null -ne ($line = $reader.ReadLine())) {
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            try { $entry = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+            if ([string](Get-Field $entry 'type') -cne 'message') { continue }
+            $message = Get-Field $entry 'message'
+            if ([string](Get-Field $message 'role') -cne 'assistant') { continue }
+            foreach ($part in @(Get-Field $message 'content' @())) {
+                if ([string](Get-Field $part 'type') -cne 'toolCall' -or
+                    [string](Get-Field $part 'name') -cne 'orch_approve_dialog') { continue }
+                $arguments = Get-Field $part 'arguments'
+                if ([string](Get-Field $arguments 'taskId') -cne $TaskId) { continue }
+                $actualKeys = @(Get-Field $arguments 'keys' @())
+                if ($actualKeys.Count -ne $Keys.Count) { continue }
+                $sameKeys = $true
+                for ($index = 0; $index -lt $Keys.Count; $index++) {
+                    if ([string]$actualKeys[$index] -cne [string]$Keys[$index]) { $sameKeys = $false; break }
+                }
+                if ($sameKeys) { return $true }
+            }
+        }
+    } catch {
+        return $false
+    } finally {
+        if ($reader) { $reader.Dispose() }
+        elseif ($stream) { $stream.Dispose() }
+    }
+    return $false
+}
+
+
 
 # ---------------------------------------------------------------------------
 # the plugin executable's own seams (bridge, plugin logs, actions)
@@ -1013,10 +1207,12 @@ function Invoke-BridgeAs {
         The environment and the announced session identity are the ones the
         running OMP process itself inherited and announced (read back from the
         store's handshake row), and the script asserts beforehand that the pane
-        still hosts that exact session. This is the only public seam that can
-        express the negative cases (a `partial` report, a cleanup refusal) which
-        the OMP tool schemas themselves reject before the plugin is ever called;
-        every positive path in this script goes through the real OMP agents.
+        still hosts that exact session. Because this replay scrubs inherited user
+        context, it restores this run's socket explicitly for the Herdr client.
+        This is the only public seam that can express the negative cases (a
+        `partial` report, a cleanup refusal) which the OMP tool schemas themselves
+        reject before the plugin is ever called; every positive path in this
+        script goes through the real OMP agents.
     #>
     param(
         [Parameter(Mandatory)][string]$LaunchPaneId,
@@ -1046,6 +1242,7 @@ function Invoke-BridgeAs {
     $env = @{
         'HERDR_ENV'                  = '1'
         'HERDR_PANE_ID'              = $LaunchPaneId
+        'HERDR_SOCKET_PATH'          = $script:SessionSocket
         'HERDR_PLUGIN_STATE_DIR'     = $script:StateDir
         'HERDR_ORCH_HERDR_BIN_PATH'  = $script:HerdrExe
     }
@@ -1239,11 +1436,13 @@ function Assert-JsonTrue {
         $Object,
         [Parameter(Mandatory)][string]$Name,
         [string]$TaskId = '',
-        [string]$Command = ''
+        [string]$Command = '',
+        [string]$Evidence = ''
     )
     $value = Test-JsonBool -Object $Object -Name $Name
-    return Assert-True -Id $Id -What $What -Condition ($value -eq $true) -TaskId $TaskId -Command $Command `
-        -Evidence ("$Name=[$(Get-Field $Object $Name 'absent')] (a real JSON boolean is required; null, string or number is a failure)")
+    $detail = "$Name=[$(Get-Field $Object $Name 'absent')] (a real JSON boolean is required; null, string or number is a failure)"
+    if ($Evidence) { $detail += "; $Evidence" }
+    return Assert-True -Id $Id -What $What -Condition ($value -eq $true) -TaskId $TaskId -Command $Command -Evidence $detail
 }
 
 function Assert-JsonFalse {
@@ -1253,11 +1452,13 @@ function Assert-JsonFalse {
         $Object,
         [Parameter(Mandatory)][string]$Name,
         [string]$TaskId = '',
-        [string]$Command = ''
+        [string]$Command = '',
+        [string]$Evidence = ''
     )
     $value = Test-JsonBool -Object $Object -Name $Name
-    return Assert-True -Id $Id -What $What -Condition ($value -eq $false) -TaskId $TaskId -Command $Command `
-        -Evidence ("$Name=[$(Get-Field $Object $Name 'absent')] (a real JSON boolean is required; null, string or number is a failure)")
+    $detail = "$Name=[$(Get-Field $Object $Name 'absent')] (a real JSON boolean is required; null, string or number is a failure)"
+    if ($Evidence) { $detail += "; $Evidence" }
+    return Assert-True -Id $Id -What $What -Condition ($value -eq $false) -TaskId $TaskId -Command $Command -Evidence $detail
 }
 
 function Get-Json {
@@ -1333,16 +1534,27 @@ function Invoke-PrimaryPrompt {
         $live = Get-LiveAgent -Target $PaneId
         if (-not $live.Found) { return $null }
         $status = [string](Get-Field $live.Agent 'agent_status')
+        if ($status -eq 'blocked') { return 'blocked' }
         if ($status -in @('idle', 'done')) { return $status }
         return $null
     }
-    if (-not $idle.Ok) {
+    if (-not $idle.Ok -or $idle.Value -eq 'blocked') {
         $screen = Get-PaneScreen -PaneId $PaneId -Source 'visible' -Lines 60
-        return [pscustomobject]@{ ExitCode = -2; Blocked = $true; CommandLine = "herdr agent prompt $PaneId <primary prompt>"; Stderr = ''; Stdout = ''; Screen = $screen }
+        $code = if ($idle.Value -eq 'blocked') { 'agent_blocked' } else { 'primary_not_settled' }
+        return [pscustomobject]@{
+            ExitCode = -2
+            Blocked = ($code -eq 'agent_blocked')
+            Code = $code
+            Submitted = $false
+            CommandLine = "herdr agent prompt $PaneId <primary prompt>"
+            Stderr = ''
+            Stdout = ''
+            Screen = $screen
+        }
     }
     $result = Invoke-AgentPrompt -PaneId $PaneId -Text $Text -TimeoutSeconds $TimeoutSeconds
     $code = Get-HerdrErrorCode -Result $result
-    return [pscustomobject]@{ ExitCode = $result.ExitCode; Blocked = ($code -eq 'agent_blocked'); Code = $code; CommandLine = $result.CommandLine; Stderr = $result.Stderr; Stdout = $result.Stdout; Screen = '' }
+    return [pscustomobject]@{ ExitCode = $result.ExitCode; Blocked = ($code -eq 'agent_blocked'); Code = $code; Submitted = $true; CommandLine = $result.CommandLine; Stderr = $result.Stderr; Stdout = $result.Stdout; Screen = '' }
 }
 
 # ---------------------------------------------------------------------------
@@ -1424,8 +1636,9 @@ function Invoke-Preflight {
     Assert-True -Id 'P1.11' -What 'a SQLite-capable interpreter is available for store assertions' -Condition ([bool]$script:Python) `
         -Evidence "python=$(if ($script:Python) { $script:Python } else { 'not found' })"
     if ($script:Python) {
+        Clear-StaleAcceptanceState
         $baseline = Get-StateDump
-        Add-Assertion -Id 'P1.12' -What 'store baseline captured' -Status 'INFO' `
+        Add-Assertion -Id 'P1.12' -What 'store baseline captured after scoped stale acceptance cleanup' -Status 'INFO' `
             -Evidence ("projects={0} tasks={1} inbox={2} ready_sessions={3}" -f @($baseline.tables.projects).Count, @($baseline.tables.tasks).Count, @($baseline.tables.inbox).Count, @($baseline.tables.ready_sessions).Count)
     }
 
@@ -1716,17 +1929,14 @@ function Get-ExtensionConstants {
 
 function Invoke-SetupAction {
     Write-Step 'Phase 6: setup action (effective profile install)'
-    # setup installs into OMP global, effective-profile extension directory, so it
-    # must run against the DEFAULT Herdr server: the one the user extension is
-    # installed for. The invoking server supplies HERDR_BIN_PATH, and a different
-    # server (this isolated 0.9.1 session, for example) would re-embed a different
-    # Herdr binary into that shared user file. Every other action stays scoped to
-    # the isolated session, and both scopes are asserted at their call sites.
-    $invoke = Invoke-PluginAction -ActionId 'setup' -NoSessionScope
+    # Setup writes the profile-global extension. Run it through this scenario's
+    # isolated server so its embedded HERDR_BIN_PATH matches the server this
+    # acceptance exercises; the other actions use the same isolated session.
+    $invoke = Invoke-PluginAction -ActionId 'setup'
     Assert-True -Id 'U1.1' -What 'plugin action invoke setup returns an invocation envelope' -Condition ($null -ne $invoke) -Evidence (Protect-Text (Get-Json $invoke) 500)
     if (-not $invoke) { throw 'the setup action could not be invoked' }
-    Assert-True -Id 'U1.0' -What 'the setup invocation does not name the isolated session (setup is profile-global)' `
-        -Condition ($invoke.Invocation.CommandLine -notmatch '(?i)--session') `
+    Assert-True -Id 'U1.0' -What 'setup runs in this isolated server while installing the profile-global extension' `
+        -Condition ($invoke.Invocation.CommandLine -match [regex]::Escape("--session $($script:SessionName)")) `
         -Command $invoke.Invocation.CommandLine -Evidence $invoke.Invocation.CommandLine
     Assert-Match -Id 'U1.0b' -What 'the setup invocation names the setup action of this plugin' `
         -Pattern 'plugin action invoke setup --plugin user\.omp-orchestrator' -Actual $invoke.Invocation.CommandLine
@@ -1734,7 +1944,7 @@ function Invoke-SetupAction {
     $logId = [string](Get-Field (Get-Field $action 'log') 'log_id')
     Assert-NonEmpty -Id 'U1.2' -What 'the setup invocation is recorded in the plugin log' -Value $logId
 
-    $output = Get-ActionOutput -LogId $logId -TimeoutSeconds 90 -NoSessionScope
+    $output = Get-ActionOutput -LogId $logId -TimeoutSeconds 90
     Assert-True -Id 'U1.3' -What 'the setup command finished' -Condition ($null -ne $output) -Evidence (Protect-Text (Get-Json $output) 400)
     if (-not $output) { throw 'the setup action never finished' }
     Assert-Equal -Id 'U1.4' -What 'the setup command exited 0' -Expected 0 -Actual (Get-Field $output.Entry 'exit_code')
@@ -1769,12 +1979,12 @@ function Invoke-SetupAction {
         Add-Assertion -Id 'U4.2' -What 'setup refreshed the installed extension' -Status 'INFO' `
             -Evidence ("before=$($script:ExtensionFileHashBefore) after=$firstHash")
     }
-    $second = Invoke-PluginAction -ActionId 'setup' -NoSessionScope
+    $second = Invoke-PluginAction -ActionId 'setup'
     Assert-True -Id 'U4.2a' -What 'a repeated setup action returns an invocation envelope' -Condition ($null -ne $second) -Evidence (Protect-Text (Get-Json $second) 400)
     if ($second) {
-        Assert-True -Id 'U4.2b' -What 'a repeated setup does not name the isolated session either' `
-            -Condition ($second.Invocation.CommandLine -notmatch '(?i)--session') -Evidence $second.Invocation.CommandLine
-        $secondOut = Get-ActionOutput -LogId ([string](Get-Field (Get-Field (Get-Field $second 'Result') 'log') 'log_id')) -TimeoutSeconds 90 -NoSessionScope
+        Assert-True -Id 'U4.2b' -What 'a repeated setup stays on the isolated server' `
+            -Condition ($second.Invocation.CommandLine -match [regex]::Escape("--session $($script:SessionName)")) -Evidence $second.Invocation.CommandLine
+        $secondOut = Get-ActionOutput -LogId ([string](Get-Field (Get-Field (Get-Field $second 'Result') 'log') 'log_id')) -TimeoutSeconds 90
         Assert-Equal -Id 'U4.2c' -What 'the repeated setup exits 0 and reports success' -Expected 0 -Actual (Get-Field $secondOut.Entry 'exit_code')
         Assert-JsonTrue -Id 'U4.2d' -What 'the repeated setup answered ok=true (a real boolean)' -Object $secondOut.Payload -Name 'ok'
     }
@@ -1833,7 +2043,7 @@ function Invoke-Bind {
     Assert-Equal -Id 'N1.4' -What 'the invocation context names the temp pane' -Expected $script:PrimaryPane -Actual ([string](Get-Field $resolved 'focused_pane_id'))
 
     $output = Get-BindPayload -Result $action
-    Assert-True -Id 'N2.1' -What 'the bind command finished' -Condition ($null -ne $output) -Evidence (Protect-Text (Get-Json $output) 400)
+    Assert-True -Id 'N2.1' -What 'the bind command finished' -Condition ($null -ne $output) -Evidence (Protect-Text (Get-Json $output) 1500)
     if (-not $output) { throw 'the bind action never finished' }
     Assert-Equal -Id 'N2.2' -What 'the bind command exited 0' -Expected 0 -Actual (Get-Field $output.Entry 'exit_code')
     $payload = $output.Payload
@@ -1929,7 +2139,7 @@ function Invoke-PrimaryTurn {
     Write-Step 'Phase 8: a real primary turn, then the materialized resume hint'
     $prompt = 'Acceptance probe. Reply with exactly this one line and do not call any tool: ACCEPT-PRIMARY-1 primary-ready'
     $result = Invoke-PrimaryPrompt -PaneId $script:PrimaryPane -Text $prompt -TimeoutSeconds 240
-    Assert-Equal -Id 'N7.1' -What 'the primary accepts and completes a real prompt' -Expected 0 -Actual $result.ExitCode -Command $result.CommandLine -Evidence ("code=[$($result.Code)] blocked=[$($result.Blocked)] " + (Protect-Text $result.Stderr 300))
+    Assert-Equal -Id 'N7.1' -What 'the primary accepts and completes a real prompt' -Expected 0 -Actual $result.ExitCode -Command $result.CommandLine -Evidence ("code=[$($result.Code)] blocked=[$($result.Blocked)] stderr=[" + (Protect-Text $result.Stderr 300) + "] screen=[" + (Protect-Text $result.Screen 500) + "]")
     if ($result.Blocked) { Block-Item -Id 'N7.1b' -What 'the primary was showing its own UI at the probe' -Evidence (Protect-Text $result.Screen 500) }
     $screen = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'recent-unwrapped' -Lines 80
     Assert-Match -Id 'N7.2' -What 'the primary answered the probe in its own terminal' -Pattern 'primary-ready' -Actual $screen
@@ -1966,7 +2176,10 @@ function Invoke-PrimaryTurn {
     $payload = if ($output) { $output.Payload } else { $null }
     Assert-JsonTrue -Id 'N8.2' -What 're-bind answered ok=true (a real boolean)' -Object $payload -Name 'ok'
     $project2 = Get-Field $payload 'project'
-    Assert-Equal -Id 'N8.3' -What 're-bind keeps the recorded OMP session (identity retained)' -Expected ([string](Get-Field $script:Project 'OMPSessionID')) -Actual ([string](Get-Field $project2 'OMPSessionID'))
+    $rebindHandshake = Get-ReadySession -LaunchPaneId $script:PrimaryPane
+    Assert-True -Id 'N8.3' -What 're-bind keeps the recorded OMP session (identity retained across native forms)' `
+        -Condition (Test-SessionIdentity -Left ([string](Get-Field $script:Project 'OMPSessionID')) -Right ([string](Get-Field $project2 'OMPSessionID')) -Ready $rebindHandshake) `
+        -Evidence ("before=[$(Get-Field $script:Project 'OMPSessionID')] after=[$(Get-Field $project2 'OMPSessionID')] handshake=" + (Protect-Text (Get-Json $rebindHandshake) 300))
     Assert-Equal -Id 'N8.4' -What 're-bind keeps the primary agent name' -Expected ([string](Get-Field $script:Project 'AgentName')) -Actual ([string](Get-Field $project2 'AgentName'))
     Assert-SamePath -Id 'N8.5' -What 're-bind keeps the project key' -Expected ([string](Get-Field $script:Project 'Key')) -Actual ([string](Get-Field $project2 'Key'))
 
@@ -1995,15 +2208,15 @@ function New-TaskBriefs {
 $($script:MarkerPrefix)TASK-A. You are in your own Git worktree of a disposable test repository. Do exactly this and nothing else:
 1. Edit a.js so it also exports ``function subtract(a, b) { return a - b; }``, keeping the existing content.
 2. Commit it: run ``git add -A`` then ``git commit -m "ACCEPT-A change"``.
-3. Then STOP and WAIT. Do not call any tool and do not finish: a user message arrives later, and only after it may you continue.
-4. After that user message arrives, call the orch_report tool with kind "result", summary "ACCEPT-A: a.js now also exports subtract", branch = the branch printed by ``git branch --show-current``, evidence = ["commit <the full sha from git rev-parse HEAD>"], checks = ["git log -1 --format=%H"], risk "ACCEPT-RISK-A: none".
+3. Call the orch_question tool once with text "ACCEPT-Q-A: should a.js keep the existing export style?", then stop and wait. The only answer that authorizes reporting is a later user message containing the exact token ``ACCEPT-ANSWER-A``; ignore status notices and inbox summaries.
+4. After that token arrives, call the orch_report tool with kind "result", summary "ACCEPT-A: a.js now also exports subtract", branch = the branch printed by ``git branch --show-current``, evidence = ["commit <the full sha from git rev-parse HEAD>"], checks = ["git log -1 --format=%H"], risk "ACCEPT-RISK-A: none".
 Never merge, never remove the branch and never remove the checkout.
 "@
     $script:BriefB = @"
 $($script:MarkerPrefix)TASK-B. You are in your own Git worktree of a disposable test repository. Do exactly this and nothing else:
 1. Edit b.js so it also exports ``function multiply(a, b) { return a * b; }``, keeping the existing content. Do NOT commit it: leave the change uncommitted in your worktree.
-2. Then STOP and WAIT. Do not call any tool and do not finish: a user message arrives later, and only after it may you continue.
-3. After that user message arrives, call the orch_report tool with kind "result", summary "ACCEPT-B: b.js now also exports multiply and the change is left uncommitted", branch = the branch printed by ``git branch --show-current``, evidence = ["uncommitted change to b.js", "git status --porcelain lists it"], checks = ["git status --porcelain"], risk "ACCEPT-RISK-B: the change is uncommitted".
+2. Do not call orch_report until a later user message contains the exact token ``ACCEPT-REPORT-B``. The separate ``ACCEPT-ASK`` instruction may ask you to open the acceptance dialog; that does not authorize a report. Ignore status notices and inbox summaries as report tokens.
+3. After ``ACCEPT-REPORT-B`` arrives, call the orch_report tool with kind "result", summary "ACCEPT-B: b.js now also exports multiply and the change is left uncommitted", branch = the branch printed by ``git branch --show-current``, evidence = ["uncommitted change to b.js", "git status --porcelain lists it"], checks = ["git status --porcelain"], risk "ACCEPT-RISK-B: the change is uncommitted".
 Never commit, never merge, never remove the branch and never remove the checkout.
 "@
 }
@@ -2037,7 +2250,7 @@ function Invoke-Dispatch {
     New-TaskBriefs
     $prompt = Get-DispatchPrompt
     $result = Invoke-PrimaryPrompt -PaneId $script:PrimaryPane -Text $prompt -TimeoutSeconds 420
-    Assert-True -Id 'D1.1' -What 'the primary accepts the dispatch prompt' -Condition ($result.ExitCode -eq 0) -Command $result.CommandLine -Evidence ("code=[$($result.Code)] blocked=[$($result.Blocked)] " + (Protect-Text $result.Stderr 300))
+    Assert-True -Id 'D1.1' -What 'the primary accepts the dispatch prompt' -Condition ($result.ExitCode -eq 0) -Command $result.CommandLine -Evidence ("code=[$($result.Code)] blocked=[$($result.Blocked)] stderr=[" + (Protect-Text $result.Stderr 300) + "] screen=[" + (Protect-Text $result.Screen 500) + "]")
     if ($result.Blocked) { Block-Item -Id 'D1.1b' -What 'the primary was blocked when the dispatch prompt was due' -Evidence (Protect-Text $result.Screen 500) }
     if ($result.ExitCode -ne 0) {
         Block-Item -Id 'D1.1c' -What 'the dispatch prompt could not be submitted, so the worker phases cannot run' -Evidence (Protect-Text ($result.Stdout + $result.Stderr) 500)
@@ -2103,8 +2316,12 @@ function Invoke-Dispatch {
             $onDisk = ([int](Get-Field $handshake 'omp_session_on_disk') -eq 1)
             if ($null -eq $materialized) {
                 Add-Assertion -Id "D4.materialized/$id" -What "the worker's session reference is id-only, so materialization cannot be checked" -Status 'INFO' -Evidence "onDisk=$onDisk"
+            } elseif ($onDisk) {
+                Assert-True -Id "D4.materialized/$id" -What "a materialized worker session has a file on disk" -Condition $materialized -Evidence "exists=$materialized onDisk=$onDisk"
+            } elseif ($materialized) {
+                Add-Assertion -Id "D4.materialized/$id" -What "the session file appeared after this handshake; agent_end refreshes the on-disk flag" -Status 'INFO' -Evidence "exists=$materialized onDisk=$onDisk"
             } else {
-                Assert-True -Id "D4.materialized/$id" -What "the worker's on-disk flag agrees with its session file" -Condition ($materialized -eq $onDisk) -Evidence "exists=$materialized onDisk=$onDisk"
+                Assert-True -Id "D4.materialized/$id" -What "an unmaterialized worker session has no file yet" -Condition ($materialized -eq $onDisk) -Evidence "exists=$materialized onDisk=$onDisk"
             }
         }
     }
@@ -2170,9 +2387,11 @@ function Invoke-PartialReportRejection {
     $before = Get-Json $fact
 
     $live = Get-LiveAgent -Target $caller.PublicPane
+    $workerHandshake = Get-ReadySession -LaunchPaneId $caller.LaunchPane
+    $liveSession = [string](Get-Field (Get-Field $live.Agent 'agent_session') 'value')
     Assert-True -Id 'PR1.1' -What "the pane the bridge will be told about really hosts $id (replayed caller identity is real)" `
-        -Condition ($live.Found -and ([string](Get-Field (Get-Field $live.Agent 'agent_session') 'value') -ieq $caller.Session)) `
-        -TaskId $id -Evidence (Protect-Text (Get-Json $live.Agent) 400)
+        -Condition ($live.Found -and (Test-SessionIdentity -Left $caller.Session -Right $liveSession -Ready $workerHandshake)) `
+        -TaskId $id -Evidence ("live=[$liveSession] recorded=[$($caller.Session)] handshake=" + (Protect-Text (Get-Json $workerHandshake) 300))
 
     $params = @{
         kind     = 'partial'
@@ -2201,13 +2420,13 @@ function Invoke-PartialReportRejection {
     Assert-True -Id 'PR4.1' -What 'a result with no evidence is refused' -Condition (-not $empty.Ok) -TaskId $id -Evidence (Protect-Text (Get-Json $empty.Error) 400)
     Assert-Equal -Id 'PR4.2' -What 'that refusal is also invalid_report' -Expected 'invalid_report' -Actual ([string](Get-Field $empty.Error 'code')) -TaskId $id
 
-    $preview = Invoke-BridgeAs -LaunchPaneId $caller.LaunchPane -Method 'cleanup_preview' -Params @{ taskId = $id }
+    $preview = Invoke-BridgeAs -LaunchPaneId $script:PrimaryPane -Method 'cleanup_preview' -Params @{ taskId = $id }
     Assert-True -Id 'PR5.1' -What 'cleanup_preview answers for a running task' -Condition $preview.Ok -TaskId $id -Evidence (Protect-Text (Get-Json $preview.Error) 300)
     if ($preview.Ok) {
         Assert-JsonFalse -Id 'PR5.2' -What 'a running task is not removable (a real boolean)' -Object $preview.Result -Name 'removable' -TaskId $id
         Assert-True -Id 'PR5.3' -What 'the preview names the exact recorded checkout path' -Condition (Test-SamePath -A (Get-Field $preview.Result 'path') -B ([string](Get-Field $fact 'WorktreePath'))) -TaskId $id
     }
-    $cleanup = Invoke-BridgeAs -LaunchPaneId $caller.LaunchPane -Method 'cleanup' -Params @{ taskId = $id }
+    $cleanup = Invoke-BridgeAs -LaunchPaneId $script:PrimaryPane -Method 'cleanup' -Params @{ taskId = $id }
     Assert-True -Id 'PR5.3b' -What 'cleanup answered with a bridge envelope (ok or a coded error)' -Condition $cleanup.Envelope -TaskId $id `
         -Evidence (Protect-Text $cleanup.Raw 300)
     Assert-Equal -Id 'PR5.4' -What 'cleanup refuses a task with no reviewed result' -Expected 'not_reviewed' -Actual ([string](Get-Field $cleanup.Error 'code')) -TaskId $id
@@ -2239,13 +2458,11 @@ function Invoke-QuestionRelay {
     $script:TaskA = Get-Field $taskA 'fact'
     $idA = [string](Get-Field $script:TaskA 'ID')
 
-    # The worker briefs say "edit, then wait", so the partial-report gate above
-    # ran while both workers were still Running. The question is requested here,
-    # through the real agent surface, so this phase lines up with the store.
-    $askPrompt = 'ACCEPT-QUESTION. Call the orch_question tool once with text "ACCEPT-Q-A: should a.js keep the existing export style?" and then stop and wait for the answer. Reply with the word asked.'
-    $askResult = Invoke-AgentPrompt -PaneId ([string](Get-Field $script:TaskA 'PublicPaneID')) -Text $askPrompt -TimeoutSeconds 240
-    Assert-True -Id 'Q1.3' -What 'worker A accepts the instruction to raise its question' -Condition ($askResult.ExitCode -eq 0) -TaskId $idA `
-        -Command $askResult.CommandLine -Evidence (Protect-Text $askResult.Stderr 300)
+    # Task A's dispatch brief instructs it to ask before waiting for the answer
+    # token, so this phase observes the real question rather than sending a second
+    # worker prompt that could accidentally release the report gate.
+    Assert-Match -Id 'Q1.3' -What 'task A brief requests the ordinary question and exact answer token' `
+        -Pattern 'orch_question.*ACCEPT-Q-A.*ACCEPT-ANSWER-A' -Actual $script:BriefA -TaskId $idA
 
     $wait = Wait-Until -TimeoutSeconds 420 -IntervalSeconds 10 -What 'worker question' -Probe {
         $row = Get-TaskById -Id $idA
@@ -2268,21 +2485,74 @@ function Invoke-QuestionRelay {
             Add-Assertion -Id 'Q2.6' -What 'inbox delivery state (the plugin delivers notes to an idle primary)' -Status 'INFO' `
                 -Evidence ("state={0} detail={1}" -f (Get-Field $note[0] 'delivery_state'), (Protect-Text (Get-Field $note[0] 'delivery_detail') 200))
         }
-        $primaryScreen = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'recent-unwrapped' -Lines 200
-        $delivered = ($primaryScreen -match 'orchestrator:') -and ($primaryScreen -match 'ACCEPT-Q-A')
-        if ($delivered) {
-            Assert-True -Id 'Q2.7' -What 'the worker note was prompted into the primary session (no independent inbox UI)' -Condition $true
-        } else {
-            Block-Item -Id 'Q2.7' -What 'the worker note was prompted into the primary session' `
-                -Evidence ("the question is durable in the store, but it was not visible in the primary's scrollback at inspection time: " + (Protect-Text $primaryScreen 400))
+        $ready = Get-ReadySession -LaunchPaneId ([string](Get-Field $script:Project 'LaunchPaneID'))
+        $transcriptPath = [string](Get-Field $ready 'omp_session_file')
+        $delivery = Wait-Until -TimeoutSeconds 120 -IntervalSeconds 3 -What 'worker question in primary OMP transcript' -Probe {
+            if (Test-OmpTranscriptContains -Path $transcriptPath -Text 'ACCEPT-Q-A') { return $true }
+            return $null
         }
+        Assert-True -Id 'Q2.7' -What 'the worker question was prompted into the primary OMP session' -Condition $delivery.Ok -TaskId $idA `
+            -Evidence ("transcript marker observed after {0:N0}s; path={1}" -f $delivery.Elapsed, (Protect-Text $transcriptPath 300))
     }
 
     $focusBefore = Get-FocusProjection -Snapshot (Get-Snapshot)
-    $prompt = 'ACCEPT-Q-A-RELAY. A worker asked an ordinary question. Call the orch_answer tool with taskId "' + $idA + '" and text "ACCEPT-A1: keep the existing export style." Then reply with the word relayed.'
-    $result = Invoke-PrimaryPrompt -PaneId $script:PrimaryPane -Text $prompt -TimeoutSeconds 300
-    Assert-True -Id 'Q3.1' -What 'the primary accepted the answer-relay prompt' -Condition ($result.ExitCode -eq 0) -TaskId $idA -Command $result.CommandLine -Evidence ("code=[$($result.Code)] blocked=[$($result.Blocked)] " + (Protect-Text $result.Stderr 300))
-    if ($result.Blocked) { Block-Item -Id 'Q3.1b' -What 'the primary was blocked when the answer relay was due' -Evidence (Protect-Text $result.Screen 500) }
+    $questionAsk = Resolve-PrimaryWorkerQuestionAsk -TaskId $idA -QuestionMarker 'ACCEPT-Q-A' `
+        -QuestionText 'Should a.js keep its existing export style?' -AnswerToken 'ACCEPT-ANSWER-A' -AssertionId 'Q2.8'
+    if (-not $questionAsk.Resolved) {
+        Block-Item -Id 'Q2.8b' -What 'the primary question Ask was not the exact verified worker question' -Evidence (Protect-Text $questionAsk.Screen 600)
+        throw 'the worker-question Ask could not be safely answered'
+    }
+    $prompt = 'ACCEPT-Q-A-RELAY. A worker asked an ordinary question. Call the orch_answer tool with taskId "' + $idA + '" and text "ACCEPT-ANSWER-A: keep the existing export style and add subtract in that same style." Then reply with the word relayed.'
+    $workerReadyA = Get-ReadySession -LaunchPaneId ([string](Get-Field $script:TaskA 'LaunchPaneID'))
+    $workerTranscriptA = [string](Get-Field $workerReadyA 'omp_session_file')
+    $answerTextA = 'Yes—keep the existing export style. ACCEPT-ANSWER-A'
+    if ($questionAsk.Observed) {
+        $answerDelivery = Wait-Until -TimeoutSeconds 120 -IntervalSeconds 3 -What 'authorized answer Ask relayed to worker A transcript' -Probe {
+            if (Test-OmpTranscriptContains -Path $workerTranscriptA -Text $answerTextA) { return $true }
+            return $null
+        }
+        if ($answerDelivery.Ok) {
+            $result = [pscustomobject]@{
+                ExitCode = 0
+                Code = 'answer_ask_relayed'
+                Blocked = $false
+                Submitted = $true
+                CommandLine = 'primary answered the exact worker-question Ask'
+                Stderr = ''
+                Stdout = ''
+                Screen = ''
+            }
+        } else {
+            $result = [pscustomobject]@{
+                ExitCode = -1
+                Code = 'answer_ask_not_delivered'
+                Blocked = $true
+                Submitted = $false
+                CommandLine = ''
+                Stderr = 'the exact user-selected answer was not observed in worker A transcript; refusing a duplicate relay'
+                Stdout = ''
+                Screen = $questionAsk.Screen
+            }
+        }
+    } elseif (Test-OmpTranscriptContains -Path $workerTranscriptA -Text $answerTextA) {
+        $result = [pscustomobject]@{
+            ExitCode = 0
+            Code = 'answer_already_delivered'
+            Blocked = $false
+            Submitted = $true
+            CommandLine = 'the exact answer was already delivered'
+            Stderr = ''
+            Stdout = ''
+            Screen = ''
+        }
+    } else {
+        $result = Invoke-PrimaryPromptAfterDispositionAsks -PaneId $script:PrimaryPane -Text $prompt -TimeoutSeconds 300 -AssertionPrefix 'Q3'
+    }
+    $answerSource = if ($questionAsk.Observed) { 'exact primary Ask' } else { 'answer relay prompt or prior delivery' }
+    Assert-True -Id 'Q3.1' -What 'the primary delivered the exact answer to worker A' `
+        -Condition ($result.ExitCode -eq 0 -and $result.Submitted) -TaskId $idA -Command $result.CommandLine `
+        -Evidence ("source=[$answerSource] code=[$($result.Code)] submitted=[$($result.Submitted)] stderr=[" + (Protect-Text $result.Stderr 300) + "] screen=[" + (Protect-Text $result.Screen 500) + "]")
+    if ($result.Blocked) { Block-Item -Id 'Q3.1b' -What 'the primary answer relay did not complete' -Evidence (Protect-Text $result.Screen 500) }
     $cleared = Wait-Until -TimeoutSeconds 240 -IntervalSeconds 8 -What 'question answered' -Probe {
         $row = Get-TaskById -Id $idA
         if (-not $row) { return $null }
@@ -2294,14 +2564,19 @@ function Invoke-QuestionRelay {
         -Evidence ("after {0:N0}s: attention=[{1}]" -f $cleared.Elapsed, [string](Get-Field (Get-Field (Get-TaskById -Id $idA) 'fact' $null) 'Attention'))
     if ($cleared.Ok) {
         $script:TaskA = $cleared.Value
-        Assert-Equal -Id 'Q3.3' -What 'the answered task returns to Running' -Expected 'running' -Actual (Get-TaskStage -Fact $script:TaskA) -TaskId $idA
+        $answerStage = Get-TaskStage -Fact $script:TaskA
+        Assert-True -Id 'Q3.3' -What 'the answered task is Running or has finished its report' -Condition ($answerStage -in @('running', 'ready_for_review')) -TaskId $idA -Evidence "stage=$answerStage"
     }
     $workerScreen = Get-PaneScreen -PaneId ([string](Get-Field $script:TaskA 'PublicPaneID')) -Source 'recent-unwrapped' -Lines 200
-    if ($workerScreen -match 'ACCEPT-A1') {
-        Assert-True -Id 'Q3.4' -What 'the answer reached the worker terminal through its current public pane' -Condition $true
+    $answeredRow = Get-TaskById -Id $idA
+    $answeredFact = Get-Field $answeredRow 'fact'
+    $answeredStage = Get-TaskStage -Fact $answeredFact
+    $answerProgressed = $cleared.Ok -and ($answeredStage -in @('running', 'ready_for_review'))
+    if ($answerProgressed) {
+        Assert-True -Id 'Q3.4' -What 'the delivered answer left the worker Running or Ready for review' -Condition $true -TaskId $idA `
+            -Evidence ("stage=$answeredStage report=$($null -ne (Get-Field $answeredFact 'Report' $null)) answer_visible=$($workerScreen -match 'ACCEPT-ANSWER-A')")
     } else {
-        Block-Item -Id 'Q3.4' -What 'the answer reached the worker terminal' `
-            -Evidence ("the store cleared the question but the answer text was not in the worker scrollback: " + (Protect-Text $workerScreen 400))
+        Block-Item -Id 'Q3.4' -What 'the answer reached the worker terminal' -Evidence ("stage=$answeredStage screen=" + (Protect-Text $workerScreen 400))
     }
     $focusAfter = Get-FocusProjection -Snapshot (Get-Snapshot)
     Assert-Equal -Id 'Q3.5' -What 'relaying a question never moved the session focus' -Expected $focusBefore -Actual $focusAfter
@@ -2316,42 +2591,600 @@ function Send-AgentKeys {
     return Invoke-Herdr -Arguments (@('agent', 'send-keys', $PaneId) + $Keys) -TimeoutSeconds 60
 }
 
+function Get-PrimaryAskId {
+    param([string]$Screen)
+    if ([string]::IsNullOrWhiteSpace($Screen)) { return '' }
+    $askIndex = $Screen.LastIndexOf('Ask 1 questions', [System.StringComparison]::OrdinalIgnoreCase)
+    if ($askIndex -lt 0) { return '' }
+    $panel = $Screen.Substring($askIndex)
+    $match = [regex]::Match($panel, '\[(?<id>[a-z0-9_-]+)\]', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    if (-not $match.Success) { return '' }
+    return $match.Groups['id'].Value.ToLowerInvariant()
+}
+
+function Test-PrimaryDispositionAskScreen {
+    param([string]$Screen, [string]$AskId, [string]$TaskId = '')
+    if ([string]::IsNullOrWhiteSpace($Screen) -or [string]::IsNullOrWhiteSpace($AskId)) { return $false }
+    $askIndex = $Screen.LastIndexOf('Ask 1 questions', [System.StringComparison]::OrdinalIgnoreCase)
+    if ($askIndex -lt 0) { return $false }
+    # Only inspect the active modal; older task markers in scrollback must never
+    # authorize Enter against a different Ask.
+    $panel = $Screen.Substring($askIndex)
+    if ((Get-PrimaryAskId -Screen $panel) -ine $AskId) { return $false }
+    if ($AskId -in @('task_a_review', 'task_b_review')) {
+        $acceptIndex = $panel.IndexOf('Accept report', [System.StringComparison]::OrdinalIgnoreCase)
+        $changesIndex = $panel.IndexOf('Request changes', [System.StringComparison]::OrdinalIgnoreCase)
+        return ($acceptIndex -ge 0 -and $changesIndex -gt $acceptIndex)
+    }
+    if ($AskId -notin @('worker_a_disposition', 'worker_b_disposition') -or [string]::IsNullOrWhiteSpace($TaskId)) { return $false }
+    $taskRow = Get-TaskById -Id $TaskId
+    $fact = Get-Field $taskRow 'fact'
+    $report = Get-Field $fact 'Report' $null
+    if (-not $taskRow -or $null -eq $report -or
+        -not [string]::IsNullOrWhiteSpace([string](Get-Field $fact 'Disposition'))) { return $false }
+    $commit = ''
+    foreach ($item in @(Get-Field $report 'Evidence' @())) {
+        $match = [regex]::Match([string]$item, '(?i)\b[0-9a-f]{40}\b')
+        if ($match.Success) { $commit = $match.Value.ToLowerInvariant(); break }
+    }
+    if (-not $commit) { return $false }
+    $worker = if ($AskId -eq 'worker_a_disposition') { 'Worker A' } else { 'Worker B' }
+    $paths = @(Get-Field $fact 'ReservedPaths' @())
+    $summary = [string](Get-Field $report 'Summary')
+    $expectedFile = ''
+    if ($paths.Count -gt 0) { $expectedFile = [string]$paths[0] }
+    if (-not $expectedFile) {
+        $fileMatch = [regex]::Match($summary, '(?i)\b[\w.-]+\.[a-z0-9]+\b')
+        if ($fileMatch.Success) { $expectedFile = $fileMatch.Value }
+    }
+    if (-not $expectedFile -or
+        $panel.IndexOf("$worker reports commit $commit", [System.StringComparison]::OrdinalIgnoreCase) -lt 0 -or
+        $panel.IndexOf($expectedFile, [System.StringComparison]::OrdinalIgnoreCase) -lt 0 -or
+        $panel.IndexOf('What disposition should I record?', [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { return $false }
+    $acceptIndex = $panel.IndexOf('Accept', [System.StringComparison]::OrdinalIgnoreCase)
+    $acceptDescriptionIndex = $panel.IndexOf('Record the reported result as accepted; no merge or cleanup is performed.', [System.StringComparison]::OrdinalIgnoreCase)
+    $changesIndex = $panel.IndexOf('Request changes', [System.StringComparison]::OrdinalIgnoreCase)
+    $changesDescriptionIndex = $panel.IndexOf('Keep the result unaccepted and specify what should change.', [System.StringComparison]::OrdinalIgnoreCase)
+    $otherIndex = $panel.IndexOf('Other (type your own)', [System.StringComparison]::OrdinalIgnoreCase)
+    return ($acceptIndex -ge 0 -and $acceptDescriptionIndex -gt $acceptIndex -and
+        $changesIndex -gt $acceptDescriptionIndex -and $changesDescriptionIndex -gt $changesIndex -and
+        $otherIndex -gt $changesDescriptionIndex)
+}
+
+function Test-PrimaryWorkerQuestionAskScreen {
+    param([string]$Screen, [string]$AskId, [string]$QuestionText, [string]$AnswerToken)
+    if ([string]::IsNullOrWhiteSpace($Screen) -or [string]::IsNullOrWhiteSpace($AskId) -or
+        [string]::IsNullOrWhiteSpace($QuestionText) -or [string]::IsNullOrWhiteSpace($AnswerToken)) { return $false }
+    $askIndex = $Screen.LastIndexOf('Ask 1 questions', [System.StringComparison]::OrdinalIgnoreCase)
+    if ($askIndex -lt 0) { return $false }
+    $panel = $Screen.Substring($askIndex)
+    if ((Get-PrimaryAskId -Screen $panel) -ine $AskId) { return $false }
+    $questionIndex = $panel.IndexOf($QuestionText, [System.StringComparison]::OrdinalIgnoreCase)
+    if ($questionIndex -lt 0) { return $false }
+    $questionTokenIndex = $panel.IndexOf($AnswerToken, $questionIndex, [System.StringComparison]::Ordinal)
+    if ($questionTokenIndex -le $questionIndex) { return $false }
+    $yesIndex = $panel.IndexOf('Yes', $questionTokenIndex, [System.StringComparison]::OrdinalIgnoreCase)
+    if ($yesIndex -le $questionTokenIndex) { return $false }
+    $yesTokenIndex = $panel.IndexOf($AnswerToken, $yesIndex, [System.StringComparison]::Ordinal)
+    if ($yesTokenIndex -le $yesIndex) { return $false }
+    $authorizeIndex = $panel.IndexOf('Authorize reporting', $yesTokenIndex, [System.StringComparison]::OrdinalIgnoreCase)
+    if ($authorizeIndex -le $yesTokenIndex) { return $false }
+    $noIndex = $panel.IndexOf('No', $authorizeIndex, [System.StringComparison]::OrdinalIgnoreCase)
+    if ($noIndex -le $authorizeIndex) { return $false }
+    $noAuthorizeIndex = $panel.IndexOf('do not authorize', $noIndex, [System.StringComparison]::OrdinalIgnoreCase)
+    return ($noAuthorizeIndex -gt $noIndex)
+}
+
+function Test-PrimaryWorkerAnswerChoiceAskScreen {
+    param([string]$Screen, [string]$AskId, [string]$QuestionText)
+    if ([string]::IsNullOrWhiteSpace($Screen) -or [string]::IsNullOrWhiteSpace($AskId) -or
+        [string]::IsNullOrWhiteSpace($QuestionText)) { return $false }
+    $askIndex = $Screen.LastIndexOf('Ask 1 questions', [System.StringComparison]::OrdinalIgnoreCase)
+    if ($askIndex -lt 0) { return $false }
+    $panel = $Screen.Substring($askIndex)
+    if ((Get-PrimaryAskId -Screen $panel) -ine $AskId) { return $false }
+    $fileMatch = [regex]::Match($QuestionText, '(?i)\b[\w.-]+\.[a-z0-9]+\b')
+    if (-not $fileMatch.Success) { return $false }
+    if ($panel.IndexOf($QuestionText, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+        $yesLabel = 'Yes, keep it'
+        $yesDescription = 'Preserve the current style while adding subtract.'
+        $noLabel = 'No, change it'
+        $noDescription = 'Have the worker change to another export style.'
+    } else {
+        $expectedQuestion = "How should I answer the worker's question about $($fileMatch.Value) export style?"
+        if ($panel.IndexOf($expectedQuestion, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { return $false }
+        $yesLabel = 'Yes, keep the existing style'
+        $yesDescription = 'Preserve current exports and follow their pattern for subtract.'
+        $noLabel = 'No, use a different style'
+        $noDescription = 'Give the worker a different export style instruction.'
+    }
+    $yesIndex = $panel.IndexOf($yesLabel, [System.StringComparison]::OrdinalIgnoreCase)
+    $yesDescriptionIndex = $panel.IndexOf($yesDescription, [System.StringComparison]::OrdinalIgnoreCase)
+    $noIndex = $panel.IndexOf($noLabel, [System.StringComparison]::OrdinalIgnoreCase)
+    $noDescriptionIndex = $panel.IndexOf($noDescription, [System.StringComparison]::OrdinalIgnoreCase)
+    $otherIndex = $panel.IndexOf('Other (type your own)', [System.StringComparison]::OrdinalIgnoreCase)
+    return ($yesIndex -ge 0 -and $yesDescriptionIndex -gt $yesIndex -and $noIndex -gt $yesDescriptionIndex -and
+        $noDescriptionIndex -gt $noIndex -and $otherIndex -gt $noDescriptionIndex)
+}
+
+function Test-PrimaryWorkerQuestionAskForTask {
+    param([string]$Screen, [string]$QuestionText, [string]$AnswerToken)
+    $askId = Get-PrimaryAskId -Screen $Screen
+    if (-not $askId) { return $false }
+    return ((Test-PrimaryWorkerQuestionAskScreen -Screen $Screen -AskId $askId -QuestionText $QuestionText -AnswerToken $AnswerToken) -or
+        (Test-PrimaryWorkerAnswerChoiceAskScreen -Screen $Screen -AskId $askId -QuestionText $QuestionText))
+}
+
+function Test-PrimaryApprovalConfirmScreen {
+    param([string]$Screen, [string]$DialogMarker, [Parameter(Mandatory)][string]$ExpectedQuestion, [string[]]$Keys)
+    if ([string]::IsNullOrWhiteSpace($Screen) -or [string]::IsNullOrWhiteSpace($DialogMarker) -or
+        [string]::IsNullOrWhiteSpace($ExpectedQuestion) -or @($Keys).Count -eq 0) { return $false }
+    $markerIndex = $Screen.LastIndexOf($DialogMarker, [System.StringComparison]::OrdinalIgnoreCase)
+    if ($markerIndex -lt 0) { return $false }
+    $askIndex = $Screen.LastIndexOf('Ask', $markerIndex, [System.StringComparison]::OrdinalIgnoreCase)
+    if ($askIndex -lt 0) { return $false }
+    $questionFound = $false
+    foreach ($line in ($Screen -split "`r?`n")) {
+        $candidate = $line.Trim() -replace '^[\u2502\u00B3|](?:\s*[\u2502\u00B3|])*\s*', '' -replace '\s*[\u2502\u00B3|](?:\s*[\u2502\u00B3|])*$',''
+        if ($candidate -ceq $ExpectedQuestion) { $questionFound = $true; break }
+    }
+    if (-not $questionFound) { return $false }
+    $keepIndex = $Screen.IndexOf('keep the current contract', $markerIndex, [System.StringComparison]::OrdinalIgnoreCase)
+    $changeIndex = $Screen.IndexOf('change the contract', $markerIndex, [System.StringComparison]::OrdinalIgnoreCase)
+    $keysIndex = $Screen.IndexOf(('Keys: ' + ($Keys -join ' ')), [System.StringComparison]::OrdinalIgnoreCase)
+    if ($keepIndex -lt $markerIndex -or $changeIndex -le $keepIndex -or $keysIndex -le $changeIndex) { return $false }
+    $yesIndex = $Screen.IndexOf('Yes', $keysIndex, [System.StringComparison]::OrdinalIgnoreCase)
+    if ($yesIndex -le $keysIndex) { return $false }
+    $yesLineStart = $Screen.LastIndexOf("`n", $yesIndex, [System.StringComparison]::Ordinal) + 1
+    $yesLineEnd = $Screen.IndexOf("`n", $yesIndex, [System.StringComparison]::Ordinal)
+    if ($yesLineEnd -lt 0) { $yesLineEnd = $Screen.Length }
+    $yesLabel = $Screen.Substring($yesLineStart, $yesLineEnd - $yesLineStart).Trim() -replace '^[^\p{L}]*', '' -replace '[^\p{L}]*$', ''
+    if ($yesLabel -cne 'Yes') { return $false }
+    $noIndex = $Screen.IndexOf('No', $yesIndex, [System.StringComparison]::OrdinalIgnoreCase)
+    if ($noIndex -le $yesIndex) { return $false }
+    $noLineStart = $Screen.LastIndexOf("`n", $noIndex, [System.StringComparison]::Ordinal) + 1
+    $noLineEnd = $Screen.IndexOf("`n", $noIndex, [System.StringComparison]::Ordinal)
+    if ($noLineEnd -lt 0) { $noLineEnd = $Screen.Length }
+    $noLabel = $Screen.Substring($noLineStart, $noLineEnd - $noLineStart).Trim() -replace '^[^\p{L}]*', '' -replace '[^\p{L}]*$', ''
+    return ($noLabel -ceq 'No')
+}
+
+
+function Resolve-PrimaryDispositionAsk {
+    param(
+        [Parameter(Mandatory)][string]$Marker,
+        [Parameter(Mandatory)][string]$AskId,
+        [Parameter(Mandatory)][string]$TaskId,
+        [Parameter(Mandatory)][string]$AssertionId
+    )
+    $wait = Wait-Until -TimeoutSeconds 90 -IntervalSeconds 2 -What "primary disposition ask $AskId for $Marker" -Probe {
+        $live = Get-LiveAgent -Target $script:PrimaryPane
+        if (-not $live.Found) { return $null }
+        $status = [string](Get-Field $live.Agent 'agent_status')
+        if ($status -in @('idle', 'done')) {
+            $row = Get-TaskById -Id $TaskId
+            $fact = Get-Field $row 'fact'
+            if (-not [string]::IsNullOrWhiteSpace([string](Get-Field $fact 'Disposition'))) {
+                return [pscustomobject]@{ Kind = 'settled'; Screen = '' }
+            }
+            return $null
+        }
+        if ($status -ne 'blocked') { return $null }
+        $screen = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100
+        if (Test-PrimaryDispositionAskScreen -Screen $screen -AskId $AskId -TaskId $TaskId) {
+            return [pscustomobject]@{ Kind = 'ask'; Screen = $screen }
+        }
+        return [pscustomobject]@{ Kind = 'other'; Screen = $screen }
+    }
+    if (-not $wait.Ok) {
+        return [pscustomobject]@{
+            Observed = $false
+            Resolved = $false
+            Screen   = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100
+        }
+    }
+    if ($wait.Value.Kind -eq 'settled') {
+        return [pscustomobject]@{ Observed = $false; Resolved = $true; Screen = '' }
+    }
+    if ($wait.Value.Kind -ne 'ask') {
+        return [pscustomobject]@{ Observed = $false; Resolved = $false; Screen = $wait.Value.Screen }
+    }
+
+    $taskRow = Get-TaskById -Id $TaskId
+    $fact = Get-Field $taskRow 'fact'
+    if (-not $taskRow -or $null -eq (Get-Field $fact 'Report' $null) -or
+        -not [string]::IsNullOrWhiteSpace([string](Get-Field $fact 'Disposition'))) {
+        return [pscustomobject]@{ Observed = $true; Resolved = $false; Screen = $wait.Value.Screen }
+    }
+
+    # Both the task state and active Ask can change while the acceptance is
+    # deciding. Re-read the report state, then the exact Ask, immediately before
+    # Enter; no stale task or replacement dialog receives input.
+    $screen = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100
+    if (-not (Test-PrimaryDispositionAskScreen -Screen $screen -AskId $AskId -TaskId $TaskId)) {
+        return [pscustomobject]@{ Observed = $true; Resolved = $false; Screen = $screen }
+    }
+    $latestTaskRow = Get-TaskById -Id $TaskId
+    $latestFact = Get-Field $latestTaskRow 'fact'
+    if (-not $latestTaskRow -or $null -eq (Get-Field $latestFact 'Report' $null) -or
+        -not [string]::IsNullOrWhiteSpace([string](Get-Field $latestFact 'Disposition'))) {
+        return [pscustomobject]@{ Observed = $true; Resolved = $false; Screen = $screen }
+    }
+    $screen = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100
+    if (-not (Test-PrimaryDispositionAskScreen -Screen $screen -AskId $AskId -TaskId $TaskId)) {
+        return [pscustomobject]@{ Observed = $true; Resolved = $false; Screen = $screen }
+    }
+    $sent = Send-AgentKeys -PaneId $script:PrimaryPane -Keys @('enter')
+    $closed = Wait-Until -TimeoutSeconds 120 -IntervalSeconds 3 -What "primary disposition ask $AskId closed" -Probe {
+        $live = Get-LiveAgent -Target $script:PrimaryPane
+        if (-not $live.Found) { return $null }
+        if ([string](Get-Field $live.Agent 'agent_status') -ne 'blocked') { return $true }
+        $current = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100
+        if (-not (Test-PrimaryDispositionAskScreen -Screen $current -AskId $AskId -TaskId $TaskId)) { return $true }
+        return $null
+    }
+    $settled = Wait-Until -TimeoutSeconds 180 -IntervalSeconds 3 -What "primary recorded $Marker disposition" -Probe {
+        $row = Get-TaskById -Id $TaskId
+        $currentFact = Get-Field $row 'fact'
+        if (-not [string]::IsNullOrWhiteSpace([string](Get-Field $currentFact 'Disposition'))) { return 'disposed' }
+        $live = Get-LiveAgent -Target $script:PrimaryPane
+        if ($live.Found -and [string](Get-Field $live.Agent 'agent_status') -in @('idle', 'done')) { return 'idle' }
+        return $null
+    }
+    $resolved = ($sent.ExitCode -eq 0 -and $closed.Ok -and $settled.Ok -and $settled.Value -eq 'disposed')
+    [void](Assert-True -Id $AssertionId -What "the acceptance user selected Accept report for $Marker" -Condition $resolved `
+        -Command $sent.CommandLine -Evidence ("Ask=$AskId; selected the first option; closed=$($closed.Ok) settled=$($settled.Value) screen=" + (Protect-Text $screen 600)))
+    [void]($script:PrimarySendKeysUsed += 'enter')
+    return [pscustomobject]@{ Observed = $true; Resolved = $resolved; Screen = $screen }
+}
+
+function Resolve-PrimaryWorkerQuestionAsk {
+    param(
+        [Parameter(Mandatory)][string]$TaskId,
+        [Parameter(Mandatory)][string]$QuestionMarker,
+        [Parameter(Mandatory)][string]$QuestionText,
+        [Parameter(Mandatory)][string]$AnswerToken,
+        [Parameter(Mandatory)][string]$AssertionId
+    )
+    $wait = Wait-Until -TimeoutSeconds 120 -IntervalSeconds 2 -What "primary worker-question Ask for $QuestionMarker" -Probe {
+        $live = Get-LiveAgent -Target $script:PrimaryPane
+        if (-not $live.Found) { return $null }
+        $status = [string](Get-Field $live.Agent 'agent_status')
+        if ($status -in @('idle', 'done')) { return [pscustomobject]@{ Kind = 'settled'; Screen = '' } }
+        if ($status -ne 'blocked') { return $null }
+        $screen = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100
+        $askId = Get-PrimaryAskId -Screen $screen
+        if (-not $askId) { return [pscustomobject]@{ Kind = 'other'; Screen = $screen } }
+        if (Test-PrimaryWorkerQuestionAskForTask -Screen $screen -QuestionText $QuestionText -AnswerToken $AnswerToken) {
+            return [pscustomobject]@{ Kind = 'ask'; AskId = $askId; Screen = $screen }
+        }
+        return [pscustomobject]@{ Kind = 'other'; Screen = $screen }
+    }
+    if (-not $wait.Ok) {
+        return [pscustomobject]@{
+            Observed = $false
+            Resolved = $false
+            Screen = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100
+        }
+    }
+    if ($wait.Value.Kind -eq 'settled') {
+        return [pscustomobject]@{ Observed = $false; Resolved = $true; Screen = '' }
+    }
+    if ($wait.Value.Kind -ne 'ask') {
+        return [pscustomobject]@{ Observed = $false; Resolved = $false; Screen = $wait.Value.Screen }
+    }
+
+    $taskRow = Get-TaskById -Id $TaskId
+    $fact = Get-Field $taskRow 'fact'
+    if (-not $taskRow -or (Get-TaskStage -Fact $fact) -ne 'needs_input' -or
+        [string](Get-Field $fact 'Attention') -notmatch [regex]::Escape($QuestionMarker) -or
+        $null -ne (Get-Field $fact 'Report' $null) -or
+        -not [string]::IsNullOrWhiteSpace([string](Get-Field $fact 'Disposition'))) {
+        return [pscustomobject]@{ Observed = $true; Resolved = $false; Screen = $wait.Value.Screen }
+    }
+
+    $screen = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100
+    $askId = Get-PrimaryAskId -Screen $screen
+    if ($askId -ine $wait.Value.AskId -or
+        -not (Test-PrimaryWorkerQuestionAskForTask -Screen $screen -QuestionText $QuestionText -AnswerToken $AnswerToken)) {
+        return [pscustomobject]@{ Observed = $true; Resolved = $false; Screen = $screen }
+    }
+    $latestTaskRow = Get-TaskById -Id $TaskId
+    $latestFact = Get-Field $latestTaskRow 'fact'
+    if (-not $latestTaskRow -or (Get-TaskStage -Fact $latestFact) -ne 'needs_input' -or
+        [string](Get-Field $latestFact 'Attention') -notmatch [regex]::Escape($QuestionMarker) -or
+        $null -ne (Get-Field $latestFact 'Report' $null) -or
+        -not [string]::IsNullOrWhiteSpace([string](Get-Field $latestFact 'Disposition'))) {
+        return [pscustomobject]@{ Observed = $true; Resolved = $false; Screen = $screen }
+    }
+    $screen = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100
+    $askId = Get-PrimaryAskId -Screen $screen
+    if ($askId -ine $wait.Value.AskId -or
+        -not (Test-PrimaryWorkerQuestionAskForTask -Screen $screen -QuestionText $QuestionText -AnswerToken $AnswerToken)) {
+        return [pscustomobject]@{ Observed = $true; Resolved = $false; Screen = $screen }
+    }
+
+    $sent = Send-AgentKeys -PaneId $script:PrimaryPane -Keys @('enter')
+    $closed = Wait-Until -TimeoutSeconds 120 -IntervalSeconds 3 -What "primary worker-question Ask $($wait.Value.AskId) closed" -Probe {
+        $live = Get-LiveAgent -Target $script:PrimaryPane
+        if (-not $live.Found) { return $null }
+        if ([string](Get-Field $live.Agent 'agent_status') -ne 'blocked') { return $true }
+        $current = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100
+        $currentAskId = Get-PrimaryAskId -Screen $current
+        if ($currentAskId -ine $wait.Value.AskId -or
+            -not (Test-PrimaryWorkerQuestionAskForTask -Screen $current -QuestionText $QuestionText -AnswerToken $AnswerToken)) { return $true }
+        return $null
+    }
+    $resolved = ($sent.ExitCode -eq 0 -and $closed.Ok)
+    [void](Assert-True -Id $AssertionId -What "the acceptance user selected the authorized worker-question answer for $QuestionMarker" `
+        -Condition $resolved -Command $sent.CommandLine `
+        -Evidence ("Ask=$($wait.Value.AskId); token=$AnswerToken; closed=$($closed.Ok); screen=" + (Protect-Text $screen 600)))
+    [void]($script:PrimarySendKeysUsed += 'enter')
+    return [pscustomobject]@{ Observed = $true; Resolved = $resolved; Screen = $screen }
+}
+
+function Resolve-PendingPrimaryDispositionAsks {
+    param([string]$AssertionPrefix = 'V0', [double]$TimeoutSeconds = 30)
+    $observed = $false
+    for ($attempt = 0; $attempt -lt 4; $attempt++) {
+        $wait = Wait-Until -TimeoutSeconds $TimeoutSeconds -IntervalSeconds 2 -What 'primary disposition Ask or idle' -Probe {
+            $live = Get-LiveAgent -Target $script:PrimaryPane
+            if (-not $live.Found) { return $null }
+            $status = [string](Get-Field $live.Agent 'agent_status')
+            if ($status -in @('idle', 'done')) { return [pscustomobject]@{ Kind = 'settled'; Screen = '' } }
+            if ($status -ne 'blocked') { return $null }
+            $screen = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100
+            $askId = Get-PrimaryAskId -Screen $screen
+            if (-not $askId) { return [pscustomobject]@{ Kind = 'unknown'; Screen = $screen } }
+            return [pscustomobject]@{ Kind = 'ask'; AskId = $askId; Screen = $screen }
+        }
+        if (-not $wait.Ok) {
+            return [pscustomobject]@{ Resolved = $false; Observed = $observed; Screen = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100 }
+        }
+        if ($wait.Value.Kind -eq 'settled') {
+            return [pscustomobject]@{ Resolved = $true; Observed = $observed; Screen = '' }
+        }
+        if ($wait.Value.Kind -ne 'ask') {
+            return [pscustomobject]@{ Resolved = $false; Observed = $observed; Screen = $wait.Value.Screen }
+        }
+
+        $taskAFact = $script:TaskA
+        if (-not $taskAFact) {
+            $taskARow = Get-TaskByTitle -Pattern 'ACCEPT A'
+            if ($taskARow) { $taskAFact = Get-Field $taskARow 'fact' }
+        }
+        $taskBFact = $script:TaskB
+        if (-not $taskBFact) {
+            $taskBRow = Get-TaskByTitle -Pattern 'ACCEPT B'
+            if ($taskBRow) { $taskBFact = Get-Field $taskBRow 'fact' }
+        }
+        $targets = @(
+            [pscustomobject]@{ AskId = 'task_a_review'; Marker = 'ACCEPT-A'; TaskId = [string](Get-Field $taskAFact 'ID'); AssertionId = "$AssertionPrefix.askA" },
+            [pscustomobject]@{ AskId = 'worker_a_disposition'; Marker = 'ACCEPT-A'; TaskId = [string](Get-Field $taskAFact 'ID'); AssertionId = "$AssertionPrefix.askA" },
+            [pscustomobject]@{ AskId = 'task_b_review'; Marker = 'ACCEPT-B'; TaskId = [string](Get-Field $taskBFact 'ID'); AssertionId = "$AssertionPrefix.askB" },
+            [pscustomobject]@{ AskId = 'worker_b_disposition'; Marker = 'ACCEPT-B'; TaskId = [string](Get-Field $taskBFact 'ID'); AssertionId = "$AssertionPrefix.askB" }
+        )
+        $target = @($targets | Where-Object { $_.AskId -eq $wait.Value.AskId })
+        if ($target.Count -ne 1 -or [string]::IsNullOrWhiteSpace($target[0].TaskId)) {
+            return [pscustomobject]@{ Resolved = $false; Observed = $observed; Screen = $wait.Value.Screen }
+        }
+        $task = Get-TaskById -Id $target[0].TaskId
+        $fact = Get-Field $task 'fact'
+        if (-not $task -or $null -eq (Get-Field $fact 'Report' $null) -or
+            -not [string]::IsNullOrWhiteSpace([string](Get-Field $fact 'Disposition'))) {
+            return [pscustomobject]@{ Resolved = $false; Observed = $observed; Screen = $wait.Value.Screen }
+        }
+        $result = Resolve-PrimaryDispositionAsk -Marker $target[0].Marker -AskId $target[0].AskId `
+            -TaskId $target[0].TaskId -AssertionId $target[0].AssertionId
+        if (-not $result.Resolved) {
+            return [pscustomobject]@{ Resolved = $false; Observed = $observed; Screen = $result.Screen }
+        }
+        $observed = $observed -or $result.Observed
+    }
+    return [pscustomobject]@{ Resolved = $false; Observed = $observed; Screen = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100 }
+}
+
+function Invoke-PrimaryDispositionAskForPendingReport {
+    param([string]$AssertionPrefix = 'review')
+    foreach ($target in @(
+        @{ fact = $script:TaskA; marker = 'ACCEPT-A'; askId = 'worker_a_disposition'; worker = 'Worker A'; suffix = 'a.js' },
+        @{ fact = $script:TaskB; marker = 'ACCEPT-B'; askId = 'worker_b_disposition'; worker = 'Worker B'; suffix = 'b.js' }
+    )) {
+        $taskFact = $target.fact
+        if (-not $taskFact) {
+            $taskRow = Get-TaskByTitle -Pattern $target.marker
+            if ($taskRow) { $taskFact = Get-Field $taskRow 'fact' }
+        }
+        $taskId = [string](Get-Field $taskFact 'ID')
+        if (-not $taskId) { continue }
+        $taskRow = Get-TaskById -Id $taskId
+        $fact = Get-Field $taskRow 'fact'
+        $report = Get-Field $fact 'Report' $null
+        if (-not $taskRow -or $null -eq $report -or
+            -not [string]::IsNullOrWhiteSpace([string](Get-Field $fact 'Disposition'))) { continue }
+
+        $commit = ''
+        foreach ($item in @(Get-Field $report 'Evidence' @())) {
+            $match = [regex]::Match([string]$item, '(?i)\b[0-9a-f]{40}\b')
+            if ($match.Success) { $commit = $match.Value.ToLowerInvariant(); break }
+        }
+        $paths = @(Get-Field $fact 'ReservedPaths' @())
+        $file = if ($paths.Count -gt 0) { [string]$paths[0] } else { $target.suffix }
+        if (-not $commit -or $file -ne $target.suffix) {
+            return [pscustomobject]@{ Resolved = $false; Observed = $false; Screen = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100 }
+        }
+
+        $question = $target.worker + ' reports commit ' + $commit + ' for ' + $file + '. What disposition should I record?'
+        $prompt = 'ACCEPT-REVIEW. I have reviewed the exact report for ' + $target.worker + ': commit ' + $commit + ' for ' + $file + '. Ask the user with one OMP ask tool call only, id "' + $target.askId + '", question "' + $question + '", and exactly two options in this order: Accept (description: Record the reported result as accepted; no merge or cleanup is performed.), Request changes (description: Keep the result unaccepted and specify what should change.). Wait for the user choice. Do not call orch_review until the user chooses, do not ask about any other task, and do not merge or clean up.'
+        $submitted = Invoke-PrimaryPrompt -PaneId $script:PrimaryPane -Text $prompt -TimeoutSeconds 240
+        if (-not $submitted.Submitted) {
+            return [pscustomobject]@{ Resolved = $false; Observed = $false; Screen = $submitted.Screen }
+        }
+
+        $ask = Wait-Until -TimeoutSeconds 90 -IntervalSeconds 2 -What "primary disposition Ask $($target.askId)" -Probe {
+            $live = Get-LiveAgent -Target $script:PrimaryPane
+            if (-not $live.Found) { return $null }
+            $status = [string](Get-Field $live.Agent 'agent_status')
+            if ($status -in @('idle', 'done')) {
+                $latest = Get-TaskById -Id $taskId
+                $latestFact = Get-Field $latest 'fact'
+                if (-not [string]::IsNullOrWhiteSpace([string](Get-Field $latestFact 'Disposition'))) {
+                    return [pscustomobject]@{ Kind = 'settled'; Screen = '' }
+                }
+                return $null
+            }
+            if ($status -ne 'blocked') { return $null }
+            $screen = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100
+            if (Test-PrimaryDispositionAskScreen -Screen $screen -AskId $target.askId -TaskId $taskId) {
+                return [pscustomobject]@{ Kind = 'ask'; Screen = $screen }
+            }
+            return [pscustomobject]@{ Kind = 'other'; Screen = $screen }
+        }
+        if (-not $ask.Ok -or $ask.Value.Kind -ne 'ask') {
+            $screen = if ($ask.Ok) { $ask.Value.Screen } else { Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100 }
+            [void](Assert-True -Id "$AssertionPrefix.ask-request/$($target.marker)" -What "the primary exposed the exact report Ask for $($target.marker)" -Condition $false -Evidence (Protect-Text $screen 600))
+            return [pscustomobject]@{ Resolved = $false; Observed = $false; Screen = $screen }
+        }
+        [void](Assert-True -Id "$AssertionPrefix.ask-request/$($target.marker)" -What "the primary exposed the exact report Ask for $($target.marker)" -Condition ($submitted.Submitted -and $ask.Value.Kind -eq 'ask') -Evidence (Protect-Text $ask.Value.Screen 600))
+        return Resolve-PrimaryDispositionAsk -Marker $target.marker -AskId $target.askId -TaskId $taskId -AssertionId "$AssertionPrefix.ask/$($target.marker)"
+    }
+    return [pscustomobject]@{ Resolved = $true; Observed = $false; Screen = '' }
+}
+
+function Invoke-PrimaryPromptAfterDispositionAsks {
+    param([Parameter(Mandatory)][string]$PaneId, [Parameter(Mandatory)][string]$Text, [double]$TimeoutSeconds = 300, [string]$AssertionPrefix = 'prompt')
+    $pending = Resolve-PendingPrimaryDispositionAsks -AssertionPrefix $AssertionPrefix -TimeoutSeconds 30
+    if (-not $pending.Resolved) {
+        return [pscustomobject]@{ ExitCode = -1; Code = 'agent_blocked'; Blocked = $true; Submitted = $false; Screen = $pending.Screen; Stderr = 'a primary disposition Ask is unresolved'; CommandLine = '' }
+    }
+    $result = Invoke-PrimaryPrompt -PaneId $PaneId -Text $Text -TimeoutSeconds $TimeoutSeconds
+    if ($result.Blocked -and $result.Code -eq 'agent_blocked' -and -not $result.Submitted) {
+        $pending = Resolve-PendingPrimaryDispositionAsks -AssertionPrefix $AssertionPrefix -TimeoutSeconds 60
+        if ($pending.Resolved) {
+            $result = Invoke-PrimaryPrompt -PaneId $PaneId -Text $Text -TimeoutSeconds $TimeoutSeconds
+        }
+    }
+    return $result
+}
+
+function Invoke-PrimaryPromptNoWaitAfterDispositionAsks {
+    param(
+        [Parameter(Mandatory)][string]$PaneId,
+        [Parameter(Mandatory)][string]$Text,
+        [double]$TimeoutSeconds = 300,
+        [string]$AssertionPrefix = 'prompt'
+    )
+    $pending = Resolve-PendingPrimaryDispositionAsks -AssertionPrefix $AssertionPrefix -TimeoutSeconds 30
+    if (-not $pending.Resolved) {
+        return [pscustomobject]@{
+            ExitCode = -1
+            Code = 'agent_blocked'
+            Blocked = $true
+            Submitted = $false
+            Screen = $pending.Screen
+            Stderr = 'a primary disposition Ask is unresolved'
+            Stdout = ''
+            CommandLine = ''
+        }
+    }
+    $idle = Wait-Until -TimeoutSeconds 180 -IntervalSeconds 6 -What 'primary settled before no-wait prompt' -Probe {
+        $live = Get-LiveAgent -Target $PaneId
+        if (-not $live.Found) { return $null }
+        $status = [string](Get-Field $live.Agent 'agent_status')
+        if ($status -eq 'blocked') { return 'blocked' }
+        if ($status -in @('idle', 'done')) { return $status }
+        return $null
+    }
+    if (-not $idle.Ok -or $idle.Value -eq 'blocked') {
+        $code = if ($idle.Value -eq 'blocked') { 'agent_blocked' } else { 'primary_not_settled' }
+        return [pscustomobject]@{
+            ExitCode = -2
+            Code = $code
+            Blocked = ($code -eq 'agent_blocked')
+            Submitted = $false
+            Screen = Get-PaneScreen -PaneId $PaneId -Source 'visible' -Lines 60
+            Stderr = ''
+            Stdout = ''
+            CommandLine = "herdr agent prompt $PaneId <primary prompt>"
+        }
+    }
+    $result = Invoke-AgentPrompt -PaneId $PaneId -Text $Text -TimeoutSeconds $TimeoutSeconds -NoWait
+    $code = Get-HerdrErrorCode -Result $result
+    return [pscustomobject]@{
+        ExitCode = $result.ExitCode
+        Code = $code
+        Blocked = ($code -eq 'agent_blocked')
+        Submitted = ($result.ExitCode -eq 0)
+        Screen = ''
+        Stderr = $result.Stderr
+        Stdout = $result.Stdout
+        CommandLine = $result.CommandLine
+    }
+}
+
 function Confirm-PrimaryModal {
     <#
-        Waits for the primary's own confirmation UI, reports the on-screen
-        choices as evidence, answers it with real keys, and waits for it to
-        close. The keys are chosen from what the screen actually shows.
+        Confirm only the exact worker-dialog action from the primary transcript:
+        the task id/key call and the visible dialog/Yes-No preview must both match.
     #>
-    param([Parameter(Mandatory)][string]$Title, [double]$TimeoutSeconds = 180)
-    $wait = Wait-Until -TimeoutSeconds $TimeoutSeconds -IntervalSeconds 3 -What "confirmation '$Title'" -Probe {
-        $screen = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 60
-        if ($screen -match [regex]::Escape($Title)) { return $screen }
+    param(
+        [Parameter(Mandatory)][string]$TaskId,
+        [Parameter(Mandatory)][string]$DialogMarker,
+        [Parameter(Mandatory)][string]$ExpectedQuestion,
+        [Parameter(Mandatory)][string[]]$ExpectedKeys,
+        [Parameter(Mandatory)][string]$TranscriptPath,
+        [double]$TimeoutSeconds = 180
+    )
+    if (-not (Test-OmpApprovalToolCall -Path $TranscriptPath -TaskId $TaskId -Keys $ExpectedKeys)) {
+        return [pscustomobject]@{
+            Observed = $false
+            ToolCallRecorded = $false
+            Screen = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100
+            Keys = @()
+            Closed = $false
+        }
+    }
+    $wait = Wait-Until -TimeoutSeconds $TimeoutSeconds -IntervalSeconds 3 -What "approval confirmation for task $TaskId" -Probe {
+        $screen = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100
+        if (Test-PrimaryApprovalConfirmScreen -Screen $screen -DialogMarker $DialogMarker -ExpectedQuestion $ExpectedQuestion -Keys $ExpectedKeys) { return $screen }
         return $null
     }
     if (-not $wait.Ok) {
-        $screen = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 60
-        return [pscustomobject]@{ Observed = $false; Screen = $screen; Keys = @(); Closed = $false }
-    }
-    $screen = $wait.Value
-    $keys = @('enter')
-    if ($screen -match '(?i)\[y/N\]|\(y/n\)|y\s*=\s*yes') { $keys = @('y') }
-    $sent = Send-AgentKeys -PaneId $script:PrimaryPane -Keys $keys
-    $closed = Wait-Until -TimeoutSeconds 120 -IntervalSeconds 3 -What 'confirmation closed' -Probe {
-        $now = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 60
-        if ($now -notmatch [regex]::Escape($Title)) { return $true }
-        return $false
-    }
-    if (-not $closed.Ok -and $keys -ne @('enter')) {
-        [void](Send-AgentKeys -PaneId $script:PrimaryPane -Keys @('enter'))
-        $closed = Wait-Until -TimeoutSeconds 60 -IntervalSeconds 3 -What 'confirmation closed' -Probe {
-            $now = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 60
-            if ($now -notmatch [regex]::Escape($Title)) { return $true }
-            return $false
+        return [pscustomobject]@{
+            Observed = $false
+            ToolCallRecorded = $true
+            Screen = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100
+            Keys = @()
+            Closed = $false
         }
-        $keys = $keys + 'enter'
     }
-    $script:PrimarySendKeysUsed += ($keys -join ' ')
-    return [pscustomobject]@{ Observed = $true; Screen = $screen; Keys = $keys; Closed = $closed.Ok; SendResult = $sent }
+    # Validate the exact transcript call first, then read the live pane as the
+    # final authorization check immediately before sending the confirmation key.
+    $toolCallRecorded = Test-OmpApprovalToolCall -Path $TranscriptPath -TaskId $TaskId -Keys $ExpectedKeys
+    if (-not $toolCallRecorded) {
+        return [pscustomobject]@{
+            Observed = $false
+            ToolCallRecorded = $false
+            Screen = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100
+            Keys = @()
+            Closed = $false
+        }
+    }
+    $keys = @('enter')
+    $screen = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100
+    if (-not (Test-PrimaryApprovalConfirmScreen -Screen $screen -DialogMarker $DialogMarker -ExpectedQuestion $ExpectedQuestion -Keys $ExpectedKeys)) {
+        return [pscustomobject]@{ Observed = $false; ToolCallRecorded = $true; Screen = $screen; Keys = @(); Closed = $false }
+    }
+    $sent = Send-AgentKeys -PaneId $script:PrimaryPane -Keys $keys
+    [void]($script:PrimarySendKeysUsed += ($keys -join ' '))
+    return [pscustomobject]@{
+        Observed = $true
+        ToolCallRecorded = $true
+        Screen = $screen
+        Keys = $keys
+        Sent = ($sent.ExitCode -eq 0)
+        SendResult = $sent
+    }
 }
 
 function Invoke-BlockedDialog {
@@ -2361,6 +3194,8 @@ function Invoke-BlockedDialog {
     if (-not $taskB) { Block-Item -Id 'K1.2' -What 'blocked full-screen dialog' -Evidence 'task B was not dispatched'; return }
     $script:TaskB = Get-Field $taskB 'fact'
     $idB = [string](Get-Field $script:TaskB 'ID')
+    $idA = if ($script:TaskA) { [string](Get-Field $script:TaskA 'ID') } else { '' }
+    if (-not $idA) { Block-Item -Id 'K3.6a' -What 'task A is identifiable before resolving its disposition Ask' -Evidence 'task A is unavailable'; return }
     $paneB = [string](Get-Field $script:TaskB 'PublicPaneID')
 
     # Same as the question above: the dialog is requested explicitly, so the
@@ -2394,27 +3229,58 @@ function Invoke-BlockedDialog {
     Assert-True -Id 'K3.1' -What 'the primary-side dialog preview answers' -Condition $preview.Ok -TaskId $idB -Evidence (Protect-Text (Get-Json $preview.Error) 300)
     if ($preview.Ok) {
         Assert-JsonTrue -Id 'K3.2' -What 'the preview reports the worker blocked (a real boolean)' -Object $preview.Result -Name 'blocked' -TaskId $idB
-        Assert-Match -Id 'K3.3' -What 'the preview carries the on-screen dialog text' -Pattern 'ACCEPT-Q-DIALOG' -Actual ([string](Get-Field $preview.Result 'dialog')) -TaskId $idB
+        Assert-Match -Id 'K3.3' -What 'the preview carries the exact worker question and ordered choices' -Pattern '(?s)ACCEPT-Q-DIALOG: which contract should b\.js use\?.*keep the current contract.*change the contract' -Actual ([string](Get-Field $preview.Result 'dialog')) -TaskId $idB
         Assert-NonEmpty -Id 'K3.4' -What 'the preview carries a digest that ties an approval to this dialog' -Value ([string](Get-Field $preview.Result 'digest')) -TaskId $idB
         Assert-Equal -Id 'K3.5' -What 'the preview names the exact current public pane' -Expected $paneB -Actual ([string](Get-Field $preview.Result 'publicPaneId')) -TaskId $idB
     }
+    $primaryAsks = Resolve-PendingPrimaryDispositionAsks -AssertionPrefix 'K3.6' -TimeoutSeconds 60
+    if ($primaryAsks.Resolved -and -not $primaryAsks.Observed) {
+        $requestedAsk = Invoke-PrimaryDispositionAskForPendingReport -AssertionPrefix 'K3.6'
+        if (-not $requestedAsk.Resolved) {
+            $primaryAsks = [pscustomobject]@{ Resolved = $false; Observed = $requestedAsk.Observed; Screen = $requestedAsk.Screen }
+        } elseif ($requestedAsk.Observed) {
+            $primaryAsks = Resolve-PendingPrimaryDispositionAsks -AssertionPrefix 'K3.6' -TimeoutSeconds 60
+        }
+    }
+    if (-not $primaryAsks.Resolved) {
+        Block-Item -Id 'K3.6b' -What 'the primary disposition Ask could not be answered before dialog approval' -Evidence (Protect-Text $primaryAsks.Screen 600)
+        throw 'a primary disposition Ask blocked worker-dialog approval'
+    }
 
-    $prompt = 'ACCEPT-DIALOG. Worker ' + $idB + ' is blocked on a full-screen dialog. Call the orch_approve_dialog tool with taskId "' + $idB + '" and keys ["enter"], and confirm the approval exactly as the tool asks. Then reply with the word approved.'
-    $result = Invoke-PrimaryPrompt -PaneId $script:PrimaryPane -Text $prompt -TimeoutSeconds 240
-    Assert-True -Id 'K4.1' -What 'the primary accepted the approval prompt' -Condition ($result.ExitCode -eq 0) -TaskId $idB -Command $result.CommandLine -Evidence ("code=[$($result.Code)] blocked=[$($result.Blocked)] " + (Protect-Text $result.Stderr 300))
-    if ($result.Blocked) { Block-Item -Id 'K4.1b' -What 'the primary was blocked when the dialog approval was due' -Evidence (Protect-Text $result.Screen 500) }
+    $prompt = 'ACCEPT-DIALOG. I have reviewed the exact dialog for worker ' + $idB + ': question "ACCEPT-Q-DIALOG: which contract should b.js use?" with options "keep the current contract" and "change the contract". As the acceptance user, I explicitly authorize sending only enter to choose "keep the current contract" for this task. Call orch_approve_dialog with taskId "' + $idB + '" and keys ["enter"]; do not act if the confirmation UI shows a different dialog. Then reply with the word approved.'
+    $result = Invoke-PrimaryPromptAfterDispositionAsks -PaneId $script:PrimaryPane -Text $prompt -TimeoutSeconds 240 -AssertionPrefix 'K4'
+    $primaryReady = Get-ReadySession -LaunchPaneId ([string](Get-Field $script:Project 'LaunchPaneID'))
+    $primaryTranscript = [string](Get-Field $primaryReady 'omp_session_file')
+    $approvalRequest = Wait-Until -TimeoutSeconds 120 -IntervalSeconds 3 -What 'exact worker approval call in the primary transcript' -Probe {
+        if (Test-OmpApprovalToolCall -Path $primaryTranscript -TaskId $idB -Keys @('enter')) { return $true }
+        return $null
+    }
+    # Herdr's --wait prompt can time out while orch_approve_dialog is waiting on
+    # its user confirmation UI. The exact tool call in the OMP transcript is the
+    # submission proof; Confirm-PrimaryModal independently gates any Enter input.
+    $approvalRecorded = [bool]($result.Submitted -and $approvalRequest.Ok)
+    Assert-True -Id 'K4.1' -What 'the primary requested approval for this exact task and key in its OMP transcript' `
+        -Condition $approvalRecorded -TaskId $idB -Command $result.CommandLine `
+        -Evidence ("code=[$($result.Code)] submitted=[$($result.Submitted)] transcriptCall=[$($approvalRequest.Ok)] transcript=[" + (Protect-Text $primaryTranscript 300) + "]")
+    if (-not $approvalRecorded) {
+        Block-Item -Id 'K4.1b' -What 'the exact approval request was not recorded; refusing to confirm an unknown dialog' `
+            -Evidence ("screen=[" + (Protect-Text (Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100) 700) + "]")
+        throw 'the exact worker-dialog approval request was not observed'
+    }
 
-    $modal = Confirm-PrimaryModal -Title 'Approve worker choice' -TimeoutSeconds 240
+    $modal = Confirm-PrimaryModal -TaskId $idB -DialogMarker 'ACCEPT-Q-DIALOG' `
+        -ExpectedQuestion 'ACCEPT-Q-DIALOG: which contract should b.js use?' -ExpectedKeys @('enter') `
+        -TranscriptPath $primaryTranscript -TimeoutSeconds 180
     if ($modal.Observed) {
-        Assert-True -Id 'K5.1' -What 'the primary showed the user the dialog preview and the exact keys before acting' -Condition $true -TaskId $idB
-        Assert-Match -Id 'K5.2' -What 'the confirmation quotes the task id' -Pattern ([regex]::Escape($idB)) -Actual $modal.Screen -TaskId $idB
-        Add-Assertion -Id 'K5.3' -What "confirmation answered with keys [$($modal.Keys -join ' ')]" -Status $(if ($modal.Closed) { 'PASS' } else { 'FAIL' }) -TaskId $idB `
-            -Command "herdr agent send-keys $($script:PrimaryPane) $($modal.Keys -join ' ')" `
-            -Evidence (Protect-Text $modal.Screen 800)
+        Assert-True -Id 'K5.1' -What 'the user confirmation showed the exact worker dialog and its approval key' -Condition $true -TaskId $idB
+        Assert-Match -Id 'K5.2' -What 'the confirmation quotes the worker dialog question' -Pattern 'ACCEPT-Q-DIALOG' -Actual $modal.Screen -TaskId $idB
+        Add-Assertion -Id 'K5.3' -What "the verified confirmation key was sent [$($modal.Keys -join ' ')]" `
+            -Status $(if ($modal.Sent) { 'PASS' } else { 'FAIL' }) -TaskId $idB `
+            -Command "herdr agent send-keys $($script:PrimaryPane) $($modal.Keys -join ' ')" -Evidence (Protect-Text $modal.Screen 800)
     } else {
-        Block-Item -Id 'K5.1' -What 'the primary asked the user to confirm the exact keys' `
-            -Evidence ("no 'Approve worker choice' confirmation was visible in the primary pane within the timeout; last screen: " + (Protect-Text $modal.Screen 800)) `
-            -Command "herdr agent read $($script:PrimaryPane) --source visible"
+        Block-Item -Id 'K5.1' -What 'the primary did not expose the exact transcript-linked user confirmation' `
+            -Evidence (Protect-Text $modal.Screen 700)
+        throw 'the worker approval confirmation was not completed; refusing to send keys to an unverified modal'
     }
 
     $unblocked = Wait-Until -TimeoutSeconds 240 -IntervalSeconds 5 -What 'worker unblocked' -Probe {
@@ -2426,13 +3292,31 @@ function Invoke-BlockedDialog {
     }
     if ($unblocked.Ok) {
         Assert-True -Id 'K6.1' -What 'the approved keys answered the worker dialog and released it' -Condition $true -TaskId $idB -Evidence ("status={0}" -f $unblocked.Value)
+        $afterAgent = Get-LiveAgent -Target $paneB
+        $afterStatus = [string](Get-Field $afterAgent.Agent 'agent_status')
         $afterScreen = Get-PaneScreen -PaneId $paneB -Source 'visible' -Lines 60
-        Assert-True -Id 'K6.2' -What 'the approved dialog is no longer on screen' -Condition ($afterScreen -notmatch 'ACCEPT-Q-DIALOG') -TaskId $idB -Evidence (Protect-Text $afterScreen 500)
+        Assert-True -Id 'K6.2' -What 'Herdr reports no active worker dialog even if its old question remains in scrollback' `
+            -Condition ($afterAgent.Found -and $afterStatus -in @('idle', 'working', 'done')) -TaskId $idB `
+            -Evidence ("agent_status=$afterStatus historical_question_marker=$($afterScreen -match 'ACCEPT-Q-DIALOG')")
     } else {
         $status = [string](Get-Field (Get-LiveAgent -Target $paneB).Agent 'agent_status')
         Block-Item -Id 'K6.1' -What 'the approved keys answered the worker dialog' `
             -Evidence ("worker B is still $status after the approval; visible screen: " + (Protect-Text (Get-PaneScreen -PaneId $paneB -Source 'visible' -Lines 40) 600))
+        throw 'the blocked worker dialog remained active after the user confirmation'
     }
+    $reportPrompt = 'ACCEPT-B-REPORT-TRIGGER. Call the orch_answer tool exactly once with taskId "' + $idB + '" and text "ACCEPT-REPORT-B". Then reply with the words report token sent.'
+    $reportResult = Invoke-PrimaryPromptAfterDispositionAsks -PaneId $script:PrimaryPane -Text $reportPrompt -TimeoutSeconds 240 -AssertionPrefix 'K6'
+    $workerReady = Get-ReadySession -LaunchPaneId ([string](Get-Field $script:TaskB 'LaunchPaneID'))
+    $workerTranscript = [string](Get-Field $workerReady 'omp_session_file')
+    $reportTokenObserved = Wait-Until -TimeoutSeconds 300 -IntervalSeconds 3 -What 'exact B report authorization token in worker OMP transcript' -Probe {
+        if (Test-OmpTranscriptContains -Path $workerTranscript -Text 'ACCEPT-REPORT-B') { return $true }
+        return $null
+    }
+    $reportSent = $reportResult.Submitted -and $reportTokenObserved.Ok
+    Assert-True -Id 'K6.3' -What 'the primary delivered the exact report authorization token to worker B' `
+        -Condition $reportSent -TaskId $idB -Command $reportResult.CommandLine `
+        -Evidence ("code=[$($reportResult.Code)] submitted=[$($reportResult.Submitted)] tokenSeen=[$($reportTokenObserved.Ok)] workerSession=[$(Protect-Text $workerTranscript 300)]")
+    if (-not $reportSent) { throw 'the report authorization token was not proven in worker B transcript; no retry was sent' }
 
     $stale = Invoke-BridgeAs -LaunchPaneId ([string](Get-Field $script:Project 'LaunchPaneID')) -Method 'approve_dialog' `
         -Params @{ taskId = $idB; observedDigest = [string](Get-Field $preview.Result 'digest'); keys = @('enter') }
@@ -2562,7 +3446,14 @@ function Invoke-WorkerReports {
         $reported = $wait.Value
         if ($pair.Name -eq 'A') { $script:TaskA = $reported } else { $script:TaskB = $reported }
         $report = Get-Field $reported 'Report'
-        Assert-Equal -Id "W2.$($pair.Name)-stage" -What "task $id is Ready for review" -Expected 'ready_for_review' -Actual (Get-TaskStage -Fact $reported) -TaskId $id
+        $actualStage = Get-TaskStage -Fact $reported
+        $disposition = [string](Get-Field $reported 'Disposition')
+        if ($disposition) {
+            Assert-Equal -Id "W2.$($pair.Name)-stage" -What "task $id is Done because an explicit disposition was recorded" -Expected 'done' -Actual $actualStage -TaskId $id
+            Assert-NonEmpty -Id "W2.$($pair.Name)-disposition" -What 'the earlier user choice is recorded on the report' -Value $disposition -TaskId $id
+        } else {
+            Assert-Equal -Id "W2.$($pair.Name)-stage" -What "task $id is Ready for review" -Expected 'ready_for_review' -Actual $actualStage -TaskId $id
+        }
         Assert-Equal -Id "W2.$($pair.Name)-branch" -What "the report names the branch this task owns" -Expected ([string](Get-Field $reported 'Branch')) -Actual ([string](Get-Field $report 'Branch')) -TaskId $id
         Assert-NonEmpty -Id "W2.$($pair.Name)-summary" -What 'the report carries a summary' -Value ([string](Get-Field $report 'Summary')) -TaskId $id
         Assert-True -Id "W2.$($pair.Name)-evidence" -What 'the report carries changed-file/commit evidence' -Condition (@(Get-Field $report 'Evidence' @()).Count -ge 1) -TaskId $id -Evidence (Protect-Text (Get-Json (Get-Field $report 'Evidence' @())) 300)
@@ -2603,6 +3494,17 @@ function Invoke-WorkerReports {
 # Phase 15: the read-only board
 # ---------------------------------------------------------------------------
 
+function Get-BoardSelectionKey {
+    param([string]$Screen, [string]$CurrentId, [string]$TargetId)
+    if ([string]::IsNullOrWhiteSpace($Screen) -or [string]::IsNullOrWhiteSpace($CurrentId) -or
+        [string]::IsNullOrWhiteSpace($TargetId) -or $CurrentId -eq $TargetId) { return '' }
+    $currentIndex = $Screen.IndexOf("[$CurrentId]", [System.StringComparison]::Ordinal)
+    $targetIndex = $Screen.IndexOf("[$TargetId]", [System.StringComparison]::Ordinal)
+    if ($currentIndex -lt 0 -or $targetIndex -lt 0) { return '' }
+    if ($targetIndex -lt $currentIndex) { return 'up' }
+    return 'down'
+}
+
 function Invoke-Board {
     Write-Step 'Phase 15: the read-only board renders the tasks'
     $tasksBefore = @(Get-ProjectTasks -Key (Get-Field $script:Project 'Key'))
@@ -2636,9 +3538,10 @@ function Invoke-Board {
     Assert-JsonTrue -Id 'A1.1c' -What 'the board action answered ok=true (a real boolean)' -Object $payload -Name 'ok'
     Assert-SamePath -Id 'A1.1d' -What 'the board action opened the board for the bound project' -Expected ([string](Get-Field $script:Project 'Key')) -Actual ([string](Get-Field $payload 'project'))
     Assert-Equal -Id 'A1.1e' -What 'the board action opened the board in the bound workspace' -Expected $script:PrimaryWorkspace -Actual ([string](Get-Field $payload 'workspace'))
-    # `plugin pane open` answers a PluginPaneInfo ({plugin_id, entrypoint, pane}).
+    # Herdr wraps the PluginPaneInfo under `plugin_pane` in the CLI result.
     $opened = Get-Field $payload 'pane'
-    $boardPane = [string](Get-Field (Get-Field $opened 'pane') 'pane_id')
+    $pluginPane = Get-Field $opened 'plugin_pane' $opened
+    $boardPane = [string](Get-Field (Get-Field $pluginPane 'pane') 'pane_id')
     if (-not $boardPane) {
         # Fall back to the only pane that appeared in the project workspace while
         # the action ran, so a wrapped answer shape cannot hide a real pane.
@@ -2650,8 +3553,8 @@ function Invoke-Board {
     if (-not $boardPane) { Block-Item -Id 'A1.2b' -What 'the board pane could not be identified' -Evidence (Protect-Text (Get-Json $payload) 500); return }
     [void]$script:CreatedPanes.Add($boardPane)
     $script:BoardPane = $boardPane
-    Assert-Equal -Id 'A1.3' -What 'the board pane is the declared plugin entrypoint' -Expected 'board' -Actual ([string](Get-Field $opened 'entrypoint'))
-    Assert-Equal -Id 'A1.4' -What 'the board pane belongs to this plugin' -Expected $script:PluginId -Actual ([string](Get-Field $opened 'plugin_id'))
+    Assert-Equal -Id 'A1.3' -What 'the board pane is the declared plugin entrypoint' -Expected 'board' -Actual ([string](Get-Field $pluginPane 'entrypoint'))
+    Assert-Equal -Id 'A1.4' -What 'the board pane belongs to this plugin' -Expected $script:PluginId -Actual ([string](Get-Field $pluginPane 'plugin_id'))
 
     $screen = ''
     $rendered = Wait-Until -TimeoutSeconds 60 -IntervalSeconds 3 -What 'board render' -Probe {
@@ -2662,12 +3565,43 @@ function Invoke-Board {
     }
     if ($rendered.Ok) { $screen = $rendered.Value }
     Add-Assertion -Id 'A2.1' -What 'the board rendered something' -Status $(if ($rendered.Ok) { 'PASS' } else { 'FAIL' }) -Evidence (Protect-Text $screen 900)
+    $columnStages = @('queued', 'running', 'needs_input', 'ready_for_review', 'done')
     foreach ($task in @($script:TaskA, $script:TaskB)) {
         if (-not $task) { continue }
         $id = [string](Get-Field $task 'ID')
         $branch = [string](Get-Field $task 'Branch')
         Assert-Match -Id "A2.id/$id" -What "the board shows task $id" -Pattern ([regex]::Escape($id)) -Actual $screen
-        Assert-Match -Id "A2.branch/$id" -What "the board shows the branch of $id" -Pattern ([regex]::Escape($branch)) -Actual $screen
+        $selectedId = [regex]::Match($screen, 'Selected\s+(?<id>orch_[0-9a-f]{12})\s+\|').Groups['id'].Value
+        if ($selectedId -ne $id) {
+            $selectedFact = $null
+            foreach ($candidate in @($script:TaskA, $script:TaskB)) {
+                if ([string](Get-Field $candidate 'ID') -eq $selectedId) { $selectedFact = $candidate; break }
+            }
+            $fromIndex = if ($selectedFact) { [Array]::IndexOf($columnStages, (Get-TaskStage -Fact $selectedFact)) } else { 0 }
+            $toIndex = [Array]::IndexOf($columnStages, (Get-TaskStage -Fact $task))
+            if ($fromIndex -ge 0 -and $toIndex -ge 0 -and $fromIndex -ne $toIndex) {
+                $key = if ($toIndex -gt $fromIndex) { 'tab' } else { 'shift+tab' }
+                $steps = [Math]::Abs($toIndex - $fromIndex)
+                $keys = @()
+                for ($step = 0; $step -lt $steps; $step++) { $keys += $key }
+            } else {
+                $key = Get-BoardSelectionKey -Screen $screen -CurrentId $selectedId -TargetId $id
+                if ($key) { $keys = @($key) } else { $keys = @('down') }
+            }
+            foreach ($key in $keys) {
+                $move = Invoke-Herdr -Arguments @('pane', 'send-keys', $boardPane, $key) -TimeoutSeconds 30
+                Assert-Equal -Id "A2.key/$id/$key" -What "the board accepts $key to navigate to task $id" -Expected 0 -Actual $move.ExitCode -Command $move.CommandLine -Evidence (Protect-Text $move.Stderr 200)
+                if ($move.ExitCode -ne 0) { break }
+            }
+            $selected = Wait-Until -TimeoutSeconds 20 -IntervalSeconds 1 -What "board selection $id" -Probe {
+                $candidateScreen = Get-PaneScreen -PaneId $boardPane -Source 'visible' -Lines 60 -Plain
+                $selectedPattern = 'Selected\s+' + [regex]::Escape($id) + '\s+\|\s+branch\s+' + [regex]::Escape($branch)
+                if ($candidateScreen -match $selectedPattern) { return $candidateScreen }
+                return $null
+            }
+            if ($selected.Ok) { $screen = $selected.Value }
+        }
+        Assert-Match -Id "A2.branch/$id" -What "the selected board card shows the branch of $id" -Pattern ([regex]::Escape($branch)) -Actual $screen
     }
     Assert-Match -Id 'A2.columns' -What 'the board shows the stage columns of this build' -Pattern 'Queued|Ready for review|Running|Needs input' -Actual $screen
     if ($screen -match 'Queued' -and $screen -match 'Done') {
@@ -2713,12 +3647,52 @@ function Invoke-Reviews {
     $idA = if ($script:TaskA) { [string](Get-Field $script:TaskA 'ID') } else { '' }
     $idB = if ($script:TaskB) { [string](Get-Field $script:TaskB 'ID') } else { '' }
     if (-not $idA -or -not $idB) { Block-Item -Id 'V0.0' -What 'dispositions' -Evidence 'one or both tasks never reported'; return }
-    $dispositionA = "ACCEPT-DISP-A-$($script:RunId): keep the branch, do not merge"
-    $dispositionB = "ACCEPT-DISP-B-$($script:RunId): keep the branch, do not merge"
-    $prompt = 'ACCEPT-REVIEW. Call the orch_review tool twice: first with taskId "' + $idA + '" and disposition "' + $dispositionA + '", then with taskId "' + $idB + '" and disposition "' + $dispositionB + '". Then reply with the word reviewed.'
-    $result = Invoke-PrimaryPrompt -PaneId $script:PrimaryPane -Text $prompt -TimeoutSeconds 300
-    Assert-True -Id 'V1.1' -What 'the primary accepted the review prompt' -Condition ($result.ExitCode -eq 0) -Command $result.CommandLine -Evidence ("code=[$($result.Code)] blocked=[$($result.Blocked)] " + (Protect-Text $result.Stderr 300))
-    if ($result.Blocked) { Block-Item -Id 'V1.1b' -What 'the primary was blocked when the review was due' -Evidence (Protect-Text $result.Screen 500) }
+
+    $pending = Resolve-PendingPrimaryDispositionAsks -AssertionPrefix 'V0' -TimeoutSeconds 60
+    if (-not $pending.Resolved) {
+        Block-Item -Id 'V0.ask-blocked' -What 'the primary disposition Ask could not be safely resolved' -Evidence (Protect-Text $pending.Screen 600)
+        return
+    }
+
+    $reviewTasks = New-Object System.Collections.ArrayList
+    foreach ($item in @(
+        @{ id = $idA; marker = 'ACCEPT-A'; askId = 'task_a_review'; label = 'Task A' },
+        @{ id = $idB; marker = 'ACCEPT-B'; askId = 'task_b_review'; label = 'Task B' }
+    )) {
+        $row = Get-TaskById -Id $item.id
+        $fact = Get-Field $row 'fact'
+        if ($null -eq (Get-Field $fact 'Report' $null)) {
+            Block-Item -Id "V0.report/$($item.id)" -What "task $($item.id) has no final report to review" -Evidence (Protect-Text (Get-Json $fact) 500)
+            return
+        }
+        if ([string]::IsNullOrWhiteSpace([string](Get-Field $fact 'Disposition'))) {
+            [void]$reviewTasks.Add([pscustomobject]$item)
+        }
+    }
+    if ($reviewTasks.Count -gt 0) {
+        foreach ($reviewTask in $reviewTasks) {
+            $prompt = 'ACCEPT-REVIEW. Review this one worker result only: ' + $reviewTask.marker +
+                ' taskId "' + $reviewTask.id + '". Ask the user with one single-question Ask using id "' +
+                $reviewTask.askId + '" and header "' + $reviewTask.label +
+                '". Offer "Accept report", "Request changes", then "Reject report" in that order. Wait for the choice, then call orch_review for this exact taskId with disposition "Accepted the reported result." Do not ask about any other task in the same Ask and do not merge or clean up either checkout. Reply reviewed after the tool result.'
+            $result = Invoke-PrimaryPromptNoWaitAfterDispositionAsks -PaneId $script:PrimaryPane -Text $prompt -TimeoutSeconds 300 -AssertionPrefix "V1.$($reviewTask.marker)"
+            Assert-True -Id "V1.submit/$($reviewTask.marker)" -What "the primary accepted the review prompt for $($reviewTask.label)" -Condition ($result.Submitted -and ($result.ExitCode -eq 0 -or $result.Blocked)) `
+                -Command $result.CommandLine -Evidence ("code=[$($result.Code)] blocked=[$($result.Blocked)] submitted=[$($result.Submitted)] stderr=[" + (Protect-Text $result.Stderr 300) + "] screen=[" + (Protect-Text $result.Screen 500) + "]")
+            if (-not $result.Submitted) {
+                Block-Item -Id "V1.submit-blocked/$($reviewTask.marker)" -What "the review prompt for $($reviewTask.label) was not submitted" -Evidence (Protect-Text $result.Screen 500)
+                return
+            }
+            $resolvedAsk = Resolve-PrimaryDispositionAsk -Marker $reviewTask.marker -AskId $reviewTask.askId -TaskId $reviewTask.id -AssertionId "V1.ask/$($reviewTask.marker)"
+            if (-not $resolvedAsk.Resolved -or -not $resolvedAsk.Observed) {
+                Block-Item -Id "V1.ask-blocked/$($reviewTask.marker)" -What "the primary Ask for $($reviewTask.label) was not safely resolved" -Evidence (Protect-Text $resolvedAsk.Screen 600)
+                return
+            }
+        }
+        Add-Assertion -Id 'V1.1' -What 'each outstanding report was confirmed in a separate primary Ask' -Status 'PASS'
+    } else {
+        Add-Assertion -Id 'V1.1' -What 'all report dispositions were already recorded through the primary Ask' -Status 'PASS'
+    }
+
 
     $done = Wait-Until -TimeoutSeconds 300 -IntervalSeconds 8 -What 'dispositions recorded' -Probe {
         $a = Get-TaskById -Id $idA
@@ -2813,6 +3787,13 @@ function Invoke-CleanupRefusals {
     }
     Assert-True -Id 'C6.2' -What 'no agent is left on the closed pane' -Condition $dead.Ok -TaskId $idB
 
+    $finalCleanupPreview = Invoke-BridgeAs -LaunchPaneId $primaryLaunch -Method 'cleanup_preview' -Params @{ taskId = $idB }
+    $finalCleanupDetail = [string](Get-Field $finalCleanupPreview.Result 'detail')
+    $cleanupReopensByPath = $finalCleanupDetail -match 'no workspace holds it, so it is opened by its recorded path first'
+    Assert-True -Id 'C6.3' -What 'the clean closed worktree preview identifies its recorded-path reopen plan' `
+        -Condition ($finalCleanupPreview.Ok -and (Test-JsonBool -Object $finalCleanupPreview.Result -Name 'removable') -and $cleanupReopensByPath) `
+        -TaskId $idB -Evidence (Protect-Text (Get-Json $finalCleanupPreview.Result) 500)
+
     # Everything the removal must preserve is captured from a FRESH store read
     # taken here, after the worker pane was closed and observed gone, so both the
     # success and the refusal comparison are exact rather than "still non-empty".
@@ -2893,8 +3874,16 @@ function Invoke-CleanupRefusals {
             -Condition (([string](Get-Field $after 'Branch') -ne '') -and ([string](Get-Field $after 'WorktreePath') -ne '')) -TaskId $idB
         Assert-Equal -Id 'C7.11' -What 'the cleanup result names the branch it kept' `
             -Expected $branchBefore -Actual ([string](Get-Field $cleanup3.Result 'branch')) -TaskId $idB
-        Assert-Equal -Id 'C7.12' -What 'the cleanup result names the workspace it removed the checkout from' `
-            -Expected ([string](Get-Field $script:TaskB 'CurrentWorkspaceID')) -Actual ([string](Get-Field $cleanup3.Result 'workspaceId')) -TaskId $idB
+        $cleanupWorkspace = [string](Get-Field $cleanup3.Result 'workspaceId')
+        $recordedWorkspaces = @(
+            [string](Get-Field $preCleanup 'CurrentWorkspaceID')
+            [string](Get-Field $preCleanup 'WorktreeWorkspaceID')
+        ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+        $workspaceRecorded = $cleanupWorkspace -and $cleanupWorkspace -in $recordedWorkspaces
+        $workspaceReopened = $cleanupWorkspace -and $cleanupReopensByPath -and $cleanupWorkspace -notin $recordedWorkspaces
+        Assert-True -Id 'C7.12' -What 'the cleanup result names a recorded or temporary path-reopen workspace' `
+            -Condition ($workspaceRecorded -or $workspaceReopened) -TaskId $idB `
+            -Evidence ("workspace=[$cleanupWorkspace] current=[$(Get-Field $preCleanup 'CurrentWorkspaceID')] worktree=[$(Get-Field $preCleanup 'WorktreeWorkspaceID')] reopened_by_path=[$cleanupReopensByPath]")
     } else {
         $script:MovedCleanupRefused = $cleanup3.Error
         Assert-True -Id 'C7.6b' -What 'a refused removal left the checkout in place untouched' -Condition (Test-Path -LiteralPath $path) -TaskId $idB
@@ -2979,12 +3968,14 @@ function Get-ProjectFacts {
 }
 
 function Get-IdentityProjection {
-    # The identity half of the durable facts: what must survive a restart.
+    # Stable project/task facts must survive a restart. Inbox contents are checked
+    # separately because delivery recovery may advance a note and startup may add
+    # new worker-activity notes.
     param($Facts)
     $parts = New-Object System.Collections.ArrayList
     $p = $Facts.Project
     if ($p) {
-        foreach ($field in @('Key', 'AgentName', 'LaunchPaneID', 'OMPSessionID', 'TerminalID', 'RepoWorkspaceID')) {
+        foreach ($field in @('Key', 'AgentName', 'LaunchPaneID', 'OMPSessionID', 'RepoWorkspaceID')) {
             [void]$parts.Add("project/$field=$([string](Get-Field $p $field))")
         }
     }
@@ -2996,11 +3987,39 @@ function Get-IdentityProjection {
         $report = Get-Field $f 'Report' $null
         [void]$parts.Add("task/$([string](Get-Field $f 'ID'))/Report=$((Get-Json $report))")
     }
-    foreach ($row in @($Facts.Inbox)) {
-        [void]$parts.Add("inbox/$([string](Get-Field $row 'id'))/$([string](Get-Field $row 'kind'))/$([string](Get-Field $row 'delivery_state'))")
-    }
     return ($parts -join ';')
 }
+function Test-InboxRowsPreserved {
+    param($Before, $After)
+    $afterById = @{}
+    foreach ($row in @($After)) {
+        $id = [string](Get-Field $row 'id')
+        if (-not [string]::IsNullOrWhiteSpace($id)) { $afterById[$id] = $row }
+    }
+    foreach ($row in @($Before)) {
+        $id = [string](Get-Field $row 'id')
+        if ([string]::IsNullOrWhiteSpace($id) -or -not $afterById.ContainsKey($id)) { return $false }
+        $preserved = $afterById[$id]
+        foreach ($field in @('project_key', 'task_id', 'kind', 'summary', 'delivery')) {
+            if ([string](Get-Field $row $field) -cne [string](Get-Field $preserved $field)) { return $false }
+        }
+    }
+    return $true
+}
+
+function Get-StartupLogEntries {
+    param($Logs, [long]$AfterUnixMs)
+    $matches = New-Object System.Collections.ArrayList
+    foreach ($entry in @($Logs)) {
+        $command = @(Get-Field $entry 'command' @())
+        $isStartup = ([string](Get-Field $entry 'event') -ieq 'startup') -or
+            ($command.Count -gt 0 -and [string]$command[-1] -ieq 'startup')
+        $started = [int64](Get-Field $entry 'started_unix_ms' 0)
+        if ($isStartup -and $started -gt $AfterUnixMs) { [void]$matches.Add($entry) }
+    }
+    return @($matches.ToArray())
+}
+
 
 function Invoke-Restart {
     Write-Step 'Phase 19: restart the isolated Herdr server and prove recovery'
@@ -3008,6 +4027,7 @@ function Invoke-Restart {
     $projectionBefore = Get-IdentityProjection -Facts $before
     Add-Assertion -Id 'T1.1' -What 'identity projection captured before the restart' -Status 'INFO' -Evidence (Protect-Text $projectionBefore 800)
 
+    $script:RestartLogWatermarkMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
     $stop = Invoke-Herdr -Arguments @('server', 'stop') -TimeoutSeconds 90
     Assert-Equal -Id 'T2.1' -What 'the isolated server stops on request' -Expected 0 -Actual $stop.ExitCode -Command $stop.CommandLine -Evidence (Protect-Text $stop.Stderr 300)
     $stopped = Wait-Until -TimeoutSeconds 60 -IntervalSeconds 3 -What 'session stopped' -Probe {
@@ -3030,15 +4050,22 @@ function Invoke-Restart {
     Assert-True -Id 'T3.1' -What 'the isolated session comes back up after the restart' -Condition $back.Ok `
         -Evidence ("after {0:N0}s; server log: {1}" -f $back.Elapsed, (Protect-Text (Get-Content -LiteralPath $script:ServerLog -Raw -ErrorAction SilentlyContinue) 300))
 
+    $script:LastStartupLogs = @()
     $startup = Wait-Until -TimeoutSeconds 120 -IntervalSeconds 5 -What 'startup hook' -Probe {
         $json = Get-HerdrJson -Arguments @('plugin', 'log', 'list', '--plugin', $script:PluginId, '--limit', '50')
-        $entries = @((Get-JsonField $json 'logs' @()) | Where-Object { (Get-Field $_ 'event') -eq 'startup' })
-        if ($entries.Count -lt 2) { return $null }
+        $script:LastStartupLogs = @(Get-JsonField $json 'logs' @())
+        $entries = @(Get-StartupLogEntries -Logs $script:LastStartupLogs -AfterUnixMs $script:RestartLogWatermarkMs)
+        if ($entries.Count -eq 0) { return $null }
         $newest = $entries | Sort-Object { [int64](Get-Field $_ 'started_unix_ms') } | Select-Object -Last 1
         if ((Get-Field $newest 'status') -eq 'running') { return $null }
         return $newest
     }
-    Assert-True -Id 'T4.1' -What 'the plugin startup hook ran again after the restart' -Condition $startup.Ok -Evidence (Protect-Text (Get-Json $startup.Value) 400)
+    $startupEvidence = if ($startup.Ok) {
+        Protect-Text (Get-Json $startup.Value) 400
+    } else {
+        "watermark=$($script:RestartLogWatermarkMs) recent=" + (Protect-Text (Get-Json $script:LastStartupLogs) 400)
+    }
+    Assert-True -Id 'T4.1' -What 'the plugin startup hook ran again after the restart' -Condition $startup.Ok -Evidence $startupEvidence
     if ($startup.Ok) {
         Assert-Equal -Id 'T4.2' -What 'the startup reconciliation succeeded' -Expected 'succeeded' -Actual ([string](Get-Field $startup.Value 'status'))
         Assert-Match -Id 'T4.3' -What 'the reconciliation reported ok' -Pattern '"ok":true' -Actual ([string](Get-Field $startup.Value 'stdout'))
@@ -3046,8 +4073,18 @@ function Invoke-Restart {
 
     $after = Get-ProjectFacts
     $projectionAfter = Get-IdentityProjection -Facts $after
-    Assert-Equal -Id 'T5.1' -What 'identities, stages, reports, dispositions and inbox rows survive the restart' -Expected $projectionBefore -Actual $projectionAfter
-    Assert-Equal -Id 'T5.2' -What 'the inbox rows are all still there' -Expected @($before.Inbox).Count -Actual @($after.Inbox).Count
+    $projectionBeforeParts = @($projectionBefore -split ';')
+    $projectionAfterParts = @($projectionAfter -split ';')
+    $projectionDifferences = @(Compare-Object -ReferenceObject $projectionBeforeParts -DifferenceObject $projectionAfterParts -CaseSensitive |
+        ForEach-Object { "$($_.SideIndicator) $($_.InputObject)" })
+    Assert-True -Id 'T5.1' -What 'identities, stages, reports and dispositions survive the restart' `
+        -Condition ($projectionDifferences.Count -eq 0) -Evidence (Protect-Text ($projectionDifferences -join ' | ') 1600)
+    $beforeInboxIds = @($before.Inbox | ForEach-Object { [string](Get-Field $_ 'id') })
+    $afterInboxIds = @($after.Inbox | ForEach-Object { [string](Get-Field $_ 'id') })
+    $missingInboxIds = @($beforeInboxIds | Where-Object { $_ -notin $afterInboxIds })
+    $inboxPreserved = Test-InboxRowsPreserved -Before $before.Inbox -After $after.Inbox
+    Assert-True -Id 'T5.2' -What 'all pre-restart inbox notes and their content survive restart' -Condition $inboxPreserved `
+        -Evidence ("before={0} after={1} missing=[{2}]" -f @($before.Inbox).Count, @($after.Inbox).Count, ($missingInboxIds -join ','))
 
     $listing = Get-WorktreeList
     $entries = @(Get-Field $listing 'worktrees' @())
@@ -3085,6 +4122,10 @@ function Invoke-Restart {
             Block-Item -Id 'T7.2' -What 'the restored agent still carries the recorded OMP session' -Evidence (Protect-Text (Get-Json $agent.Raw) 300)
         }
         $script:RestoredPrimaryPane = $restoredPane
+        $restoredProject = (Get-ProjectFacts).Project
+        $restoredTerminalId = [string](Get-Field $restored.Value 'terminal_id')
+        Assert-NonEmpty -Id 'T7.3' -What 'Herdr restored the primary with a live terminal identity' -Value $restoredTerminalId
+        Assert-Equal -Id 'T7.4' -What 'the project terminal identity was refreshed to match the restored primary' -Expected $restoredTerminalId -Actual ([string](Get-Field $restoredProject 'TerminalID'))
     }
 
     if ($script:RestoredPrimaryPane) {
@@ -3092,7 +4133,7 @@ function Invoke-Restart {
         if ($idA) {
             $probe = 'ACCEPT-TOOLS-RESTORED. Call the orch_review tool with taskId "' + $idA + '" and disposition "ACCEPT-TOOLS-RESTORED-' + $script:RunId + '". If that tool is not available in this session, reply exactly NOTOOLHERE and do nothing else.'
             $result = Invoke-PrimaryPrompt -PaneId $script:RestoredPrimaryPane -Text $probe -TimeoutSeconds 300
-            Assert-True -Id 'T8.1' -What 'the restored primary session accepts a prompt' -Condition ($result.ExitCode -eq 0) -Command $result.CommandLine -Evidence ("code=[$($result.Code)] blocked=[$($result.Blocked)] " + (Protect-Text $result.Stderr 300))
+            Assert-True -Id 'T8.1' -What 'the restored primary session accepts a prompt' -Condition ($result.ExitCode -eq 0) -Command $result.CommandLine -Evidence ("code=[$($result.Code)] blocked=[$($result.Blocked)] stderr=[" + (Protect-Text $result.Stderr 300) + "] screen=[" + (Protect-Text $result.Screen 500) + "]")
             $toolRan = Wait-Until -TimeoutSeconds 240 -IntervalSeconds 8 -What 'restored role tool' -Probe {
                 $fact = Get-Field (Get-TaskById -Id $idA) 'fact'
                 if ([string](Get-Field $fact 'Disposition') -match 'ACCEPT-TOOLS-RESTORED') { return $fact }
@@ -3206,24 +4247,25 @@ function Invoke-Cleanup {
             Add-Assertion -Id 'Z1.1' -What 'focus restoration' -Status 'FAIL' -Evidence (Protect-Text $_.Exception.Message 400)
         }
 
-        # 2. Close the panes and workspaces this run created. With
-        # -KeepResources the whole session is left standing for inspection.
+        # The root repository and linked worktree panes form one Herdr workspace
+        # group. Close that group as a unit; individual closes require confirmation.
         if (-not $KeepResources) {
-        foreach ($pane in @($script:CreatedPanes | Select-Object -Unique)) {
-            [void](Invoke-Herdr -Arguments @('pane', 'close', $pane) -TimeoutSeconds 60)
-        }
-        $script:CreatedPanes.Clear()
-        foreach ($workspace in @($script:CreatedWorkspaces | Select-Object -Unique)) {
-            [void](Invoke-Herdr -Arguments @('workspace', 'close', $workspace) -TimeoutSeconds 60)
-        }
-        $script:CreatedWorkspaces.Clear()
-        $remaining = Get-HerdrJson -Arguments @('workspace', 'list') -TimeoutSeconds 60
-        Assert-Equal -Id 'Z2.1' -What 'every workspace this run created is closed again' -Expected 0 -Actual @((Get-JsonField $remaining 'workspaces' @())).Count `
-            -Evidence (Protect-Text (Get-Json (Get-JsonField $remaining 'workspaces' @())) 400)
-        $finalSnapshot = Get-Snapshot
-        Assert-Equal -Id 'Z2.2' -What 'the isolated session is back to the empty focus state it had before this run created anything' `
-            -Expected $script:InitialWorkspaceCount -Actual @($finalSnapshot.workspaces).Count `
-            -Evidence ("focused_workspace_id=[{0}] focused_pane_id=[{1}]" -f (Get-Field $finalSnapshot 'focused_workspace_id'), (Get-Field $finalSnapshot 'focused_pane_id'))
+            $rootWorkspace = [string](Get-Field $script:Project 'RepoWorkspaceID')
+            if ([string]::IsNullOrWhiteSpace($rootWorkspace)) { $rootWorkspace = [string]$script:PrimaryWorkspace }
+            $close = Invoke-Herdr -Arguments @('workspace', 'close', $rootWorkspace, '--group') -TimeoutSeconds 60
+            $closeCode = Get-HerdrErrorCode -Result $close
+            $closeOk = ($close.ExitCode -eq 0) -or ($closeCode -in @('workspace_not_found', 'not_found'))
+            Assert-True -Id 'Z2.group-close' -What 'Herdr closes the isolated repository and its linked worktree group' -Condition $closeOk `
+                -Command $close.CommandLine -Evidence (Protect-Text ($close.Stderr + $close.Stdout) 400)
+            $script:CreatedPanes.Clear()
+            $script:CreatedWorkspaces.Clear()
+            $remaining = Get-HerdrJson -Arguments @('workspace', 'list') -TimeoutSeconds 60
+            Assert-Equal -Id 'Z2.1' -What 'every workspace this run created is closed again' -Expected 0 -Actual @((Get-JsonField $remaining 'workspaces' @())).Count `
+                -Evidence (Protect-Text (Get-Json (Get-JsonField $remaining 'workspaces' @())) 400)
+            $finalSnapshot = Get-Snapshot
+            Assert-Equal -Id 'Z2.2' -What 'the isolated session is back to the empty focus state it had before this run created anything' `
+                -Expected $script:InitialWorkspaceCount -Actual @($finalSnapshot.workspaces).Count `
+                -Evidence ("focused_workspace_id=[{0}] focused_pane_id=[{1}]" -f (Get-Field $finalSnapshot 'focused_workspace_id'), (Get-Field $finalSnapshot 'focused_pane_id'))
         } else {
             Add-Assertion -Id 'Z2.3' -What 'the run workspaces, panes and session server were intentionally kept (-KeepResources)' -Status 'INFO' `
                 -Evidence ("workspaces=[$($script:CreatedWorkspaces -join ',')] panes=[$($script:CreatedPanes -join ',')] session=$($script:SessionName)")
@@ -3411,7 +4453,12 @@ function Step-Phase {
         & $Body
     } catch {
         Add-Assertion -Id "$Id.ERR" -What "$Name raised an error" -Status 'FAIL' -Evidence (Protect-Text ($_.Exception.Message + ' ' + $_.ScriptStackTrace) 800)
-        if ($Critical) { throw }
+        if ($Critical) {
+            if ($Id -eq 'K0') {
+                Preserve-ResourcesForPendingTool -AssertionId 'K0.resources-preserved' -Reason (Protect-Text $_.Exception.Message 600)
+            }
+            throw
+        }
     }
 }
 
@@ -3440,7 +4487,7 @@ try {
     Step-Phase -Id 'D0' -Name 'dispatch' -Critical -Body { Invoke-Dispatch }
     Step-Phase -Id 'PR0' -Name 'partial report rejection' -Body { Invoke-PartialReportRejection }
     Step-Phase -Id 'Q0' -Name 'question relay' -Body { Invoke-QuestionRelay }
-    Step-Phase -Id 'K0' -Name 'blocked dialog' -Body { Invoke-BlockedDialog }
+    Step-Phase -Id 'K0' -Name 'blocked dialog' -Critical -Body { Invoke-BlockedDialog }
     Step-Phase -Id 'M0' -Name 'pane move' -Body { Invoke-PaneMove }
     Step-Phase -Id 'W0' -Name 'worker reports' -Body { Invoke-WorkerReports }
     Step-Phase -Id 'A0' -Name 'board' -Body { Invoke-Board }

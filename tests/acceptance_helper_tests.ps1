@@ -121,6 +121,22 @@ Check 'Test-Below child' (Test-Below -Root 'C:\a\b' -Path 'C:\a\b\c\d') 'child'
 Check 'Test-Below rejects prefix sibling' (-not (Test-Below -Root 'C:\a\b' -Path 'C:\a\bc')) 'prefix'
 Check 'ConvertTo-NormalPath trims trailing' ((ConvertTo-NormalPath 'C:/x/y/') -eq 'C:\x\y') (ConvertTo-NormalPath 'C:/x/y/')
 
+if (Get-Command Get-AcceptanceRunIdFromProjectKey -ErrorAction SilentlyContinue) {
+    $staleProjectKey = Join-Path (Join-Path $env:TEMP 'orch-accept-f762c17c') 'repo'
+    $acceptanceRunId = Get-AcceptanceRunIdFromProjectKey -Key $staleProjectKey -TempRoot $env:TEMP
+    $nonAcceptanceKey = Join-Path (Join-Path $env:TEMP 'ordinary-project') 'repo'
+    $nonAcceptanceRunId = Get-AcceptanceRunIdFromProjectKey -Key $nonAcceptanceKey -TempRoot $env:TEMP
+    $siblingTemp = "$($env:TEMP)-sibling"
+    $siblingKey = Join-Path (Join-Path $siblingTemp 'orch-accept-f762c17c') 'repo'
+    $siblingRunId = Get-AcceptanceRunIdFromProjectKey -Key $siblingKey -TempRoot $env:TEMP
+} else {
+    $acceptanceRunId = ''
+    $nonAcceptanceRunId = ''
+    $siblingRunId = ''
+}
+Check 'stale acceptance key recognizes exact temp repo' ($acceptanceRunId -eq 'f762c17c') $acceptanceRunId
+Check 'ordinary temp repo is not stale acceptance state' ($nonAcceptanceRunId -eq '') $nonAcceptanceRunId
+Check 'temp-prefix sibling is not stale acceptance state' ($siblingRunId -eq '') $siblingRunId
 # --- redaction --------------------------------------------------------------
 $secret = 'sk-abcdefghijklmnopqrstuvwxyz'
 $red = Protect-Text "token=$secret and ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"
@@ -268,6 +284,35 @@ $reported = $fact.PSObject.Copy()
 $reported.Report = [pscustomobject]@{ Kind = 'result'; Summary = 's' }
 Check 'projection (stage form) notices a report' ((Get-TaskProjection -Fact $fact) -cne (Get-TaskProjection -Fact $reported)) 'report'
 Check 'projection (move form) ignores a report' ((Get-TaskProjection -Fact $fact -MoveSensitive) -ceq (Get-TaskProjection -Fact $reported -MoveSensitive)) 'report/move'
+$identityFacts = [pscustomobject]@{
+    Project = [pscustomobject]@{ Key = 'repo'; AgentName = 'primary'; LaunchPaneID = 'p1'; OMPSessionID = 's1'; TerminalID = 't1'; RepoWorkspaceID = 'w1' }
+    Tasks = @()
+    Inbox = @([pscustomobject]@{ id = 'i1'; kind = 'activity'; delivery_state = 'delivered' })
+}
+$identityProjection = ''
+try { $identityProjection = Get-IdentityProjection -Facts $identityFacts } catch { }
+Check 'restart identity projection accepts Facts and excludes mutable inbox rows' ($identityProjection -match 'project/Key=repo' -and $identityProjection -notmatch 'inbox/i1') 'project fields only'
+$identityFactsAfter = [pscustomobject]@{
+    Project = $identityFacts.Project.PSObject.Copy()
+    Tasks = @()
+    Inbox = @()
+}
+$identityFactsAfter.Project.TerminalID = 't2'
+$identityProjectionAfter = ''
+try { $identityProjectionAfter = Get-IdentityProjection -Facts $identityFactsAfter } catch { }
+Check 'restart identity projection ignores the terminal id that Herdr reassigns' ($identityProjection -ceq $identityProjectionAfter) "before=[$identityProjection] after=[$identityProjectionAfter]"
+$boardOrderScreen = @'
+Ready for review
+[task_b] B
+> [task_a] A
+Selected task_a | branch branch-a
+'@
+$boardMoveUp = ''
+$boardMoveDown = ''
+try { $boardMoveUp = Get-BoardSelectionKey -Screen $boardOrderScreen -CurrentId 'task_a' -TargetId 'task_b' } catch { }
+try { $boardMoveDown = Get-BoardSelectionKey -Screen $boardOrderScreen -CurrentId 'task_b' -TargetId 'task_a' } catch { }
+Check 'board selector moves upward to a preceding task in the same stage' ($boardMoveUp -eq 'up') "move=$boardMoveUp"
+Check 'board selector moves downward to a following task in the same stage' ($boardMoveDown -eq 'down') "move=$boardMoveDown"
 
 $pathHandshake = [pscustomobject]@{ omp_session_file = (Join-Path $script:HarnessRoot 'materialized-probe.txt'); omp_session_on_disk = 1 }
 Set-Content -LiteralPath $pathHandshake.omp_session_file -Value 'x'
@@ -358,6 +403,197 @@ Check 'Assert-JsonTrue records FAIL for the string "false"' ((Assert-JsonTrue -I
 Check 'Assert-JsonTrue records FAIL for a missing value' ((Assert-JsonTrue -Id 'H.3' -What 'bool absent' -Object ([pscustomobject]@{}) -Name 'ok').status -eq 'FAIL') 'absent'
 Check 'Assert-JsonFalse records PASS for a real false' ((Assert-JsonFalse -Id 'H.4' -What 'bool false' -Object ([pscustomobject]@{ ok = $false }) -Name 'ok').status -eq 'PASS') 'false'
 Check 'Assert-JsonFalse records FAIL for a number' ((Assert-JsonFalse -Id 'H.5' -What 'bool number' -Object ([pscustomobject]@{ ok = 1 }) -Name 'ok').status -eq 'FAIL') 'number'
+# Evidence-enriched assertion calls must not throw while formatting a failure.
+$withNonEmptyEvidence = $null
+try {
+    $withNonEmptyEvidence = Assert-NonEmpty -Id 'H.6' -What 'non-empty details' -Value 'pane-1' -Evidence 'context=board-pane'
+} catch { }
+Check 'Assert-NonEmpty accepts and records caller evidence' ($null -ne $withNonEmptyEvidence -and $withNonEmptyEvidence.evidence -match 'context=board-pane') 'evidence'
+$withBoolEvidence = $null
+try {
+    $withBoolEvidence = Assert-JsonTrue -Id 'H.7' -What 'boolean details' -Object ([pscustomobject]@{ ok = $true }) -Name 'ok' -Evidence 'rows=2'
+} catch { }
+Check 'Assert-JsonTrue accepts and records caller evidence' ($null -ne $withBoolEvidence -and $withBoolEvidence.evidence -match 'rows=2') 'evidence'
+$withFalseEvidence = $null
+try {
+    $withFalseEvidence = Assert-JsonFalse -Id 'H.8' -What 'false details' -Object ([pscustomobject]@{ ok = $false }) -Name 'ok' -Evidence 'rows=0'
+} catch { }
+Check 'Assert-JsonFalse accepts and records caller evidence' ($null -ne $withFalseEvidence -and $withFalseEvidence.evidence -match 'rows=0') 'evidence'
+$sessionHandshake = [pscustomobject]@{
+    omp_session_id = 'session-1'
+    omp_session_file = 'C:\temp\session.jsonl'
+    verified_value = 'C:\temp\session.jsonl'
+}
+Check 'session identity links ID and path through the handshake' (Test-SessionIdentity -Left 'session-1' -Right 'C:\temp\session.jsonl' -Ready $sessionHandshake) 'same announced session'
+Check 'session identity rejects an unrelated ID despite a matching path form' (-not (Test-SessionIdentity -Left 'session-2' -Right 'C:\temp\session.jsonl' -Ready $sessionHandshake)) 'unrelated ID'
+$transcriptPath = Join-Path $script:HarnessRoot 'primary-session.jsonl'
+Set-Content -LiteralPath $transcriptPath -Value '{"type":"message","message":{"content":[{"type":"text","text":"orchestrator: ACCEPT-Q-A question"}]}}' -Encoding UTF8
+$transcriptHasMarker = $false
+try { $transcriptHasMarker = Test-OmpTranscriptContains -Path $transcriptPath -Text 'ACCEPT-Q-A' } catch { }
+Check 'OMP transcript confirms a prompt outside the visible scrollback' $transcriptHasMarker 'marker in JSONL'
+$transcriptMissingMarker = $true
+try { $transcriptMissingMarker = Test-OmpTranscriptContains -Path $transcriptPath -Text 'ACCEPT-Q-Z' } catch { }
+Check 'OMP transcript rejects an absent prompt marker' (-not $transcriptMissingMarker) 'missing marker'
+$approvalTranscriptPath = Join-Path $script:HarnessRoot 'approval-session.jsonl'
+Set-Content -LiteralPath $approvalTranscriptPath -Value '{"type":"message","message":{"role":"assistant","content":[{"type":"toolCall","name":"orch_approve_dialog","arguments":{"taskId":"orch_abc","keys":["enter"]}}]}}' -Encoding UTF8
+$approvalToolCallMatches = $false
+try { $approvalToolCallMatches = Test-OmpApprovalToolCall -Path $approvalTranscriptPath -TaskId 'orch_abc' -Keys @('enter') } catch { }
+Check 'primary transcript proves the exact approval task and key call' $approvalToolCallMatches 'task/key toolCall'
+$wrongApprovalToolTask = $true
+try { $wrongApprovalToolTask = Test-OmpApprovalToolCall -Path $approvalTranscriptPath -TaskId 'orch_other' -Keys @('enter') } catch { }
+Check 'primary transcript refuses an approval tool call for another task' (-not $wrongApprovalToolTask) 'wrong task'
+$wrongApprovalToolKeys = $true
+try { $wrongApprovalToolKeys = Test-OmpApprovalToolCall -Path $approvalTranscriptPath -TaskId 'orch_abc' -Keys @('escape') } catch { }
+Check 'primary transcript refuses a different approval key set' (-not $wrongApprovalToolKeys) 'wrong keys'
+$primaryAskScreen = @'
+Earlier conversation contained a completed task-A review:
+Ask 1 questions
+[task_a_review] · options:3
+Accept report
+Request changes
+The active dialog is now for Task B.
+Ask 1 questions
+[task_b_review] · options:3
+Task B reports the uncommitted change. How should I record the disposition?
+Accept report
+Request changes
+'@
+$parsedAskId = Get-PrimaryAskId -Screen $primaryAskScreen
+Check 'active Ask id is parsed from the modal header' ($parsedAskId -eq 'task_b_review') $parsedAskId
+$primaryAskMatches = $false
+try { $primaryAskMatches = Test-PrimaryDispositionAskScreen -Screen $primaryAskScreen -AskId 'task_b_review' } catch { }
+Check 'primary disposition matcher identifies the active task-B Ask' $primaryAskMatches 'active Ask id'
+$staleTaskMatches = $true
+try { $staleTaskMatches = Test-PrimaryDispositionAskScreen -Screen $primaryAskScreen -AskId 'task_a_review' } catch { }
+Check 'primary disposition matcher ignores an old task-A marker outside the active Ask' (-not $staleTaskMatches) 'old scrollback marker'
+$wrongTaskMatches = $true
+try { $wrongTaskMatches = Test-PrimaryDispositionAskScreen -Screen $primaryAskScreen -AskId 'task_c_review' } catch { }
+Check 'primary disposition matcher refuses a different active Ask id' (-not $wrongTaskMatches) 'wrong active Ask'
+$reversedAskScreen = $primaryAskScreen -replace 'Accept report', 'TEMP' -replace 'Request changes', 'Accept report' -replace 'TEMP', 'Request changes'
+$reversedAskMatches = $true
+try { $reversedAskMatches = Test-PrimaryDispositionAskScreen -Screen $reversedAskScreen -AskId 'task_b_review' } catch { }
+Check 'primary disposition matcher refuses when Accept is not the first choice' (-not $reversedAskMatches) 'wrong choice order'
+$primaryWorkerQuestionAskScreen = @'
+Older scrollback mentions another worker question.
+Ask 1 questions
+[answer_a] · options:2
+Should a.js keep its existing export style? The worker reports only after the exact token ACCEPT-ANSWER-A.
+Yes — ACCEPT-ANSWER-A
+Authorize reporting and keep the existing export style.
+No — do not authorize
+Do not report.
+'@
+$workerQuestionAskMatches = $false
+try { $workerQuestionAskMatches = Test-PrimaryWorkerQuestionAskScreen -Screen $primaryWorkerQuestionAskScreen -AskId 'answer_a' -QuestionText 'Should a.js keep its existing export style?' -AnswerToken 'ACCEPT-ANSWER-A' } catch { }
+Check 'worker-question matcher recognizes only the exact active answer Ask' $workerQuestionAskMatches 'answer_a + exact token'
+$wrongWorkerQuestionAskMatches = $true
+try { $wrongWorkerQuestionAskMatches = Test-PrimaryWorkerQuestionAskScreen -Screen $primaryWorkerQuestionAskScreen -AskId 'answer_b' -QuestionText 'Should a.js keep its existing export style?' -AnswerToken 'ACCEPT-ANSWER-A' } catch { }
+Check 'worker-question matcher refuses a different active Ask id' (-not $wrongWorkerQuestionAskMatches) 'wrong Ask id'
+$wrongWorkerQuestionTokenMatches = $true
+try { $wrongWorkerQuestionTokenMatches = Test-PrimaryWorkerQuestionAskScreen -Screen $primaryWorkerQuestionAskScreen -AskId 'answer_a' -QuestionText 'Should a.js keep its existing export style?' -AnswerToken 'ACCEPT-ANSWER-B' } catch { }
+Check 'worker-question matcher refuses a different authorization token' (-not $wrongWorkerQuestionTokenMatches) 'wrong token'
+$reversedWorkerQuestionAskScreen = $primaryWorkerQuestionAskScreen -replace 'Yes — ACCEPT-ANSWER-A', 'TEMP' -replace 'No — do not authorize', 'Yes — ACCEPT-ANSWER-A' -replace 'TEMP', 'No — do not authorize'
+$reversedWorkerQuestionAskMatches = $true
+try { $reversedWorkerQuestionAskMatches = Test-PrimaryWorkerQuestionAskScreen -Screen $reversedWorkerQuestionAskScreen -AskId 'answer_a' -QuestionText 'Should a.js keep its existing export style?' -AnswerToken 'ACCEPT-ANSWER-A' } catch { }
+Check 'worker-question matcher refuses when the authorized token is not the first option' (-not $reversedWorkerQuestionAskMatches) 'reversed authorization choice'
+$primaryWorkerAnswerChoiceAskScreen = @'
+Ask 1 questions
+[export-style] · options:2
+How should I answer the worker's question about a.js export style?
+Yes, keep the existing style
+Preserve current exports and follow their pattern for subtract.
+No, use a different style
+Give the worker a different export style instruction.
+Other (type your own)
+'@
+$workerAnswerChoiceMatches = $false
+try { $workerAnswerChoiceMatches = Test-PrimaryWorkerAnswerChoiceAskScreen -Screen $primaryWorkerAnswerChoiceAskScreen -AskId 'export-style' -QuestionText 'Should a.js keep its existing export style?' } catch { }
+Check 'worker-answer matcher accepts the exact primary answer-choice Ask with a dynamic id' $workerAnswerChoiceMatches 'export-style + exact yes/no options'
+$wrongWorkerAnswerChoiceMatches = $true
+try { $wrongWorkerAnswerChoiceMatches = Test-PrimaryWorkerAnswerChoiceAskScreen -Screen $primaryWorkerAnswerChoiceAskScreen -AskId 'export-style' -QuestionText 'Should b.js keep its existing export style?' } catch { }
+Check 'worker-answer matcher refuses a choice Ask for a different worker question' (-not $wrongWorkerAnswerChoiceMatches) 'wrong worker question'
+$reversedWorkerAnswerChoiceScreen = $primaryWorkerAnswerChoiceAskScreen -replace 'Yes, keep the existing style', 'TEMP' -replace 'No, use a different style', 'Yes, keep the existing style' -replace 'TEMP', 'No, use a different style'
+$reversedWorkerAnswerChoiceMatches = $true
+try { $reversedWorkerAnswerChoiceMatches = Test-PrimaryWorkerAnswerChoiceAskScreen -Screen $reversedWorkerAnswerChoiceScreen -AskId 'export-style' -QuestionText 'Should a.js keep its existing export style?' } catch { }
+Check 'worker-answer matcher refuses when the authorized style choice is not first' (-not $reversedWorkerAnswerChoiceMatches) 'reversed worker answer choices'
+$primaryWorkerExactQuestionAskScreen = @'
+Ask 1 questions
+[style] · options:2
+Should a.js keep its existing export style?
+Yes, keep it
+Preserve the current style while adding subtract.
+No, change it
+Have the worker change to another export style.
+Other (type your own)
+'@
+$exactWorkerQuestionAskMatches = $false
+try { $exactWorkerQuestionAskMatches = Test-PrimaryWorkerAnswerChoiceAskScreen -Screen $primaryWorkerExactQuestionAskScreen -AskId 'style' -QuestionText 'Should a.js keep its existing export style?' } catch { }
+Check 'worker-answer matcher accepts the exact question with the actual style/no-style options' $exactWorkerQuestionAskMatches 'style + exact question and options'
+$wrongExactWorkerQuestionAskMatches = $true
+try { $wrongExactWorkerQuestionAskMatches = Test-PrimaryWorkerAnswerChoiceAskScreen -Screen $primaryWorkerExactQuestionAskScreen -AskId 'style' -QuestionText 'Should b.js keep its existing export style?' } catch { }
+Check 'worker-answer matcher refuses the exact-question Ask for another file' (-not $wrongExactWorkerQuestionAskMatches) 'wrong file question'
+$approvalConfirmScreen = @'
+Open acceptance dialog as instructed
+Ask
+ACCEPT-Q-DIALOG: which contract should b.js use?
+keep the current contract
+change the contract
+Keys: enter
+Yes
+No
+'@
+$approvalConfirmMatches = $false
+try { $approvalConfirmMatches = Test-PrimaryApprovalConfirmScreen -Screen $approvalConfirmScreen -DialogMarker 'ACCEPT-Q-DIALOG' -ExpectedQuestion 'ACCEPT-Q-DIALOG: which contract should b.js use?' -Keys @('enter') } catch { }
+Check 'approval modal matches the exact dialog, key and confirmation buttons' $approvalConfirmMatches 'exact confirmation'
+$wrongApprovalKeyMatches = $true
+try { $wrongApprovalKeyMatches = Test-PrimaryApprovalConfirmScreen -Screen $approvalConfirmScreen -DialogMarker 'ACCEPT-Q-DIALOG' -ExpectedQuestion 'ACCEPT-Q-DIALOG: which contract should b.js use?' -Keys @('escape') } catch { }
+Check 'approval modal refuses a different key set' (-not $wrongApprovalKeyMatches) 'wrong keys'
+$wrongApprovalDialogMatches = $true
+try { $wrongApprovalDialogMatches = Test-PrimaryApprovalConfirmScreen -Screen $approvalConfirmScreen -DialogMarker 'UNRELATED' -ExpectedQuestion 'ACCEPT-Q-DIALOG: which contract should b.js use?' -Keys @('enter') } catch { }
+Check 'approval modal refuses a different dialog' (-not $wrongApprovalDialogMatches) 'wrong dialog'
+$reversedApprovalChoices = $approvalConfirmScreen -replace 'keep the current contract', 'TEMP' -replace 'change the contract', 'keep the current contract' -replace 'TEMP', 'change the contract'
+$reversedApprovalMatches = $true
+try { $reversedApprovalMatches = Test-PrimaryApprovalConfirmScreen -Screen $reversedApprovalChoices -DialogMarker 'ACCEPT-Q-DIALOG' -ExpectedQuestion 'ACCEPT-Q-DIALOG: which contract should b.js use?' -Keys @('enter') } catch { }
+Check 'approval modal refuses reversed worker-choice options' (-not $reversedApprovalMatches) 'wrong worker option order'
+$missingConfirmButtons = $true
+try { $missingConfirmButtons = Test-PrimaryApprovalConfirmScreen -Screen ($approvalConfirmScreen -replace 'Yes\r?\nNo', '') -DialogMarker 'ACCEPT-Q-DIALOG' -ExpectedQuestion 'ACCEPT-Q-DIALOG: which contract should b.js use?' -Keys @('enter') } catch { }
+Check 'approval modal refuses when its yes/no confirmation buttons are absent' (-not $missingConfirmButtons) 'missing buttons'
+$changedApprovalQuestion = $approvalConfirmScreen -replace 'which contract should b\.js use\?', 'which namespace should b.js use?'
+$wrongApprovalQuestionMatches = $true
+try { $wrongApprovalQuestionMatches = Test-PrimaryApprovalConfirmScreen -Screen $changedApprovalQuestion -DialogMarker 'ACCEPT-Q-DIALOG' -ExpectedQuestion 'ACCEPT-Q-DIALOG: which contract should b.js use?' -Keys @('enter') } catch { }
+Check 'approval modal refuses a different question even when its marker and options are unchanged' (-not $wrongApprovalQuestionMatches) 'wrong exact question'
+$verticalBorderForTest = [string][char]0x2502
+$nestedBorderQuestion = $verticalBorderForTest + ' ' + $verticalBorderForTest + ' ACCEPT-Q-DIALOG: which contract should b.js use? ' + $verticalBorderForTest
+$nestedBorderScreen = $approvalConfirmScreen -replace 'ACCEPT-Q-DIALOG: which contract should b\.js use\?', $nestedBorderQuestion
+$nestedBorderMatches = $false
+try { $nestedBorderMatches = Test-PrimaryApprovalConfirmScreen -Screen $nestedBorderScreen -DialogMarker 'ACCEPT-Q-DIALOG' -ExpectedQuestion 'ACCEPT-Q-DIALOG: which contract should b.js use?' -Keys @('enter') } catch { }
+Check 'approval matcher accepts an exact question inside nested terminal borders' $nestedBorderMatches 'double box border'
+$inboxBefore = @(
+    [pscustomobject]@{ id = 'i1'; project_key = 'repo'; task_id = 't1'; kind = 'question'; summary = 'Need input'; delivery = 'worker question'; delivery_state = 'sending'; delivery_detail = '' }
+)
+$inboxAfter = @(
+    [pscustomobject]@{ id = 'i1'; project_key = 'repo'; task_id = 't1'; kind = 'question'; summary = 'Need input'; delivery = 'worker question'; delivery_state = 'uncertain'; delivery_detail = 'recovered after restart' },
+    [pscustomobject]@{ id = 'i2'; project_key = 'repo'; task_id = 't2'; kind = 'activity'; summary = 'worker resumed'; delivery = 'worker activity'; delivery_state = 'delivered'; delivery_detail = '' }
+)
+$inboxSurvived = $false
+try { $inboxSurvived = Test-InboxRowsPreserved -Before $inboxBefore -After $inboxAfter } catch { }
+Check 'restart preserves old inbox content while permitting delivery recovery and new notes' $inboxSurvived 'preserved row and one new note'
+$inboxMissing = $true
+try { $inboxMissing = Test-InboxRowsPreserved -Before $inboxBefore -After @() } catch { }
+Check 'restart inbox preservation rejects a missing prior note' (-not $inboxMissing) 'missing row'
+$inboxChanged = $true
+$changedInbox = @([pscustomobject]@{ id = 'i1'; project_key = 'repo'; task_id = 't1'; kind = 'question'; summary = 'Changed'; delivery = 'worker question'; delivery_state = 'uncertain'; delivery_detail = '' })
+try { $inboxChanged = Test-InboxRowsPreserved -Before $inboxBefore -After $changedInbox } catch { }
+Check 'restart inbox preservation rejects changed note content' (-not $inboxChanged) 'changed summary'
+$startupLogs = @(
+    [pscustomobject]@{ event = $null; command = @('./herdr-omp-orchestrator.exe', 'startup'); started_unix_ms = 90; status = 'succeeded' },
+    [pscustomobject]@{ event = 'pane.moved'; command = @('./herdr-omp-orchestrator.exe', 'event'); started_unix_ms = 150; status = 'succeeded' },
+    [pscustomobject]@{ event = $null; command = @('./herdr-omp-orchestrator.exe', 'startup'); started_unix_ms = 200; status = 'succeeded' }
+)
+$newStartupLogs = @()
+try { $newStartupLogs = @(Get-StartupLogEntries -Logs $startupLogs -AfterUnixMs 100) } catch { }
+Check 'restart startup log is recognized from argv after the time watermark' ($newStartupLogs.Count -eq 1 -and $newStartupLogs[0].started_unix_ms -eq 200) 'one new startup'
+
 
 # --- resume-hint implication (T10.1) ----------------------------------------
 Check 'hint: unmaterialized with no resume passes' ((Test-ResumeHintImplication -Hint ([pscustomobject]@{ onDisk = $false; resume = '' })) -eq $true) 'false+empty'
@@ -366,6 +602,380 @@ Check 'hint: unmaterialized but offering a resume fails' ((Test-ResumeHintImplic
 Check 'hint: materialized with no resume fails' ((Test-ResumeHintImplication -Hint ([pscustomobject]@{ onDisk = $true; resume = '' })) -eq $false) 'true+empty'
 Check 'hint: string flag fails' ((Test-ResumeHintImplication -Hint ([pscustomobject]@{ onDisk = 'false'; resume = '' })) -eq $false) 'string'
 Check 'hint: absent flag fails' ((Test-ResumeHintImplication -Hint ([pscustomobject]@{ resume = '' })) -eq $false) 'absent'
+
+# A blocked primary is already settled for prompt dispatch purposes: preserve the
+# visible UI and refuse immediately instead of waiting for an idle state.
+$script:PrimaryAgentStatusForTest = 'blocked'
+$script:PrimaryScreenForTest = 'Ask dialog is waiting for an answer'
+$script:PrimaryPromptCallsForTest = 0
+function Wait-Until {
+    param([double]$TimeoutSeconds, [double]$IntervalSeconds, [string]$What, [scriptblock]$Probe)
+    $value = & $Probe
+    return [pscustomobject]@{ Ok = ($null -ne $value); Value = $value }
+}
+function Get-LiveAgent {
+    param([string]$Target)
+    return [pscustomobject]@{ Found = $true; Agent = [pscustomobject]@{ agent_status = $script:PrimaryAgentStatusForTest } }
+}
+function Get-PaneScreen {
+    param([string]$PaneId, [string]$Source, [int]$Lines)
+    return $script:PrimaryScreenForTest
+}
+function Invoke-AgentPrompt {
+    param([string]$PaneId, [string]$Text, [double]$TimeoutSeconds, [switch]$NoWait)
+    $script:PrimaryPromptCallsForTest++
+    $script:PrimaryNoWaitObservedForTest = $NoWait.IsPresent
+    $script:PrimaryPromptTextForTest = $Text
+    return [pscustomobject]@{ ExitCode = 0; Stderr = ''; Stdout = ''; CommandLine = 'herdr agent prompt -NoWait' }
+}
+$blockedPrimary = Invoke-PrimaryPrompt -PaneId 'w1:p1' -Text 'do not type into a modal'
+Check 'Invoke-PrimaryPrompt refuses a blocked primary with a typed code' ($blockedPrimary.Blocked -and (Get-Field $blockedPrimary 'Code') -eq 'agent_blocked') 'blocked result'
+Check 'Invoke-PrimaryPrompt captures the blocked screen without sending a prompt' ((Get-Field $blockedPrimary 'Screen') -eq $script:PrimaryScreenForTest -and $script:PrimaryPromptCallsForTest -eq 0) 'screen/calls'
+Check 'Invoke-PrimaryPrompt proves its blocked prompt was not submitted' ($blockedPrimary.PSObject.Properties['Submitted'] -and $blockedPrimary.Submitted -eq $false) 'submitted=false'
+
+$script:PrimaryNoWaitObservedForTest = $false
+$script:PrimaryPromptTextForTest = ''
+function Resolve-PendingPrimaryDispositionAsks {
+    param([string]$AssertionPrefix, [double]$TimeoutSeconds = 60)
+    return [pscustomobject]@{ Resolved = $true; Observed = $false; Screen = '' }
+}
+$script:PrimaryAgentStatusForTest = 'idle'
+$script:PrimaryPromptCallsForTest = 0
+$script:PrimaryNoWaitObservedForTest = $true
+$script:PrimaryPromptCallsForTest = 0
+$syncPrimary = $null
+try { $syncPrimary = Invoke-PrimaryPromptAfterDispositionAsks -PaneId 'w1:p1' -Text 'approval submission must observe blocked state' -TimeoutSeconds 30 } catch { }
+Check 'primary approval prompt uses the state-aware wait path' ($null -ne $syncPrimary -and $syncPrimary.Submitted -and $syncPrimary.ExitCode -eq 0 -and -not $script:PrimaryNoWaitObservedForTest -and $script:PrimaryPromptTextForTest -eq 'approval submission must observe blocked state') 'wait path'
+$script:PrimaryNoWaitObservedForTest = $false
+$script:PrimaryPromptCallsForTest = 0
+$asyncPrimary = $null
+try { $asyncPrimary = Invoke-PrimaryPromptNoWaitAfterDispositionAsks -PaneId 'w1:p1' -Text 'approve exact dialog' -TimeoutSeconds 30 } catch { }
+Check 'primary approval prompt is submitted without waiting for its user confirmation' ($null -ne $asyncPrimary -and $asyncPrimary.Submitted -and $asyncPrimary.ExitCode -eq 0 -and $script:PrimaryNoWaitObservedForTest -and $script:PrimaryPromptTextForTest -eq 'approve exact dialog') 'no-wait submission'
+$script:PrimaryAgentStatusForTest = 'blocked'
+$script:PrimaryPromptCallsForTest = 0
+$blockedAsyncPrimary = $null
+try { $blockedAsyncPrimary = Invoke-PrimaryPromptNoWaitAfterDispositionAsks -PaneId 'w1:p1' -Text 'must not type into active UI' -TimeoutSeconds 30 } catch { }
+Check 'no-wait primary prompt refuses an already blocked session without submitting' ($null -ne $blockedAsyncPrimary -and $blockedAsyncPrimary.Blocked -and -not $blockedAsyncPrimary.Submitted -and $script:PrimaryPromptCallsForTest -eq 0) 'blocked refusal'
+$savedKeepResources = [bool]$script:KeepResources
+$script:KeepResources = $false
+if (Get-Command Preserve-ResourcesForPendingTool -ErrorAction SilentlyContinue) {
+    Preserve-ResourcesForPendingTool -AssertionId 'TEST.preserve-resources' -Reason 'approval may still be active'
+}
+$preservedResources = ([bool]$script:KeepResources -eq $true)
+Check 'pending approval switches final cleanup to preserve resources' $preservedResources 'KeepResources=true'
+$script:KeepResources = $savedKeepResources
+$script:PrimarySendKeysUsed = @()
+$script:PrimaryScreenForTest = $primaryAskScreen
+$script:ResolveWaitForTest = 0
+function Wait-Until {
+    param([double]$TimeoutSeconds, [double]$IntervalSeconds, [string]$What, [scriptblock]$Probe)
+    $script:ResolveWaitForTest++
+    if ($script:ResolveWaitForTest -eq 1) {
+        return [pscustomobject]@{ Ok = $true; Value = [pscustomobject]@{ Kind = 'ask'; Screen = $script:PrimaryScreenForTest } }
+    }
+    if ($script:ResolveWaitForTest -eq 2) { return [pscustomobject]@{ Ok = $true; Value = $true } }
+    return [pscustomobject]@{ Ok = $true; Value = 'disposed' }
+}
+function Send-AgentKeys {
+    param([string]$PaneId, [string[]]$Keys)
+    return [pscustomobject]@{ ExitCode = 0; CommandLine = "send-keys $PaneId $($Keys -join ' ')" }
+}
+function Get-TaskById {
+    param([string]$Id)
+    return [pscustomobject]@{ fact = [pscustomobject]@{ Disposition = ''; Report = [pscustomobject]@{ Summary = 'result' } } }
+}
+$script:WorkerDispositionAskTaskForTest = [pscustomobject]@{
+    fact = [pscustomobject]@{
+        ID = 'task-a'
+        Title = 'ACCEPT A: helper in a.js'
+        ReservedPaths = @('a.js')
+        Report = [pscustomobject]@{
+            Summary = 'ACCEPT-A: a.js now also exports subtract'
+            Evidence = @('commit 0123456789abcdef0123456789abcdef01234567')
+        }
+    }
+}
+function Get-TaskById {
+    param([string]$Id)
+    if ($Id -eq 'task-a') { return $script:WorkerDispositionAskTaskForTest }
+    return [pscustomobject]@{ fact = [pscustomobject]@{ Disposition = ''; Report = [pscustomobject]@{ Summary = 'result' } } }
+}
+$workerDispositionAskScreen = @'
+Ask 1 questions
+[worker_a_disposition] · options:2
+Worker A reports commit 0123456789abcdef0123456789abcdef01234567 adding subtract to a.js. What disposition should I record?
+Accept
+Record the reported result as accepted; no merge or cleanup is performed.
+Request changes
+Keep the result unaccepted and specify what should change.
+Other (type your own)
+'@
+$workerDispositionAskMatches = $false
+try { $workerDispositionAskMatches = Test-PrimaryDispositionAskScreen -Screen $workerDispositionAskScreen -AskId 'worker_a_disposition' -TaskId 'task-a' } catch { }
+Check 'disposition matcher ties the active worker-A Ask to its reported commit and choices' $workerDispositionAskMatches 'exact task report + Accept first'
+$wrongWorkerDispositionCommit = $workerDispositionAskScreen -replace '0123456789abcdef0123456789abcdef01234567', '1123456789abcdef0123456789abcdef01234567'
+$wrongWorkerDispositionMatches = $true
+try { $wrongWorkerDispositionMatches = Test-PrimaryDispositionAskScreen -Screen $wrongWorkerDispositionCommit -AskId 'worker_a_disposition' -TaskId 'task-a' } catch { }
+Check 'disposition matcher refuses a worker Ask naming a different report commit' (-not $wrongWorkerDispositionMatches) 'different report commit'
+$reversedWorkerDispositionAsk = $workerDispositionAskScreen -replace 'Accept', 'TEMP' -replace 'Request changes', 'Accept' -replace 'TEMP', 'Request changes'
+$reversedWorkerDispositionMatches = $true
+try { $reversedWorkerDispositionMatches = Test-PrimaryDispositionAskScreen -Screen $reversedWorkerDispositionAsk -AskId 'worker_a_disposition' -TaskId 'task-a' } catch { }
+Check 'disposition matcher refuses when Accept is not the first choice' (-not $reversedWorkerDispositionMatches) 'reversed disposition choices'
+$resolverOutput = @(Resolve-PrimaryDispositionAsk -Marker 'ACCEPT-B' -AskId 'task_b_review' -TaskId 'task-b' -AssertionId 'TEST.askB')
+Check 'primary Ask resolver emits exactly one result object' ($resolverOutput.Count -eq 1 -and $null -ne $resolverOutput[0].PSObject.Properties['Resolved']) ("count=$($resolverOutput.Count)")
+$script:ResolveWaitForTest = 0
+$script:PrimaryAgentStatusForTest = 'blocked'
+$script:PrimaryScreenForTest = $workerDispositionAskScreen
+$script:WorkerDispositionKeysForTest = @()
+function Send-AgentKeys {
+    param([string]$PaneId, [string[]]$Keys)
+    $script:WorkerDispositionKeysForTest += ($Keys -join ' ')
+    return [pscustomobject]@{ ExitCode = 0; CommandLine = "send-keys $PaneId $($Keys -join ' ')" }
+}
+$workerDispositionResolution = $null
+try { $workerDispositionResolution = Resolve-PrimaryDispositionAsk -Marker 'ACCEPT-A' -AskId 'worker_a_disposition' -TaskId 'task-a' -AssertionId 'TEST.workerDisposition' } catch { }
+Check 'disposition resolver selects Accept only for the exact active worker report Ask' ($null -ne $workerDispositionResolution -and $workerDispositionResolution.Resolved -and $workerDispositionResolution.Observed -and $script:WorkerDispositionKeysForTest.Count -eq 1 -and $script:WorkerDispositionKeysForTest[0] -eq 'enter') ("result=$(Get-Json $workerDispositionResolution); keys=$($script:WorkerDispositionKeysForTest -join ',')")
+$script:PrimaryPane = 'w1:p1'
+function Wait-Until {
+    param([double]$TimeoutSeconds, [double]$IntervalSeconds, [string]$What, [scriptblock]$Probe)
+    $value = & $Probe
+    return [pscustomobject]@{ Ok = ($null -ne $value); Value = $value }
+}
+function Send-AgentKeys {
+    param([string]$PaneId, [string[]]$Keys)
+    $script:SentKeysCallsForTest += ($Keys -join ' ')
+    return [pscustomobject]@{ ExitCode = 0; CommandLine = "send-keys $PaneId $($Keys -join ' ')" }
+}
+$script:SentKeysCallsForTest = @()
+$script:PrimaryScreenForTest = $approvalConfirmScreen
+$script:PrimarySendKeysUsed = @()
+$confirmedModal = $null
+try { $confirmedModal = Confirm-PrimaryModal -TaskId 'orch_abc' -DialogMarker 'ACCEPT-Q-DIALOG' -ExpectedQuestion 'ACCEPT-Q-DIALOG: which contract should b.js use?' -ExpectedKeys @('enter') -TranscriptPath $approvalTranscriptPath -TimeoutSeconds 1 } catch { }
+Check 'confirmation sends the user key only after transcript and visible modal both match' ($null -ne $confirmedModal -and $confirmedModal.Observed -and $script:SentKeysCallsForTest.Count -eq 1 -and $script:SentKeysCallsForTest[0] -eq 'enter' -and $script:PrimarySendKeysUsed.Count -eq 1) ("result=$(Get-Json $confirmedModal); send_calls=$($script:SentKeysCallsForTest -join ',')")
+$script:FinalModalPaneReadsForTest = 0
+$script:FinalModalReadsAtSendForTest = -1
+function Get-PaneScreen {
+    param([string]$PaneId, [string]$Source, [int]$Lines)
+    $script:FinalModalPaneReadsForTest++
+    return $script:PrimaryScreenForTest
+}
+function Send-AgentKeys {
+    param([string]$PaneId, [string[]]$Keys)
+    $script:SentKeysCallsForTest += ($Keys -join ' ')
+    $script:FinalModalReadsAtSendForTest = $script:FinalModalPaneReadsForTest
+    return [pscustomobject]@{ ExitCode = 0; CommandLine = "send-keys $PaneId $($Keys -join ' ')" }
+}
+$script:FinalModalPaneReadsForTest = 0
+$script:FinalModalReadsAtSendForTest = -1
+$noPostInputModal = $null
+try { $noPostInputModal = Confirm-PrimaryModal -TaskId 'orch_abc' -DialogMarker 'ACCEPT-Q-DIALOG' -ExpectedQuestion 'ACCEPT-Q-DIALOG: which contract should b.js use?' -ExpectedKeys @('enter') -TranscriptPath $approvalTranscriptPath -TimeoutSeconds 1 } catch { }
+Check 'confirmation performs no pane I/O after sending the verified key' ($null -ne $noPostInputModal -and $noPostInputModal.Observed -and $script:FinalModalReadsAtSendForTest -eq $script:FinalModalPaneReadsForTest) ("reads_at_send=$($script:FinalModalReadsAtSendForTest) final_reads=$($script:FinalModalPaneReadsForTest)")
+$script:PrimaryScreenForTest = 'Ask: unrelated approval'
+$script:SentKeysCallsForTest = @()
+$script:PrimarySendKeysUsed = @()
+$mismatchedModal = $null
+try { $mismatchedModal = Confirm-PrimaryModal -TaskId 'orch_abc' -DialogMarker 'ACCEPT-Q-DIALOG' -ExpectedQuestion 'ACCEPT-Q-DIALOG: which contract should b.js use?' -ExpectedKeys @('enter') -TranscriptPath $approvalTranscriptPath -TimeoutSeconds 1 } catch { }
+Check 'confirmation sends no key when the visible modal differs from the expected dialog' ($null -ne $mismatchedModal -and -not $mismatchedModal.Observed -and $script:SentKeysCallsForTest.Count -eq 0) 'mismatched modal refusal'
+$script:PrimaryScreenForTest = $approvalConfirmScreen
+$script:SentKeysCallsForTest = @()
+$script:PrimarySendKeysUsed = @()
+$wrongTaskModal = $null
+try { $wrongTaskModal = Confirm-PrimaryModal -TaskId 'orch_other' -DialogMarker 'ACCEPT-Q-DIALOG' -ExpectedQuestion 'ACCEPT-Q-DIALOG: which contract should b.js use?' -ExpectedKeys @('enter') -TranscriptPath $approvalTranscriptPath -TimeoutSeconds 1 } catch { }
+Check 'confirmation sends no key when transcript task identity differs' ($null -ne $wrongTaskModal -and -not $wrongTaskModal.Observed -and $script:SentKeysCallsForTest.Count -eq 0) 'wrong task refusal'
+$script:PrimaryScreenReadsForTest = 0
+function Get-PaneScreen {
+    param([string]$PaneId, [string]$Source, [int]$Lines)
+    $script:PrimaryScreenReadsForTest++
+    if ($script:PrimaryScreenReadsForTest -eq 1) { return $approvalConfirmScreen }
+    return 'Ask: replacement modal appeared after the confirmation snapshot'
+}
+$script:PrimaryScreenForTest = $approvalConfirmScreen
+$script:SentKeysCallsForTest = @()
+$script:PrimarySendKeysUsed = @()
+$replacedModal = $null
+try { $replacedModal = Confirm-PrimaryModal -TaskId 'orch_abc' -DialogMarker 'ACCEPT-Q-DIALOG' -ExpectedQuestion 'ACCEPT-Q-DIALOG: which contract should b.js use?' -ExpectedKeys @('enter') -TranscriptPath $approvalTranscriptPath -TimeoutSeconds 1 } catch { }
+Check 'confirmation re-reads the active modal immediately before sending keys' ($null -ne $replacedModal -and -not $replacedModal.Observed -and $script:SentKeysCallsForTest.Count -eq 0 -and $script:PrimaryScreenReadsForTest -ge 2) 'modal changed after snapshot'
+$script:ApprovalTranscriptReadsForTest = 0
+function Test-OmpApprovalToolCall {
+    param([string]$Path, [string]$TaskId, [string[]]$Keys)
+    $script:ApprovalTranscriptReadsForTest++
+    if ($script:ApprovalTranscriptReadsForTest -eq 2) {
+        $script:PrimaryScreenForTest = 'Ask: replacement modal appeared during transcript verification'
+    }
+    return $true
+}
+function Get-PaneScreen {
+    param([string]$PaneId, [string]$Source, [int]$Lines)
+    return $script:PrimaryScreenForTest
+}
+$script:ApprovalTranscriptReadsForTest = 0
+$script:PrimaryScreenForTest = $approvalConfirmScreen
+$script:SentKeysCallsForTest = @()
+$script:PrimarySendKeysUsed = @()
+$lateReplacementModal = $null
+try { $lateReplacementModal = Confirm-PrimaryModal -TaskId 'orch_abc' -DialogMarker 'ACCEPT-Q-DIALOG' -ExpectedQuestion 'ACCEPT-Q-DIALOG: which contract should b.js use?' -ExpectedKeys @('enter') -TranscriptPath $approvalTranscriptPath -TimeoutSeconds 1 } catch { }
+Check 'confirmation reads the pane after the final transcript check and refuses a replacement modal' ($null -ne $lateReplacementModal -and -not $lateReplacementModal.Observed -and $script:SentKeysCallsForTest.Count -eq 0 -and $script:ApprovalTranscriptReadsForTest -ge 2) 'screen changed during transcript verification'
+$script:DispositionWaitCallsForTest = 0
+$script:ReplacementDispositionScreen = $primaryAskScreen -replace 'task_b_review', 'task_a_review'
+function Wait-Until {
+    param([double]$TimeoutSeconds, [double]$IntervalSeconds, [string]$What, [scriptblock]$Probe)
+    $script:DispositionWaitCallsForTest++
+    if ($script:DispositionWaitCallsForTest -eq 1) {
+        return [pscustomobject]@{ Ok = $true; Value = [pscustomobject]@{ Kind = 'ask'; Screen = $primaryAskScreen } }
+    }
+    $value = & $Probe
+    return [pscustomobject]@{ Ok = ($null -ne $value); Value = $value }
+}
+function Get-PaneScreen {
+    param([string]$PaneId, [string]$Source, [int]$Lines)
+    return $script:ReplacementDispositionScreen
+}
+$script:PrimaryAgentStatusForTest = 'blocked'
+$script:SentKeysCallsForTest = @()
+$replacedDisposition = $null
+try { $replacedDisposition = Resolve-PrimaryDispositionAsk -Marker 'ACCEPT-B' -AskId 'task_b_review' -TaskId 'task-b' -AssertionId 'TEST.askB-race' } catch { }
+Check 'disposition resolver refuses to send Enter when the active Ask changes after polling' ($null -ne $replacedDisposition -and -not $replacedDisposition.Resolved -and $script:SentKeysCallsForTest.Count -eq 0) 'replacement Ask'
+$script:DispositionWaitCallsForTest = 0
+$script:DispositionScreenForTest = $primaryAskScreen
+$script:DispositionTaskReadsForTest = 0
+function Wait-Until {
+    param([double]$TimeoutSeconds, [double]$IntervalSeconds, [string]$What, [scriptblock]$Probe)
+    $script:DispositionWaitCallsForTest++
+    if ($script:DispositionWaitCallsForTest -eq 1) {
+        return [pscustomobject]@{ Ok = $true; Value = [pscustomobject]@{ Kind = 'ask'; Screen = $primaryAskScreen } }
+    }
+    $value = & $Probe
+    return [pscustomobject]@{ Ok = ($null -ne $value); Value = $value }
+}
+function Get-PaneScreen {
+    param([string]$PaneId, [string]$Source, [int]$Lines)
+    return $script:DispositionScreenForTest
+}
+function Get-TaskById {
+    param([string]$Id)
+    $script:DispositionTaskReadsForTest++
+    $disposition = if ($script:DispositionTaskReadsForTest -ge 2) { 'accepted' } else { '' }
+    return [pscustomobject]@{ fact = [pscustomobject]@{ Disposition = $disposition; Report = [pscustomobject]@{ Summary = 'result' } } }
+}
+$script:SentKeysCallsForTest = @()
+$changedDisposition = $null
+try { $changedDisposition = Resolve-PrimaryDispositionAsk -Marker 'ACCEPT-B' -AskId 'task_b_review' -TaskId 'task-b' -AssertionId 'TEST.askB-state-race' } catch { }
+Check 'disposition resolver refuses Enter when the task is already disposed before input' ($null -ne $changedDisposition -and -not $changedDisposition.Resolved -and $script:SentKeysCallsForTest.Count -eq 0) 'disposition changed before Enter'
+$script:PrimaryAgentStatusForTest = 'idle'
+$script:DispositionWaitCallsForTest = 0
+function Wait-Until {
+    param([double]$TimeoutSeconds, [double]$IntervalSeconds, [string]$What, [scriptblock]$Probe)
+    $value = & $Probe
+    return [pscustomobject]@{ Ok = ($null -ne $value); Value = $value }
+}
+function Get-TaskById {
+    param([string]$Id)
+    return [pscustomobject]@{ fact = [pscustomobject]@{ Disposition = ''; Report = [pscustomobject]@{ Summary = 'result' } } }
+}
+$script:SentKeysCallsForTest = @()
+$idleUndisposedAsk = $null
+try { $idleUndisposedAsk = Resolve-PrimaryDispositionAsk -Marker 'ACCEPT-A' -AskId 'worker_a_disposition' -TaskId 'task-a' -AssertionId 'TEST.ask-idle-undisposed' } catch { }
+Check 'disposition resolver does not treat an idle primary as resolved while its report is undisposed' ($null -ne $idleUndisposedAsk -and -not $idleUndisposedAsk.Resolved -and $script:SentKeysCallsForTest.Count -eq 0) 'idle with pending report'
+$script:QuestionAskWaitCallsForTest = 0
+$script:QuestionAskTaskReadsForTest = 0
+$script:QuestionAskScreenForTest = $primaryWorkerQuestionAskScreen
+$script:PrimaryAgentStatusForTest = 'blocked'
+function Wait-Until {
+    param([double]$TimeoutSeconds, [double]$IntervalSeconds, [string]$What, [scriptblock]$Probe)
+    $script:QuestionAskWaitCallsForTest++
+    if ($script:QuestionAskWaitCallsForTest -eq 1) {
+        return [pscustomobject]@{ Ok = $true; Value = [pscustomobject]@{ Kind = 'ask'; AskId = 'answer_a'; Screen = $primaryWorkerQuestionAskScreen } }
+    }
+    $value = & $Probe
+    return [pscustomobject]@{ Ok = ($null -ne $value); Value = $value }
+}
+function Get-PaneScreen {
+    param([string]$PaneId, [string]$Source, [int]$Lines)
+    return $script:QuestionAskScreenForTest
+}
+function Get-TaskById {
+    param([string]$Id)
+    $script:QuestionAskTaskReadsForTest++
+    return [pscustomobject]@{ fact = [pscustomobject]@{ ID = $Id; Attention = 'worker question: ACCEPT-Q-A: should a.js keep its existing export style?'; Disposition = ''; Report = $null } }
+}
+function Send-AgentKeys {
+    param([string]$PaneId, [string[]]$Keys)
+    $script:SentKeysCallsForTest += ($Keys -join ' ')
+    $script:PrimaryAgentStatusForTest = 'idle'
+    $script:QuestionAskScreenForTest = 'The user selected Yes — ACCEPT-ANSWER-A'
+    return [pscustomobject]@{ ExitCode = 0; CommandLine = "send-keys $PaneId $($Keys -join ' ')" }
+}
+$script:SentKeysCallsForTest = @()
+$workerQuestionAskResult = $null
+try { $workerQuestionAskResult = Resolve-PrimaryWorkerQuestionAsk -QuestionMarker 'ACCEPT-Q-A' -QuestionText 'Should a.js keep its existing export style?' -TaskId 'task-a' -AnswerToken 'ACCEPT-ANSWER-A' -AssertionId 'TEST.question-answer' } catch { }
+Check 'worker-question resolver enters only the exact active Ask and selects its authorized token' ($null -ne $workerQuestionAskResult -and $workerQuestionAskResult.Resolved -and $script:SentKeysCallsForTest.Count -eq 1 -and $script:SentKeysCallsForTest[0] -eq 'enter') 'exact worker Ask'
+$script:QuestionAskWaitCallsForTest = 0
+$script:PrimaryAgentStatusForTest = 'blocked'
+$script:QuestionAskScreenForTest = $primaryWorkerAnswerChoiceAskScreen
+function Wait-Until {
+    param([double]$TimeoutSeconds, [double]$IntervalSeconds, [string]$What, [scriptblock]$Probe)
+    $script:QuestionAskWaitCallsForTest++
+    if ($script:QuestionAskWaitCallsForTest -eq 1) {
+        return [pscustomobject]@{ Ok = $true; Value = [pscustomobject]@{ Kind = 'ask'; AskId = 'export-style'; Screen = $primaryWorkerAnswerChoiceAskScreen } }
+    }
+    $value = & $Probe
+    return [pscustomobject]@{ Ok = ($null -ne $value); Value = $value }
+}
+$script:SentKeysCallsForTest = @()
+$workerAnswerChoiceResolution = $null
+try { $workerAnswerChoiceResolution = Resolve-PrimaryWorkerQuestionAsk -QuestionMarker 'ACCEPT-Q-A' -QuestionText 'Should a.js keep its existing export style?' -TaskId 'task-a' -AnswerToken 'ACCEPT-ANSWER-A' -AssertionId 'TEST.question-answer-choice' } catch { }
+Check 'worker-question resolver selects only the exact active dynamic-id answer-choice Ask' ($null -ne $workerAnswerChoiceResolution -and $workerAnswerChoiceResolution.Resolved -and $script:SentKeysCallsForTest.Count -eq 1 -and $script:SentKeysCallsForTest[0] -eq 'enter') 'export-style answer choice'
+$script:QuestionAskWaitCallsForTest = 0
+$script:PrimaryAgentStatusForTest = 'blocked'
+$script:QuestionAskScreenForTest = $primaryWorkerQuestionAskScreen -replace 'ACCEPT-ANSWER-A', 'ACCEPT-ANSWER-B'
+$script:SentKeysCallsForTest = @()
+$wrongWorkerQuestionAskResult = $null
+try { $wrongWorkerQuestionAskResult = Resolve-PrimaryWorkerQuestionAsk -QuestionMarker 'ACCEPT-Q-A' -QuestionText 'Should a.js keep its existing export style?' -TaskId 'task-a' -AnswerToken 'ACCEPT-ANSWER-A' -AssertionId 'TEST.question-answer-wrong' } catch { }
+Check 'worker-question resolver refuses an Ask with a different authorization token without typing' ($null -ne $wrongWorkerQuestionAskResult -and -not $wrongWorkerQuestionAskResult.Resolved -and $script:SentKeysCallsForTest.Count -eq 0) 'wrong worker Ask'
+$script:PrimaryPane = 'w1:p1'
+$script:PrimaryAgentStatusForTest = 'idle'
+$script:TaskA = [pscustomobject]@{ ID = 'task-a' }
+$script:TaskB = $null
+$script:PendingDispositionTaskForTest = [pscustomobject]@{
+    fact = [pscustomobject]@{
+        ID = 'task-a'
+        Title = 'ACCEPT A: helper in a.js'
+        ReservedPaths = @('a.js')
+        Disposition = ''
+        Report = [pscustomobject]@{
+            Summary = 'ACCEPT-A: a.js now also exports subtract'
+            Evidence = @('commit 0123456789abcdef0123456789abcdef01234567')
+        }
+    }
+}
+function Get-TaskById {
+    param([string]$Id)
+    return $script:PendingDispositionTaskForTest
+}
+$script:PendingDispositionAskScreen = $workerDispositionAskScreen
+$script:PendingDispositionPromptTextForTest = ''
+$script:PendingDispositionResolvedAskForTest = $null
+function Get-PaneScreen {
+    param([string]$PaneId, [string]$Source, [int]$Lines)
+    return $script:PendingDispositionAskScreen
+}
+function Invoke-PrimaryPrompt {
+    param([string]$PaneId, [string]$Text, [double]$TimeoutSeconds = 300)
+    $script:PendingDispositionPromptTextForTest = $Text
+    return [pscustomobject]@{ Submitted = $true; ExitCode = 0; Code = ''; CommandLine = 'herdr agent prompt --wait'; Screen = '' }
+}
+function Wait-Until {
+    param([double]$TimeoutSeconds, [double]$IntervalSeconds, [string]$What, [scriptblock]$Probe)
+    return [pscustomobject]@{ Ok = $true; Value = [pscustomobject]@{ Kind = 'ask'; Screen = $script:PendingDispositionAskScreen } }
+}
+function Resolve-PrimaryDispositionAsk {
+    param([string]$Marker, [string]$AskId, [string]$TaskId, [string]$AssertionId)
+    $script:PendingDispositionResolvedAskForTest = [pscustomobject]@{ Marker = $Marker; AskId = $AskId; TaskId = $TaskId }
+    return [pscustomobject]@{ Resolved = $true; Observed = $true; Screen = $script:PendingDispositionAskScreen }
+}
+$pendingDispositionAskResult = $null
+try { $pendingDispositionAskResult = Invoke-PrimaryDispositionAskForPendingReport -AssertionPrefix 'TEST.pending-report' } catch { }
+Check 'pending report gets one exact OMP disposition Ask before its first option is selected' ($null -ne $pendingDispositionAskResult -and $pendingDispositionAskResult.Resolved -and $pendingDispositionAskResult.Observed -and $script:PendingDispositionResolvedAskForTest.AskId -eq 'worker_a_disposition' -and $script:PendingDispositionResolvedAskForTest.TaskId -eq 'task-a' -and $script:PendingDispositionPromptTextForTest.Contains('0123456789abcdef0123456789abcdef01234567') -and $script:PendingDispositionPromptTextForTest.Contains('Do not call orch_review until the user chooses')) 'exact pending report Ask'
 
 } finally {
     # One owned directory holds every path this run created, so cleanup is a single

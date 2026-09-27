@@ -3324,6 +3324,65 @@ func TestDialogApprovalRevalidatesTheApprovedScreen(t *testing.T) {
 		wantError(t, approve(preview.Digest, `[]`), "bad_request")
 	})
 }
+func TestDialogApprovalIgnoresVolatileScreenOutsideActiveDialog(t *testing.T) {
+	f := newBridgeFixture(t)
+	f.seedPrimary()
+	f.seedWorker("t1", workerPane, workerPane, workerSession)
+	f.asWorker()
+	f.asPrimary()
+
+	activeDialog := func(question string) string {
+		return strings.Join([]string{
+			"╭─ Ask",
+			"│ " + question,
+			"├─ choices",
+			"│ keep the current contract",
+			"│ change the contract",
+			"│ Enter select · n note · ↑/↓ move · Esc cancel",
+			"╰─",
+		}, "\n")
+	}
+	screen := func(status, question string) string {
+		panelLines := strings.Split(activeDialog(question), "\n")
+		for i := range panelLines {
+			panelLines[i] = "│ " + panelLines[i] + " │"
+		}
+		return strings.Join([]string{
+			"previous output changed at " + status,
+			strings.Join(panelLines, "\n"),
+			"terminal status " + status,
+		}, "\n")
+	}
+	blocked := workerAgent(workerPane, workerSession, f.worktree)
+	blocked.AgentStatus = "blocked"
+	stub := f.useHerdrStub(stubScript{
+		RepoRoot: f.repoRoot,
+		Agents:   map[string]stubAgent{workerPane: blocked},
+	})
+	ops := CoordinatorOps(f.coordinator(t))
+	approve := func(text string, digest string) bridgeResponse {
+		stub.queueReads(stubRead{Text: text})
+		return f.callWith("approve_dialog", primarySession,
+			fmt.Sprintf(`{"taskId":"t1","observedDigest":%q,"keys":["enter"]}`, digest), ops)
+	}
+
+	stub.queueReads(stubRead{Text: screen("00:00:01", "ACCEPT-Q-DIALOG: which contract should b.js use?")})
+	var preview coord.DialogPreview
+	f.callWith("dialog_preview", primarySession, `{"taskId":"t1"}`, ops).decodeResult(t, &preview)
+	if strings.Contains(preview.Dialog, "previous output") || strings.Contains(preview.Dialog, "terminal status") {
+		t.Fatalf("preview included volatile content outside the active dialog: %q", preview.Dialog)
+	}
+	if resp := approve(screen("00:00:02", "ACCEPT-Q-DIALOG: which contract should b.js use?"), preview.Digest); !resp.OK {
+		t.Fatalf("unchanged active dialog was refused after surrounding output changed: %+v", resp.Error)
+	}
+	if got := stub.script().SentKeys; len(got) != 1 || got[0].Pane != workerPane || !slices.Equal(got[0].Keys, []string{"enter"}) {
+		t.Fatalf("sent keys = %+v, want exactly [enter] on %q", got, workerPane)
+	}
+	wantError(t, approve(screen("00:00:03", "ACCEPT-Q-DIALOG: which namespace should b.js use?"), preview.Digest), "dialog_changed")
+	if got := len(stub.script().SentKeys); got != 1 {
+		t.Fatalf("changed active question sent keys again (%d send-keys calls)", got)
+	}
+}
 
 // TestDialogAndCleanupAcceptTheSessionFormsHerdrReallyReports reproduces the Run-2
 // failure: a build reports the session file while the record kept the announced

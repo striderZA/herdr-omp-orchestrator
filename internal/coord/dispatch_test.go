@@ -108,6 +108,9 @@ type fixturePlan struct {
 	// PromptError makes `agent prompt` refuse with that Herdr code before any
 	// input is written, the way a blocked or vanished agent is refused.
 	PromptError string `json:"prompt_error"`
+	// RecoverInboxDuringPrompt simulates a concurrent startup recovery after a
+	// flush claimed its batch but before AgentPrompt returns.
+	RecoverInboxDuringPrompt bool `json:"recover_inbox_during_prompt"`
 	// PromptDelayMillis delays agent prompts after the subprocess starts, so
 	// tests can exercise adjudication while an external write is still live.
 	PromptDelayMillis int `json:"prompt_delay_millis"`
@@ -488,6 +491,11 @@ func fixtureAgentPrompt(dir string, plan fixturePlan, state *fixtureState, argv 
 	if agent == nil {
 		return fixtureError("agent_not_found", "agent target "+pane+" not found")
 	}
+	if plan.RecoverInboxDuringPrompt {
+		if err := recoverFixtureInbox(os.Getenv(fixtureEnvStore)); err != nil {
+			return 31
+		}
+	}
 	if plan.PromptError != "" {
 		// Refused before anything was written: Herdr rejects a prompt to a
 		// blocked or vanished agent without sending input.
@@ -512,6 +520,15 @@ func fixtureAgentPrompt(dir string, plan fixturePlan, state *fixtureState, argv 
 		"type":  "agent_prompted",
 		"agent": agentInfo(*state, pane, fixtureCwd(plan, *state, pane), agent, fixtureReference(plan, fixtureAnnouncement(plan, agent.Session))),
 	})
+}
+
+func recoverFixtureInbox(storeDir string) error {
+	store, err := state.Open(storeDir)
+	if err != nil {
+		return err
+	}
+	_, recoverErr := store.RecoverInbox(context.Background())
+	return errors.Join(recoverErr, store.Close())
 }
 
 // fixtureBound reports whether the store already binds this pane to the

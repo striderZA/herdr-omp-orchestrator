@@ -95,6 +95,12 @@ const (
 // treats the write as a no-op.
 var errSuperseded = errors.New("coord: a newer binding already landed")
 
+// errInboxDeferred marks a prompt that Herdr definitively refused before
+// writing input. Startup can succeed with those notes safely requeued; a later
+// idle event will retry them. Ambiguous outcomes and persistence failures remain
+// errors.
+var errInboxDeferred = errors.New("coord: inbox delivery safely deferred")
+
 // herdrAgentStatuses is the status enum of Herdr's schema. A status outside it
 // is not an observation this plugin can store, so the hook is refused instead of
 // recording something Herdr never reported.
@@ -876,8 +882,13 @@ func (c *Coordinator) deliverInbox(ctx context.Context, paneID string, notes []t
 	_, err := c.herdr.AgentPrompt(callCtx, paneID, text)
 	switch {
 	case err == nil:
-		if _, settleErr := c.store.SettleInbox(ctx, ids, task.DeliveryDelivered, "prompted to "+paneID); settleErr != nil {
+		settled, settleErr := c.store.SettleInbox(ctx, ids, task.DeliveryDelivered, "prompted to "+paneID)
+		if settleErr != nil {
 			return fmt.Errorf("settle the delivered inbox of pane %s: %w", paneID, settleErr)
+		}
+		if settled != len(ids) {
+			return fmt.Errorf("settle the delivered inbox of pane %s: settled %d of %d claimed notes",
+				paneID, settled, len(ids))
 		}
 		return nil
 	case errors.Is(err, herdr.ErrAmbiguous):
@@ -888,12 +899,19 @@ func (c *Coordinator) deliverInbox(ctx context.Context, paneID string, notes []t
 		return fmt.Errorf("%w: %v", ErrAmbiguousStep, err)
 	case isNonDelivery(err):
 		// Herdr refused before any input was written, so the notes stay queued
-		// for a later safe turn instead of being marked uncertain.
-		if _, settleErr := c.store.SettleInbox(ctx, ids, task.DeliveryPending,
-			"the primary refused the prompt before any input was written: "+err.Error()); settleErr != nil {
+		// for a later safe turn instead of being marked uncertain. Reconciliation
+		// can treat that as a successful defer, but direct flush callers still
+		// receive an error describing the refusal.
+		settled, settleErr := c.store.SettleInbox(ctx, ids, task.DeliveryPending,
+			"the primary refused the prompt before any input was written: "+err.Error())
+		if settleErr != nil {
 			return errors.Join(err, fmt.Errorf("requeue the inbox of pane %s: %w", paneID, settleErr))
 		}
-		return err
+		if settled != len(ids) {
+			return fmt.Errorf("requeue the inbox of pane %s after definite non-delivery: settled %d of %d claimed notes: %w",
+				paneID, settled, len(ids), err)
+		}
+		return fmt.Errorf("%w: %v", errInboxDeferred, err)
 	default:
 		// A failure that proves nothing about whether the input was written is
 		// never retried blindly.
@@ -1005,7 +1023,7 @@ func (c *Coordinator) Reconcile(ctx context.Context) error {
 	// queued. FlushInbox itself re-verifies, so a project with nothing pending
 	// submits no prompt.
 	for _, project := range projects {
-		if err := c.FlushInbox(ctx, project.Key); err != nil {
+		if err := c.FlushInbox(ctx, project.Key); err != nil && !errors.Is(err, errInboxDeferred) {
 			failures = append(failures, err)
 		}
 	}

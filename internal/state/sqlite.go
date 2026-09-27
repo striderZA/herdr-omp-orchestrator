@@ -122,6 +122,8 @@ var inboxColumns = []struct{ name, ddl string }{
 	{"delivery_detail", `ALTER TABLE inbox ADD COLUMN delivery_detail TEXT NOT NULL DEFAULT ''`},
 }
 
+const inboxRecoveryDetail = "the plugin stopped while this delivery was in flight; inspect `agent get`/`agent read` before retrying"
+
 // taskColumns are the columns a task needs beyond its first release shape. The
 // provisioning slot is the one the dispatch gate uses: an older state database
 // has no claimed slots, and every existing task is judged by the phase it
@@ -879,9 +881,10 @@ func (s *Store) ClaimInbox(ctx context.Context, ids []string) ([]task.Inbox, err
 	return claimed, nil
 }
 
-// SettleInbox moves claimed notes to their outcome and returns how many were
-// settled. Only a note in sending may be settled, so a late result cannot
-// reopen or overwrite a note another attempt already resolved.
+// SettleInbox moves a claimed note to its outcome and returns how many were
+// settled. A sending note is owned by the caller; an uncertain note is settleable
+// only when it carries the exact startup-recovery detail, so the original live
+// caller can record its eventual result without overwriting unrelated uncertainty.
 func (s *Store) SettleInbox(ctx context.Context, ids []string, state, detail string) (int, error) {
 	next, err := inboxState(state, "")
 	if err != nil {
@@ -901,8 +904,9 @@ func (s *Store) SettleInbox(ctx context.Context, ids []string, state, detail str
 			return 0, fmt.Errorf("%w: inbox id is required", ErrInvalid)
 		}
 		res, err := tx.ExecContext(ctx,
-			`UPDATE inbox SET delivery_state = ?, delivery_detail = ? WHERE id = ? AND delivery_state = ?`,
-			next, detail, id, task.DeliverySending)
+			`UPDATE inbox SET delivery_state = ?, delivery_detail = ?
+			 WHERE id = ? AND (delivery_state = ? OR (delivery_state = ? AND delivery_detail = ?))`,
+			next, detail, id, task.DeliverySending, task.DeliveryUncertain, inboxRecoveryDetail)
 		if err != nil {
 			return 0, fmt.Errorf("settle inbox %q: %w", id, err)
 		}
@@ -918,19 +922,17 @@ func (s *Store) SettleInbox(ctx context.Context, ids []string, state, detail str
 	return settled, nil
 }
 
-// RecoverInbox settles the notes a previous process left mid-delivery. A claim
-// whose outcome nobody recorded is uncertain, never delivered: the note may or
-// may not have reached the primary, so a human inspects before anything is
-// retried. It reports how many notes it recovered.
-//
-// It is the startup counterpart of a claim: nothing else may resolve a sending
-// note, because the only process that could have resolved it is gone.
+// RecoverInbox marks sending notes uncertain during startup. If the original
+// caller is still alive, its later SettleInbox may replace only this exact
+// recovery marker with the result it observed; unrelated uncertainty remains
+// untouched. A recovered note with no later result stays uncertain for a human
+// to inspect before anything is retried. It reports how many notes it recovered.
 func (s *Store) RecoverInbox(ctx context.Context) (int, error) {
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE inbox SET delivery_state = ?, delivery_detail = ?
 		 WHERE delivery_state = ?`,
 		task.DeliveryUncertain,
-		"the plugin stopped while this delivery was in flight; inspect `agent get`/`agent read` before retrying",
+		inboxRecoveryDetail,
 		task.DeliverySending)
 	if err != nil {
 		return 0, fmt.Errorf("recover inbox deliveries: %w", err)

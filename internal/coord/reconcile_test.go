@@ -1194,6 +1194,63 @@ func TestPrimaryLossKeepsWorkersAndInboxWithoutRespawning(t *testing.T) {
 	}
 }
 
+func TestReconcileRequeuesInboxWhenPrimaryDisappearsAfterVerification(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	worker := f.boundWorker(t)
+	primary := f.boundProject(t).PublicPaneID
+	noteID := f.queueNote(t, worker, "progress", "halfway", "worker progress").ID
+	f.updatePlan(func(plan *fixturePlan) { plan.PromptError = "agent_not_found" })
+
+	if err := f.coord.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile after a definite non-delivery: %v", err)
+	}
+	if state := f.noteState(t, noteID); state != task.DeliveryPending {
+		t.Fatalf("note state = %q, want %q: no prompt input was written", state, task.DeliveryPending)
+	}
+	if delivered := f.state().Prompts[primary]; len(delivered) != 0 {
+		t.Fatalf("a refused prompt was recorded as delivered: %v", delivered)
+	}
+}
+
+func TestReconcileRequeuesDefiniteRefusalAfterConcurrentInboxRecovery(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	worker := f.boundWorker(t)
+	primary := f.boundProject(t).PublicPaneID
+	noteID := f.queueNote(t, worker, "progress", "halfway", "worker progress").ID
+	f.updatePlan(func(plan *fixturePlan) {
+		plan.PromptError = "agent_not_found"
+		plan.RecoverInboxDuringPrompt = true
+	})
+
+	if err := f.coord.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile after a definitely refused prompt: %v", err)
+	}
+	if state := f.noteState(t, noteID); state != task.DeliveryPending {
+		t.Fatalf("note state = %q, want %q: the refused prompt wrote no input", state, task.DeliveryPending)
+	}
+	if delivered := f.state().Prompts[primary]; len(delivered) != 0 {
+		t.Fatalf("a refused prompt was recorded as delivered: %v", delivered)
+	}
+}
+
+func TestReconcileSettlesSuccessfulDeliveryAfterConcurrentInboxRecovery(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	worker := f.boundWorker(t)
+	primary := f.boundProject(t).PublicPaneID
+	noteID := f.queueNote(t, worker, "progress", "halfway", "worker progress").ID
+	f.updatePlan(func(plan *fixturePlan) { plan.RecoverInboxDuringPrompt = true })
+
+	if err := f.coord.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile after a successful prompt: %v", err)
+	}
+	if state := f.noteState(t, noteID); state != task.DeliveryDelivered {
+		t.Fatalf("note state = %q, want %q: the active flush returned success", state, task.DeliveryDelivered)
+	}
+	if delivered := f.state().Prompts[primary]; len(delivered) != 1 {
+		t.Fatalf("recorded deliveries = %d, want 1 (%v)", len(delivered), delivered)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // durable inbox delivery
 // ---------------------------------------------------------------------------
