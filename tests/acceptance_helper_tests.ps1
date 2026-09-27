@@ -756,6 +756,12 @@ $reversedWorkerDispositionAsk = $workerDispositionAskScreen -replace 'Accept', '
 $reversedWorkerDispositionMatches = $true
 try { $reversedWorkerDispositionMatches = Test-PrimaryDispositionAskScreen -Screen $reversedWorkerDispositionAsk -AskId 'worker_a_disposition' -TaskId 'task-a' } catch { }
 Check 'disposition matcher refuses when Accept is not the first choice' (-not $reversedWorkerDispositionMatches) 'reversed disposition choices'
+$normalizedDispositionAskScreen = $workerDispositionAskScreen -replace 'worker_a_disposition', 'disposition_a'
+$normalizedDispositionAskId = Get-PrimaryAskId -Screen $normalizedDispositionAskScreen
+Check 'alternate OMP disposition Ask ids normalize to the report-bound worker id' ($normalizedDispositionAskId -eq 'worker_a_disposition') $normalizedDispositionAskId
+$normalizedDispositionAskMatches = $false
+try { $normalizedDispositionAskMatches = Test-PrimaryDispositionAskScreen -Screen $normalizedDispositionAskScreen -AskId 'worker_a_disposition' -TaskId 'task-a' } catch { }
+Check 'alternate OMP disposition Ask ids still require the exact report and choice content' $normalizedDispositionAskMatches 'report-bound alternate id'
 $script:PrimaryPane = 'w1:p1'
 $script:Project = [pscustomobject]@{ LaunchPaneID = 'w1:p1' }
 $savedReviewModal = (Get-Command Confirm-PrimaryReviewModal).ScriptBlock
@@ -1043,6 +1049,134 @@ function Resolve-PrimaryDispositionAsk {
 $pendingDispositionAskResult = $null
 try { $pendingDispositionAskResult = Invoke-PrimaryDispositionAskForPendingReport -AssertionPrefix 'TEST.pending-report' } catch { }
 Check 'pending report gets one exact OMP disposition Ask before its first option is selected' ($null -ne $pendingDispositionAskResult -and $pendingDispositionAskResult.Resolved -and $pendingDispositionAskResult.Observed -and $script:PendingDispositionResolvedAskForTest.AskId -eq 'worker_a_disposition' -and $script:PendingDispositionResolvedAskForTest.TaskId -eq 'task-a' -and $script:PendingDispositionPromptTextForTest.Contains('0123456789abcdef0123456789abcdef01234567') -and $script:PendingDispositionPromptTextForTest.Contains('Do not call orch_review until the user chooses')) 'exact pending report Ask'
+
+# --- preflight cleanup refuses live/ambiguous sessions and scoped artifacts ---
+$oldRunId = 'abcdef12'
+$oldRoot = Join-Path $script:HarnessRoot "orch-accept-$oldRunId"
+$oldRepo = Join-Path $oldRoot 'repo'
+$sessionBase = Join-Path $script:HarnessRoot 'herdr-sessions'
+$oldSession = [pscustomobject]@{
+    name = "orch-acc-$oldRunId"; running = $false
+    session_dir = (Join-Path $sessionBase "orch-acc-$oldRunId")
+}
+$stoppedSafe = $false
+try { $stoppedSafe = (Get-StaleAcceptanceSessionDisposition -RunId $oldRunId -Sessions @($oldSession) -SessionsRoot $sessionBase) -eq 'stopped' } catch { }
+Check 'preflight recognizes only an exact stopped acceptance session' $stoppedSafe 'stopped session'
+$liveRefused = $false
+$oldSession.running = $true
+try { [void](Get-StaleAcceptanceSessionDisposition -RunId $oldRunId -Sessions @($oldSession) -SessionsRoot $sessionBase) } catch { $liveRefused = $_.Exception.Message -match 'still running' }
+Check 'preflight refuses to retire a live acceptance session' $liveRefused 'live session'
+$oldSession.running = $false
+$oldSession.session_dir = Join-Path $script:HarnessRoot 'other-session'
+$wrongDirRefused = $false
+try { [void](Get-StaleAcceptanceSessionDisposition -RunId $oldRunId -Sessions @($oldSession) -SessionsRoot $sessionBase) } catch { $wrongDirRefused = $true }
+Check 'preflight refuses a session outside the exact session directory' $wrongDirRefused 'foreign directory'
+
+New-Item -ItemType Directory -Path $oldRepo -Force | Out-Null
+Set-Content -LiteralPath (Join-Path $oldRepo 'owned.txt') -Value 'acceptance fixture'
+@{ runId = $oldRunId; session = "orch-acc-$oldRunId"; projectKey = $oldRepo } |
+    ConvertTo-Json | Set-Content -LiteralPath (Join-Path $oldRoot 'report.json')
+$rootRemoved = $false
+$rootError = ''
+try { Remove-StaleAcceptanceRunRoot -RunId $oldRunId -ProjectKey $oldRepo -TempRoot $script:HarnessRoot; $rootRemoved = -not (Test-Path -LiteralPath $oldRoot) } catch { $rootError = $_.Exception.Message }
+Check 'preflight removes only the verified old run root after state cleanup' $rootRemoved "root=$oldRoot error=$rootError"
+New-Item -ItemType Directory -Path $oldRoot -Force | Out-Null
+@{ runId = '99999999'; session = "orch-acc-$oldRunId"; projectKey = $oldRepo } |
+    ConvertTo-Json | Set-Content -LiteralPath (Join-Path $oldRoot 'report.json')
+$mismatchRefused = $false
+try { Remove-StaleAcceptanceRunRoot -RunId $oldRunId -ProjectKey $oldRepo -TempRoot $script:HarnessRoot } catch { $mismatchRefused = $true }
+Check 'preflight preserves a run root whose report identity disagrees' ($mismatchRefused -and (Test-Path -LiteralPath $oldRoot)) 'mismatched report'
+$interruptedRunId = 'eeddbb11'
+$interruptedRoot = Join-Path $script:HarnessRoot "orch-accept-$interruptedRunId"
+$interruptedRepo = Join-Path $interruptedRoot 'repo'
+New-Item -ItemType Directory -Path $interruptedRepo -Force | Out-Null
+$savedIdentity = [pscustomobject]@{
+    RunId = $script:RunId; SessionName = $script:SessionName; RepoPath = $script:RepoPath
+    ReportJson = $script:ReportJson; Project = $script:Project
+}
+$script:RunId = $interruptedRunId
+$script:SessionName = "orch-acc-$interruptedRunId"
+$script:RepoPath = $interruptedRepo
+$script:ReportJson = Join-Path $interruptedRoot 'report.json'
+$script:Project = $null
+$interruptIdentityWritten = $false
+try {
+    Write-BindRunIdentity
+    $identity = Get-Content -LiteralPath $script:ReportJson -Raw | ConvertFrom-Json
+    $interruptIdentityWritten = ((Get-Field $identity 'runId') -ceq $interruptedRunId -and
+        (Get-Field $identity 'session') -ceq "orch-acc-$interruptedRunId" -and
+        (Test-SamePath -A (Get-Field $identity 'projectKey') -B $interruptedRepo))
+} catch { }
+Check 'an interrupted run records a verifiable project identity before bind' $interruptIdentityWritten 'report identity before action'
+$script:RunId = $savedIdentity.RunId
+$script:SessionName = $savedIdentity.SessionName
+$script:RepoPath = $savedIdentity.RepoPath
+$script:ReportJson = $savedIdentity.ReportJson
+$script:Project = $savedIdentity.Project
+
+# Exercise the actual preflight path against a synthetic store and session list.
+$savedTemp = $env:TEMP
+$savedDb = $script:StateDb
+$env:TEMP = $script:HarnessRoot
+try {
+    $script:StateDb = Join-Path $script:HarnessRoot 'preflight.sqlite'
+    [void](Invoke-Native -File $script:Python -Arguments @($seedPath, $script:StateDb) -TimeoutSeconds 60)
+    $preflightRunId = 'fedcba12'
+    $preflightRoot = Join-Path $script:HarnessRoot "orch-accept-$preflightRunId"
+    $preflightRepo = Join-Path $preflightRoot 'repo'
+    New-Item -ItemType Directory -Path $preflightRepo -Force | Out-Null
+    @{ runId = $preflightRunId; session = "orch-acc-$preflightRunId"; projectKey = $preflightRepo } |
+        ConvertTo-Json | Set-Content -LiteralPath (Join-Path $preflightRoot 'report.json')
+    $preflightSeed = @'
+import json, sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+key = sys.argv[2]
+run = sys.argv[3]
+con.execute("INSERT INTO projects VALUES (?,?)", (key, json.dumps({"Key": key, "LaunchPaneID": "w8:p8"})))
+con.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?)", ("orch_fedcba12abcd", key, "w8:p9", "w8:p9", 1, json.dumps({"ID": "orch_fedcba12abcd", "WorktreePath": key[:-4] + "worktrees\\repo\\orch-fedcba12abcd"})))
+con.execute("INSERT INTO inbox VALUES (?,?,?,?,?,?,?,?)", ("preflight-note", key, "orch_fedcba12abcd", "question", "x", "worker question", "pending", ""))
+con.execute("INSERT INTO ready_sessions VALUES (?,?,?,?,?,?,?,?,?)", ("w8:p9", "", "C:\\omp\\orch-accept-" + run + "\\session.jsonl", 1, 1, 1, "path", "x", 1))
+con.commit()
+'@
+    $preflightSeedPath = Join-Path $script:HarnessRoot 'preflight_seed.py'
+    Set-Content -LiteralPath $preflightSeedPath -Value $preflightSeed
+    $seedResult = Invoke-Native -File $script:Python -Arguments @($preflightSeedPath, $script:StateDb, $preflightRepo, $preflightRunId) -TimeoutSeconds 60
+    Check 'preflight fixture contains scoped state' ($seedResult.ExitCode -eq 0) $seedResult.Stderr
+    $script:PreflightSessionForTest = [pscustomobject]@{
+        name = "orch-acc-$preflightRunId"; running = $true
+        session_dir = (Join-Path (Join-Path $script:HarnessRoot 'sessions') "orch-acc-$preflightRunId")
+    }
+    function Get-Sessions {
+        $default = [pscustomobject]@{ name = 'default'; session_dir = $script:HarnessRoot; running = $true }
+        if ($script:PreflightSessionForTest) { return @($default, $script:PreflightSessionForTest) }
+        return @($default)
+    }
+    function Invoke-Herdr {
+        param([string[]]$Arguments, [switch]$NoSessionScope, [double]$TimeoutSeconds)
+        if ($Arguments[0] -eq 'session' -and $Arguments[1] -eq 'delete' -and $Arguments[2] -eq $script:PreflightSessionForTest.name) {
+            $script:PreflightSessionForTest = $null
+            return [pscustomobject]@{ ExitCode = 0 }
+        }
+        throw 'unexpected Herdr call during synthetic preflight'
+    }
+    $liveError = ''
+    try { Clear-StaleAcceptanceState } catch { $liveError = $_.Exception.Message }
+    Check 'live preflight refuses without deleting session, store or report' `
+        ($liveError -match 'still running' -and $script:PreflightSessionForTest -and (Test-Path -LiteralPath $preflightRoot) -and
+         @((Get-StateDump).tables.projects | Where-Object { $_.key -eq $preflightRepo }).Count -eq 1) $liveError
+    $script:PreflightSessionForTest.running = $false
+    $cleanupError = ''
+    try { Clear-StaleAcceptanceState } catch { $cleanupError = $_.Exception.Message }
+    $afterPreflight = Get-StateDump
+    Check 'stopped preflight retires only its session and removes its scoped state and root' `
+        (-not $cleanupError -and -not $script:PreflightSessionForTest -and -not (Test-Path -LiteralPath $preflightRoot) -and
+         @($afterPreflight.tables.projects).Count -eq 2 -and @($afterPreflight.tables.tasks).Count -eq 3 -and
+         @($afterPreflight.tables.inbox).Count -eq 2 -and @($afterPreflight.tables.ready_sessions).Count -eq 2) `
+        ("error=$cleanupError projects=$(@($afterPreflight.tables.projects).Count) tasks=$(@($afterPreflight.tables.tasks).Count) inbox=$(@($afterPreflight.tables.inbox).Count) ready=$(@($afterPreflight.tables.ready_sessions).Count)")
+} finally {
+    $env:TEMP = $savedTemp
+    $script:StateDb = $savedDb
+}
 
 } finally {
     # One owned directory holds every path this run created, so cleanup is a single

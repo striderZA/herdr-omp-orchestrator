@@ -375,11 +375,12 @@ function Get-Sessions {
         standard {id,result} envelope every API command uses.
     #>
     $result = Invoke-Herdr -Arguments @('session', 'list', '--json') -NoSessionScope -TimeoutSeconds 30
-    if ($result.ExitCode -ne 0 -and -not $result.Stdout) { return @() }
-    $parsed = $null
-    try { $parsed = $result.Stdout | ConvertFrom-Json } catch { return @() }
-    if ($null -eq $parsed) { return @() }
-    return @(Get-Field $parsed 'sessions' @())
+    if ($result.ExitCode -ne 0) { throw "herdr session list failed: $(Protect-Text $result.Stderr 300)" }
+    try { $parsed = $result.Stdout | ConvertFrom-Json } catch { throw 'herdr session list did not return JSON' }
+    if ($null -eq $parsed -or $null -eq $parsed.PSObject.Properties['sessions']) {
+        throw 'herdr session list did not contain sessions'
+    }
+    return @($parsed.sessions)
 }
 
 function Report-CommandFailure {
@@ -827,6 +828,53 @@ function Invoke-State {
 function Get-StateDump {
     return (Invoke-State -Operation 'dump')
 }
+function Get-StaleAcceptanceSessionDisposition {
+    param([string]$RunId, [object[]]$Sessions, [string]$SessionsRoot)
+    if ($RunId -notmatch '^[0-9a-f]{8}$' -or -not $SessionsRoot) { throw "invalid acceptance session identity: $RunId" }
+    $name = "orch-acc-$RunId"
+    $matches = @($Sessions | Where-Object { (Get-Field $_ 'name') -eq $name })
+    if ($matches.Count -eq 0) { return 'absent' }
+    if ($matches.Count -ne 1 -or -not (Test-SamePath -A (Get-Field $matches[0] 'session_dir') -B (Join-Path $SessionsRoot $name))) {
+        throw "refusing to clean ${name}: session directory or listing is ambiguous"
+    }
+    $running = Test-JsonBool -Object $matches[0] -Name 'running'
+    if ($null -eq $running) { throw "refusing to clean ${name}: running state is unknown" }
+    if ($running) { throw "refusing to clean ${name}: session is still running" }
+    return 'stopped'
+}
+
+function Assert-StaleAcceptanceRunRoot {
+    param([string]$RunId, [string]$ProjectKey, [string]$TempRoot = $env:TEMP)
+    $root = Join-Path $TempRoot "orch-accept-$RunId"
+    if ((Get-AcceptanceRunIdFromProjectKey -Key $ProjectKey -TempRoot $TempRoot) -ne $RunId -or
+        -not (Test-SamePath -A $ProjectKey -B (Join-Path $root 'repo'))) {
+        throw "refusing to remove run root: project key does not identify $root"
+    }
+    if (-not (Test-Path -LiteralPath $root)) { return $root }
+    $reportPath = Join-Path $root 'report.json'
+    if (-not (Test-Path -LiteralPath $reportPath)) { throw "refusing to remove ${root}: report identity is missing" }
+    try { $report = Get-Content -LiteralPath $reportPath -Raw | ConvertFrom-Json } catch {
+        throw "refusing to remove ${root}: report identity cannot be read"
+    }
+    if ((Get-Field $report 'runId') -cne $RunId -or
+        (Get-Field $report 'session') -cne "orch-acc-$RunId" -or
+        -not (Test-SamePath -A (Get-Field $report 'projectKey') -B $ProjectKey)) {
+        throw "refusing to remove ${root}: report identity disagrees with the project"
+    }
+    $entries = @((Get-Item -LiteralPath $root -Force)) + @(Get-ChildItem -LiteralPath $root -Recurse -Force)
+    $links = @($entries | Where-Object { $_.Attributes -band [System.IO.FileAttributes]::ReparsePoint })
+    if ($links.Count -gt 0) { throw "refusing to remove ${root}: reparse point present" }
+    return $root
+}
+
+function Remove-StaleAcceptanceRunRoot {
+    param([string]$RunId, [string]$ProjectKey, [string]$TempRoot = $env:TEMP)
+    $root = Assert-StaleAcceptanceRunRoot -RunId $RunId -ProjectKey $ProjectKey -TempRoot $TempRoot
+    if (Test-Path -LiteralPath $root) {
+        Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction Stop
+    }
+}
+
 function Clear-StaleAcceptanceState {
     $dump = Get-StateDump
     $staleProjects = @()
@@ -845,13 +893,20 @@ function Clear-StaleAcceptanceState {
         $staleRunSet[$item.RunId] = $true
     }
     $sessions = @(Get-Sessions)
+    $defaultSession = @($sessions | Where-Object { (Get-Field $_ 'name') -eq 'default' })
+    if ($defaultSession.Count -ne 1) { throw 'refusing stale cleanup: default session directory cannot be verified' }
+    $sessionsRoot = Join-Path ([string](Get-Field $defaultSession[0] 'session_dir')) 'sessions'
     foreach ($item in $staleProjects) {
         $sessionName = "orch-acc-$($item.RunId)"
-        if (@($sessions | Where-Object { (Get-Field $_ 'name') -eq $sessionName }).Count -gt 0) {
-            throw "refusing to clean stale acceptance project $($item.Key): session $sessionName is still listed"
-        }
-
+        $disposition = Get-StaleAcceptanceSessionDisposition -RunId $item.RunId -Sessions $sessions -SessionsRoot $sessionsRoot
+        $root = Assert-StaleAcceptanceRunRoot -RunId $item.RunId -ProjectKey $item.Key
         $projectTasks = @($dump.tables.tasks | Where-Object { $_.project_key -eq $item.Key })
+        foreach ($taskRow in $projectTasks) {
+            $worktree = [string](Get-Field (Get-Field $taskRow 'fact') 'WorktreePath')
+            if ($worktree -and -not (Test-Below -Root $root -Path $worktree)) {
+                throw "refusing to clean stale acceptance project $($item.Key): task worktree is outside $root"
+            }
+        }
         $paneIds = @()
         foreach ($row in @($item.Row) + $projectTasks) {
             $fact = Get-Field $row 'fact'
@@ -896,10 +951,21 @@ function Clear-StaleAcceptanceState {
         if (@($plan.foreign).Count -gt 0) {
             throw "refusing to clean stale acceptance project $($item.Key): foreign references remain"
         }
+        if ($disposition -eq 'stopped') {
+            $current = Get-StaleAcceptanceSessionDisposition -RunId $item.RunId -Sessions @(Get-Sessions) -SessionsRoot $sessionsRoot
+            if ($current -ne 'stopped') { throw "refusing to delete ${sessionName}: session listing changed" }
+            $retired = Invoke-Herdr -Arguments @('session', 'delete', $sessionName) -NoSessionScope -TimeoutSeconds 60
+            if ($retired.ExitCode -ne 0 -or
+                (Get-StaleAcceptanceSessionDisposition -RunId $item.RunId -Sessions @(Get-Sessions) -SessionsRoot $sessionsRoot) -ne 'absent') {
+                throw "failed to retire stopped acceptance session $sessionName"
+            }
+            $sessions = @(Get-Sessions)
+        }
         $deleted = Invoke-State -Operation 'delete-scoped' -Arguments @($item.Key, $paneArgument)
         if (-not (Get-Flag $deleted 'ok') -or -not (Get-Flag $deleted 'others_identical')) {
             throw "scoped cleanup did not preserve unrelated state for $($item.Key)"
         }
+        Remove-StaleAcceptanceRunRoot -RunId $item.RunId -ProjectKey $item.Key
         Add-Assertion -Id "P1.12a-$($item.RunId)" -What 'stale acceptance state removed without changing unrelated rows' -Status 'INFO' `
             -Evidence ("project={0}; deleted={1}" -f $item.Key, (Get-Json $deleted.deleted))
         $dump = Get-StateDump
@@ -2064,8 +2130,24 @@ function Get-BindPayload {
     return (Get-ActionOutput -LogId $logId -TimeoutSeconds $TimeoutSeconds)
 }
 
+function Write-BindRunIdentity {
+    # Persist identity before bind may create the project. A killed process has
+    # no final report, but the next preflight can still verify exactly its root.
+    if (-not (Test-Below -Root $script:WorkRoot -Path $script:RepoPath) -or
+        -not (Test-Path -LiteralPath $script:RepoPath -PathType Container)) {
+        throw 'refusing to bind without an owned temporary repository'
+    }
+    [pscustomobject]@{
+        runId = $script:RunId
+        session = $script:SessionName
+        projectKey = $script:RepoPath
+        startedAt = $script:StartedAt
+    } | ConvertTo-Json | Set-Content -LiteralPath $script:ReportJson -Encoding UTF8
+}
+
 function Invoke-Bind {
     Write-Step 'Phase 7: bind the primary (real action, real pane context)'
+    Write-BindRunIdentity
     # The context env below is exactly what Herdr injects into a plugin command
     # it starts from a pane; the script supplies the pane it just proved is the
     # temp repository, and asserts the context Herdr resolved.
@@ -2644,7 +2726,11 @@ function Get-PrimaryAskId {
     $panel = $Screen.Substring($askIndex)
     $match = [regex]::Match($panel, '\[(?<id>[a-z0-9_-]+)\]', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
     if (-not $match.Success) { return '' }
-    return $match.Groups['id'].Value.ToLowerInvariant()
+    $id = $match.Groups['id'].Value.ToLowerInvariant()
+    if ($id -in @('disposition_a', 'disposition_b')) {
+        return $id -replace '^disposition_', 'worker_' -replace '$', '_disposition'
+    }
+    return $id
 }
 
 function Test-PrimaryDispositionAskScreen {
@@ -4497,9 +4583,10 @@ function Invoke-Cleanup {
     Assert-True -Id 'Z6.1b' -What "no pane or agent of the user's default session works anywhere in this run's temp root" `
         -Condition (-not (Test-ProjectionMentions -Projection $defaultProjection -Path $script:WorkRoot)) `
         -Evidence (Protect-Text $defaultProjection 500)
+    $defaultSocket = [string](Get-Field $script:DefaultSessionRecord 'Socket')
     Assert-True -Id 'Z6.1c' -What 'this run used its own server, not the default session socket' `
-        -Condition ($script:SessionSocket -and $script:DefaultSessionRecord -and ((ConvertTo-NormalPath $script:SessionSocket) -ine (ConvertTo-NormalPath $script:DefaultSessionRecord.Socket))) `
-        -Evidence "run=$(Protect-Text $script:SessionSocket 200) default=$(Protect-Text $script:DefaultSessionRecord.Socket 200)"
+        -Condition ($script:SessionSocket -and $defaultSocket -and ((ConvertTo-NormalPath $script:SessionSocket) -ine (ConvertTo-NormalPath $defaultSocket))) `
+        -Evidence "run=$(Protect-Text $script:SessionSocket 200) default=$(Protect-Text $defaultSocket 200)"
 
     $pluginList = Get-HerdrJson -Arguments @('plugin', 'list', '--json', '--plugin', $script:PluginId) -NoSessionScope
     $plugin = @((Get-JsonField $pluginList 'plugins' @()) | Where-Object { (Get-Field $_ 'plugin_id') -eq $script:PluginId })
@@ -4551,7 +4638,7 @@ function Write-Report {
         failed       = $script:Failures
         blocked      = $script:Blocked
         exitCode     = 0
-        projectKey   = if ($script:Project) { [string](Get-Field $script:Project 'Key') } else { '' }
+        projectKey   = if ($script:Project) { [string](Get-Field $script:Project 'Key') } elseif (Test-Path -LiteralPath $script:ReportJson) { [string]$script:RepoPath } else { '' }
         serverVersion = $script:SessionServerVersion
         assertions   = @($script:Assertions)
     }
