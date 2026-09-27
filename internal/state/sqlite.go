@@ -156,10 +156,17 @@ const postMigrateIndexes = `
 CREATE INDEX IF NOT EXISTS inbox_pending ON inbox (project_key, delivery_state);
 `
 
-// migrate adds the columns an older state database is missing.
+// migrate holds SQLite's immediate write lock across column discovery and every
+// ALTER. Otherwise two plugin processes can both observe a missing column and
+// the second fails with a duplicate-column error after the first adds it.
 func migrate(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin schema migration: %w", err)
+	}
+	defer tx.Rollback()
 	for _, table := range migratedColumns {
-		existing, err := columnNames(ctx, db, table.table)
+		existing, err := columnNames(ctx, tx, table.table)
 		if err != nil {
 			return err
 		}
@@ -167,17 +174,20 @@ func migrate(ctx context.Context, db *sql.DB) error {
 			if existing[column.name] {
 				continue
 			}
-			if _, err := db.ExecContext(ctx, column.ddl); err != nil {
+			if _, err := tx.ExecContext(ctx, column.ddl); err != nil {
 				return fmt.Errorf("add %s.%s: %w", table.table, column.name, err)
 			}
 		}
 	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit schema migration: %w", err)
+	}
 	return nil
 }
 
-// columnNames reads the column names of one table.
-func columnNames(ctx context.Context, db *sql.DB, table string) (map[string]bool, error) {
-	rows, err := db.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
+// columnNames reads the column names of one table within the migration lock.
+func columnNames(ctx context.Context, tx *sql.Tx, table string) (map[string]bool, error) {
+	rows, err := tx.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
 	if err != nil {
 		return nil, fmt.Errorf("inspect %s: %w", table, err)
 	}
