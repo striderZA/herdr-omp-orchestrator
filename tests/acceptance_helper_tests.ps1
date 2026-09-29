@@ -74,6 +74,22 @@ function Check {
     $script:checks++
     if ($Ok) { Write-Host "ok   $Name" } else { Write-Host "FAIL $Name :: $Detail" -ForegroundColor Red; $script:fails++ }
 }
+$savedAssertions = $script:Assertions
+$savedUndriven = $script:Undriven
+$script:Assertions = New-Object System.Collections.ArrayList
+$script:Undriven = New-Object System.Collections.ArrayList
+$blockRecordsTask = $false
+try {
+    Block-Item -Id 'TDD.block-task' -What 'blocked task context survives assertion recording' `
+        -TaskId 'orch_test1234' -Evidence 'precondition unavailable'
+    $blockRecord = @($script:Assertions | Where-Object { $_.id -eq 'TDD.block-task' })
+    $undrivenRecord = @($script:Undriven | Where-Object { $_.id -eq 'TDD.block-task' })
+    $blockRecordsTask = ($blockRecord.Count -eq 1 -and $blockRecord[0].task -ceq 'orch_test1234' -and
+        $undrivenRecord.Count -eq 1 -and $undrivenRecord[0].task -ceq 'orch_test1234')
+} catch { }
+Check 'Block-Item accepts and records task context' $blockRecordsTask 'TaskId rejected or not recorded'
+$script:Assertions = $savedAssertions
+$script:Undriven = $savedUndriven
 
 # --- Invoke-Native argv integrity (spaces, quotes, newline, backslash) -------
 $py = (Get-Command python).Source

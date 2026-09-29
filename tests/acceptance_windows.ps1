@@ -519,11 +519,12 @@ function Block-Item {
     param(
         [Parameter(Mandatory)][string]$Id,
         [Parameter(Mandatory)][string]$What,
+        [string]$TaskId = '',
         [string]$Evidence = '',
         [string]$Command = ''
     )
-    [void]$script:Undriven.Add([pscustomobject]@{ id = $Id; what = $What; evidence = Protect-Text $Evidence 400 })
-    return Add-Assertion -Id $Id -What $What -Status 'BLOCKED' -Command $Command -Evidence $Evidence
+    [void]$script:Undriven.Add([pscustomobject]@{ id = $Id; what = $What; task = $TaskId; evidence = Protect-Text $Evidence 400 })
+    return Add-Assertion -Id $Id -What $What -Status 'BLOCKED' -TaskId $TaskId -Command $Command -Evidence $Evidence
 }
 function Preserve-ResourcesForPendingTool {
     param([Parameter(Mandatory)][string]$AssertionId, [Parameter(Mandatory)][string]$Reason)
