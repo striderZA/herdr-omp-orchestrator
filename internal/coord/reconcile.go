@@ -1376,7 +1376,37 @@ func (c *Coordinator) applyPrimaryPane(ctx context.Context, project task.Project
 // task after the workspace it was created in is closed.
 func (c *Coordinator) applyTaskPane(ctx context.Context, st task.Task, probe paneProbe) error {
 	next := st
-	if adoptsLaunchID(st.LaunchPaneID, probe) {
+	restoredLaunch := adoptsLaunchID(st.LaunchPaneID, probe)
+	if restoredLaunch {
+		announced, verified, err := c.store.VerifiedAnnouncement(ctx, st.LaunchPaneID)
+		if err != nil {
+			return fmt.Errorf("read the confirmed session of task %s before restoring its launch pane: %w", st.ID, err)
+		}
+		if !verified || !announced.Proves(st.OMPSessionID, probe.Ref) {
+			return fmt.Errorf("%w: task %s restore no longer matches its confirmed launch-pane session", ErrAgentChanged, st.ID)
+		}
+		binding, err := c.store.ByPane(ctx, probe.Pane.PaneID)
+		if err == nil && (binding.Role != state.RoleWorker || binding.Task.ID != st.ID) {
+			return fmt.Errorf("%w: restored pane %s is already bound to another record", ErrAgentChanged, probe.Pane.PaneID)
+		}
+		if err != nil && !errors.Is(err, state.ErrNotFound) {
+			return fmt.Errorf("check restored pane %s ownership: %w", probe.Pane.PaneID, err)
+		}
+		// The old launch pane's verified announcement and the new pane's live
+		// agent_get reference must agree with the new pane's own ready announcement.
+		// Never overwrite that announcement: a mismatch is evidence that this pane
+		// may now hold a different OMP session.
+		restoredAnnouncement, found, err := c.store.AnnouncedSession(ctx, probe.Pane.PaneID)
+		if err != nil {
+			return fmt.Errorf("read restored readiness for task %s: %w", st.ID, err)
+		}
+		if !found || !restoredAnnouncement.Proves(st.OMPSessionID, probe.Ref) ||
+			!announced.Proves(st.OMPSessionID, probe.Ref) {
+			return fmt.Errorf("%w: task %s restored pane %s has no announcement for its confirmed live session", ErrAgentChanged, st.ID, probe.Pane.PaneID)
+		}
+		if err := c.store.ConfirmReady(ctx, probe.Pane.PaneID, probe.Ref); err != nil {
+			return fmt.Errorf("confirm restored readiness for task %s: %w", st.ID, err)
+		}
 		next.LaunchPaneID = probe.Pane.PaneID
 	}
 	next.PublicPaneID = probe.Pane.PaneID

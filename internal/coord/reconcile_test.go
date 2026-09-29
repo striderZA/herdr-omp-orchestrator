@@ -1004,6 +1004,16 @@ func TestReconcileAdoptsAVerifiedRestoredSessionInANewTerminal(t *testing.T) {
 		current.Agents["restored:p1"] = agent
 	})
 
+	oldAnnouncement, verified, err := f.store.VerifiedAnnouncement(context.Background(), worker.LaunchPaneID)
+	if err != nil || !verified {
+		t.Fatalf("VerifiedAnnouncement(old pane) = (%+v, %v, %v), want confirmed session", oldAnnouncement, verified, err)
+	}
+	if err := f.store.RecordReady(context.Background(), "restored:p1", oldAnnouncement, 1); err != nil {
+		t.Fatalf("RecordReady(restored pane): %v", err)
+	}
+	if ready, err := f.store.Ready(context.Background(), "restored:p1", oldAnnouncement); err != nil || ready {
+		t.Fatalf("restored readiness before reconciliation = (%v, %v), want unverified", ready, err)
+	}
 	if err := f.coord.Reconcile(context.Background()); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
@@ -1022,8 +1032,54 @@ func TestReconcileAdoptsAVerifiedRestoredSessionInANewTerminal(t *testing.T) {
 	case after.Attention != "" || after.Blocker != "":
 		t.Fatalf("a verified restore raised attention=%q blocker=%q", after.Attention, after.Blocker)
 	}
+	announced, verified, err := f.store.VerifiedAnnouncement(context.Background(), after.LaunchPaneID)
+	if err != nil {
+		t.Fatalf("VerifiedAnnouncement(restored pane): %v", err)
+	}
+	if !verified {
+		t.Fatalf("restored launch pane %q has no verified readiness handshake", after.LaunchPaneID)
+	}
+	liveAgent := f.state().Agents[after.LaunchPaneID]
+	if liveAgent == nil {
+		t.Fatalf("restored launch pane %q has no live agent", after.LaunchPaneID)
+	}
+	liveRef := fixtureReference(f.plan, task.Announcement{ID: liveAgent.Session, File: sessionFileFor(liveAgent.Session)})
+	if liveRef == nil || !announced.Proves(after.OMPSessionID, *liveRef) {
+		t.Fatalf("restored readiness does not prove the live session for task %s: announcement=%+v liveRef=%+v", after.ID, announced, liveRef)
+	}
 	if f.countCalls("agent start") != startsBefore {
 		t.Fatalf("startup started an agent: %d start calls before, %d after", startsBefore, f.countCalls("agent start"))
+	}
+}
+func TestReconcileDoesNotRekeyOntoRestoredPaneWithMismatchedAnnouncement(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	worker := f.boundWorker(t)
+	oldPane := worker.PublicPaneID
+	f.rewriteState(func(current *fixtureState) {
+		agent := current.Agents[oldPane]
+		delete(current.Agents, oldPane)
+		delete(current.Workspaces, workspaceOfPane(oldPane))
+		agent.Terminal = "term-restored"
+		current.Workspaces["restored"] = worker.WorktreePath
+		current.Agents["restored:p1"] = agent
+	})
+	wrong := task.Announcement{ID: "omp-unrelated", File: sessionFileFor("omp-unrelated")}
+	if err := f.store.RecordReady(context.Background(), "restored:p1", wrong, 1); err != nil {
+		t.Fatalf("RecordReady(unrelated restored session): %v", err)
+	}
+	if err := f.coord.Reconcile(context.Background()); !errors.Is(err, ErrAgentChanged) {
+		t.Fatalf("Reconcile error = %v, want ErrAgentChanged", err)
+	}
+	after := f.taskByID(t, worker.ID)
+	if after.LaunchPaneID != worker.LaunchPaneID || after.PublicPaneID != worker.PublicPaneID {
+		t.Fatalf("mismatched restore changed task panes to %q/%q", after.LaunchPaneID, after.PublicPaneID)
+	}
+	announced, found, err := f.store.AnnouncedSession(context.Background(), "restored:p1")
+	if err != nil || !found || announced.ID != wrong.ID || announced.File != wrong.File {
+		t.Fatalf("mismatched announcement was overwritten: announced=%+v found=%v err=%v", announced, found, err)
+	}
+	if ready, err := f.store.Ready(context.Background(), "restored:p1", wrong); err != nil || ready {
+		t.Fatalf("mismatched restored pane readiness = (%v, %v), want unverified", ready, err)
 	}
 }
 
