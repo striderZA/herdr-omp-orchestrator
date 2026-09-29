@@ -128,6 +128,50 @@ Check 'Invoke-Native removes inherited env' ($r5.Stdout.Trim() -eq 'absent') $r5
 $r6 = Invoke-Native -File $py -Arguments @('-c', 'import os;print(os.environ.get("HERDR_PANE_ID","absent"))') -Environment @{ 'HERDR_PANE_ID' = 'w9:p9' } -RemoveEnvironment @('HERDR_PANE_ID') -TimeoutSeconds 60
 Check 'Invoke-Native applies overrides after removal' ($r6.Stdout.Trim() -eq 'w9:p9') $r6.Stdout
 Remove-Item env:HERDR_PANE_ID
+$oldRunServerValues = @{
+    HerdrExe = $script:HerdrExe
+    SessionName = $script:SessionName
+    RepoRoot = $script:RepoRoot
+    ConfigPath = $script:ConfigPath
+}
+$oldCallerEnvironment = @{}
+foreach ($key in $script:HerdrCallerEnvKeys) {
+    $oldCallerEnvironment[$key] = [System.Environment]::GetEnvironmentVariable($key, 'Process')
+}
+try {
+    foreach ($key in $script:HerdrCallerEnvKeys) {
+        [System.Environment]::SetEnvironmentVariable($key, "inherited-$key", 'Process')
+    }
+    $script:HerdrExe = Join-Path $env:SystemRoot 'System32\herdr-test.exe'
+    $script:SessionName = 'orch-acc-test1234'
+    $script:RepoRoot = $script:HarnessRoot
+    $script:ConfigPath = Join-Path $script:HarnessRoot 'isolated-config.toml'
+    $serverStartInfo = if (Get-Command New-RunServerStartInfo -ErrorAction SilentlyContinue) {
+        New-RunServerStartInfo
+    } else {
+        $null
+    }
+    $callerContextClear = ($null -ne $serverStartInfo)
+    if ($serverStartInfo) {
+        foreach ($key in $script:HerdrCallerEnvKeys) {
+            if ($key -eq 'HERDR_CONFIG_PATH') {
+                if ($serverStartInfo.EnvironmentVariables[$key] -ne $script:ConfigPath) { $callerContextClear = $false }
+            } elseif ($serverStartInfo.EnvironmentVariables.ContainsKey($key)) {
+                $callerContextClear = $false
+            }
+        }
+    }
+    Check 'isolated server strips inherited Herdr caller context' $callerContextClear 'caller Herdr variables remain in server environment'
+} finally {
+    foreach ($key in $script:HerdrCallerEnvKeys) {
+        [System.Environment]::SetEnvironmentVariable($key, $oldCallerEnvironment[$key], 'Process')
+    }
+    $script:HerdrExe = $oldRunServerValues.HerdrExe
+    $script:SessionName = $oldRunServerValues.SessionName
+    $script:RepoRoot = $oldRunServerValues.RepoRoot
+    $script:ConfigPath = $oldRunServerValues.ConfigPath
+}
+
 
 # --- paths ------------------------------------------------------------------
 Check 'Test-SamePath mixed slashes' (Test-SamePath -A 'C:/Users/Jaco/x' -B 'C:\Users\Jaco\x') 'mixed'
@@ -136,6 +180,21 @@ Check 'Test-SamePath rejects sibling' (-not (Test-SamePath -A 'C:\a\b' -B 'C:\a\
 Check 'Test-Below child' (Test-Below -Root 'C:\a\b' -Path 'C:\a\b\c\d') 'child'
 Check 'Test-Below rejects prefix sibling' (-not (Test-Below -Root 'C:\a\b' -Path 'C:\a\bc')) 'prefix'
 Check 'ConvertTo-NormalPath trims trailing' ((ConvertTo-NormalPath 'C:/x/y/') -eq 'C:\x\y') (ConvertTo-NormalPath 'C:/x/y/')
+$socketCheckCommand = Get-Command Test-SessionSocketSeparation -ErrorAction SilentlyContinue
+$socketCheckExists = $null -ne $socketCheckCommand
+Check 'socket separation helper exists' $socketCheckExists 'missing helper'
+$socketCheckSupportsServerState = $socketCheckExists -and $socketCheckCommand.Parameters.ContainsKey('ServerStarted')
+Check 'socket separation helper requires startup state' $socketCheckSupportsServerState 'missing ServerStarted parameter'
+if ($socketCheckSupportsServerState) {
+    Check 'socket check is skipped when isolated server never started' `
+        ($null -eq (Test-SessionSocketSeparation -ServerStarted $false -RunSocket '' -DefaultSocket 'C:\default\herdr.sock')) 'server never started'
+    Check 'socket check fails when server started but run socket is missing' `
+        ((Test-SessionSocketSeparation -ServerStarted $true -RunSocket '' -DefaultSocket 'C:\default\herdr.sock') -eq $false) 'started server has no captured socket'
+    Check 'socket check distinguishes separate run server' `
+        ((Test-SessionSocketSeparation -ServerStarted $true -RunSocket 'C:\run\herdr.sock' -DefaultSocket 'C:\default\herdr.sock') -eq $true) 'different sockets'
+    Check 'socket check rejects default server reuse' `
+        ((Test-SessionSocketSeparation -ServerStarted $true -RunSocket 'C:\default\herdr.sock' -DefaultSocket 'C:\default\herdr.sock') -eq $false) 'same socket'
+}
 
 if (Get-Command Get-AcceptanceRunIdFromProjectKey -ErrorAction SilentlyContinue) {
     $staleProjectKey = Join-Path (Join-Path $env:TEMP 'orch-accept-f762c17c') 'repo'
@@ -302,7 +361,11 @@ Check 'projection (stage form) notices a report' ((Get-TaskProjection -Fact $fac
 Check 'projection (move form) ignores a report' ((Get-TaskProjection -Fact $fact -MoveSensitive) -ceq (Get-TaskProjection -Fact $reported -MoveSensitive)) 'report/move'
 $identityFacts = [pscustomobject]@{
     Project = [pscustomobject]@{ Key = 'repo'; AgentName = 'primary'; LaunchPaneID = 'p1'; OMPSessionID = 's1'; TerminalID = 't1'; RepoWorkspaceID = 'w1' }
-    Tasks = @()
+    Tasks = @([pscustomobject]@{ fact = [pscustomobject]@{
+        ID = 'task1'; ProjectKey = 'repo'; Title = 'task'; Branch = 'branch'; BaseRevision = 'base'
+        WorktreePath = 'C:\wt'; WorktreeWorkspaceID = 'w2'; LaunchPaneID = 'p2'; OMPSessionID = 's2'
+        Phase = 'running'; Blocker = ''; Attention = ''; Disposition = ''; CurrentWorkspaceID = 'w2'; Report = $null
+    } })
     Inbox = @([pscustomobject]@{ id = 'i1'; kind = 'activity'; delivery_state = 'delivered' })
 }
 $identityProjection = ''
@@ -310,13 +373,14 @@ try { $identityProjection = Get-IdentityProjection -Facts $identityFacts } catch
 Check 'restart identity projection accepts Facts and excludes mutable inbox rows' ($identityProjection -match 'project/Key=repo' -and $identityProjection -notmatch 'inbox/i1') 'project fields only'
 $identityFactsAfter = [pscustomobject]@{
     Project = $identityFacts.Project.PSObject.Copy()
-    Tasks = @()
-    Inbox = @()
+    Tasks = @([pscustomobject]@{ fact = $identityFacts.Tasks[0].fact.PSObject.Copy() })
 }
 $identityFactsAfter.Project.TerminalID = 't2'
+$identityFactsAfter.Project.LaunchPaneID = 'p9'
+$identityFactsAfter.Tasks[0].fact.LaunchPaneID = 'p8'
 $identityProjectionAfter = ''
 try { $identityProjectionAfter = Get-IdentityProjection -Facts $identityFactsAfter } catch { }
-Check 'restart identity projection ignores the terminal id that Herdr reassigns' ($identityProjection -ceq $identityProjectionAfter) "before=[$identityProjection] after=[$identityProjectionAfter]"
+Check 'restart identity projection permits runtime pane rekeys while preserving session facts' ($identityProjection -ceq $identityProjectionAfter) "before=[$identityProjection] after=[$identityProjectionAfter]"
 $boardOrderScreen = @'
 Ready for review
 [task_b] B
@@ -450,6 +514,94 @@ Check 'OMP transcript confirms a prompt outside the visible scrollback' $transcr
 $transcriptMissingMarker = $true
 try { $transcriptMissingMarker = Test-OmpTranscriptContains -Path $transcriptPath -Text 'ACCEPT-Q-Z' } catch { }
 Check 'OMP transcript rejects an absent prompt marker' (-not $transcriptMissingMarker) 'missing marker'
+$questionNoticePath = Join-Path $script:HarnessRoot 'worker-question-notice.jsonl'
+$questionNoticeLines = @(
+    '{"type":"message","message":{"role":"user","content":[{"type":"text","text":"Dispatch brief contains ACCEPT-Q-A"}]}}'
+)
+Set-Content -LiteralPath $questionNoticePath -Value $questionNoticeLines -Encoding UTF8
+$briefCountedAsDelivery = $true
+try {
+    $briefCountedAsDelivery = Test-OmpTranscriptContainsWorkerQuestionNote `
+        -Path $questionNoticePath -TaskId 'orch_abc' -QuestionMarker 'ACCEPT-Q-A'
+} catch { }
+Check 'question delivery parser rejects a marker found only in the dispatch brief' (-not $briefCountedAsDelivery) 'brief is not delivery'
+ $questionNoticeLines += '{"type":"message","message":{"role":"user","content":[{"type":"text","text":"orchestrator: 1 worker note(s)\n- orch_other [question]: ACCEPT-Q-A"}]}}'
+ Add-Content -LiteralPath $questionNoticePath -Value $questionNoticeLines[-1] -Encoding UTF8
+ $wrongTaskQuestionNote = $true
+ try { $wrongTaskQuestionNote = Test-OmpTranscriptContainsWorkerQuestionNote -Path $questionNoticePath -TaskId 'orch_abc' -QuestionMarker 'ACCEPT-Q-A' } catch { }
+ Check 'question delivery parser rejects another task note' (-not $wrongTaskQuestionNote) 'wrong task'
+ $questionNoticeLines += '{"type":"message","message":{"role":"user","content":[{"type":"text","text":"orchestrator: 1 worker note(s)\n- orch_abc [question]: ACCEPT-Q-A"}]}}'
+ Add-Content -LiteralPath $questionNoticePath -Value $questionNoticeLines[-1] -Encoding UTF8
+ $exactTaskQuestionNote = $false
+ try { $exactTaskQuestionNote = Test-OmpTranscriptContainsWorkerQuestionNote -Path $questionNoticePath -TaskId 'orch_abc' -QuestionMarker 'ACCEPT-Q-A' } catch { }
+ Check 'question delivery parser recognizes this task-specific inbox note' $exactTaskQuestionNote 'exact task note'
+$primaryAuthorizationTranscriptPath = Join-Path $script:HarnessRoot 'primary-authorization-session.jsonl'
+$primaryAuthorizationLines = @(
+    '{"type":"message","message":{"role":"user","content":[{"type":"text","text":"Dispatch brief: ACCEPT-Q-A; exact token ACCEPT-ANSWER-A must arrive later"}]}}'
+    '{"type":"message","message":{"role":"user","content":[{"type":"text","text":"ACCEPT-ANSWER-A"}],"attribution":"user","steering":true,"liveSteered":true}}'
+    '{"type":"message","message":{"role":"user","content":[{"type":"text","text":"orchestrator: 1 worker note(s)\n- task-a [question]: ACCEPT-Q-A: should a.js keep its existing export style?"}]}}'
+    '{"type":"message","message":{"role":"user","content":[{"type":"text","text":"orchestrator: waiting for ACCEPT-ANSWER-A; no response has been received"}],"attribution":"user"}}'
+    '{"type":"message","message":{"role":"user","content":[{"type":"text","text":"Yes—keep the existing export style."}],"attribution":"user","steering":true,"liveSteered":true}}'
+    '{"type":"message","message":{"role":"assistant","content":[{"type":"toolCall","name":"orch_answer","arguments":{"taskId":"task-a","text":"ACCEPT-ANSWER-A"}}]}}'
+)
+Set-Content -LiteralPath $primaryAuthorizationTranscriptPath -Value $primaryAuthorizationLines -Encoding UTF8
+$preNoteAuthorization = $true
+try {
+    $preNoteAuthorization = Test-OmpTranscriptContainsLaterUserAuthorization -Path $primaryAuthorizationTranscriptPath `
+        -TaskId 'task-a' -QuestionMarker 'ACCEPT-Q-A' -Token 'ACCEPT-ANSWER-A'
+} catch { }
+Check 'a direct token before the task-specific inbox note does not authorize reporting' (-not $preNoteAuthorization) 'pre-note token'
+$preAuthorizationRelay = $true
+try {
+    $preAuthorizationRelay = Test-OmpAnswerCallAfterUserAuthorization -Path $primaryAuthorizationTranscriptPath `
+        -QuestionMarker 'ACCEPT-Q-A' -Token 'ACCEPT-ANSWER-A' -TaskId 'task-a'
+} catch { }
+Check 'orch_answer before a direct post-note user token is rejected' (-not $preAuthorizationRelay) 'relay before authorization'
+$primaryAuthorizationLines += '{"type":"message","message":{"role":"user","content":[{"type":"text","text":"ACCEPT-ANSWER-A"}],"attribution":"user","steering":true,"liveSteered":true}}'
+Add-Content -LiteralPath $primaryAuthorizationTranscriptPath -Value $primaryAuthorizationLines[-1] -Encoding UTF8
+$primaryAuthorizationLines += '{"type":"message","message":{"role":"assistant","content":[{"type":"toolCall","name":"orch_answer","arguments":{"taskId":"task-a","text":"ACCEPT-ANSWER-A"}}]}}'
+Add-Content -LiteralPath $primaryAuthorizationTranscriptPath -Value $primaryAuthorizationLines[-1] -Encoding UTF8
+$laterUserAuthorization = $false
+try {
+    $laterUserAuthorization = Test-OmpTranscriptContainsLaterUserAuthorization -Path $primaryAuthorizationTranscriptPath `
+        -TaskId 'task-a' -QuestionMarker 'ACCEPT-Q-A' -Token 'ACCEPT-ANSWER-A'
+} catch { }
+Check 'a direct token after the task-specific note authorizes reporting' $laterUserAuthorization 'post-note token'
+$authorizedAnswerRelay = $false
+try {
+    $authorizedAnswerRelay = Test-OmpAnswerCallAfterUserAuthorization -Path $primaryAuthorizationTranscriptPath `
+        -QuestionMarker 'ACCEPT-Q-A' -Token 'ACCEPT-ANSWER-A' -TaskId 'task-a'
+} catch { }
+Check 'orch_answer is accepted only after the exact direct post-note token and for the bound task' $authorizedAnswerRelay 'authorized relay'
+$wrongTaskAnswerRelay = $true
+try {
+    $wrongTaskAnswerRelay = Test-OmpAnswerCallAfterUserAuthorization -Path $primaryAuthorizationTranscriptPath `
+        -QuestionMarker 'ACCEPT-Q-A' -Token 'ACCEPT-ANSWER-A' -TaskId 'task-b'
+} catch { }
+Check 'orch_answer for a different task is rejected after user authorization' (-not $wrongTaskAnswerRelay) 'wrong task relay'
+$unreviewedCleanupFact = [pscustomobject]@{ Report = $null; Disposition = ''; Attention = '' }
+$unreviewedWithReportFact = [pscustomobject]@{ Report = [pscustomobject]@{ Kind = 'result' }; Disposition = ''; Attention = '' }
+$partialReportWithDispositionFact = [pscustomobject]@{ Report = [pscustomobject]@{ Kind = 'partial' }; Disposition = 'Accepted'; Attention = '' }
+$reviewedDoneFact = [pscustomobject]@{ Report = [pscustomobject]@{ Kind = 'result' }; Disposition = 'Accepted'; Attention = '' }
+$noReportReviewed = $true
+$reportWithoutDispositionReviewed = $true
+$partialReportReviewed = $true
+$acceptedReportReviewed = $false
+try { $noReportReviewed = Test-TaskIsReviewedDone -Fact $unreviewedCleanupFact } catch { }
+try { $reportWithoutDispositionReviewed = Test-TaskIsReviewedDone -Fact $unreviewedWithReportFact } catch { }
+try { $partialReportReviewed = Test-TaskIsReviewedDone -Fact $partialReportWithDispositionFact } catch { }
+try { $acceptedReportReviewed = Test-TaskIsReviewedDone -Fact $reviewedDoneFact } catch { }
+Check 'cleanup refusal suite requires a reviewed final result, not a partial report or mere disposition' `
+    ((-not $noReportReviewed) -and (-not $reportWithoutDispositionReviewed) -and (-not $partialReportReviewed) -and $acceptedReportReviewed) 'review prerequisite'
+$exactBlockedK0 = $false
+$unrelatedBlockedK0 = $true
+$wrongPhaseBlockedK0 = $true
+try { $exactBlockedK0 = Test-IsBlockedPrimaryDispositionPrerequisite -PhaseId 'K0' -Message 'a primary disposition Ask blocked worker-dialog approval' } catch { }
+try { $unrelatedBlockedK0 = Test-IsBlockedPrimaryDispositionPrerequisite -PhaseId 'K0' -Message 'worktree move failed' } catch { }
+try { $wrongPhaseBlockedK0 = Test-IsBlockedPrimaryDispositionPrerequisite -PhaseId 'V0' -Message 'a primary disposition Ask blocked worker-dialog approval' } catch { }
+Check 'K0 disposition-Ask block is a known blocked prerequisite' $exactBlockedK0 'exact K0 prerequisite'
+Check 'K0 does not suppress an unrelated failure as blocked' (-not $unrelatedBlockedK0) 'unrelated K0 failure'
+Check 'the same disposition-Ask message in another phase is not suppressed' (-not $wrongPhaseBlockedK0) 'wrong phase'
 $approvalTranscriptPath = Join-Path $script:HarnessRoot 'approval-session.jsonl'
 Set-Content -LiteralPath $approvalTranscriptPath -Value '{"type":"message","message":{"role":"assistant","content":[{"type":"toolCall","name":"orch_approve_dialog","arguments":{"taskId":"orch_abc","keys":["enter"]}}]}}' -Encoding UTF8
 $approvalToolCallMatches = $false
@@ -1078,10 +1230,12 @@ $oldSession = [pscustomobject]@{
 $stoppedSafe = $false
 try { $stoppedSafe = (Get-StaleAcceptanceSessionDisposition -RunId $oldRunId -Sessions @($oldSession) -SessionsRoot $sessionBase) -eq 'stopped' } catch { }
 Check 'preflight recognizes only an exact stopped acceptance session' $stoppedSafe 'stopped session'
-$liveRefused = $false
 $oldSession.running = $true
-try { [void](Get-StaleAcceptanceSessionDisposition -RunId $oldRunId -Sessions @($oldSession) -SessionsRoot $sessionBase) } catch { $liveRefused = $_.Exception.Message -match 'still running' }
-Check 'preflight refuses to retire a live acceptance session' $liveRefused 'live session'
+$liveDetected = $false
+try { $liveDetected = (Get-StaleAcceptanceSessionDisposition -RunId $oldRunId -Sessions @($oldSession) -SessionsRoot $sessionBase) -eq 'running' } catch { }
+Check 'preflight identifies a live acceptance session for explicit confirmation' $liveDetected 'live session'
+$absentDisposition = (Get-StaleAcceptanceSessionDisposition -RunId $oldRunId -Sessions @() -SessionsRoot $sessionBase)
+Check 'preflight recognizes an already absent acceptance session' ($absentDisposition -eq 'absent') $absentDisposition
 $oldSession.running = $false
 $oldSession.session_dir = Join-Path $script:HarnessRoot 'other-session'
 $wrongDirRefused = $false
@@ -1102,6 +1256,205 @@ New-Item -ItemType Directory -Path $oldRoot -Force | Out-Null
 $mismatchRefused = $false
 try { Remove-StaleAcceptanceRunRoot -RunId $oldRunId -ProjectKey $oldRepo -TempRoot $script:HarnessRoot } catch { $mismatchRefused = $true }
 Check 'preflight preserves a run root whose report identity disagrees' ($mismatchRefused -and (Test-Path -LiteralPath $oldRoot)) 'mismatched report'
+$script:RunArchiveRoot = Join-Path $script:HarnessRoot 'run-archive'
+$manifestRunId = 'ccdd0011'
+$manifestRoot = Join-Path $script:HarnessRoot "orch-accept-$manifestRunId"
+$manifestRepo = Join-Path $manifestRoot 'repo'
+$manifestRecordDir = Join-Path $script:RunArchiveRoot $manifestRunId
+New-Item -ItemType Directory -Path $manifestRepo -Force | Out-Null
+$centralManifest = [pscustomobject]@{
+    schemaVersion = 1
+    runId = $manifestRunId
+    session = "orch-acc-$manifestRunId"
+    projectKey = $manifestRepo
+    workRoot = $manifestRoot
+    status = 'interrupted'
+    pendingUserInteraction = $false
+    resourcesPreserved = $false
+    keepResourcesRequested = $false
+}
+Write-AtomicRunManifest -Manifest $centralManifest -Path (Join-Path $manifestRecordDir 'manifest.json')
+$manifestRootRemoved = $false
+$manifestRootError = ''
+try {
+    Remove-StaleAcceptanceRunRoot -RunId $manifestRunId -ProjectKey $manifestRepo -TempRoot $script:HarnessRoot
+    $manifestRootRemoved = (-not (Test-Path -LiteralPath $manifestRoot)) -and
+        (Test-Path -LiteralPath (Join-Path $manifestRecordDir 'manifest.json'))
+} catch { $manifestRootError = $_.Exception.Message }
+Check 'preflight verifies and removes a stale work root from its durable manifest without deleting the journal' `
+    $manifestRootRemoved "root=$manifestRoot error=$manifestRootError"
+$legacyRunId = 'eeff2233'
+$legacyRoot = Join-Path $script:HarnessRoot "orch-accept-$legacyRunId"
+$legacyRepo = Join-Path $legacyRoot 'repo'
+New-Item -ItemType Directory -Path $legacyRepo -Force | Out-Null
+$script:RetireStaleAcceptanceRunId = ''
+$legacyMissingRefused = $false
+try { [void](Read-AcceptanceRunIdentity -RunId $legacyRunId -ProjectKey $legacyRepo -TempRoot $script:HarnessRoot) } catch { $legacyMissingRefused = $true }
+Check 'legacy missing-report identity is refused without exact run-id retirement' $legacyMissingRefused 'missing report must not authorize itself'
+$script:RetireStaleAcceptanceRunId = $legacyRunId
+$legacyIdentity = $null
+try { $legacyIdentity = Read-AcceptanceRunIdentity -RunId $legacyRunId -ProjectKey $legacyRepo -TempRoot $script:HarnessRoot } catch { }
+Check 'exact-ID legacy retirement uses only database-bound identity and forces consent' `
+    ($null -ne $legacyIdentity -and
+     (Get-Field $legacyIdentity 'runId') -ceq $legacyRunId -and
+     (Test-JsonBool -Object $legacyIdentity -Name 'pendingUserInteraction') -eq $true -and
+     (Test-JsonBool -Object $legacyIdentity -Name 'resourcesPreserved') -eq $true) `
+    (Get-Json $legacyIdentity)
+$script:RetireStaleAcceptanceRunId = ''
+$cleanupFixtureId = 'aabb0011'
+$cleanupFixtureRoot = Join-Path $script:HarnessRoot "orch-accept-$cleanupFixtureId"
+$cleanupFixtureRepo = Join-Path $cleanupFixtureRoot 'repo'
+$cleanupFixtureRecord = Join-Path $script:RunArchiveRoot $cleanupFixtureId
+New-Item -ItemType Directory -Path $cleanupFixtureRepo -Force | Out-Null
+$cleanupFixtureIdentity = [pscustomobject]@{
+    runId = $cleanupFixtureId
+    session = "orch-acc-$cleanupFixtureId"
+    projectKey = $cleanupFixtureRepo
+    workRoot = $cleanupFixtureRoot
+    ownerPid = 2147483647
+    ownerStartedAt = '2000-01-01T00:00:00.0000000Z'
+    status = 'preserved'
+    pendingUserInteraction = $true
+    resourcesPreserved = $true
+    keepResourcesRequested = $true
+}
+$cleanupLegacyReport = [pscustomobject]@{
+    runId = $cleanupFixtureId
+    session = "orch-acc-$cleanupFixtureId"
+    projectKey = $cleanupFixtureRepo
+    passed = 4
+    failed = 0
+    blocked = 1
+    keepResourcesRequested = $true
+    resourcesPreserved = $true
+}
+$cleanupLegacyReport | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $cleanupFixtureRoot 'report.json') -Encoding UTF8
+Set-Content -LiteralPath (Join-Path $cleanupFixtureRoot 'report.txt') -Value 'legacy acceptance report'
+$cleanupStart = $null
+try {
+    $cleanupStart = Start-AcceptanceRunCleanup -RunId $cleanupFixtureId -ProjectKey $cleanupFixtureRepo `
+        -Identity $cleanupFixtureIdentity -RetirementAuthorized $true -TempRoot $script:HarnessRoot
+} catch { }
+$cleanupManifestPath = Join-Path $cleanupFixtureRecord 'manifest.json'
+$cleanupStarted = ($null -ne $cleanupStart -and (Test-Path -LiteralPath $cleanupManifestPath) -and
+    (Test-Path -LiteralPath (Join-Path $cleanupFixtureRecord 'report.json')) -and
+    ((Get-Field (Get-Content -LiteralPath $cleanupManifestPath -Raw | ConvertFrom-Json) 'retirementAuthorized') -eq $true))
+Check 'retirement journals consent and archives legacy reports before touching the temp root' $cleanupStarted 'cleanup journal missing'
+$cleanupCompleted = $false
+try {
+    Complete-AcceptanceRunCleanup -RunId $cleanupFixtureId
+    $completedManifest = Get-Content -LiteralPath $cleanupManifestPath -Raw | ConvertFrom-Json
+    $cleanupCompleted = ((Get-Field $completedManifest 'status') -ceq 'complete' -and
+        (Test-JsonBool -Object $completedManifest -Name 'pendingUserInteraction') -eq $false -and
+        (Test-JsonBool -Object $completedManifest -Name 'resourcesPreserved') -eq $false -and
+        (Test-Path -LiteralPath $cleanupFixtureRoot))
+} catch { }
+Check 'completed retirement finalizes the central manifest while preserving its report' $cleanupCompleted 'completion journal'
+$legacyReportTemp = Join-Path $script:HarnessRoot 'legacy-report-temp'
+$legacyReportId = '1122aa33'
+$legacyReportRoot = Join-Path $legacyReportTemp "orch-accept-$legacyReportId"
+$legacyReportRecord = Join-Path $script:RunArchiveRoot $legacyReportId
+New-Item -ItemType Directory -Path $legacyReportRoot -Force | Out-Null
+@{
+    runId = $legacyReportId
+    session = "orch-acc-$legacyReportId"
+    projectKey = ''
+    keepResourcesRequested = $false
+    resourcesPreserved = $false
+    passed = 3
+    failed = 1
+    blocked = 0
+} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $legacyReportRoot 'report.json') -Encoding UTF8
+Set-Content -LiteralPath (Join-Path $legacyReportRoot 'report.txt') -Value 'legacy report-only run'
+$emptyRunState = [pscustomobject]@{ tables = [pscustomobject]@{ projects = @(); tasks = @(); inbox = @(); ready_sessions = @() } }
+$legacyReportMigrated = $false
+$legacyMigrationError = ''
+try {
+    $legacyReportMigrated = Move-LegacyAcceptanceReportRootToArchive -RunId $legacyReportId -TempRoot $legacyReportTemp `
+        -ArchiveRoot $script:RunArchiveRoot -StateDump $emptyRunState -Sessions @() -DefaultProjection ''
+} catch { $legacyMigrationError = $_.Exception.Message }
+$legacyManifestPath = Join-Path $legacyReportRecord 'manifest.json'
+$legacyReportMigrated = $legacyReportMigrated -and
+    (-not (Test-Path -LiteralPath $legacyReportRoot)) -and
+    (Test-Path -LiteralPath (Join-Path $legacyReportRecord 'report.json')) -and
+    ((Get-Field (Get-Content -LiteralPath $legacyManifestPath -Raw | ConvertFrom-Json) 'status') -eq 'complete')
+Check 'report-only legacy temp root moves its evidence into the bounded archive and is removed' $legacyReportMigrated `
+    ("root=$legacyReportRoot migrationError=$legacyMigrationError")
+$legacyBlockedId = '2233aa44'
+$legacyBlockedRoot = Join-Path $legacyReportTemp "orch-accept-$legacyBlockedId"
+New-Item -ItemType Directory -Path $legacyBlockedRoot -Force | Out-Null
+@{ runId = $legacyBlockedId; session = "orch-acc-$legacyBlockedId"; projectKey = ''; keepResourcesRequested = $false; resourcesPreserved = $false } |
+    ConvertTo-Json | Set-Content -LiteralPath (Join-Path $legacyBlockedRoot 'report.json') -Encoding UTF8
+Set-Content -LiteralPath (Join-Path $legacyBlockedRoot 'unowned.dat') -Value 'do not delete'
+$legacyExtraPreserved = $false
+try {
+    $legacyExtraPreserved = -not (Move-LegacyAcceptanceReportRootToArchive -RunId $legacyBlockedId -TempRoot $legacyReportTemp `
+        -ArchiveRoot $script:RunArchiveRoot -StateDump $emptyRunState -Sessions @() -DefaultProjection '')
+} catch { $legacyExtraPreserved = $true }
+Check 'legacy root with anything beyond its report files is never swept as report-only' `
+    ($legacyExtraPreserved -and (Test-Path -LiteralPath $legacyBlockedRoot)) 'unexpected cleanup'
+$manifestOnlyTemp = Join-Path $script:HarnessRoot 'manifest-only-temp'
+$manifestOnlyId = '44556677'
+$manifestOnlyRoot = Join-Path $manifestOnlyTemp "orch-accept-$manifestOnlyId"
+$manifestOnlyRepo = Join-Path $manifestOnlyRoot 'repo'
+$manifestOnlyRecord = Join-Path $script:RunArchiveRoot $manifestOnlyId
+New-Item -ItemType Directory -Path $manifestOnlyRepo -Force | Out-Null
+$manifestOnlyDb = Join-Path $script:HarnessRoot 'manifest-only.sqlite'
+[void](Invoke-Native -File $script:Python -Arguments @($seedPath, $manifestOnlyDb) -TimeoutSeconds 60)
+$savedLockStore = $script:RunLockStateDb
+$script:RunLockStateDb = $manifestOnlyDb
+$manifestOnlyRecordData = [pscustomobject]@{
+    schemaVersion = 1
+    runId = $manifestOnlyId
+    session = "orch-acc-$manifestOnlyId"
+    projectKey = $manifestOnlyRepo
+    workRoot = $manifestOnlyRoot
+    stateDb = $manifestOnlyDb
+    ownerPid = 2147483647
+    ownerStartedAt = '2000-01-01T00:00:00.0000000Z'
+    status = 'active'
+    pendingUserInteraction = $false
+    resourcesPreserved = $false
+    keepResourcesRequested = $false
+    createdWorkspaces = @()
+    createdPanes = @()
+}
+Write-AtomicRunManifest -Manifest $manifestOnlyRecordData -Path (Join-Path $manifestOnlyRecord 'manifest.json')
+$defaultRecordForRecovery = [pscustomobject]@{ name = 'default'; session_dir = (Join-Path $script:HarnessRoot 'sessions'); running = $true }
+$recoveredManifestOnly = $false
+try {
+    $recoveredManifestOnly = Recover-ManifestOnlyAcceptanceRun -RunId $manifestOnlyId -TempRoot $manifestOnlyTemp `
+        -StateDump (Get-StateDump) -Sessions @($defaultRecordForRecovery) -SessionsRoot (Join-Path $defaultRecordForRecovery.session_dir 'sessions') `
+        -DefaultProjection ''
+} catch { }
+$manifestOnlyFinal = Get-Content -LiteralPath (Join-Path $manifestOnlyRecord 'manifest.json') -Raw | ConvertFrom-Json
+Check 'abandoned pre-bind manifest with absent session removes only its exact temp root and finalizes the journal' `
+    ($recoveredManifestOnly -and -not (Test-Path -LiteralPath $manifestOnlyRoot) -and
+     (Get-Field $manifestOnlyFinal 'status') -ceq 'complete') 'manifest-only recovery'
+$pendingOnlyId = '44556678'
+$pendingOnlyRoot = Join-Path $manifestOnlyTemp "orch-accept-$pendingOnlyId"
+$pendingOnlyRepo = Join-Path $pendingOnlyRoot 'repo'
+New-Item -ItemType Directory -Path $pendingOnlyRepo -Force | Out-Null
+$pendingOnlyManifest = $manifestOnlyRecordData.PSObject.Copy()
+$pendingOnlyManifest.runId = $pendingOnlyId
+$pendingOnlyManifest.session = "orch-acc-$pendingOnlyId"
+$pendingOnlyManifest.projectKey = $pendingOnlyRepo
+$pendingOnlyManifest.workRoot = $pendingOnlyRoot
+$pendingOnlyManifest.status = 'preserved'
+$pendingOnlyManifest.pendingUserInteraction = $true
+$pendingOnlyManifest.resourcesPreserved = $true
+$pendingOnlyManifest.keepResourcesRequested = $true
+$pendingOnlyRecord = Join-Path $script:RunArchiveRoot $pendingOnlyId
+Write-AtomicRunManifest -Manifest $pendingOnlyManifest -Path (Join-Path $pendingOnlyRecord 'manifest.json')
+$pendingRecoveryRefused = $false
+try {
+    [void](Recover-ManifestOnlyAcceptanceRun -RunId $pendingOnlyId -TempRoot $manifestOnlyTemp `
+        -StateDump (Get-StateDump) -Sessions @($defaultRecordForRecovery) -SessionsRoot (Join-Path $defaultRecordForRecovery.session_dir 'sessions') `
+        -DefaultProjection '')
+} catch { $pendingRecoveryRefused = $true }
+Check 'manifest-only run with a preserved pending user interaction is never auto-retired' `
+    ($pendingRecoveryRefused -and (Test-Path -LiteralPath $pendingOnlyRoot)) 'pending manifest was removed'
+$script:RunLockStateDb = $savedLockStore
 $interruptedRunId = 'eeddbb11'
 $interruptedRoot = Join-Path $script:HarnessRoot "orch-accept-$interruptedRunId"
 $interruptedRepo = Join-Path $interruptedRoot 'repo'
@@ -1111,6 +1464,7 @@ $savedIdentity = [pscustomobject]@{
     ReportJson = $script:ReportJson; ReportText = $script:ReportText; WorkRoot = $script:WorkRoot
     Project = $script:Project; StartedAt = $script:StartedAt
     PrimaryPane = $script:PrimaryPane; PrimaryWorkspace = $script:PrimaryWorkspace; PrimaryTab = $script:PrimaryTab
+    KeepResourcesRequested = $script:KeepResourcesRequested
 }
 $script:RunId = $interruptedRunId
 $script:SessionName = "orch-acc-$interruptedRunId"
@@ -1118,13 +1472,21 @@ $script:RepoPath = $interruptedRepo
 $script:WorkRoot = $interruptedRoot
 $script:ReportJson = Join-Path $interruptedRoot 'report.json'
 $script:ReportText = Join-Path $interruptedRoot 'report.txt'
+$script:RunArchiveRoot = Join-Path $script:HarnessRoot 'run-archive'
+$script:RunRecordDir = Join-Path $script:RunArchiveRoot $interruptedRunId
+$script:RunManifestPath = Join-Path $script:RunRecordDir 'manifest.json'
+$script:RunManifest = $null
+$script:SessionDir = ''
+$script:OwnerProcessStartedAt = (Get-Process -Id $PID).StartTime.ToUniversalTime().ToString('o')
 $script:StartedAt = '2026-01-01T00:00:00.0000000Z'
 $script:PrimaryPane = 'w9:p9'; $script:PrimaryWorkspace = 'w9'; $script:PrimaryTab = 'w9:t9'
 $script:Project = $null
+$script:KeepResourcesRequested = $true
 # The bind action is the run's first Herdr side effect, so the identity the next
-# preflight needs must already be on disk when it is invoked. The stub stands in
-# for Herdr and captures the report state at exactly that moment.
+# preflight needs must already be on disk when it is invoked. The stub captures
+# both the compatibility report and durable lifecycle manifest.
 $script:IdentityAtBindInvocation = $null
+$script:ManifestAtBindInvocation = $null
 function Invoke-PluginAction {
     param(
         [Parameter(Mandatory)][string]$ActionId,
@@ -1134,6 +1496,9 @@ function Invoke-PluginAction {
     )
     $script:IdentityAtBindInvocation = if (Test-Path -LiteralPath $script:ReportJson) {
         Get-Content -LiteralPath $script:ReportJson -Raw | ConvertFrom-Json
+    } else { $null }
+    $script:ManifestAtBindInvocation = if (Test-Path -LiteralPath $script:RunManifestPath) {
+        Get-Content -LiteralPath $script:RunManifestPath -Raw | ConvertFrom-Json
     } else { $null }
     throw 'stub: the helper harness never starts Herdr'
 }
@@ -1145,14 +1510,25 @@ Check 'an interrupted run records a verifiable project identity before the bind 
      (Get-Field $identityAtBind 'session') -ceq "orch-acc-$interruptedRunId" -and
      (Test-SamePath -A (Get-Field $identityAtBind 'projectKey') -B $interruptedRepo)) `
     'report identity at the bind invocation'
+$manifestAtBind = $script:ManifestAtBindInvocation
+Check 'a durable run manifest exists before the first bind side effect' `
+    ($null -ne $manifestAtBind -and
+     (Get-Field $manifestAtBind 'runId') -ceq $interruptedRunId -and
+     (Get-Field $manifestAtBind 'session') -ceq "orch-acc-$interruptedRunId" -and
+     (Test-SamePath -A (Get-Field $manifestAtBind 'projectKey') -B $interruptedRepo) -and
+     (Get-Field $manifestAtBind 'phase') -eq 'bind') `
+    'run manifest at bind'
 $finalFallbackKept = $false
+$finalKeepIntent = $false
 try {
     [void](Write-Report)
     $finalReport = Get-Content -LiteralPath $script:ReportJson -Raw | ConvertFrom-Json
     $finalFallbackKept = ((Get-Field $finalReport 'runId') -ceq $interruptedRunId -and
         (Test-SamePath -A (Get-Field $finalReport 'projectKey') -B $interruptedRepo))
+    $finalKeepIntent = (Test-JsonBool -Object $finalReport -Name 'keepResourcesRequested') -eq $true
 } catch { }
 Check 'the final report keeps the run repository key when bind returned no project' $finalFallbackKept 'final report project key'
+Check 'the final report records explicit KeepResources intent' $finalKeepIntent 'keepResourcesRequested'
 $script:RunId = $savedIdentity.RunId
 $script:SessionName = $savedIdentity.SessionName
 $script:RepoPath = $savedIdentity.RepoPath
@@ -1164,27 +1540,279 @@ $script:StartedAt = $savedIdentity.StartedAt
 $script:PrimaryPane = $savedIdentity.PrimaryPane
 $script:PrimaryWorkspace = $savedIdentity.PrimaryWorkspace
 $script:PrimaryTab = $savedIdentity.PrimaryTab
+$script:KeepResourcesRequested = $savedIdentity.KeepResourcesRequested
+$runArchiveRoot = Join-Path $script:HarnessRoot 'run-archive'
+$runRoot = Join-Path $script:HarnessRoot 'active-run'
+$runManifestPath = Join-Path $runArchiveRoot 'a1b2c3d4\manifest.json'
+New-Item -ItemType Directory -Path $runRoot -Force | Out-Null
+$runManifest = [pscustomobject]@{
+    schemaVersion = 1
+    runId = 'a1b2c3d4'
+    session = 'orch-acc-a1b2c3d4'
+    projectKey = Join-Path $runRoot 'repo'
+    workRoot = $runRoot
+    ownerPid = $PID
+    ownerStartedAt = (Get-Process -Id $PID).StartTime.ToUniversalTime().ToString('o')
+    status = 'active'
+    pendingUserInteraction = $false
+    resourcesPreserved = $false
+    finishedAt = ''
+}
+$atomicManifestWrite = $false
+try {
+    Write-AtomicRunManifest -Manifest $runManifest -Path $runManifestPath
+    $savedManifest = Get-Content -LiteralPath $runManifestPath -Raw | ConvertFrom-Json
+    $atomicManifestWrite = ((Get-Field $savedManifest 'runId') -ceq 'a1b2c3d4' -and
+        (Get-Field $savedManifest 'session') -ceq 'orch-acc-a1b2c3d4' -and
+        (Get-Field $savedManifest 'status') -ceq 'active' -and
+        @(Get-ChildItem -LiteralPath (Split-Path $runManifestPath) -Filter '*.tmp').Count -eq 0)
+} catch { }
+Check 'run manifest is atomically persisted with exact run identity and no temp residue' $atomicManifestWrite $runManifestPath
+$runManifest.status = 'cleanup'
+$atomicManifestReplacement = $false
+try {
+    Write-AtomicRunManifest -Manifest $runManifest -Path $runManifestPath
+    $replacedManifest = Get-Content -LiteralPath $runManifestPath -Raw | ConvertFrom-Json
+    $residualManifestTemp = @(Get-ChildItem -LiteralPath (Split-Path $runManifestPath) -Force | Where-Object { $_.Name -match '\.(tmp|bak)(\.|$)' })
+    $atomicManifestReplacement = ((Get-Field $replacedManifest 'status') -ceq 'cleanup' -and $residualManifestTemp.Count -eq 0)
+} catch { }
+Check 'manifest replacement is atomic and cleans its backup/temp files' $atomicManifestReplacement $runManifestPath
+$ownerIsCurrent = $false
+try {
+    $ownerIsCurrent = Test-RunOwnerAlive -OwnerPid $PID -OwnerStartedAt $runManifest.ownerStartedAt
+} catch { }
+Check 'run owner identity recognizes the current process' $ownerIsCurrent 'current PID/start-time pair'
+$ownerIsAbsent = $true
+try { $ownerIsAbsent = Test-RunOwnerAlive -OwnerPid 2147483647 -OwnerStartedAt '2000-01-01T00:00:00.0000000Z' } catch { }
+Check 'run owner identity treats a missing process as dead' (-not $ownerIsAbsent) 'missing PID'
+$safeInterruptedManifest = [pscustomobject]@{
+    ownerPid = 2147483647
+    ownerStartedAt = '2000-01-01T00:00:00.0000000Z'
+    status = 'active'
+    pendingUserInteraction = $false
+    resourcesPreserved = $false
+    keepResourcesRequested = $false
+}
+$safeRecoveryMode = 'unknown'
+try { $safeRecoveryMode = Get-AcceptanceRecoveryDisposition -Manifest $safeInterruptedManifest -SessionDisposition 'running' } catch { }
+Check 'dead non-interactive run is eligible for exact-session recovery' ($safeRecoveryMode -eq 'recover') $safeRecoveryMode
+$pendingRecoveryManifest = $safeInterruptedManifest.PSObject.Copy()
+$absentRecoveryMode = 'unknown'
+try { $absentRecoveryMode = Get-AcceptanceRecoveryDisposition -Manifest $safeInterruptedManifest -SessionDisposition 'absent' } catch { }
+Check 'dead owner with an absent session is eligible for cleanup recovery' ($absentRecoveryMode -eq 'recover') $absentRecoveryMode
+$unknownOwnerManifest = $safeInterruptedManifest.PSObject.Copy()
+$unknownOwnerManifest.ownerPid = 0
+$unknownRecoveryMode = 'unknown'
+try { $unknownRecoveryMode = Get-AcceptanceRecoveryDisposition -Manifest $unknownOwnerManifest -SessionDisposition 'absent' } catch { }
+Check 'absent session with unknown owner metadata still requires exact confirmation' ($unknownRecoveryMode -eq 'confirm') $unknownRecoveryMode
+$pendingRecoveryManifest.pendingUserInteraction = $true
+$pendingRecoveryMode = 'unknown'
+try { $pendingRecoveryMode = Get-AcceptanceRecoveryDisposition -Manifest $pendingRecoveryManifest -SessionDisposition 'running' } catch { }
+Check 'pending user interaction requires explicit retirement, never automatic recovery' ($pendingRecoveryMode -eq 'confirm') $pendingRecoveryMode
+$authorizedCleanupManifest = $pendingRecoveryManifest.PSObject.Copy()
+$authorizedCleanupManifest.status = 'cleanup'
+Add-Member -InputObject $authorizedCleanupManifest -NotePropertyName retirementAuthorized -NotePropertyValue $true
+$authorizedCleanupMode = 'unknown'
+try { $authorizedCleanupMode = Get-AcceptanceRecoveryDisposition -Manifest $authorizedCleanupManifest -SessionDisposition 'running' } catch { }
+Check 'a persisted exact-ID retirement resumes idempotently after an interrupted cleanup' `
+    ($authorizedCleanupMode -eq 'recover') $authorizedCleanupMode
+$liveAuthorizedCleanup = $authorizedCleanupManifest.PSObject.Copy()
+$liveAuthorizedCleanup.ownerPid = $PID
+$liveAuthorizedCleanup.ownerStartedAt = (Get-Process -Id $PID).StartTime.ToUniversalTime().ToString('o')
+$liveCleanupModes = @()
+foreach ($sessionMode in @('running', 'stopped', 'absent')) {
+    $mode = 'unknown'
+    try { $mode = Get-AcceptanceRecoveryDisposition -Manifest $liveAuthorizedCleanup -SessionDisposition $sessionMode } catch { }
+    $liveCleanupModes += $mode
+}
+Check 'cleanup retirement flag never overrides a live owner, regardless of session listing' `
+    (@($liveCleanupModes | Where-Object { $_ -ne 'active' }).Count -eq 0) ($liveCleanupModes -join ',')
+$unknownAuthorizedCleanup = $pendingRecoveryManifest.PSObject.Copy()
+$unknownAuthorizedCleanup.ownerPid = 0
+$unknownAuthorizedCleanup.status = 'cleanup'
+Add-Member -InputObject $unknownAuthorizedCleanup -NotePropertyName retirementAuthorized -NotePropertyValue $true
+$unknownAuthorizedMode = 'unknown'
+try { $unknownAuthorizedMode = Get-AcceptanceRecoveryDisposition -Manifest $unknownAuthorizedCleanup -SessionDisposition 'absent' } catch { }
+Check 'persisted cleanup authorization never overrides a missing owner identity' ($unknownAuthorizedMode -eq 'confirm') $unknownAuthorizedMode
+$liveRecoveryManifest = $safeInterruptedManifest.PSObject.Copy()
+$liveRecoveryManifest.ownerPid = $PID
+$liveRecoveryManifest.ownerStartedAt = (Get-Process -Id $PID).StartTime.ToUniversalTime().ToString('o')
+$liveRecoveryMode = 'unknown'
+try { $liveRecoveryMode = Get-AcceptanceRecoveryDisposition -Manifest $liveRecoveryManifest -SessionDisposition 'running' } catch { }
+Check 'live run owner is never classified as abandoned' ($liveRecoveryMode -eq 'active') $liveRecoveryMode
+$runLockPath = Join-Path $script:HarnessRoot 'acceptance.lock'
+$runLock = $null
+$duplicateRunLock = $null
+try {
+    $runLock = Enter-AcceptanceRunLock -Path $runLockPath
+    $duplicateRunLock = Enter-AcceptanceRunLock -Path $runLockPath
+} catch { }
+Check 'only one runner acquires the same exclusive lock' ($null -ne $runLock -and $null -eq $duplicateRunLock) 'duplicate acquisition'
+if ($duplicateRunLock) { Exit-AcceptanceRunLock -Lock $duplicateRunLock }
+if ($runLock) { Exit-AcceptanceRunLock -Lock $runLock }
+$releasedRunLock = $null
+try { $releasedRunLock = Enter-AcceptanceRunLock -Path $runLockPath } catch { }
+Check 'the run lock becomes available after its owner releases it' ($null -ne $releasedRunLock) 'lock remained held'
+if ($releasedRunLock) { Exit-AcceptanceRunLock -Lock $releasedRunLock }
+$storeLockA = Get-AcceptanceRunLockPath -StateDb 'C:\Herdr\plugins\orch\orchestrator.sqlite' -Root $script:HarnessRoot
+$storeLockSame = Get-AcceptanceRunLockPath -StateDb 'c:/herdr/plugins/orch/orchestrator.sqlite' -Root $script:HarnessRoot
+$storeLockOther = Get-AcceptanceRunLockPath -StateDb 'C:\Herdr\plugins\other\orchestrator.sqlite' -Root $script:HarnessRoot
+Check 'run lock keys the canonical shared SQLite store rather than repository path' `
+    (($storeLockA -ceq $storeLockSame) -and ($storeLockA -cne $storeLockOther)) `
+    "same=[$storeLockSame] other=[$storeLockOther]"
+$crossProcessLockPath = Join-Path $script:HarnessRoot 'cross-process.lock'
+$readyPath = Join-Path $script:HarnessRoot 'cross-process.ready'
+$releasePath = Join-Path $script:HarnessRoot 'cross-process.release'
+$holderPath = Join-Path $script:HarnessRoot 'lock-holder.ps1'
+@'
+param([string]$LockPath, [string]$ReadyPath, [string]$ReleasePath)
+$directory = Split-Path -Parent $LockPath
+[void](New-Item -ItemType Directory -Path $directory -Force)
+$stream = [System.IO.File]::Open($LockPath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+try {
+    [System.IO.File]::WriteAllText($ReadyPath, 'ready')
+    while (-not (Test-Path -LiteralPath $ReleasePath)) { Start-Sleep -Milliseconds 50 }
+} finally { $stream.Dispose() }
+'@ | Set-Content -LiteralPath $holderPath -Encoding UTF8
+$child = $null
+$crossProcessBlocked = $false
+$crossProcessReleased = $false
+try {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = (Get-Command powershell.exe).Source
+    $psi.Arguments = (@('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $holderPath, $crossProcessLockPath, $readyPath, $releasePath) |
+        ForEach-Object { ConvertTo-ArgumentLiteral $_ }) -join ' '
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $child = New-Object System.Diagnostics.Process
+    $child.StartInfo = $psi
+    [void]$child.Start()
+    for ($waitIndex = 0; $waitIndex -lt 100 -and -not (Test-Path -LiteralPath $readyPath); $waitIndex++) {
+        Start-Sleep -Milliseconds 50
+    }
+    if (Test-Path -LiteralPath $readyPath) {
+        $contendedLock = Enter-AcceptanceRunLock -Path $crossProcessLockPath
+        $crossProcessBlocked = ($null -eq $contendedLock)
+        if ($contendedLock) { Exit-AcceptanceRunLock -Lock $contendedLock }
+        $child.Kill()
+        $crossProcessReleased = $child.WaitForExit(10000)
+        if ($crossProcessReleased) {
+            $afterChildExit = Enter-AcceptanceRunLock -Path $crossProcessLockPath
+            $crossProcessReleased = ($null -ne $afterChildExit)
+            if ($afterChildExit) { Exit-AcceptanceRunLock -Lock $afterChildExit }
+        }
+    }
+} catch {
+    $crossProcessBlocked = $false
+    $crossProcessReleased = $false
+} finally {
+    if (-not (Test-Path -LiteralPath $releasePath)) { Set-Content -LiteralPath $releasePath -Value 'release' }
+    if ($child) {
+        if (-not $child.HasExited) { try { $child.Kill() } catch { } }
+        $child.Dispose()
+    }
+}
+Check 'a separate PowerShell process cannot take the same store lock and OS release frees it after force termination' `
+    ($crossProcessBlocked -and $crossProcessReleased) "blocked=$crossProcessBlocked releasedAfterKill=$crossProcessReleased"
+$preflightWorkRoot = Join-Path $script:HarnessRoot 'must-not-exist-before-preflight'
+$preflightRecordDir = Join-Path $script:HarnessRoot 'preflight-record'
+$preflightLockPath = Join-Path $script:HarnessRoot 'preflight.lock'
+$preflightManifestPath = Join-Path $preflightRecordDir 'manifest.json'
+$preflightManifest = [pscustomobject]@{
+    schemaVersion = 1
+    runId = 'aabbccdd'
+    session = 'orch-acc-aabbccdd'
+    projectKey = Join-Path $preflightWorkRoot 'repo'
+    workRoot = $preflightWorkRoot
+    ownerPid = $PID
+    ownerStartedAt = (Get-Process -Id $PID).StartTime.ToUniversalTime().ToString('o')
+    status = 'active'
+    pendingUserInteraction = $false
+    resourcesPreserved = $false
+    keepResourcesRequested = $false
+}
+$initializedRunLock = $null
+try {
+    $initializedRunLock = Initialize-AcceptanceRun -LockPath $preflightLockPath `
+        -RecordDir $preflightRecordDir -Manifest $preflightManifest
+} catch { }
+$preflightBeforeTempRoot = ($null -ne $initializedRunLock -and
+    (Test-Path -LiteralPath $preflightManifestPath) -and
+    (-not (Test-Path -LiteralPath $preflightWorkRoot)) -and
+    ((Get-Field (Get-Content -LiteralPath $preflightManifestPath -Raw | ConvertFrom-Json) 'status') -eq 'active'))
+Check 'preflight creates durable journal under the lock without creating the working temp root' $preflightBeforeTempRoot 'temp root created too early'
+if ($initializedRunLock) { Exit-AcceptanceRunLock -Lock $initializedRunLock }
+$retentionRoot = Join-Path $script:HarnessRoot 'retention-archive'
+$archiveNow = [DateTime]::UtcNow
+foreach ($archiveRun in @(
+    @{ Id = '00000001'; Age = 0; Status = 'complete'; Preserved = $false }
+    @{ Id = '00000002'; Age = 1; Status = 'complete'; Preserved = $false }
+    @{ Id = '00000003'; Age = 2; Status = 'complete'; Preserved = $false }
+    @{ Id = '00000004'; Age = 100; Status = 'preserved'; Preserved = $true }
+    @{ Id = '00000005'; Age = 0; Status = 'active'; Preserved = $false }
+)) {
+$archivePath = Join-Path $retentionRoot "$($archiveRun.Id)"
+    New-Item -ItemType Directory -Path $archivePath -Force | Out-Null
+    [pscustomobject]@{
+        schemaVersion = 1
+        runId = $archiveRun.Id
+        session = "orch-acc-$($archiveRun.Id)"
+        projectKey = ''
+        workRoot = ''
+        ownerPid = 2147483647
+        ownerStartedAt = '2000-01-01T00:00:00.0000000Z'
+        status = $archiveRun.Status
+        pendingUserInteraction = $false
+        resourcesPreserved = $archiveRun.Preserved
+        keepResourcesRequested = $archiveRun.Preserved
+        finishedAt = $archiveNow.AddDays(-$archiveRun.Age).ToString('o')
+    } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $archivePath 'manifest.json') -Encoding UTF8
+    if ($archiveRun.Id -in @('00000001', '00000004', '00000005')) { Set-Content -LiteralPath (Join-Path $archivePath 'state_query.py') -Value 'temporary' }
+}
+$archivePruned = $false
+try {
+    Prune-RunReportArchive -Root $retentionRoot -KeepCount 2 -RetentionDays 30 -Now $archiveNow
+$archivePruned = (-not (Test-Path -LiteralPath (Join-Path $retentionRoot '00000003'))) -and
+    (Test-Path -LiteralPath (Join-Path $retentionRoot '00000001')) -and
+    (Test-Path -LiteralPath (Join-Path $retentionRoot '00000002')) -and
+    (Test-Path -LiteralPath (Join-Path $retentionRoot '00000004')) -and
+    (Test-Path -LiteralPath (Join-Path $retentionRoot '00000005')) -and
+    (-not (Test-Path -LiteralPath (Join-Path $retentionRoot '00000001\state_query.py'))) -and
+    (Test-Path -LiteralPath (Join-Path $retentionRoot '00000004\state_query.py')) -and
+    (Test-Path -LiteralPath (Join-Path $retentionRoot '00000005\state_query.py'))
+} catch { }
+Check 'archive pruning keeps the newest completed reports and never prunes preserved runs' $archivePruned 'archive retention'
 
+$script:RunArchiveRoot = Join-Path $script:HarnessRoot 'run-archive'
+$script:RunRecordDir = Join-Path $script:RunArchiveRoot $script:RunId
+$script:RunManifestPath = Join-Path $script:RunRecordDir 'manifest.json'
+$script:RunLockStream = $null
+$script:RunManifest = $null
+$script:LifecyclePhase = $null
+$script:PendingUserInteraction = $false
+$script:OwnerProcessStartedAt = (Get-Process -Id $PID).StartTime.ToUniversalTime().ToString('o')
 # Exercise the actual preflight path against a synthetic store and session list.
 $savedTemp = $env:TEMP
 $savedDb = $script:StateDb
-$env:TEMP = $script:HarnessRoot
+$preflightTempRoot = Join-Path $script:HarnessRoot 'preflight-temp'
+New-Item -ItemType Directory -Path $preflightTempRoot -Force | Out-Null
+$env:TEMP = $preflightTempRoot
 try {
     $script:StateDb = Join-Path $script:HarnessRoot 'preflight.sqlite'
     [void](Invoke-Native -File $script:Python -Arguments @($seedPath, $script:StateDb) -TimeoutSeconds 60)
     $preflightRunId = 'fedcba12'
-    $preflightRoot = Join-Path $script:HarnessRoot "orch-accept-$preflightRunId"
+$preflightRoot = Join-Path $env:TEMP "orch-accept-$preflightRunId"
     $preflightRepo = Join-Path $preflightRoot 'repo'
     New-Item -ItemType Directory -Path $preflightRepo -Force | Out-Null
-    @{ runId = $preflightRunId; session = "orch-acc-$preflightRunId"; projectKey = $preflightRepo } |
+    @{ runId = $preflightRunId; session = "orch-acc-$preflightRunId"; projectKey = $preflightRepo; keepResourcesRequested = $true } |
         ConvertTo-Json | Set-Content -LiteralPath (Join-Path $preflightRoot 'report.json')
     $preflightSeed = @'
 import json, sqlite3, sys
 con = sqlite3.connect(sys.argv[1])
 key = sys.argv[2]
 run = sys.argv[3]
-con.execute("INSERT INTO projects VALUES (?,?)", (key, json.dumps({"Key": key, "LaunchPaneID": "w8:p8"})))
-con.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?)", ("orch_fedcba12abcd", key, "w8:p9", "w8:p9", 1, json.dumps({"ID": "orch_fedcba12abcd", "WorktreePath": key[:-4] + "worktrees\\repo\\orch-fedcba12abcd"})))
+con.execute("INSERT INTO projects VALUES (?,?)", (key, json.dumps({"Key": key, "LaunchPaneID": "w8:p8", "RepoWorkspaceID": "w8"})))
+con.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?)", ("orch_fedcba12abcd", key, "w8:p9", "w8:p9", 1, json.dumps({"ID": "orch_fedcba12abcd", "WorktreePath": key[:-4] + "worktrees\\repo\\orch_fedcba12abcd", "WorktreeWorkspaceID": "w9", "CurrentWorkspaceID": "w10", "LaunchPaneID": "w8:p9", "PublicPaneID": "w10:p1"})))
 con.execute("INSERT INTO inbox VALUES (?,?,?,?,?,?,?,?)", ("preflight-note", key, "orch_fedcba12abcd", "question", "x", "worker question", "pending", ""))
 con.execute("INSERT INTO ready_sessions VALUES (?,?,?,?,?,?,?,?,?)", ("w8:p9", "", "C:\\omp\\orch-accept-" + run + "\\session.jsonl", 1, 1, 1, "path", "x", 1))
 con.commit()
@@ -1193,37 +1821,249 @@ con.commit()
     Set-Content -LiteralPath $preflightSeedPath -Value $preflightSeed
     $seedResult = Invoke-Native -File $script:Python -Arguments @($preflightSeedPath, $script:StateDb, $preflightRepo, $preflightRunId) -TimeoutSeconds 60
     Check 'preflight fixture contains scoped state' ($seedResult.ExitCode -eq 0) $seedResult.Stderr
+    $script:PreflightRunId = $preflightRunId
     $script:PreflightSessionForTest = [pscustomobject]@{
         name = "orch-acc-$preflightRunId"; running = $true
         session_dir = (Join-Path (Join-Path $script:HarnessRoot 'sessions') "orch-acc-$preflightRunId")
     }
+    $script:PreflightStopTarget = ''
+    $script:PreflightStopArguments = @()
+    $script:PreflightCloseArguments = @()
+    $script:PreflightCloseCalls = New-Object System.Collections.ArrayList
+    $script:PreflightRootClosed = $false
+    $script:PreflightDetachedWorkspaceClosed = $false
+    $script:PreflightCallOrder = @()
+    $script:PreflightDeleteCalls = 0
+    $script:PreflightUntrackedWorkspaces = $false
     function Get-Sessions {
         $default = [pscustomobject]@{ name = 'default'; session_dir = $script:HarnessRoot; running = $true }
         if ($script:PreflightSessionForTest) { return @($default, $script:PreflightSessionForTest) }
         return @($default)
     }
+    function Invoke-HerdrForSession {
+        param([string]$SessionName, [string[]]$Arguments, [double]$TimeoutSeconds)
+        if ($SessionName -cne $script:PreflightSessionForTest.name) { throw "wrong explicit test session target [$SessionName]" }
+        if ($Arguments.Count -ge 2 -and $Arguments[0] -ceq 'workspace' -and $Arguments[1] -ceq 'close') {
+            $script:PreflightCloseArguments = @($Arguments)
+            [void]$script:PreflightCloseCalls.Add(@($Arguments) -join ' ')
+            $script:PreflightCallOrder += 'workspace close'
+            if ($Arguments.Count -ne 4 -or $Arguments[3] -cne '--group') {
+                throw 'workspace close was not scoped to an exact run workspace group'
+            }
+            if ($Arguments[2] -ceq 'w8') {
+                $script:PreflightRootClosed = $true
+            } elseif ($Arguments[2] -ceq 'w10') {
+                $script:PreflightDetachedWorkspaceClosed = $true
+            } else {
+                throw "workspace close targeted unowned workspace $($Arguments[2])"
+            }
+            return [pscustomobject]@{ ExitCode = 0; Stdout = ''; Stderr = '' }
+        }
+        if ($Arguments.Count -eq 2 -and $Arguments[0] -ceq 'workspace' -and $Arguments[1] -ceq 'list') {
+            $script:PreflightCallOrder += 'workspace list'
+            if ($script:PreflightUntrackedWorkspaces) {
+                $workspacesJson = '[{"workspace_id":"w99","worktree":{"checkout_path":"C:\\unowned"}}]'
+            } elseif ($script:PreflightRootClosed -and -not $script:PreflightDetachedWorkspaceClosed) {
+                $checkout = Join-Path (Join-Path (Join-Path (Join-Path $env:TEMP "orch-accept-$($script:PreflightRunId)") 'worktrees') 'repo') 'orch_fedcba12abcd'
+                $workspacesJson = (@(@{ workspace_id = 'w10' }) | ConvertTo-Json -Compress)
+            } else {
+                $workspacesJson = '[]'
+            }
+            return [pscustomobject]@{ ExitCode = 0; Stdout = "{`"result`":{`"workspaces`":$workspacesJson}}"; Stderr = '' }
+        }
+        if ($Arguments.Count -eq 2 -and $Arguments[0] -ceq 'api' -and $Arguments[1] -ceq 'snapshot') {
+            $checkout = Join-Path (Join-Path (Join-Path (Join-Path $env:TEMP "orch-accept-$($script:PreflightRunId)") 'worktrees') 'repo') 'orch_fedcba12abcd'
+            $snapshot = @{ panes = @(@{ pane_id = 'w10:p1'; workspace_id = 'w10'; cwd = $checkout }) }
+            $response = @{ result = @{ snapshot = $snapshot } } | ConvertTo-Json -Depth 6 -Compress
+            return [pscustomobject]@{ ExitCode = 0; Stdout = $response; Stderr = '' }
+        }
+        if ($Arguments.Count -eq 2 -and $Arguments[0] -ceq 'server' -and $Arguments[1] -ceq 'stop') {
+            $script:PreflightStopTarget = $SessionName
+            $script:PreflightStopArguments = @($Arguments)
+            $script:PreflightCallOrder += 'server stop'
+            $script:PreflightSessionForTest.running = $false
+            return [pscustomobject]@{ ExitCode = 0; Stdout = ''; Stderr = '' }
+        }
+        throw "unexpected scoped Herdr call during synthetic preflight: $($Arguments -join ' ')"
+    }
     function Invoke-Herdr {
         param([string[]]$Arguments, [switch]$NoSessionScope, [double]$TimeoutSeconds)
-        if ($Arguments[0] -eq 'session' -and $Arguments[1] -eq 'delete' -and $Arguments[2] -eq $script:PreflightSessionForTest.name) {
-            $script:PreflightSessionForTest = $null
-            return [pscustomobject]@{ ExitCode = 0 }
+        if ($Arguments[0] -eq 'session' -and $Arguments[1] -eq 'delete') {
+            $script:PreflightDeleteCalls++
+            $script:PreflightCallOrder += 'session delete'
+            if ($script:PreflightSessionForTest -and $Arguments[2] -eq $script:PreflightSessionForTest.name) {
+                $script:PreflightSessionForTest = $null
+                return [pscustomobject]@{ ExitCode = 0 }
+            }
+            throw 'unexpected acceptance session delete target during synthetic preflight'
         }
-        throw 'unexpected Herdr call during synthetic preflight'
+        throw 'unexpected unscoped Herdr call during synthetic preflight'
     }
+    $script:RetireStaleAcceptanceRunId = ''
     $liveError = ''
     try { Clear-StaleAcceptanceState } catch { $liveError = $_.Exception.Message }
-    Check 'live preflight refuses without deleting session, store or report' `
-        ($liveError -match 'still running' -and $script:PreflightSessionForTest -and (Test-Path -LiteralPath $preflightRoot) -and
-         @((Get-StateDump).tables.projects | Where-Object { $_.key -eq $preflightRepo }).Count -eq 1) $liveError
-    $script:PreflightSessionForTest.running = $false
+    Check 'live preflight refuses without an exact run-id authorization' `
+        ($liveError -match 'RetireStaleAcceptanceRunId' -and $script:PreflightSessionForTest.running -and
+         (Test-Path -LiteralPath $preflightRoot) -and @((Get-StateDump).tables.projects | Where-Object { $_.key -eq $preflightRepo }).Count -eq 1) $liveError
+    $script:RetireStaleAcceptanceRunId = 'ffffffff'
+    $wrongAuthorizationError = ''
+    try { Clear-StaleAcceptanceState } catch { $wrongAuthorizationError = $_.Exception.Message }
+    Check 'live preflight rejects authorization for a different run id' `
+        ($wrongAuthorizationError -match 'RetireStaleAcceptanceRunId' -and $script:PreflightSessionForTest.running -and
+         (Test-Path -LiteralPath $preflightRoot)) $wrongAuthorizationError
+    $script:RetireStaleAcceptanceRunId = $preflightRunId
+    $script:PreflightUntrackedWorkspaces = $true
+    $untrackedError = ''
+    try { Clear-StaleAcceptanceState } catch { $untrackedError = $_.Exception.Message }
+    Check 'retirement refuses to stop while any unexpected workspace remains in the stale session' `
+        ($untrackedError -and $script:PreflightSessionForTest.running -and
+         -not $script:PreflightStopTarget -and (Test-Path -LiteralPath $preflightRoot) -and
+         (@($script:PreflightCallOrder) -join '|') -ceq 'workspace close|workspace list') $untrackedError
+    $script:PreflightRootClosed = $false
+    $script:PreflightDetachedWorkspaceClosed = $false
+    $script:PreflightCloseCalls.Clear()
+    $script:PreflightUntrackedWorkspaces = $false
+    $script:PreflightStopTarget = ''
+    $script:PreflightStopArguments = @()
+    $script:PreflightCloseArguments = @()
+    $script:PreflightCallOrder = @()
+    $script:RetireStaleAcceptanceRunId = $preflightRunId
     $cleanupError = ''
     try { Clear-StaleAcceptanceState } catch { $cleanupError = $_.Exception.Message }
     $afterPreflight = Get-StateDump
-    Check 'stopped preflight retires only its session and removes its scoped state and root' `
-        (-not $cleanupError -and -not $script:PreflightSessionForTest -and -not (Test-Path -LiteralPath $preflightRoot) -and
+    Check 'explicit retirement closes the run root and its recorded moved workspace before stopping/deleting its exact session' `
+        (-not $cleanupError -and $script:PreflightStopTarget -eq "orch-acc-$preflightRunId" -and
+         (@($script:PreflightCloseCalls) -join '|') -ceq 'workspace close w8 --group|workspace close w10 --group' -and
+         (@($script:PreflightStopArguments) -join ' ') -ceq 'server stop' -and
+         (@($script:PreflightCallOrder) -join '|') -ceq 'workspace close|workspace list|workspace close|workspace list|server stop|session delete' -and
+         -not $script:PreflightSessionForTest -and -not (Test-Path -LiteralPath $preflightRoot) -and
          @($afterPreflight.tables.projects).Count -eq 2 -and @($afterPreflight.tables.tasks).Count -eq 3 -and
          @($afterPreflight.tables.inbox).Count -eq 2 -and @($afterPreflight.tables.ready_sessions).Count -eq 2) `
-        ("error=$cleanupError projects=$(@($afterPreflight.tables.projects).Count) tasks=$(@($afterPreflight.tables.tasks).Count) inbox=$(@($afterPreflight.tables.inbox).Count) ready=$(@($afterPreflight.tables.ready_sessions).Count)")
+        ("error=$cleanupError closeCalls=$(@($script:PreflightCloseCalls) -join '|') stopTarget=$($script:PreflightStopTarget) stopArgs=$(@($script:PreflightStopArguments) -join ' ') order=$(@($script:PreflightCallOrder) -join '|') projects=$(@($afterPreflight.tables.projects).Count)")
+    $script:RetireStaleAcceptanceRunId = ''
+    $absentRunId = '11223344'
+    $script:RetireStaleAcceptanceRunId = $absentRunId
+$absentRoot = Join-Path $env:TEMP "orch-accept-$absentRunId"
+    $absentRepo = Join-Path $absentRoot 'repo'
+    New-Item -ItemType Directory -Path $absentRepo -Force | Out-Null
+    @{ runId = $absentRunId; session = "orch-acc-$absentRunId"; projectKey = $absentRepo; keepResourcesRequested = $false; resourcesPreserved = $false } |
+        ConvertTo-Json | Set-Content -LiteralPath (Join-Path $absentRoot 'report.json')
+    $absentWorktree = Join-Path $absentRoot 'worktrees\repo\orch-fake11223344'
+    New-Item -ItemType Directory -Path $absentWorktree -Force | Out-Null
+    $lockedFile = Join-Path $absentWorktree 'held-open.txt'
+    Set-Content -LiteralPath $lockedFile -Value 'synthetic lock'
+    $addAbsentProject = @'
+import json, sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+key = sys.argv[2]
+con.execute("INSERT INTO projects VALUES (?,?)", (key, json.dumps({"Key": key, "LaunchPaneID": "w8:p10"})))
+con.commit()
+'@
+    $addAbsentPath = Join-Path $script:HarnessRoot 'add_absent_project.py'
+    Set-Content -LiteralPath $addAbsentPath -Value $addAbsentProject
+    $addAbsentResult = Invoke-Native -File $script:Python -Arguments @($addAbsentPath, $script:StateDb, $absentRepo) -TimeoutSeconds 60
+    $script:PreflightDeleteCalls = 0
+    $heldFile = $null
+    $lockedRemovalError = ''
+    $afterLockedAttempt = $null
+    try {
+        $heldFile = [System.IO.File]::Open($lockedFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+        try { Clear-StaleAcceptanceState } catch { $lockedRemovalError = $_.Exception.Message }
+        $afterLockedAttempt = Get-StateDump
+    } finally {
+        if ($heldFile) { $heldFile.Dispose() }
+    }
+    Check 'locked stale root leaves scoped state intact for a safe retry' `
+        ($lockedRemovalError -and (Test-Path -LiteralPath $absentRoot) -and
+         @($afterLockedAttempt.tables.projects | Where-Object { $_.key -eq $absentRepo }).Count -eq 1) `
+        ("error=$lockedRemovalError projects=$(@($afterLockedAttempt.tables.projects).Count)")
+    $absentManifestPath = Join-Path (Join-Path $script:RunArchiveRoot $absentRunId) 'manifest.json'
+    if (Test-Path -LiteralPath $absentManifestPath) {
+        $interruptedCleanup = Get-Content -LiteralPath $absentManifestPath -Raw | ConvertFrom-Json
+        $interruptedCleanup.ownerPid = 2147483647
+        $interruptedCleanup.ownerStartedAt = '2000-01-01T00:00:00.0000000Z'
+        Write-AtomicRunManifest -Manifest $interruptedCleanup -Path $absentManifestPath
+    }
+    $script:RetireStaleAcceptanceRunId = ''
+    $absentCleanupError = ''
+    try { Clear-StaleAcceptanceState } catch { $absentCleanupError = $_.Exception.Message }
+    $afterAbsentCleanup = Get-StateDump
+    Check 'absent-session cleanup retries and deletes only its verified run after the lock is released' `
+        (-not $absentCleanupError -and $addAbsentResult.ExitCode -eq 0 -and $script:PreflightDeleteCalls -eq 0 -and
+         -not (Test-Path -LiteralPath $absentRoot) -and @($afterAbsentCleanup.tables.projects).Count -eq 2) `
+        ("error=$absentCleanupError deleteCalls=$($script:PreflightDeleteCalls) projects=$(@($afterAbsentCleanup.tables.projects).Count)")
+    $orphanRunId = '99887766'
+$orphanRoot = Join-Path $env:TEMP "orch-accept-$orphanRunId"
+    $orphanRepo = Join-Path $orphanRoot 'repo'
+    New-Item -ItemType Directory -Path $orphanRepo -Force | Out-Null
+    @{ runId = $orphanRunId; session = "orch-acc-$orphanRunId"; projectKey = $orphanRepo; keepResourcesRequested = $true; resourcesPreserved = $true } |
+        ConvertTo-Json | Set-Content -LiteralPath (Join-Path $orphanRoot 'report.json')
+    $siblingRunId = '88776655'
+    $orphanWorktree = Join-Path $orphanRoot 'worktrees\repo\worker'
+    New-Item -ItemType Directory -Path $orphanWorktree -Force | Out-Null
+    $orphanLockedFile = Join-Path $orphanWorktree 'held-open.txt'
+    Set-Content -LiteralPath $orphanLockedFile -Value 'synthetic orphan lock'
+$siblingRoot = Join-Path $env:TEMP "orch-accept-$siblingRunId"
+    $siblingRepo = Join-Path $siblingRoot 'repo'
+    New-Item -ItemType Directory -Path $siblingRepo -Force | Out-Null
+    @{ runId = $siblingRunId; session = "orch-acc-$siblingRunId"; projectKey = $siblingRepo; keepResourcesRequested = $true; resourcesPreserved = $true } |
+        ConvertTo-Json | Set-Content -LiteralPath (Join-Path $siblingRoot 'report.json')
+    function Get-HerdrJson {
+        param([string[]]$Arguments, [switch]$NoSessionScope)
+        return [pscustomobject]@{ Result = [pscustomobject]@{ snapshot = [pscustomobject]@{} } }
+    }
+    $manifestOnlyRunId = '66778899'
+    $manifestOnlyRunRoot = Join-Path $env:TEMP "orch-accept-$manifestOnlyRunId"
+    $manifestOnlyRunRepo = Join-Path $manifestOnlyRunRoot 'repo'
+    New-Item -ItemType Directory -Path $manifestOnlyRunRepo -Force | Out-Null
+    $script:RunLockStateDb = $script:StateDb
+$manifestOnlyRunManifestSeed = [pscustomobject]@{
+    schemaVersion = 1
+    runId = $manifestOnlyRunId
+    session = "orch-acc-$manifestOnlyRunId"
+    projectKey = $manifestOnlyRunRepo
+    workRoot = $manifestOnlyRunRoot
+    stateDb = $script:StateDb
+    ownerPid = 2147483647
+    ownerStartedAt = '2000-01-01T00:00:00.0000000Z'
+    status = 'active'
+    pendingUserInteraction = $false
+    resourcesPreserved = $false
+    keepResourcesRequested = $false
+}
+Write-AtomicRunManifest -Manifest $manifestOnlyRunManifestSeed `
+    -Path (Join-Path (Join-Path $script:RunArchiveRoot $manifestOnlyRunId) 'manifest.json')
+    $script:RetireStaleAcceptanceRunId = ''
+    [void](Clear-StaleAcceptanceState)
+    $manifestOnlyRunManifest = Get-Content -LiteralPath (Join-Path (Join-Path $script:RunArchiveRoot $manifestOnlyRunId) 'manifest.json') -Raw | ConvertFrom-Json
+    Check 'preflight discovers and retires an abandoned pre-bind run with no database project row' `
+        ((-not (Test-Path -LiteralPath $manifestOnlyRunRoot)) -and (Get-Field $manifestOnlyRunManifest 'status') -ceq 'complete') `
+        (Get-Json $manifestOnlyRunManifest)
+    $script:RunLockStateDb = ''
+    function Get-FocusProjection {
+        param([object]$Snapshot)
+        return ''
+    }
+    $script:RetireStaleAcceptanceRunId = ''
+    [void](Clear-StaleAcceptanceState)
+    Check 'orphan acceptance roots remain untouched without a run-specific authorization' `
+        ((Test-Path -LiteralPath $orphanRoot) -and (Test-Path -LiteralPath $siblingRoot)) 'orphan roots were removed without opt-in'
+    $script:RetireStaleAcceptanceRunId = $orphanRunId
+    $orphanHeldFile = $null
+    $orphanLockError = ''
+    try {
+        $orphanHeldFile = [System.IO.File]::Open($orphanLockedFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+        try { Clear-StaleAcceptanceState } catch { $orphanLockError = $_.Exception.Message }
+        Check 'locked exact orphan cleanup preserves its report identity for retry' `
+            ($orphanLockError -and (Test-Path -LiteralPath $orphanRoot) -and
+             (Test-Path -LiteralPath (Join-Path $orphanRoot 'report.json')) -and (Test-Path -LiteralPath $siblingRoot)) $orphanLockError
+    } finally {
+        if ($orphanHeldFile) { $orphanHeldFile.Dispose() }
+    }
+    $orphanCleanupError = ''
+    try { Clear-StaleAcceptanceState } catch { $orphanCleanupError = $_.Exception.Message }
+    Check 'exact run-id recovery retries and removes only its report-verified orphan root' `
+        (-not $orphanCleanupError -and -not (Test-Path -LiteralPath $orphanRoot) -and (Test-Path -LiteralPath $siblingRoot)) $orphanCleanupError
 } finally {
     $env:TEMP = $savedTemp
     $script:StateDb = $savedDb

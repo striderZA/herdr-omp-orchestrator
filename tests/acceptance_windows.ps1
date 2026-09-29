@@ -69,6 +69,7 @@
       powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\acceptance_windows.ps1
       powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\acceptance_windows.ps1 -TimeoutScale 2
       powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\acceptance_windows.ps1 -KeepResources
+      powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\acceptance_windows.ps1 -RetireStaleAcceptanceRunId 1ad8af22
 #>
 [CmdletBinding()]
 param(
@@ -82,12 +83,18 @@ param(
     [switch]$KeepResources,
     # Do everything else, but keep the plugin's state rows (the store keeps the
     # task facts that explain what the run observed).
-    [switch]$SkipStateCleanup
+    [switch]$SkipStateCleanup,
+    # Explicitly authorize cleanup of only this verified acceptance run ID;
+    # this may close its workspace group and stop its session, never the default.
+    [string]$RetireStaleAcceptanceRunId = ''
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+if ($RetireStaleAcceptanceRunId -and $RetireStaleAcceptanceRunId -notmatch '^[0-9a-fA-F]{8}$') {
+    throw 'RetireStaleAcceptanceRunId must be one exact eight-character acceptance run ID'
+}
 
 # ---------------------------------------------------------------------------
 # run identity and paths
@@ -116,15 +123,232 @@ if (-not $script:RepoRoot) {
     throw "the plugin root (a directory holding herdr-plugin.toml and go.mod) could not be found from $($rootCandidates -join ', ')"
 }
 $script:WorkRoot = Join-Path $env:TEMP "orch-accept-$($script:RunId)"
-$script:ReportDir = $script:WorkRoot
+$script:RunArchiveRoot = Join-Path $env:LOCALAPPDATA 'herdr\acceptance-runs'
+$script:RunRecordDir = Join-Path $script:RunArchiveRoot $script:RunId
+$script:RunManifestPath = Join-Path $script:RunRecordDir 'manifest.json'
+$script:ReportDir = $script:RunRecordDir
 $script:ReportJson = Join-Path $script:ReportDir 'report.json'
 $script:ReportText = Join-Path $script:ReportDir 'report.txt'
+$script:RunLockPath = ''
 $script:ServerLog = Join-Path $script:WorkRoot 'herdr-server.log'
 $script:ServerErr = Join-Path $script:WorkRoot 'herdr-server.err'
 $script:ConfigPath = Join-Path $script:WorkRoot 'herdr-config.toml'
 $script:RepoPath = Join-Path $script:WorkRoot 'repo'
 $script:WorktreesRoot = Join-Path $script:WorkRoot 'worktrees'
-$script:StateHelper = Join-Path $script:WorkRoot 'state_query.py'
+$script:StateHelper = Join-Path $script:ReportDir 'state_query.py'
+
+function Write-AtomicRunManifest {
+    param([Parameter(Mandatory)]$Manifest, [Parameter(Mandatory)][string]$Path)
+    $directory = Split-Path -Parent $Path
+    [void](New-Item -ItemType Directory -Path $directory -Force)
+    $temporary = Join-Path $directory ('.{0}.{1}.{2}.tmp' -f (Split-Path -Leaf $Path), $PID, [guid]::NewGuid().ToString('N'))
+    $backup = Join-Path $directory ('.{0}.{1}.{2}.bak' -f (Split-Path -Leaf $Path), $PID, [guid]::NewGuid().ToString('N'))
+    $json = ConvertTo-Json -InputObject $Manifest -Depth 12
+    $encoding = New-Object System.Text.UTF8Encoding($false)
+    try {
+        [System.IO.File]::WriteAllText($temporary, $json, $encoding)
+        if ([System.IO.File]::Exists($Path)) {
+            [System.IO.File]::Replace($temporary, $Path, $backup)
+        } else {
+            [System.IO.File]::Move($temporary, $Path)
+        }
+    } finally {
+        if ([System.IO.File]::Exists($temporary)) { [System.IO.File]::Delete($temporary) }
+        if ([System.IO.File]::Exists($backup)) { [System.IO.File]::Delete($backup) }
+    }
+}
+
+function Test-RunOwnerAlive {
+    param([Parameter(Mandatory)][int]$OwnerPid, [Parameter(Mandatory)][string]$OwnerStartedAt)
+    if ($OwnerPid -le 0) { return $false }
+    $expected = [DateTime]::MinValue
+    if (-not [DateTime]::TryParse($OwnerStartedAt, [ref]$expected)) { return $false }
+    try {
+        $process = Get-Process -Id $OwnerPid -ErrorAction Stop
+        $actual = $process.StartTime.ToUniversalTime()
+        return ([math]::Abs(($actual - $expected.ToUniversalTime()).TotalSeconds) -lt 2)
+    } catch {
+        return $false
+    }
+}
+
+function Enter-AcceptanceRunLock {
+    param([Parameter(Mandatory)][string]$Path)
+    $directory = Split-Path -Parent $Path
+    [void](New-Item -ItemType Directory -Path $directory -Force)
+    try {
+        return [System.IO.File]::Open(
+            $Path,
+            [System.IO.FileMode]::OpenOrCreate,
+            [System.IO.FileAccess]::ReadWrite,
+            [System.IO.FileShare]::None
+        )
+    } catch [System.IO.IOException] {
+        $nativeCode = $_.Exception.HResult -band 0xffff
+        if ($nativeCode -in @(32, 33)) { return $null }
+        throw
+    }
+}
+
+function Exit-AcceptanceRunLock {
+    param([Parameter(Mandatory)][System.IO.FileStream]$Lock)
+    $Lock.Dispose()
+}
+
+function Get-AcceptanceStateDbPath {
+    $stateDir = Join-Path (Join-Path $env:LOCALAPPDATA 'herdr\plugins') $script:PluginId
+    try {
+        $extensionPath = Join-Path (Get-EffectiveExtensionDir) 'herdr-orchestrator.ts'
+        if (Test-Path -LiteralPath $extensionPath -PathType Leaf) {
+            $embedded = [string](Get-Field (Get-ExtensionConstants -Path $extensionPath) 'PLUGIN_STATE_DIR')
+            if ($embedded) { $stateDir = $embedded }
+        }
+    } catch { }
+    return [System.IO.Path]::GetFullPath((Join-Path $stateDir 'orchestrator.sqlite'))
+}
+
+function Get-AcceptanceRunLockPath {
+    param([Parameter(Mandatory)][string]$StateDb, [string]$Root = $script:RunArchiveRoot)
+    $canonical = [System.IO.Path]::GetFullPath($StateDb).Replace('/', '\').ToUpperInvariant()
+    $hash = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $key = ([System.BitConverter]::ToString($hash.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($canonical))) -replace '-', '').ToLowerInvariant()
+    } finally { $hash.Dispose() }
+    return Join-Path (Join-Path $Root 'locks') "$key.lock"
+}
+
+function Initialize-AcceptanceRun {
+    param(
+        [Parameter(Mandatory)][string]$LockPath,
+        [Parameter(Mandatory)][string]$RecordDir,
+        [Parameter(Mandatory)]$Manifest
+    )
+    $lock = Enter-AcceptanceRunLock -Path $LockPath
+    if (-not $lock) { return $null }
+    try {
+        Write-AtomicRunManifest -Manifest $Manifest -Path (Join-Path $RecordDir 'manifest.json')
+        return $lock
+    } catch {
+        Exit-AcceptanceRunLock -Lock $lock
+        throw
+    }
+}
+
+function New-AcceptanceRunManifest {
+    return [ordered]@{
+        schemaVersion = 1
+        runId = $script:RunId
+        session = $script:SessionName
+        projectKey = $script:RepoPath
+        workRoot = $script:WorkRoot
+        repoPath = $script:RepoPath
+        worktreesRoot = $script:WorktreesRoot
+        configPath = $script:ConfigPath
+        stateDb = $script:RunLockStateDb
+        ownerPid = $PID
+        ownerStartedAt = $script:OwnerProcessStartedAt
+        serverPid = 0
+        serverStartedAt = ''
+        sessionDir = ''
+        phase = 'initializing'
+        status = 'active'
+        pendingUserInteraction = [bool]$script:PendingUserInteraction
+        resourcesPreserved = [bool]$script:KeepResources
+        keepResourcesRequested = [bool]$script:KeepResourcesRequested
+        tempRootCreated = [bool]$script:TempRootCreated
+        createdWorkspaces = @()
+        createdPanes = @()
+        startedAt = $script:StartedAt
+        updatedAt = [DateTime]::UtcNow.ToString('o')
+        finishedAt = ''
+    }
+}
+
+function Save-AcceptanceRunManifest {
+    param([Parameter(Mandatory)][string]$Phase, [string]$Status = 'active')
+    if (-not $script:RunManifest) { $script:RunManifest = New-AcceptanceRunManifest }
+    $script:LifecyclePhase = $Phase
+    $script:RunManifest.runId = $script:RunId
+    $script:RunManifest.session = $script:SessionName
+    $script:RunManifest.projectKey = $script:RepoPath
+    $script:RunManifest.workRoot = $script:WorkRoot
+    $script:RunManifest.repoPath = $script:RepoPath
+    $script:RunManifest.worktreesRoot = $script:WorktreesRoot
+    $script:RunManifest.configPath = $script:ConfigPath
+    $script:RunManifest.stateDb = $script:RunLockStateDb
+    $script:RunManifest.ownerPid = $PID
+    $script:RunManifest.ownerStartedAt = $script:OwnerProcessStartedAt
+    if ($script:ServerProcess) {
+        $script:RunManifest.serverPid = $script:ServerProcess.Id
+        try { $script:RunManifest.serverStartedAt = $script:ServerProcess.StartTime.ToUniversalTime().ToString('o') } catch { }
+    }
+    $script:RunManifest.sessionDir = [string]$script:SessionDir
+    $script:RunManifest.phase = $Phase
+    $script:RunManifest.status = $Status
+    $script:RunManifest.pendingUserInteraction = [bool]$script:PendingUserInteraction
+    $script:RunManifest.resourcesPreserved = [bool]$script:KeepResources
+    $script:RunManifest.keepResourcesRequested = [bool]$script:KeepResourcesRequested
+    $script:RunManifest.tempRootCreated = [bool]$script:TempRootCreated
+    $script:RunManifest.createdWorkspaces = @($script:CreatedWorkspaces)
+    $script:RunManifest.createdPanes = @($script:CreatedPanes)
+    $script:RunManifest.startedAt = $script:StartedAt
+    $script:RunManifest.updatedAt = [DateTime]::UtcNow.ToString('o')
+    $script:RunManifest.finishedAt = if ($Status -in @('complete', 'preserved', 'retired')) { [DateTime]::UtcNow.ToString('o') } else { '' }
+    Write-AtomicRunManifest -Manifest $script:RunManifest -Path $script:RunManifestPath
+}
+
+function Set-PendingUserInteraction {
+    param([Parameter(Mandatory)][bool]$Pending, [Parameter(Mandatory)][string]$Phase)
+    $script:PendingUserInteraction = $Pending
+    $status = if ($Pending) { 'awaiting_user' } else { 'active' }
+    Save-AcceptanceRunManifest -Phase $Phase -Status $status
+}
+
+function Prune-RunReportArchive {
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [ValidateRange(1, 1000)][int]$KeepCount = 20,
+        [ValidateRange(1, 3650)][int]$RetentionDays = 30,
+        [DateTime]$Now = [DateTime]::UtcNow
+    )
+    if (-not (Test-Path -LiteralPath $Root -PathType Container)) { return }
+    foreach ($directory in @(Get-ChildItem -LiteralPath $Root -Directory -Force)) {
+        $supportScript = Join-Path $directory.FullName 'state_query.py'
+        $manifestPath = Join-Path $directory.FullName 'manifest.json'
+        if (-not (Test-Path -LiteralPath $supportScript -PathType Leaf) -or
+            -not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { continue }
+        try { $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json } catch { continue }
+        if ((Get-Field $manifest 'status') -cne 'complete' -or
+            (Test-JsonBool -Object $manifest -Name 'pendingUserInteraction') -ne $false -or
+            (Test-JsonBool -Object $manifest -Name 'resourcesPreserved') -ne $false -or
+            (Test-JsonBool -Object $manifest -Name 'keepResourcesRequested') -ne $false) { continue }
+        $ownerPid = 0
+        $ownerStartedAt = [string](Get-Field $manifest 'ownerStartedAt')
+        if (-not [int]::TryParse([string](Get-Field $manifest 'ownerPid'), [ref]$ownerPid) -or
+            $ownerPid -le 0 -or [string]::IsNullOrWhiteSpace($ownerStartedAt) -or
+            (Test-RunOwnerAlive -OwnerPid $ownerPid -OwnerStartedAt $ownerStartedAt)) { continue }
+        Remove-Item -LiteralPath $supportScript -Force -ErrorAction Stop
+    }
+    $cutoff = $Now.ToUniversalTime().AddDays(-$RetentionDays)
+    $completed = New-Object System.Collections.ArrayList
+    foreach ($directory in @(Get-ChildItem -LiteralPath $Root -Directory -Force)) {
+        $manifestPath = Join-Path $directory.FullName 'manifest.json'
+        if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { continue }
+        try { $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json } catch { continue }
+        if ((Get-Field $manifest 'status') -cne 'complete' -or
+            (Test-JsonBool -Object $manifest -Name 'pendingUserInteraction') -ne $false -or
+            (Test-JsonBool -Object $manifest -Name 'resourcesPreserved') -ne $false -or
+            (Test-JsonBool -Object $manifest -Name 'keepResourcesRequested') -ne $false) { continue }
+        $finishedAt = [DateTime]::MinValue
+        if (-not [DateTime]::TryParse([string](Get-Field $manifest 'finishedAt'), [ref]$finishedAt)) { continue }
+        [void]$completed.Add([pscustomobject]@{ Path = $directory.FullName; FinishedAt = $finishedAt.ToUniversalTime() })
+    }
+    $ordered = @($completed | Sort-Object FinishedAt -Descending)
+    for ($index = 0; $index -lt $ordered.Count; $index++) {
+        if ($index -lt $KeepCount -and $ordered[$index].FinishedAt -ge $cutoff) { continue }
+        Remove-Item -LiteralPath $ordered[$index].Path -Recurse -Force -ErrorAction Stop
+    }
+}
 
 $script:PluginId = 'user.omp-orchestrator'
 # Every Herdr CLI/bridge child this script spawns starts from a clean Herdr
@@ -145,6 +369,13 @@ $script:Failures = 0
 $script:Blocked = 0
 $script:Passed = 0
 $script:ServerProcess = $null
+$script:RunLockStream = $null
+$script:RunLockStateDb = ''
+$script:RunManifest = $null
+$script:LifecyclePhase = 'initializing'
+$script:PendingUserInteraction = $false
+$script:OwnerProcessStartedAt = (Get-Process -Id $PID).StartTime.ToUniversalTime().ToString('o')
+$script:SessionDir = $null
 $script:ServerStartedByScript = $false
 $script:HerdrExe = $null
 $script:TempRootCreated = $false
@@ -167,6 +398,8 @@ $script:ResumeHintAtBind = $null
 $script:ResumeHintAfterTurn = $null
 $script:PrimarySendKeysUsed = @()
 $script:Undriven = New-Object System.Collections.ArrayList
+$script:KeepResourcesRequested = [bool]$KeepResources
+$script:RetireStaleAcceptanceRunId = ([string]$RetireStaleAcceptanceRunId).ToLowerInvariant()
 # Values assigned by the phases; declared here because the script runs under
 # Set-StrictMode -Version Latest.
 $script:Python = $null
@@ -324,6 +557,40 @@ function Invoke-Native {
     }
 }
 
+function Invoke-HerdrForSession {
+    param(
+        [Parameter(Mandatory)][string]$SessionName,
+        [Parameter(Mandatory)][string[]]$Arguments,
+        [hashtable]$ExtraEnvironment = @{},
+        [double]$TimeoutSeconds = 120
+    )
+    $argv = @('--session', $SessionName) + $Arguments
+    $env = @{ 'NO_COLOR' = '1' }
+    foreach ($k in $ExtraEnvironment.Keys) { $env[$k] = $ExtraEnvironment[$k] }
+    return Invoke-Native -File $script:HerdrExe -Arguments $argv -Environment $env `
+        -RemoveEnvironment $script:HerdrCallerEnvKeys `
+        -WorkingDirectory $script:RepoRoot -TimeoutSeconds $TimeoutSeconds
+}
+
+function Get-HerdrResultForSession {
+    param(
+        [Parameter(Mandatory)][string]$SessionName,
+        [Parameter(Mandatory)][string[]]$Arguments,
+        [double]$TimeoutSeconds = 120
+    )
+    $response = Invoke-HerdrForSession -SessionName $SessionName -Arguments $Arguments -TimeoutSeconds $TimeoutSeconds
+    if ($response.ExitCode -ne 0) {
+        throw "herdr --session $SessionName $($Arguments -join ' ') failed: $(Protect-Text $response.Stderr 400)"
+    }
+    try { $parsed = $response.Stdout | ConvertFrom-Json } catch {
+        throw "herdr --session $SessionName $($Arguments -join ' ') did not return JSON"
+    }
+    if ($null -eq $parsed -or $null -eq $parsed.PSObject.Properties['result']) {
+        throw "herdr --session $SessionName $($Arguments -join ' ') returned no result"
+    }
+    return $parsed.result
+}
+
 function Invoke-Herdr {
     <#
         Runs the Herdr CLI against THIS RUN'S isolated session. Every command
@@ -336,12 +603,13 @@ function Invoke-Herdr {
         [double]$TimeoutSeconds = 120,
         [switch]$NoSessionScope
     )
-    $argv = @()
-    if (-not $NoSessionScope) { $argv += @('--session', $script:SessionName) }
-    $argv += $Arguments
+    if (-not $NoSessionScope) {
+        return Invoke-HerdrForSession -SessionName $script:SessionName -Arguments $Arguments `
+            -ExtraEnvironment $ExtraEnvironment -TimeoutSeconds $TimeoutSeconds
+    }
     $env = @{ 'NO_COLOR' = '1' }
     foreach ($k in $ExtraEnvironment.Keys) { $env[$k] = $ExtraEnvironment[$k] }
-    return Invoke-Native -File $script:HerdrExe -Arguments $argv -Environment $env `
+    return Invoke-Native -File $script:HerdrExe -Arguments $Arguments -Environment $env `
         -RemoveEnvironment $script:HerdrCallerEnvKeys `
         -WorkingDirectory $script:RepoRoot -TimeoutSeconds $TimeoutSeconds
 }
@@ -529,6 +797,10 @@ function Block-Item {
 function Preserve-ResourcesForPendingTool {
     param([Parameter(Mandatory)][string]$AssertionId, [Parameter(Mandatory)][string]$Reason)
     $script:KeepResources = $true
+    $script:PendingUserInteraction = $true
+    if ($script:RunManifest) {
+        Save-AcceptanceRunManifest -Phase 'awaiting_user' -Status 'preserved'
+    }
     [void](Add-Assertion -Id $AssertionId -What 'isolated resources are preserved because a primary approval may still be active' -Status 'INFO' -Evidence $Reason)
 }
 
@@ -548,6 +820,13 @@ function ConvertTo-NormalPath {
 function Test-SamePath {
     param([string]$A, [string]$B)
     return ((ConvertTo-NormalPath $A) -ieq (ConvertTo-NormalPath $B))
+}
+
+function Test-SessionSocketSeparation {
+    param([Parameter(Mandatory)][bool]$ServerStarted, [string]$RunSocket, [string]$DefaultSocket)
+    if (-not $ServerStarted) { return $null }
+    if ([string]::IsNullOrWhiteSpace($RunSocket) -or [string]::IsNullOrWhiteSpace($DefaultSocket)) { return $false }
+    return -not (Test-SamePath -A $RunSocket -B $DefaultSocket)
 }
 
 function Test-Below {
@@ -840,8 +1119,250 @@ function Get-StaleAcceptanceSessionDisposition {
     }
     $running = Test-JsonBool -Object $matches[0] -Name 'running'
     if ($null -eq $running) { throw "refusing to clean ${name}: running state is unknown" }
-    if ($running) { throw "refusing to clean ${name}: session is still running" }
+    if ($running) { return 'running' }
     return 'stopped'
+}
+
+function Read-AcceptanceRunIdentity {
+    param([string]$RunId, [string]$ProjectKey, [string]$TempRoot = $env:TEMP)
+    $manifestPath = Join-Path (Join-Path $script:RunArchiveRoot $RunId) 'manifest.json'
+    $identityPath = $manifestPath
+    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+        $identityPath = Join-Path (Join-Path $TempRoot "orch-accept-$RunId") 'report.json'
+    }
+    if (-not (Test-Path -LiteralPath $identityPath -PathType Leaf)) {
+        if ($script:RetireStaleAcceptanceRunId -ceq $RunId -and
+            (Get-AcceptanceRunIdFromProjectKey -Key $ProjectKey -TempRoot $TempRoot) -ceq $RunId -and
+            (Test-SamePath -A $ProjectKey -B (Join-Path (Join-Path $TempRoot "orch-accept-$RunId") 'repo'))) {
+            return [pscustomobject]@{
+                runId = $RunId
+                session = "orch-acc-$RunId"
+                projectKey = $ProjectKey
+                workRoot = Join-Path $TempRoot "orch-accept-$RunId"
+                status = 'legacy_unknown'
+                pendingUserInteraction = $true
+                resourcesPreserved = $true
+                keepResourcesRequested = $true
+            }
+        }
+        throw "run $RunId has no verifiable durable manifest or legacy report; only an exact run-id retirement may use the database-bound legacy identity"
+    }
+    try { $identity = Get-Content -LiteralPath $identityPath -Raw | ConvertFrom-Json } catch {
+        throw "run $RunId identity cannot be read"
+    }
+    if ((Get-Field $identity 'runId') -cne $RunId -or
+        (Get-Field $identity 'session') -cne "orch-acc-$RunId" -or
+        -not (Test-SamePath -A (Get-Field $identity 'projectKey') -B $ProjectKey)) {
+        throw "run $RunId identity disagrees with its project key"
+    }
+    if ($identityPath -ceq $manifestPath -and
+        -not (Test-SamePath -A (Get-Field $identity 'workRoot') -B (Join-Path $TempRoot "orch-accept-$RunId"))) {
+        throw "run $RunId manifest names a different temporary root"
+    }
+    return $identity
+}
+
+function Get-AcceptanceRecoveryDisposition {
+    param([Parameter(Mandatory)]$Manifest, [Parameter(Mandatory)][string]$SessionDisposition)
+    if ($SessionDisposition -notin @('running', 'stopped', 'absent')) { return 'confirm' }
+    $status = [string](Get-Field $Manifest 'status')
+    $ownerPid = 0
+    $ownerIdentityValid = ([int]::TryParse([string](Get-Field $Manifest 'ownerPid'), [ref]$ownerPid) -and
+        $ownerPid -gt 0 -and -not [string]::IsNullOrWhiteSpace([string](Get-Field $Manifest 'ownerStartedAt')))
+    if ($ownerIdentityValid -and
+        (Test-RunOwnerAlive -OwnerPid $ownerPid -OwnerStartedAt ([string](Get-Field $Manifest 'ownerStartedAt')))) {
+        return 'active'
+    }
+    if ($status -ceq 'cleanup' -and $ownerIdentityValid -and
+        (Test-JsonBool -Object $Manifest -Name 'retirementAuthorized') -eq $true) { return 'recover' }
+    if ((Test-JsonBool -Object $Manifest -Name 'pendingUserInteraction') -ne $false -or
+        (Test-JsonBool -Object $Manifest -Name 'resourcesPreserved') -ne $false -or
+        (Test-JsonBool -Object $Manifest -Name 'keepResourcesRequested') -ne $false) { return 'confirm' }
+    if ($SessionDisposition -ne 'running' -and $status -eq 'complete') { return 'not-running' }
+    if ($status -notin @('active', 'cleanup', 'incomplete') -or -not $ownerIdentityValid) { return 'confirm' }
+    return 'recover'
+}
+
+function Start-AcceptanceRunCleanup {
+    param(
+        [Parameter(Mandatory)][string]$RunId,
+        [Parameter(Mandatory)][string]$ProjectKey,
+        [Parameter(Mandatory)]$Identity,
+        [Parameter(Mandatory)][bool]$RetirementAuthorized,
+        [string]$TempRoot = $env:TEMP
+    )
+    if (-not $RetirementAuthorized) { throw "refusing cleanup transition for $RunId without a verified recovery decision" }
+    $root = Assert-StaleAcceptanceRunRoot -RunId $RunId -ProjectKey $ProjectKey -TempRoot $TempRoot
+    $recordDir = Join-Path $script:RunArchiveRoot $RunId
+    [void](New-Item -ItemType Directory -Path $recordDir -Force)
+    foreach ($name in @('report.json', 'report.txt')) {
+        $source = Join-Path $root $name
+        $destination = Join-Path $recordDir $name
+        if ((Test-Path -LiteralPath $source -PathType Leaf) -and
+            -not (Test-Path -LiteralPath $destination -PathType Leaf)) {
+            Copy-Item -LiteralPath $source -Destination $destination -ErrorAction Stop
+        }
+    }
+    $now = [DateTime]::UtcNow.ToString('o')
+    $manifest = [ordered]@{
+        schemaVersion = 1
+        runId = $RunId
+        session = "orch-acc-$RunId"
+        projectKey = $ProjectKey
+        workRoot = $root
+        repoPath = $ProjectKey
+        worktreesRoot = Join-Path $root 'worktrees'
+        configPath = Join-Path $root 'herdr-config.toml'
+        stateDb = if (Get-Field $Identity 'stateDb') { [string](Get-Field $Identity 'stateDb') } else { $script:RunLockStateDb }
+        previousOwnerPid = [int](Get-Field $Identity 'ownerPid' 0)
+        previousOwnerStartedAt = [string](Get-Field $Identity 'ownerStartedAt')
+        ownerPid = $PID
+        ownerStartedAt = $script:OwnerProcessStartedAt
+        serverPid = [int](Get-Field $Identity 'serverPid' 0)
+        serverStartedAt = [string](Get-Field $Identity 'serverStartedAt')
+        sessionDir = [string](Get-Field $Identity 'sessionDir')
+        phase = 'stale-cleanup'
+        status = 'cleanup'
+        previousPendingUserInteraction = (Test-JsonBool -Object $Identity -Name 'pendingUserInteraction')
+        previousResourcesPreserved = (Test-JsonBool -Object $Identity -Name 'resourcesPreserved')
+        previousKeepResourcesRequested = (Test-JsonBool -Object $Identity -Name 'keepResourcesRequested')
+        pendingUserInteraction = $false
+        resourcesPreserved = $false
+        keepResourcesRequested = $false
+        retirementAuthorized = $true
+        tempRootCreated = (Test-JsonBool -Object $Identity -Name 'tempRootCreated')
+        createdWorkspaces = @(Get-Field $Identity 'createdWorkspaces' @())
+        createdPanes = @(Get-Field $Identity 'createdPanes' @())
+        startedAt = [string](Get-Field $Identity 'startedAt')
+        updatedAt = $now
+        finishedAt = ''
+    }
+    Write-AtomicRunManifest -Manifest $manifest -Path (Join-Path $recordDir 'manifest.json')
+    return $manifest
+}
+
+function Complete-AcceptanceRunCleanup {
+    param([Parameter(Mandatory)][string]$RunId)
+    $manifestPath = Join-Path (Join-Path $script:RunArchiveRoot $RunId) 'manifest.json'
+    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { throw "cleanup journal is missing for $RunId" }
+    try { $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json } catch {
+        throw "cleanup journal cannot be read for $RunId"
+    }
+    if ((Get-Field $manifest 'runId') -cne $RunId -or
+        (Get-Field $manifest 'session') -cne "orch-acc-$RunId" -or
+        (Get-Field $manifest 'status') -cne 'cleanup' -or
+        (Test-JsonBool -Object $manifest -Name 'retirementAuthorized') -ne $true) {
+        throw "refusing to complete an unverified cleanup journal for $RunId"
+    }
+    $manifest.phase = 'retired'
+    $manifest.status = 'complete'
+    $manifest.pendingUserInteraction = $false
+    $manifest.resourcesPreserved = $false
+    $manifest.keepResourcesRequested = $false
+    $manifest.retirementAuthorized = $false
+    $manifest.updatedAt = [DateTime]::UtcNow.ToString('o')
+    $manifest.finishedAt = $manifest.updatedAt
+    Write-AtomicRunManifest -Manifest $manifest -Path $manifestPath
+}
+
+
+function Move-LegacyAcceptanceReportRootToArchive {
+    param(
+        [Parameter(Mandatory)][string]$RunId,
+        [Parameter(Mandatory)][string]$TempRoot,
+        [Parameter(Mandatory)][string]$ArchiveRoot,
+        [Parameter(Mandatory)]$StateDump,
+        [object[]]$Sessions = @(),
+        [string]$DefaultProjection = ''
+    )
+    if ($RunId -notmatch '^[0-9a-f]{8}$') { return $false }
+    $root = Join-Path $TempRoot "orch-accept-$RunId"
+    if (-not (Test-Path -LiteralPath $root -PathType Container)) { return $false }
+    if (@($Sessions | Where-Object { (Get-Field $_ 'name') -ceq "orch-acc-$RunId" }).Count -gt 0) { return $false }
+    $reportPath = Join-Path $root 'report.json'
+    if (-not (Test-Path -LiteralPath $reportPath -PathType Leaf)) { return $false }
+    try { $report = Get-Content -LiteralPath $reportPath -Raw | ConvertFrom-Json } catch { return $false }
+    if ((Get-Field $report 'runId') -cne $RunId -or
+        (Get-Field $report 'session') -cne "orch-acc-$RunId" -or
+        (Test-JsonBool -Object $report -Name 'keepResourcesRequested') -ne $false -or
+        (Test-JsonBool -Object $report -Name 'resourcesPreserved') -ne $false) { return $false }
+    $projectKey = [string](Get-Field $report 'projectKey')
+    if ($projectKey -and
+        ((Get-AcceptanceRunIdFromProjectKey -Key $projectKey -TempRoot $TempRoot) -cne $RunId -or
+         -not (Test-SamePath -A $projectKey -B (Join-Path $root 'repo')))) { return $false }
+    if ($DefaultProjection -and (Test-ProjectionMentions -Projection $DefaultProjection -Path $root)) { return $false }
+    if ($projectKey) {
+        foreach ($table in @('projects', 'tasks', 'inbox')) {
+            foreach ($row in @(Get-Field $StateDump.tables $table @())) {
+                $key = if ($table -eq 'projects') { [string](Get-Field $row 'key') } else { [string](Get-Field $row 'project_key') }
+                if ($key -and (Test-SamePath -A $key -B $projectKey)) { return $false }
+            }
+        }
+    }
+    $entries = @(Get-ChildItem -LiteralPath $root -Force)
+    if (@($entries | Where-Object { $_.Name -notin @('report.json', 'report.txt') -or $_.PSIsContainer }).Count -gt 0) { return $false }
+    $allEntries = @((Get-Item -LiteralPath $root -Force)) + $entries
+    $links = @($allEntries | Where-Object { $_.Attributes -band [System.IO.FileAttributes]::ReparsePoint })
+    if ($links.Count -gt 0) { return $false }
+
+    $recordDir = Join-Path $ArchiveRoot $RunId
+    [void](New-Item -ItemType Directory -Path $recordDir -Force)
+    $manifestPath = Join-Path $recordDir 'manifest.json'
+    if (Test-Path -LiteralPath $manifestPath -PathType Leaf) {
+        try { $existing = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json } catch { return $false }
+        if ((Get-Field $existing 'runId') -cne $RunId -or (Get-Field $existing 'session') -cne "orch-acc-$RunId" -or
+            (Get-Field $existing 'status') -notin @('migrating', 'complete')) { return $false }
+    }
+    foreach ($name in @('report.json', 'report.txt')) {
+        $source = Join-Path $root $name
+        $destination = Join-Path $recordDir $name
+        if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { continue }
+        if (Test-Path -LiteralPath $destination -PathType Leaf) {
+            if ([System.IO.File]::ReadAllText($source) -cne [System.IO.File]::ReadAllText($destination)) {
+                throw "legacy report archive identity collision for $RunId/$name"
+            }
+        } else {
+            Copy-Item -LiteralPath $source -Destination $destination -ErrorAction Stop
+        }
+    }
+    $now = [DateTime]::UtcNow.ToString('o')
+    $manifest = [ordered]@{
+        schemaVersion = 1
+        runId = $RunId
+        session = "orch-acc-$RunId"
+        projectKey = $projectKey
+        workRoot = $root
+        repoPath = if ($projectKey) { $projectKey } else { Join-Path $root 'repo' }
+        worktreesRoot = Join-Path $root 'worktrees'
+        configPath = Join-Path $root 'herdr-config.toml'
+        stateDb = ''
+        ownerPid = 0
+        ownerStartedAt = ''
+        serverPid = 0
+        serverStartedAt = ''
+        sessionDir = ''
+        phase = 'legacy-report-migration'
+        status = 'migrating'
+        pendingUserInteraction = $false
+        resourcesPreserved = $false
+        keepResourcesRequested = $false
+        retirementAuthorized = $true
+        tempRootCreated = $true
+        createdWorkspaces = @()
+        createdPanes = @()
+        startedAt = [string](Get-Field $report 'startedAt')
+        updatedAt = $now
+        finishedAt = ''
+    }
+    Write-AtomicRunManifest -Manifest $manifest -Path $manifestPath
+    Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction Stop
+    $manifest.status = 'complete'
+    $manifest.phase = 'legacy-report-archived'
+    $manifest.retirementAuthorized = $false
+    $manifest.finishedAt = [DateTime]::UtcNow.ToString('o')
+    $manifest.updatedAt = $manifest.finishedAt
+    Write-AtomicRunManifest -Manifest $manifest -Path $manifestPath
+    return $true
 }
 
 function Assert-StaleAcceptanceRunRoot {
@@ -852,15 +1373,8 @@ function Assert-StaleAcceptanceRunRoot {
         throw "refusing to remove run root: project key does not identify $root"
     }
     if (-not (Test-Path -LiteralPath $root)) { return $root }
-    $reportPath = Join-Path $root 'report.json'
-    if (-not (Test-Path -LiteralPath $reportPath)) { throw "refusing to remove ${root}: report identity is missing" }
-    try { $report = Get-Content -LiteralPath $reportPath -Raw | ConvertFrom-Json } catch {
-        throw "refusing to remove ${root}: report identity cannot be read"
-    }
-    if ((Get-Field $report 'runId') -cne $RunId -or
-        (Get-Field $report 'session') -cne "orch-acc-$RunId" -or
-        -not (Test-SamePath -A (Get-Field $report 'projectKey') -B $ProjectKey)) {
-        throw "refusing to remove ${root}: report identity disagrees with the project"
+    try { [void](Read-AcceptanceRunIdentity -RunId $RunId -ProjectKey $ProjectKey -TempRoot $TempRoot) } catch {
+        throw "refusing to remove ${root}: $($_.Exception.Message)"
     }
     $entries = @((Get-Item -LiteralPath $root -Force)) + @(Get-ChildItem -LiteralPath $root -Recurse -Force)
     $links = @($entries | Where-Object { $_.Attributes -band [System.IO.FileAttributes]::ReparsePoint })
@@ -874,6 +1388,107 @@ function Remove-StaleAcceptanceRunRoot {
     if (Test-Path -LiteralPath $root) {
         Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction Stop
     }
+}
+
+function Recover-ManifestOnlyAcceptanceRun {
+    param(
+        [Parameter(Mandatory)][string]$RunId,
+        [Parameter(Mandatory)][string]$TempRoot,
+        [Parameter(Mandatory)]$StateDump,
+        [Parameter(Mandatory)][object[]]$Sessions,
+        [Parameter(Mandatory)][string]$SessionsRoot,
+        [string]$DefaultProjection = ''
+    )
+    if ($RunId -notmatch '^[0-9a-f]{8}$' -or $RunId -ceq $script:RunId) { return $false }
+    $manifestPath = Join-Path (Join-Path $script:RunArchiveRoot $RunId) 'manifest.json'
+    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { return $false }
+    try { $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json } catch {
+        throw "refusing manifest-only recovery for ${RunId}: its central journal is unreadable"
+    }
+    if ((Get-Field $manifest 'runId') -cne $RunId -or
+        (Get-Field $manifest 'session') -cne "orch-acc-$RunId") {
+        throw "refusing manifest-only recovery for ${RunId}: journal identity is inconsistent"
+    }
+    if (-not (Test-SamePath -A ([string](Get-Field $manifest 'stateDb')) -B $script:RunLockStateDb)) { return $false }
+    if ((Get-Field $manifest 'status') -ceq 'complete' -and
+        -not (Test-Path -LiteralPath ([string](Get-Field $manifest 'workRoot')))) { return $false }
+
+    $projectKey = [string](Get-Field $manifest 'projectKey')
+    $root = Join-Path $TempRoot "orch-accept-$RunId"
+    if (-not $projectKey -or
+        (Get-AcceptanceRunIdFromProjectKey -Key $projectKey -TempRoot $TempRoot) -cne $RunId -or
+        -not (Test-SamePath -A $projectKey -B (Join-Path $root 'repo')) -or
+        -not (Test-SamePath -A (Get-Field $manifest 'workRoot') -B $root)) {
+        throw "refusing manifest-only recovery for ${RunId}: recorded paths do not identify its exact temp root"
+    }
+    foreach ($table in @('projects', 'tasks', 'inbox')) {
+        foreach ($row in @(Get-Field $StateDump.tables $table @())) {
+            $key = if ($table -eq 'projects') { [string](Get-Field $row 'key') } else { [string](Get-Field $row 'project_key') }
+            if ($key -and (Test-SamePath -A $key -B $projectKey)) {
+                throw "refusing manifest-only recovery for ${RunId}: durable $table rows still reference its project"
+            }
+        }
+    }
+    if ($DefaultProjection -and (Test-ProjectionMentions -Projection $DefaultProjection -Path $root)) {
+        throw "refusing manifest-only recovery for ${RunId}: the default session still references $root"
+    }
+    $disposition = Get-StaleAcceptanceSessionDisposition -RunId $RunId -Sessions $Sessions -SessionsRoot $SessionsRoot
+    $recoveryMode = Get-AcceptanceRecoveryDisposition -Manifest $manifest -SessionDisposition $disposition
+    if ($recoveryMode -eq 'active') { throw "refusing manifest-only recovery for ${RunId}: its owner process is still alive" }
+    $explicit = $script:RetireStaleAcceptanceRunId -ceq $RunId
+    if ($recoveryMode -eq 'confirm' -and -not $explicit) {
+        throw "refusing to retire preserved manifest-only acceptance run $RunId; pass -RetireStaleAcceptanceRunId $RunId after resolving its user interaction"
+    }
+    if ($disposition -eq 'running' -and $recoveryMode -ne 'recover' -and -not $explicit) {
+        throw "refusing to stop manifest-only acceptance session orch-acc-$RunId without exact-run authorization"
+    }
+    [void](Start-AcceptanceRunCleanup -RunId $RunId -ProjectKey $projectKey -Identity $manifest `
+        -RetirementAuthorized $true -TempRoot $TempRoot)
+
+    if ($disposition -eq 'running') {
+        $workspaceList = Get-HerdrResultForSession -SessionName "orch-acc-$RunId" -Arguments @('workspace', 'list') -TimeoutSeconds 30
+        $workspaces = @(Get-Field $workspaceList 'workspaces' @())
+        foreach ($workspace in $workspaces) {
+            $checkout = [string](Get-Field (Get-Field $workspace 'worktree') 'checkout_path')
+            if (-not $checkout -or -not (Test-Below -Root $root -Path $checkout)) {
+                throw "refusing manifest-only recovery for ${RunId}: workspace $([string](Get-Field $workspace 'workspace_id')) is outside its temp root"
+            }
+        }
+        foreach ($workspace in $workspaces) {
+            $workspaceId = [string](Get-Field $workspace 'workspace_id')
+            $close = Invoke-HerdrForSession -SessionName "orch-acc-$RunId" `
+                -Arguments @('workspace', 'close', $workspaceId, '--group') -TimeoutSeconds 60
+            $closeCode = Get-HerdrErrorCode -Result $close
+            if ($close.ExitCode -ne 0 -and $closeCode -notin @('workspace_not_found', 'not_found')) {
+                throw "failed to close manifest-owned workspace $workspaceId for $RunId"
+            }
+        }
+        $remaining = Get-HerdrResultForSession -SessionName "orch-acc-$RunId" -Arguments @('workspace', 'list') -TimeoutSeconds 30
+        if (@(Get-Field $remaining 'workspaces' @()).Count -gt 0) {
+            throw "refusing to stop orch-acc-${RunId}: owned workspaces remain after close"
+        }
+        $stop = Invoke-HerdrForSession -SessionName "orch-acc-$RunId" -Arguments @('server', 'stop') -TimeoutSeconds 90
+        if ($stop.ExitCode -ne 0) { throw "failed to stop manifest-owned session orch-acc-$RunId" }
+        $stopped = Wait-Until -TimeoutSeconds 60 -IntervalSeconds 2 -What "manifest-owned session orch-acc-$RunId to stop" -Probe {
+            if ((Get-StaleAcceptanceSessionDisposition -RunId $RunId -Sessions @(Get-Sessions) -SessionsRoot $SessionsRoot) -eq 'stopped') { return $true }
+            return $null
+        }
+        if (-not $stopped.Ok) { throw "manifest-owned session orch-acc-$RunId did not stop" }
+    }
+    if ($disposition -ne 'absent') {
+        $current = Get-StaleAcceptanceSessionDisposition -RunId $RunId -Sessions @(Get-Sessions) -SessionsRoot $SessionsRoot
+        if ($current -ne 'stopped') { throw "refusing to delete orch-acc-${RunId}: it is not verified stopped" }
+        $delete = Invoke-Herdr -Arguments @('session', 'delete', "orch-acc-$RunId") -NoSessionScope -TimeoutSeconds 60
+        if ($delete.ExitCode -ne 0 -or
+            (Get-StaleAcceptanceSessionDisposition -RunId $RunId -Sessions @(Get-Sessions) -SessionsRoot $SessionsRoot) -ne 'absent') {
+            throw "failed to delete verified manifest-only session orch-acc-$RunId"
+        }
+    }
+    Remove-StaleAcceptanceRunRoot -RunId $RunId -ProjectKey $projectKey -TempRoot $TempRoot
+    Complete-AcceptanceRunCleanup -RunId $RunId
+    Add-Assertion -Id "P1.12e-$RunId" -What 'manifest-only interrupted run was safely retired by its recorded identity' -Status 'INFO' `
+        -Evidence "session=$disposition recovery=$recoveryMode root=$root"
+    return $true
 }
 
 function Clear-StaleAcceptanceState {
@@ -897,15 +1512,79 @@ function Clear-StaleAcceptanceState {
     $defaultSession = @($sessions | Where-Object { (Get-Field $_ 'name') -eq 'default' })
     if ($defaultSession.Count -ne 1) { throw 'refusing stale cleanup: default session directory cannot be verified' }
     $sessionsRoot = Join-Path ([string](Get-Field $defaultSession[0] 'session_dir')) 'sessions'
+    $retirementTargetFound = $false
     foreach ($item in $staleProjects) {
         $sessionName = "orch-acc-$($item.RunId)"
-        $disposition = Get-StaleAcceptanceSessionDisposition -RunId $item.RunId -Sessions $sessions -SessionsRoot $sessionsRoot
+        if ($script:RetireStaleAcceptanceRunId -and $script:RetireStaleAcceptanceRunId -cne $item.RunId) {
+            Add-Assertion -Id "P1.12c-$($item.RunId)" -What 'another acceptance run was left untouched because the retirement opt-in names a different run' -Status 'INFO' `
+                -Evidence "requested=$($script:RetireStaleAcceptanceRunId) preserved=$($item.RunId)"
+            continue
+        }
         $root = Assert-StaleAcceptanceRunRoot -RunId $item.RunId -ProjectKey $item.Key
+        $priorRecord = Read-AcceptanceRunIdentity -RunId $item.RunId -ProjectKey $item.Key
+        $disposition = Get-StaleAcceptanceSessionDisposition -RunId $item.RunId -Sessions $sessions -SessionsRoot $sessionsRoot
+        $priorKeepRequested = Test-JsonBool -Object $priorRecord -Name 'keepResourcesRequested'
+        $priorResourcesPreserved = Test-JsonBool -Object $priorRecord -Name 'resourcesPreserved'
+        $recoveryMode = Get-AcceptanceRecoveryDisposition -Manifest $priorRecord -SessionDisposition $disposition
+        $keepLabel = if ($null -eq $priorKeepRequested) { 'unknown/not recorded' } else { [string]$priorKeepRequested }
+        $preservedLabel = if ($null -eq $priorResourcesPreserved) { 'unknown/not recorded' } else { [string]$priorResourcesPreserved }
+        if ($script:RetireStaleAcceptanceRunId -ceq $item.RunId) { $retirementTargetFound = $true }
+        $requiresConsent = ($priorKeepRequested -ne $false -or $priorResourcesPreserved -ne $false -or
+            $recoveryMode -in @('confirm', 'active'))
+        if ($requiresConsent) {
+            Write-Host ("Verified stale acceptance run {0}: session={1} recovery={2} keepResources={3} resourcesPreserved={4}" -f `
+                $sessionName, $disposition, $recoveryMode, $keepLabel, $preservedLabel) -ForegroundColor Yellow
+            if ($script:RetireStaleAcceptanceRunId -cne $item.RunId) {
+                throw "refusing to retire $sessionName; pass -RetireStaleAcceptanceRunId $($item.RunId) to authorize only this verified run"
+            }
+        }
+        if ($recoveryMode -eq 'active' -and $script:RetireStaleAcceptanceRunId -cne $item.RunId) {
+            throw "refusing stale cleanup for ${sessionName}: its recorded owner process is still alive"
+        }
         $projectTasks = @($dump.tables.tasks | Where-Object { $_.project_key -eq $item.Key })
+        $projectFact = Get-Field $item.Row 'fact'
+        if (-not $projectFact) { $projectFact = $item.Row }
+        $rootWorkspace = [string](Get-Field $projectFact 'RepoWorkspaceID')
+        $runWorkspaceIds = @()
+        foreach ($workspace in @([string](Get-Field $projectFact 'RepoWorkspaceID'), [string](Get-Field $projectFact 'CurrentWorkspaceID'))) {
+            if ($workspace -and $runWorkspaceIds -notcontains $workspace) { $runWorkspaceIds += $workspace }
+        }
+        $missingWorkspaceIdentity = $false
         foreach ($taskRow in $projectTasks) {
-            $worktree = [string](Get-Field (Get-Field $taskRow 'fact') 'WorktreePath')
+            $taskFact = Get-Field $taskRow 'fact'
+            if (-not $taskFact) { $taskFact = $taskRow }
+            $worktree = [string](Get-Field $taskFact 'WorktreePath')
             if ($worktree -and -not (Test-Below -Root $root -Path $worktree)) {
                 throw "refusing to clean stale acceptance project $($item.Key): task worktree is outside $root"
+            }
+            $worktreeWorkspace = [string](Get-Field $taskFact 'WorktreeWorkspaceID')
+            if ($worktree -and -not $worktreeWorkspace) { $missingWorkspaceIdentity = $true }
+            foreach ($workspace in @($worktreeWorkspace, [string](Get-Field $taskFact 'CurrentWorkspaceID'))) {
+                if ($workspace -and $runWorkspaceIds -notcontains $workspace) { $runWorkspaceIds += $workspace }
+            }
+        }
+        if ($disposition -eq 'running' -and
+            ([string]::IsNullOrWhiteSpace($rootWorkspace) -or $missingWorkspaceIdentity -or $runWorkspaceIds.Count -eq 0)) {
+            throw "refusing to stop ${sessionName}: recorded workspace identities are incomplete"
+        }
+        if ($disposition -eq 'running') {
+            foreach ($other in @($dump.tables.projects)) {
+                if ([string](Get-Field $other 'key') -ceq $item.Key) { continue }
+                $otherFact = Get-Field $other 'fact'
+                foreach ($workspace in @([string](Get-Field $otherFact 'RepoWorkspaceID'), [string](Get-Field $otherFact 'CurrentWorkspaceID'))) {
+                    if ($workspace -and $runWorkspaceIds -contains $workspace) {
+                        throw "refusing to close stale acceptance workspace group: workspace $workspace is also owned by project $([string](Get-Field $other 'key'))"
+                    }
+                }
+            }
+            foreach ($other in @($dump.tables.tasks)) {
+                if ([string](Get-Field $other 'project_key') -ceq $item.Key) { continue }
+                $otherFact = Get-Field $other 'fact'
+                foreach ($workspace in @([string](Get-Field $otherFact 'WorktreeWorkspaceID'), [string](Get-Field $otherFact 'CurrentWorkspaceID'))) {
+                    if ($workspace -and $runWorkspaceIds -contains $workspace) {
+                        throw "refusing to close stale acceptance workspace group: workspace $workspace is also owned by task $([string](Get-Field $other 'id'))"
+                    }
+                }
             }
         }
         $paneIds = @()
@@ -952,9 +1631,88 @@ function Clear-StaleAcceptanceState {
         if (@($plan.foreign).Count -gt 0) {
             throw "refusing to clean stale acceptance project $($item.Key): foreign references remain"
         }
-        if ($disposition -eq 'stopped') {
+        [void](Start-AcceptanceRunCleanup -RunId $item.RunId -ProjectKey $item.Key `
+            -Identity $priorRecord -RetirementAuthorized $true)
+        if ($disposition -eq 'running') {
+            if ($script:RetireStaleAcceptanceRunId -cne $item.RunId -and $recoveryMode -ne 'recover') {
+                throw "refusing to stop live acceptance session ${sessionName} without a persisted recovery decision or exact run-id authorization"
+            }
+            [void](Assert-StaleAcceptanceRunRoot -RunId $item.RunId -ProjectKey $item.Key)
+            if ((Get-StaleAcceptanceSessionDisposition -RunId $item.RunId -Sessions @(Get-Sessions) -SessionsRoot $sessionsRoot) -ne 'running') {
+                throw "refusing to close ${sessionName}: session listing changed before retirement"
+            }
+            $close = Invoke-HerdrForSession -SessionName $sessionName `
+                -Arguments @('workspace', 'close', $rootWorkspace, '--group') -TimeoutSeconds 60
+            $closeCode = Get-HerdrErrorCode -Result $close
+            if ($close.ExitCode -ne 0 -and $closeCode -notin @('workspace_not_found', 'not_found')) {
+                throw "failed to close verified workspace group for ${sessionName}: $(Protect-Text $close.Stderr 300)"
+            }
+            $workspaceList = Get-HerdrResultForSession -SessionName $sessionName -Arguments @('workspace', 'list') -TimeoutSeconds 30
+            $remainingWorkspaces = @(Get-Field $workspaceList 'workspaces' @())
+            $sessionSnapshot = $null
+            foreach ($workspace in $remainingWorkspaces) {
+                $workspaceId = [string](Get-Field $workspace 'workspace_id')
+                if (-not $workspaceId -or $runWorkspaceIds -notcontains $workspaceId) {
+                    throw "refusing to close workspace $workspaceId in ${sessionName}: it is not in the recorded run workspace identities"
+                }
+                $checkout = [string](Get-Field (Get-Field $workspace 'worktree') 'checkout_path')
+                if ($checkout) {
+                    if (-not (Test-Below -Root $root -Path $checkout)) {
+                        throw "refusing to close workspace $workspaceId in ${sessionName}: checkout $checkout is outside $root"
+                    }
+                    continue
+                }
+                if (-not $sessionSnapshot) {
+                    $snapshotResult = Get-HerdrResultForSession -SessionName $sessionName -Arguments @('api', 'snapshot') -TimeoutSeconds 30
+                    $sessionSnapshot = Get-Field $snapshotResult 'snapshot'
+                }
+                $workspacePanes = @((Get-Field $sessionSnapshot 'panes' @()) | Where-Object { (Get-Field $_ 'workspace_id') -ceq $workspaceId })
+                if ($workspacePanes.Count -eq 0) {
+                    throw "refusing to close workspace $workspaceId in ${sessionName}: its checkout is unavailable and no pane proves ownership under $root"
+                }
+                foreach ($pane in $workspacePanes) {
+                    $paneId = [string](Get-Field $pane 'pane_id')
+                    $cwd = [string](Get-Field $pane 'cwd')
+                    if ($paneId -notin $paneIds -or -not (Test-Below -Root $root -Path $cwd)) {
+                        throw "refusing to close workspace $workspaceId in ${sessionName}: pane $paneId is unrecorded or works outside $root"
+                    }
+                }
+            }
+            foreach ($workspace in $remainingWorkspaces) {
+                if ((Get-StaleAcceptanceSessionDisposition -RunId $item.RunId -Sessions @(Get-Sessions) -SessionsRoot $sessionsRoot) -ne 'running') {
+                    throw "refusing to close a workspace in ${sessionName}: session listing changed during retirement"
+                }
+                $workspaceId = [string](Get-Field $workspace 'workspace_id')
+                $close = Invoke-HerdrForSession -SessionName $sessionName `
+                    -Arguments @('workspace', 'close', $workspaceId, '--group') -TimeoutSeconds 60
+                $closeCode = Get-HerdrErrorCode -Result $close
+                if ($close.ExitCode -ne 0 -and $closeCode -notin @('workspace_not_found', 'not_found')) {
+                    throw "failed to close verified workspace $workspaceId for ${sessionName}: $(Protect-Text $close.Stderr 300)"
+                }
+            }
+            $workspaceList = Get-HerdrResultForSession -SessionName $sessionName -Arguments @('workspace', 'list') -TimeoutSeconds 30
+            $liveWorkspaceIds = @((Get-Field $workspaceList 'workspaces' @()) | ForEach-Object { [string](Get-Field $_ 'workspace_id') })
+            if ($liveWorkspaceIds.Count -gt 0) {
+                throw "refusing to stop ${sessionName}: workspaces remain after closing recorded run workspaces: $($liveWorkspaceIds -join ',')"
+            }
             $current = Get-StaleAcceptanceSessionDisposition -RunId $item.RunId -Sessions @(Get-Sessions) -SessionsRoot $sessionsRoot
-            if ($current -ne 'stopped') { throw "refusing to delete ${sessionName}: session listing changed" }
+            if ($current -eq 'running') {
+                $stop = Invoke-HerdrForSession -SessionName $sessionName -Arguments @('server', 'stop') -TimeoutSeconds 90
+                if ($stop.ExitCode -ne 0) { throw "failed to stop verified acceptance session ${sessionName}: $(Protect-Text $stop.Stderr 300)" }
+            } elseif ($current -ne 'stopped') {
+                throw "refusing to stop ${sessionName}: session identity changed after workspace close"
+            }
+            $stopped = Wait-Until -TimeoutSeconds 60 -IntervalSeconds 2 -What "acceptance session $sessionName to stop" -Probe {
+                if ((Get-StaleAcceptanceSessionDisposition -RunId $item.RunId -Sessions @(Get-Sessions) -SessionsRoot $sessionsRoot) -eq 'stopped') {
+                    return $true
+                }
+                return $null
+            }
+            if (-not $stopped.Ok) { throw "acceptance session ${sessionName} did not stop; leaving its state and files in place" }
+        }
+        if ($disposition -ne 'absent') {
+            $current = Get-StaleAcceptanceSessionDisposition -RunId $item.RunId -Sessions @(Get-Sessions) -SessionsRoot $sessionsRoot
+            if ($current -ne 'stopped') { throw "refusing to delete ${sessionName}: session is not verified stopped" }
             $retired = Invoke-Herdr -Arguments @('session', 'delete', $sessionName) -NoSessionScope -TimeoutSeconds 60
             if ($retired.ExitCode -ne 0 -or
                 (Get-StaleAcceptanceSessionDisposition -RunId $item.RunId -Sessions @(Get-Sessions) -SessionsRoot $sessionsRoot) -ne 'absent') {
@@ -962,14 +1720,120 @@ function Clear-StaleAcceptanceState {
             }
             $sessions = @(Get-Sessions)
         }
+        Remove-StaleAcceptanceRunRoot -RunId $item.RunId -ProjectKey $item.Key
         $deleted = Invoke-State -Operation 'delete-scoped' -Arguments @($item.Key, $paneArgument)
         if (-not (Get-Flag $deleted 'ok') -or -not (Get-Flag $deleted 'others_identical')) {
             throw "scoped cleanup did not preserve unrelated state for $($item.Key)"
         }
-        Remove-StaleAcceptanceRunRoot -RunId $item.RunId -ProjectKey $item.Key
         Add-Assertion -Id "P1.12a-$($item.RunId)" -What 'stale acceptance state removed without changing unrelated rows' -Status 'INFO' `
             -Evidence ("project={0}; deleted={1}" -f $item.Key, (Get-Json $deleted.deleted))
+        Complete-AcceptanceRunCleanup -RunId $item.RunId
         $dump = Get-StateDump
+    }
+
+    $manifestOnlyCandidates = New-Object System.Collections.ArrayList
+    foreach ($recordDir in @(Get-ChildItem -LiteralPath $script:RunArchiveRoot -Directory -Force -ErrorAction SilentlyContinue)) {
+        $manifestPath = Join-Path $recordDir.FullName 'manifest.json'
+        if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { continue }
+        try { $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json } catch {
+            throw "refusing to recover unreadable acceptance journal $manifestPath"
+        }
+        $manifestRunId = [string](Get-Field $manifest 'runId')
+        if ($manifestRunId -notmatch '^[0-9a-f]{8}$' -or
+            (Split-Path -Leaf $recordDir.FullName) -cne $manifestRunId -or
+            $manifestRunId -ceq $script:RunId -or $staleRunSet.ContainsKey($manifestRunId)) { continue }
+        $manifestStateDb = [string](Get-Field $manifest 'stateDb')
+        if ([string]::IsNullOrWhiteSpace($manifestStateDb) -or
+            -not (Test-SamePath -A $manifestStateDb -B $script:RunLockStateDb)) { continue }
+        [void]$manifestOnlyCandidates.Add([pscustomobject]@{ RunId = $manifestRunId; Manifest = $manifest })
+    }
+    if ($manifestOnlyCandidates.Count -gt 0) {
+        $defaultSnapshot = Get-HerdrJson -Arguments @('api', 'snapshot') -NoSessionScope
+        $defaultProjection = Get-FocusProjection -Snapshot (Get-JsonField $defaultSnapshot 'snapshot')
+        foreach ($candidate in $manifestOnlyCandidates) {
+            [void](Recover-ManifestOnlyAcceptanceRun -RunId $candidate.RunId -TempRoot $env:TEMP `
+                -StateDump $dump -Sessions $sessions -SessionsRoot $sessionsRoot -DefaultProjection $defaultProjection)
+            $sessions = @(Get-Sessions)
+            $dump = Get-StateDump
+            if ($script:RetireStaleAcceptanceRunId -ceq $candidate.RunId) { $retirementTargetFound = $true }
+        }
+    }
+    if ($script:RetireStaleAcceptanceRunId -and -not $retirementTargetFound) {
+        $orphanSessionName = "orch-acc-$($script:RetireStaleAcceptanceRunId)"
+        $orphanRoot = Join-Path $env:TEMP "orch-accept-$($script:RetireStaleAcceptanceRunId)"
+        if (Test-Path -LiteralPath $orphanRoot) {
+            $orphanReportPath = Join-Path $orphanRoot 'report.json'
+            if (-not (Test-Path -LiteralPath $orphanReportPath)) {
+                throw "refusing orphan cleanup for ${orphanSessionName}: report identity is missing"
+            }
+            try { $orphanReport = Get-Content -LiteralPath $orphanReportPath -Raw | ConvertFrom-Json } catch {
+                throw "refusing orphan cleanup for ${orphanSessionName}: report identity cannot be read"
+            }
+            $orphanProjectKey = [string](Get-Field $orphanReport 'projectKey')
+            [void](Assert-StaleAcceptanceRunRoot -RunId $script:RetireStaleAcceptanceRunId -ProjectKey $orphanProjectKey)
+            if ((Get-StaleAcceptanceSessionDisposition -RunId $script:RetireStaleAcceptanceRunId -Sessions @(Get-Sessions) -SessionsRoot $sessionsRoot) -ne 'absent') {
+                throw "refusing orphan cleanup for ${orphanSessionName}: a Herdr session is still listed but its project state is missing"
+            }
+            $orphanDump = Get-StateDump
+            $projectRefs = @($orphanDump.tables.projects | Where-Object { Test-SamePath -A ([string](Get-Field $_ 'key')) -B $orphanProjectKey })
+            $taskRefs = @($orphanDump.tables.tasks | Where-Object { Test-SamePath -A ([string](Get-Field $_ 'project_key')) -B $orphanProjectKey })
+            $inboxRefs = @($orphanDump.tables.inbox | Where-Object { Test-SamePath -A ([string](Get-Field $_ 'project_key')) -B $orphanProjectKey })
+            $readyRefs = @($orphanDump.tables.ready_sessions | Where-Object {
+                ([regex]::Match([string](Get-Field $_ 'omp_session_file'), '(?i)orch-accept-([0-9a-f]{8})').Groups[1].Value.ToLowerInvariant()) -ceq $script:RetireStaleAcceptanceRunId
+            })
+            if ($projectRefs.Count -or $taskRefs.Count -or $inboxRefs.Count -or $readyRefs.Count) {
+                throw "refusing orphan cleanup for ${orphanSessionName}: state rows still reference its project or OMP sessions"
+            }
+            $default = Get-HerdrJson -Arguments @('api', 'snapshot') -NoSessionScope
+            $defaultProjection = Get-FocusProjection -Snapshot (Get-JsonField $default 'snapshot')
+            if (Test-ProjectionMentions -Projection $defaultProjection -Path $orphanRoot) {
+                throw "refusing orphan cleanup for ${orphanSessionName}: the default session still references $orphanRoot"
+            }
+            $orphanKeepRequested = Test-JsonBool -Object $orphanReport -Name 'keepResourcesRequested'
+            $orphanResourcesPreserved = Test-JsonBool -Object $orphanReport -Name 'resourcesPreserved'
+            $orphanKeepLabel = if ($null -eq $orphanKeepRequested) { 'unknown/not recorded' } else { [string]$orphanKeepRequested }
+            $orphanPreservedLabel = if ($null -eq $orphanResourcesPreserved) { 'unknown/not recorded' } else { [string]$orphanResourcesPreserved }
+            Write-Host ("Verified orphan acceptance run {0}: session=absent report passed={1} failed={2} blocked={3} prior-KeepResources={4} resourcesPreserved={5}; exact run-id opt-in supplied" -f `
+                $orphanSessionName, (Get-Field $orphanReport 'passed'), (Get-Field $orphanReport 'failed'), (Get-Field $orphanReport 'blocked'), $orphanKeepLabel, $orphanPreservedLabel) -ForegroundColor Yellow
+            Remove-StaleAcceptanceRunRoot -RunId $script:RetireStaleAcceptanceRunId -ProjectKey $orphanProjectKey
+            Add-Assertion -Id "P1.12c-$($script:RetireStaleAcceptanceRunId)" -What 'the explicitly selected, report-verified orphan acceptance root was removed without touching siblings' -Status 'INFO' `
+                -Evidence $orphanRoot
+            $retirementTargetFound = $true
+        }
+        if (-not $retirementTargetFound) {
+            throw "no verified stale acceptance resources were found for RetireStaleAcceptanceRunId $($script:RetireStaleAcceptanceRunId)"
+        }
+    }
+    $legacyRunRoots = @(Get-ChildItem -LiteralPath $env:TEMP -Directory -Filter 'orch-accept-*' -Force -ErrorAction SilentlyContinue)
+    $legacyCandidates = New-Object System.Collections.ArrayList
+    foreach ($legacyRoot in $legacyRunRoots) {
+        $legacyMatch = [regex]::Match($legacyRoot.Name, '^orch-accept-([0-9a-fA-F]{8})$')
+        if (-not $legacyMatch.Success) { continue }
+        $legacyRunId = $legacyMatch.Groups[1].Value.ToLowerInvariant()
+        if ($legacyRunId -ceq $script:RunId -or $staleRunSet.ContainsKey($legacyRunId)) { continue }
+        $legacyManifestPath = Join-Path (Join-Path $script:RunArchiveRoot $legacyRunId) 'manifest.json'
+        if (Test-Path -LiteralPath $legacyManifestPath -PathType Leaf) { continue }
+        $legacyReportPath = Join-Path $legacyRoot.FullName 'report.json'
+        if (-not (Test-Path -LiteralPath $legacyReportPath -PathType Leaf)) { continue }
+        try { $legacyReport = Get-Content -LiteralPath $legacyReportPath -Raw | ConvertFrom-Json } catch { continue }
+        if ((Get-Field $legacyReport 'runId') -cne $legacyRunId -or
+            (Get-Field $legacyReport 'session') -cne "orch-acc-$legacyRunId" -or
+            (Test-JsonBool -Object $legacyReport -Name 'keepResourcesRequested') -ne $false -or
+            (Test-JsonBool -Object $legacyReport -Name 'resourcesPreserved') -ne $false) { continue }
+        $legacyEntries = @(Get-ChildItem -LiteralPath $legacyRoot.FullName -Force)
+        if (@($legacyEntries | Where-Object { $_.Name -notin @('report.json', 'report.txt') -or $_.PSIsContainer }).Count -gt 0) { continue }
+        [void]$legacyCandidates.Add([pscustomobject]@{ RunId = $legacyRunId; Root = $legacyRoot.FullName })
+    }
+    if ($legacyCandidates.Count -gt 0) {
+        $defaultSnapshot = Get-HerdrJson -Arguments @('api', 'snapshot') -NoSessionScope
+        $defaultProjection = Get-FocusProjection -Snapshot (Get-JsonField $defaultSnapshot 'snapshot')
+        foreach ($candidate in $legacyCandidates) {
+            if (Move-LegacyAcceptanceReportRootToArchive -RunId $candidate.RunId -TempRoot $env:TEMP `
+                -ArchiveRoot $script:RunArchiveRoot -StateDump $dump -Sessions $sessions -DefaultProjection $defaultProjection) {
+                Add-Assertion -Id "P1.12d-$($candidate.RunId)" -What 'report-only legacy temp root was archived and removed without touching live/session or state resources' -Status 'INFO' `
+                    -Evidence $candidate.Root
+            }
+        }
     }
 
     $dump = Get-StateDump
@@ -1159,6 +2023,153 @@ function Test-OmpTranscriptContains {
         elseif ($stream) { $stream.Dispose() }
     }
 }
+
+function Test-OmpTranscriptContainsWorkerQuestionNote {
+    param([string]$Path, [string]$TaskId, [string]$QuestionMarker)
+    if ([string]::IsNullOrWhiteSpace($Path) -or [string]::IsNullOrWhiteSpace($TaskId) -or
+        [string]::IsNullOrWhiteSpace($QuestionMarker) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    $stream = $null
+    $reader = $null
+    $pattern = '(?is)orchestrator:\s*\d+\s+worker note\(s\).*-\s*' + [regex]::Escape($TaskId) + '\s+\[question\]:.*' + [regex]::Escape($QuestionMarker)
+    try {
+        $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        $reader = New-Object System.IO.StreamReader($stream)
+        while ($null -ne ($line = $reader.ReadLine())) {
+            try { $entry = ConvertFrom-Json -InputObject $line -ErrorAction Stop } catch { continue }
+            if ([string](Get-Field $entry 'type') -cne 'message') { continue }
+            $message = Get-Field $entry 'message'
+            if ([string](Get-Field $message 'role') -cne 'user') { continue }
+            $text = (@(Get-Field $message 'content' @()) | ForEach-Object { [string](Get-Field $_ 'text') }) -join "`n"
+            if ([regex]::IsMatch($text, $pattern)) { return $true }
+        }
+    } catch {
+        return $false
+    } finally {
+        if ($reader) { $reader.Dispose() }
+        elseif ($stream) { $stream.Dispose() }
+    }
+    return $false
+}
+
+function Test-TaskIsReviewedDone {
+    param([object]$Fact)
+    $report = Get-Field $Fact 'Report' $null
+    if ($null -eq $Fact -or $null -eq $report -or [string](Get-Field $report 'Kind') -cne 'result' -or
+        [string]::IsNullOrWhiteSpace([string](Get-Field $Fact 'Disposition'))) { return $false }
+    return ((Get-TaskStage -Fact $Fact) -eq 'done')
+}
+
+function Test-IsBlockedPrimaryDispositionPrerequisite {
+    param([string]$PhaseId, [string]$Message)
+    return ($PhaseId -ceq 'K0' -and $Message -ceq 'a primary disposition Ask blocked worker-dialog approval')
+}
+
+function Test-OmpTranscriptContainsLaterUserAuthorization {
+    param([string]$Path, [string]$TaskId, [string]$QuestionMarker, [string]$Token)
+    if ([string]::IsNullOrWhiteSpace($Path) -or [string]::IsNullOrWhiteSpace($TaskId) -or
+        [string]::IsNullOrWhiteSpace($QuestionMarker) -or [string]::IsNullOrWhiteSpace($Token) -or
+        -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    $stream = $null
+    $reader = $null
+    $questionObserved = $false
+    $tokenPattern = '(?<![\p{L}\p{N}_-])' + [regex]::Escape($Token) + '(?![\p{L}\p{N}_-])'
+    $questionNotePattern = '(?is)orchestrator:\s*\d+\s+worker note\(s\).*-\s*' + [regex]::Escape($TaskId) + '\s+\[question\]:.*' + [regex]::Escape($QuestionMarker)
+    try {
+        $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        $reader = New-Object System.IO.StreamReader($stream)
+        while ($null -ne ($line = $reader.ReadLine())) {
+            try { $entry = ConvertFrom-Json -InputObject $line -ErrorAction Stop } catch { continue }
+            if ([string](Get-Field $entry 'type') -cne 'message') { continue }
+            $message = Get-Field $entry 'message'
+            $role = [string](Get-Field $message 'role')
+            $content = Get-Field $message 'content'
+            $textParts = @()
+            foreach ($part in @($content)) {
+                $text = Get-Field $part 'text'
+                if ($text -is [string]) { $textParts += $text }
+            }
+            if ($role -cne 'user') { continue }
+            $userText = $textParts -join "`n"
+            if ([regex]::IsMatch($userText, $questionNotePattern)) {
+                $questionObserved = $true
+                continue
+            }
+            $steering = Get-Field $message 'steering' $false
+            $liveSteered = Get-Field $message 'liveSteered' $false
+            $attribution = [string](Get-Field $message 'attribution')
+            $directUserInput = (($steering -is [bool]) -and $steering) -or (($liveSteered -is [bool]) -and $liveSteered)
+            if ($questionObserved -and $role -ceq 'user' -and $attribution -ceq 'user' -and $directUserInput -and
+                [regex]::IsMatch(($textParts -join "`n"), $tokenPattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)) {
+                return $true
+            }
+        }
+    } catch {
+        return $false
+    } finally {
+        if ($reader) { $reader.Dispose() }
+        elseif ($stream) { $stream.Dispose() }
+    }
+    return $false
+}
+function Test-OmpAnswerCallAfterUserAuthorization {
+    param([string]$Path, [string]$QuestionMarker, [string]$Token, [string]$TaskId)
+    if ([string]::IsNullOrWhiteSpace($Path) -or [string]::IsNullOrWhiteSpace($QuestionMarker) -or
+        [string]::IsNullOrWhiteSpace($Token) -or [string]::IsNullOrWhiteSpace($TaskId) -or
+        -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    $stream = $null
+    $reader = $null
+    $questionObserved = $false
+    $authorizedText = $null
+    $tokenPattern = '(?<![\p{L}\p{N}_-])' + [regex]::Escape($Token) + '(?![\p{L}\p{N}_-])'
+    $questionNotePattern = '(?is)orchestrator:\s*\d+\s+worker note\(s\).*-\s*' + [regex]::Escape($TaskId) + '\s+\[question\]:.*' + [regex]::Escape($QuestionMarker)
+    try {
+        $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        $reader = New-Object System.IO.StreamReader($stream)
+        while ($null -ne ($line = $reader.ReadLine())) {
+            try { $entry = ConvertFrom-Json -InputObject $line -ErrorAction Stop } catch { continue }
+            if ([string](Get-Field $entry 'type') -cne 'message') { continue }
+            $message = Get-Field $entry 'message'
+            $role = [string](Get-Field $message 'role')
+            $content = Get-Field $message 'content'
+            $textParts = @()
+            foreach ($part in @($content)) {
+                $text = Get-Field $part 'text'
+                if ($text -is [string]) { $textParts += $text }
+            }
+            if ($role -ceq 'assistant') {
+                foreach ($part in @($content)) {
+                    $toolName = [string](Get-Field $part 'name')
+                    $arguments = Get-Field $part 'arguments'
+                    if ($authorizedText -and $toolName -ceq 'orch_answer' -and
+                        [string](Get-Field $arguments 'taskId') -ceq $TaskId -and
+                        [string](Get-Field $arguments 'text') -ceq $authorizedText) { return $true }
+                }
+                continue
+            }
+            if ($role -cne 'user') { continue }
+            $userText = $textParts -join "`n"
+            if ([regex]::IsMatch($userText, $questionNotePattern)) {
+                $questionObserved = $true
+                continue
+            }
+            $steering = Get-Field $message 'steering' $false
+            $liveSteered = Get-Field $message 'liveSteered' $false
+            $attribution = [string](Get-Field $message 'attribution')
+            $directUserInput = (($steering -is [bool]) -and $steering) -or (($liveSteered -is [bool]) -and $liveSteered)
+            if ($questionObserved -and $role -ceq 'user' -and $attribution -ceq 'user' -and $directUserInput -and
+                [regex]::IsMatch($userText, $tokenPattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)) {
+                $authorizedText = $userText
+            }
+        }
+    } catch {
+        return $false
+    } finally {
+        if ($reader) { $reader.Dispose() }
+        elseif ($stream) { $stream.Dispose() }
+    }
+    return $false
+}
+
 function Test-OmpApprovalToolCall {
     param([string]$Path, [string]$TaskId, [string[]]$Keys)
     if ([string]::IsNullOrWhiteSpace($Path) -or [string]::IsNullOrWhiteSpace($TaskId) -or
@@ -1741,6 +2752,12 @@ function Invoke-Preflight {
         }
     }
     $script:StateDb = Join-Path $script:StateDir 'orchestrator.sqlite'
+    $lockedStoreMatches = Test-SamePath -A $script:RunLockStateDb -B $script:StateDb
+    Assert-True -Id 'P1.10b' -What 'preflight uses the same shared store path that the run lock protects' `
+        -Condition $lockedStoreMatches -Evidence "locked=[$($script:RunLockStateDb)] resolved=[$($script:StateDb)]"
+    if (-not $lockedStoreMatches) {
+        throw 'preflight resolved a different shared state store than the run lock; refusing shared-state cleanup'
+    }
     Assert-True -Id 'P1.10' -What 'the plugin state store exists (the plugin has run before)' -Condition (Test-Path -LiteralPath $script:StateDb) `
         -Evidence "state db expected at $($script:StateDb)"
 
@@ -1848,6 +2865,22 @@ function Invoke-Link {
 # Phase 4: isolated Herdr session
 # ---------------------------------------------------------------------------
 
+function New-RunServerStartInfo {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $script:HerdrExe
+    $psi.Arguments = (@('--session', $script:SessionName, 'server') | ForEach-Object { ConvertTo-ArgumentLiteral $_ }) -join ' '
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.WorkingDirectory = $script:RepoRoot
+    foreach ($key in $script:HerdrCallerEnvKeys) {
+        if ($psi.EnvironmentVariables.ContainsKey($key)) { [void]$psi.EnvironmentVariables.Remove($key) }
+    }
+    # The isolated server must not inherit the invoking pane's caller identity or
+    # configuration. Reapply only this run's dedicated config path.
+    $psi.EnvironmentVariables['HERDR_CONFIG_PATH'] = $script:ConfigPath
+    return $psi
+}
+
 function Start-RunServer {
     <#
         Starts the isolated session's headless server as a child of this script.
@@ -1859,25 +2892,21 @@ function Start-RunServer {
         behind). The server's own lines therefore appear inline in this console;
         nothing in the run depends on capturing them.
     #>
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = $script:HerdrExe
-    $psi.Arguments = (@('--session', $script:SessionName, 'server') | ForEach-Object { ConvertTo-ArgumentLiteral $_ }) -join ' '
-    $psi.UseShellExecute = $false
-    $psi.CreateNoWindow = $true
-    $psi.WorkingDirectory = $script:RepoRoot
-    $psi.EnvironmentVariables['HERDR_CONFIG_PATH'] = $script:ConfigPath
     $proc = New-Object System.Diagnostics.Process
-    $proc.StartInfo = $psi
+    $proc.StartInfo = New-RunServerStartInfo
     [void]$proc.Start()
     $script:ServerProcess = $proc
     $script:ServerStartedByScript = $true
+    Save-AcceptanceRunManifest -Phase 'server-started' -Status 'active'
     return $proc
 }
 
 function Invoke-IsolatedSession {
     Write-Step "Phase 4: isolated Herdr session '$($script:SessionName)' under $($script:WorkRoot)"
+    Save-AcceptanceRunManifest -Phase 'temp-root-creating' -Status 'active'
     [void](New-Item -ItemType Directory -Path $script:WorkRoot -Force)
     $script:TempRootCreated = $true
+    Save-AcceptanceRunManifest -Phase 'temp-root-created' -Status 'active'
     Assert-True -Id 'S1.1' -What 'the run root is a unique directory under $env:TEMP' `
         -Condition ((Test-Below -Root $env:TEMP -Path $script:WorkRoot) -and (Test-Path -LiteralPath $script:WorkRoot)) -Evidence $script:WorkRoot
 
@@ -1902,6 +2931,8 @@ directory = "$($script:WorktreesRoot.Replace('\', '/'))"
         -Evidence ("after {0:N1}s; server stdout: {1}" -f $ready.Elapsed, (Protect-Text (Get-Content -LiteralPath $script:ServerLog -Raw -ErrorAction SilentlyContinue) 400))
 
     $script:SessionSocket = [string](Get-Field $ready.Value 'socket_path')
+    $script:SessionDir = [string](Get-Field $ready.Value 'session_dir')
+    Save-AcceptanceRunManifest -Phase 'session-ready' -Status 'active'
     Add-Assertion -Id 'S1.3b' -What 'the run session socket captured (it must differ from the default session)' -Status 'INFO' -Evidence $script:SessionSocket
 
     $sessionStatus = Invoke-Herdr -Arguments @('status', 'server')
@@ -1929,7 +2960,9 @@ function Invoke-Git {
 
 function Invoke-TempRepo {
     Write-Step 'Phase 5: disposable repository, workspace and focus proof'
+    Save-AcceptanceRunManifest -Phase 'temp-repository-creating' -Status 'active'
     [void](New-Item -ItemType Directory -Path $script:RepoPath -Force)
+    Save-AcceptanceRunManifest -Phase 'temp-repository-created' -Status 'active'
     $init = Invoke-Git -Arguments @('init', '-q') -Directory $script:RepoPath
     Assert-Equal -Id 'R1.1' -What 'git init succeeds in the temp repository' -Expected 0 -Actual $init.ExitCode -Command $init.CommandLine -Evidence (Protect-Text $init.Stderr 300)
 
@@ -1944,6 +2977,7 @@ function Invoke-TempRepo {
     Assert-True -Id 'R1.4' -What 'the temp repository is outside the plugin checkout' `
         -Condition (-not (Test-Below -Root $script:RepoRoot -Path $script:RepoPath)) -Evidence "$($script:RepoPath) vs $($script:RepoRoot)"
 
+    Save-AcceptanceRunManifest -Phase 'primary-workspace-creating' -Status 'active'
     $created = Get-HerdrJson -Arguments @('workspace', 'create', '--cwd', $script:RepoPath, '--no-focus', '--label', "accept-$($script:RunId)")
     $ws = Get-Field $created.Result 'workspace'
     $pane = Get-Field $created.Result 'root_pane'
@@ -1953,6 +2987,7 @@ function Invoke-TempRepo {
     $script:PrimaryTab = [string](Get-Field $tab 'tab_id')
     [void]$script:CreatedWorkspaces.Add($script:PrimaryWorkspace)
     [void]$script:CreatedPanes.Add($script:PrimaryPane)
+    Save-AcceptanceRunManifest -Phase 'primary-workspace-created' -Status 'active'
     Assert-NonEmpty -Id 'R2.1' -What 'workspace create returned a workspace id' -Value $script:PrimaryWorkspace
     Assert-NonEmpty -Id 'R2.2' -What 'workspace create returned a root pane id' -Value $script:PrimaryPane
     Assert-SamePath -Id 'R2.3' -What 'the new pane works in the temp repository' -Expected $script:RepoPath -Actual (Get-Field $pane 'cwd')
@@ -2132,12 +3167,12 @@ function Get-BindPayload {
 }
 
 function Write-BindRunIdentity {
-    # Persist identity before bind may create the project. A killed process has
-    # no final report, but the next preflight can still verify exactly its root.
+    # Persist the central lifecycle identity before bind may create durable rows.
     if (-not (Test-Below -Root $script:WorkRoot -Path $script:RepoPath) -or
         -not (Test-Path -LiteralPath $script:RepoPath -PathType Container)) {
         throw 'refusing to bind without an owned temporary repository'
     }
+    Save-AcceptanceRunManifest -Phase 'bind' -Status 'active'
     [pscustomobject]@{
         runId = $script:RunId
         session = $script:SessionName
@@ -2592,6 +3627,7 @@ function Invoke-QuestionRelay {
     Assert-Match -Id 'Q1.3' -What 'task A brief requests the ordinary question and exact answer token' `
         -Pattern 'orch_question.*ACCEPT-Q-A.*ACCEPT-ANSWER-A' -Actual $script:BriefA -TaskId $idA
 
+    Set-PendingUserInteraction -Pending $true -Phase 'awaiting-worker-question-and-user-answer'
     $wait = Wait-Until -TimeoutSeconds 420 -IntervalSeconds 10 -What 'worker question' -Probe {
         $row = Get-TaskById -Id $idA
         if (-not $row) { return $null }
@@ -2616,71 +3652,62 @@ function Invoke-QuestionRelay {
         $ready = Get-ReadySession -LaunchPaneId ([string](Get-Field $script:Project 'LaunchPaneID'))
         $transcriptPath = [string](Get-Field $ready 'omp_session_file')
         $delivery = Wait-Until -TimeoutSeconds 120 -IntervalSeconds 3 -What 'worker question in primary OMP transcript' -Probe {
-            if (Test-OmpTranscriptContains -Path $transcriptPath -Text 'ACCEPT-Q-A') { return $true }
+            if (Test-OmpTranscriptContainsWorkerQuestionNote -Path $transcriptPath -TaskId $idA -QuestionMarker 'ACCEPT-Q-A') { return $true }
             return $null
         }
-        Assert-True -Id 'Q2.7' -What 'the worker question was prompted into the primary OMP session' -Condition $delivery.Ok -TaskId $idA `
-            -Evidence ("transcript marker observed after {0:N0}s; path={1}" -f $delivery.Elapsed, (Protect-Text $transcriptPath 300))
+        Assert-True -Id 'Q2.7' -What 'the exact task-A question note was prompted into the primary OMP session' -Condition $delivery.Ok -TaskId $idA `
+            -Evidence ("taskId=$idA question marker ACCEPT-Q-A observed after {0:N0}s; path={1}" -f $delivery.Elapsed, (Protect-Text $transcriptPath 300))
     }
 
     $focusBefore = Get-FocusProjection -Snapshot (Get-Snapshot)
-    $questionAsk = Resolve-PrimaryWorkerQuestionAsk -TaskId $idA -QuestionMarker 'ACCEPT-Q-A' `
-        -QuestionText 'Should a.js keep its existing export style?' -AnswerToken 'ACCEPT-ANSWER-A' -AssertionId 'Q2.8'
-    if (-not $questionAsk.Resolved) {
-        Block-Item -Id 'Q2.8b' -What 'the primary question Ask was not the exact verified worker question' -Evidence (Protect-Text $questionAsk.Screen 600)
-        throw 'the worker-question Ask could not be safely answered'
+
+    $primaryReady = Get-ReadySession -LaunchPaneId ([string](Get-Field $script:Project 'LaunchPaneID'))
+    $primaryTranscript = [string](Get-Field $primaryReady 'omp_session_file')
+    Set-PendingUserInteraction -Pending $true -Phase 'awaiting-direct-authorization-token'
+    $authorization = Wait-Until -TimeoutSeconds 120 -IntervalSeconds 3 -What 'later user authorization token for worker A' -Probe {
+        if (Test-OmpTranscriptContainsLaterUserAuthorization -Path $primaryTranscript -TaskId $idA `
+            -QuestionMarker 'ACCEPT-Q-A' -Token 'ACCEPT-ANSWER-A') { return $true }
+        return $null
     }
-    $prompt = 'ACCEPT-Q-A-RELAY. A worker asked an ordinary question. Call the orch_answer tool with taskId "' + $idA + '" and text "ACCEPT-ANSWER-A: keep the existing export style and add subtract in that same style." Then reply with the word relayed.'
-    $workerReadyA = Get-ReadySession -LaunchPaneId ([string](Get-Field $script:TaskA 'LaunchPaneID'))
-    $workerTranscriptA = [string](Get-Field $workerReadyA 'omp_session_file')
-    $answerTextA = 'Yes—keep the existing export style. ACCEPT-ANSWER-A'
-    if ($questionAsk.Observed) {
-        $answerDelivery = Wait-Until -TimeoutSeconds 120 -IntervalSeconds 3 -What 'authorized answer Ask relayed to worker A transcript' -Probe {
-            if (Test-OmpTranscriptContains -Path $workerTranscriptA -Text $answerTextA) { return $true }
-            return $null
-        }
-        if ($answerDelivery.Ok) {
-            $result = [pscustomobject]@{
-                ExitCode = 0
-                Code = 'answer_ask_relayed'
-                Blocked = $false
-                Submitted = $true
-                CommandLine = 'primary answered the exact worker-question Ask'
-                Stderr = ''
-                Stdout = ''
-                Screen = ''
-            }
-        } else {
-            $result = [pscustomobject]@{
-                ExitCode = -1
-                Code = 'answer_ask_not_delivered'
-                Blocked = $true
-                Submitted = $false
-                CommandLine = ''
-                Stderr = 'the exact user-selected answer was not observed in worker A transcript; refusing a duplicate relay'
-                Stdout = ''
-                Screen = $questionAsk.Screen
-            }
-        }
-    } elseif (Test-OmpTranscriptContains -Path $workerTranscriptA -Text $answerTextA) {
-        $result = [pscustomobject]@{
-            ExitCode = 0
-            Code = 'answer_already_delivered'
-            Blocked = $false
-            Submitted = $true
-            CommandLine = 'the exact answer was already delivered'
-            Stderr = ''
-            Stdout = ''
-            Screen = ''
-        }
-    } else {
-        $result = Invoke-PrimaryPromptAfterDispositionAsks -PaneId $script:PrimaryPane -Text $prompt -TimeoutSeconds 300 -AssertionPrefix 'Q3'
+    if (-not $authorization.Ok) {
+        Preserve-ResourcesForPendingTool -AssertionId 'Q2.8b.resources-preserved' -Reason 'worker A is still gated on direct user authorization'
+        $screen = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'recent-unwrapped' -Lines 100
+        Block-Item -Id 'Q2.8b' -What 'worker A remains gated because no later user message supplied the exact authorization token' `
+            -Evidence ("token not found after the worker-question note; " + (Protect-Text $screen 500))
+        Block-Item -Id 'Q3.1' -What 'no worker answer was relayed because exact user authorization is absent' `
+            -Evidence 'No orch_answer call or report prompt was submitted.'
+        $focusAfter = Get-FocusProjection -Snapshot (Get-Snapshot)
+        Assert-Equal -Id 'Q3.5' -What 'relaying a question never moved the session focus' -Expected $focusBefore -Actual $focusAfter
+        return
     }
-    $answerSource = if ($questionAsk.Observed) { 'exact primary Ask' } else { 'answer relay prompt or prior delivery' }
-    Assert-True -Id 'Q3.1' -What 'the primary delivered the exact answer to worker A' `
-        -Condition ($result.ExitCode -eq 0 -and $result.Submitted) -TaskId $idA -Command $result.CommandLine `
-        -Evidence ("source=[$answerSource] code=[$($result.Code)] submitted=[$($result.Submitted)] stderr=[" + (Protect-Text $result.Stderr 300) + "] screen=[" + (Protect-Text $result.Screen 500) + "]")
-    if ($result.Blocked) { Block-Item -Id 'Q3.1b' -What 'the primary answer relay did not complete' -Evidence (Protect-Text $result.Screen 500) }
+    Add-Assertion -Id 'Q2.8a' -What 'a later user message after the worker-question note contains the exact authorization token' `
+        -Status 'PASS' -Evidence "observed in $primaryTranscript" -TaskId $idA
+    $relayPrompt = 'ACCEPT-Q-A-RELAY. The primary transcript contains a later user message with the exact ACCEPT-ANSWER-A token. Call orch_answer for taskId "' + $idA + '" using that user message verbatim; do not add or change any authorization text. Do not report. Reply relayed.'
+    $relay = Invoke-PrimaryPrompt -PaneId $script:PrimaryPane -Text $relayPrompt -TimeoutSeconds 300
+    if (-not $relay.Submitted) {
+        Block-Item -Id 'Q3.1' -What 'the primary could not relay the already-authorized user answer' `
+            -Evidence ("code=[$($relay.Code)] screen=" + (Protect-Text $relay.Screen 500))
+        $focusAfter = Get-FocusProjection -Snapshot (Get-Snapshot)
+        Assert-Equal -Id 'Q3.5' -What 'relaying a question never moved the session focus' -Expected $focusBefore -Actual $focusAfter
+        Preserve-ResourcesForPendingTool -AssertionId 'Q3.1.resources-preserved' -Reason 'the primary did not relay the authorized worker answer'
+        return
+    }
+    $answerDelivery = Wait-Until -TimeoutSeconds 120 -IntervalSeconds 3 -What 'exact authorized orch_answer call after the direct user token' -Probe {
+        if (Test-OmpAnswerCallAfterUserAuthorization -Path $primaryTranscript `
+            -QuestionMarker 'ACCEPT-Q-A' -Token 'ACCEPT-ANSWER-A' -TaskId $idA) { return $true }
+        return $null
+    }
+    if (-not $answerDelivery.Ok) {
+        Block-Item -Id 'Q3.1' -What 'the authorized orch_answer call was not observed after the direct user token' `
+            -Evidence ("tokenized tool call not found; " + (Protect-Text (Get-PaneScreen -PaneId $script:PrimaryPane -Source 'recent-unwrapped' -Lines 100) 500))
+        $focusAfter = Get-FocusProjection -Snapshot (Get-Snapshot)
+        Assert-Equal -Id 'Q3.5' -What 'relaying a question never moved the session focus' -Expected $focusBefore -Actual $focusAfter
+        Preserve-ResourcesForPendingTool -AssertionId 'Q3.1.resources-preserved' -Reason 'the direct user token arrived but orch_answer was not proven'
+        return
+    }
+    Assert-True -Id 'Q3.1' -What 'the primary relayed the exact later user authorization to worker A' `
+        -Condition $true -TaskId $idA -Command $relay.CommandLine `
+        -Evidence 'orch_answer taskId and text matched the exact direct user message after authorization'
     $cleared = Wait-Until -TimeoutSeconds 240 -IntervalSeconds 8 -What 'question answered' -Probe {
         $row = Get-TaskById -Id $idA
         if (-not $row) { return $null }
@@ -2694,6 +3721,9 @@ function Invoke-QuestionRelay {
         $script:TaskA = $cleared.Value
         $answerStage = Get-TaskStage -Fact $script:TaskA
         Assert-True -Id 'Q3.3' -What 'the answered task is Running or has finished its report' -Condition ($answerStage -in @('running', 'ready_for_review')) -TaskId $idA -Evidence "stage=$answerStage"
+        Set-PendingUserInteraction -Pending $false -Phase 'worker-question-answered'
+    } else {
+        Preserve-ResourcesForPendingTool -AssertionId 'Q3.2.resources-preserved' -Reason 'worker A attention remained open after the answer relay'
     }
     $workerScreen = Get-PaneScreen -PaneId ([string](Get-Field $script:TaskA 'PublicPaneID')) -Source 'recent-unwrapped' -Lines 200
     $answeredRow = Get-TaskById -Id $idA
@@ -2701,10 +3731,10 @@ function Invoke-QuestionRelay {
     $answeredStage = Get-TaskStage -Fact $answeredFact
     $answerProgressed = $cleared.Ok -and ($answeredStage -in @('running', 'ready_for_review'))
     if ($answerProgressed) {
-        Assert-True -Id 'Q3.4' -What 'the delivered answer left the worker Running or Ready for review' -Condition $true -TaskId $idA `
+        Assert-True -Id 'Q3.4' -What 'the authorized answer left the worker Running or Ready for review' -Condition $true -TaskId $idA `
             -Evidence ("stage=$answeredStage report=$($null -ne (Get-Field $answeredFact 'Report' $null)) answer_visible=$($workerScreen -match 'ACCEPT-ANSWER-A')")
     } else {
-        Block-Item -Id 'Q3.4' -What 'the answer reached the worker terminal' -Evidence ("stage=$answeredStage screen=" + (Protect-Text $workerScreen 400))
+        Block-Item -Id 'Q3.4' -What 'the authorized answer did not advance the worker task' -Evidence ("stage=$answeredStage screen=" + (Protect-Text $workerScreen 400))
     }
     $focusAfter = Get-FocusProjection -Snapshot (Get-Snapshot)
     Assert-Equal -Id 'Q3.5' -What 'relaying a question never moved the session focus' -Expected $focusBefore -Actual $focusAfter
@@ -3127,6 +4157,26 @@ function Resolve-PrimaryWorkerQuestionAsk {
     return [pscustomobject]@{ Observed = $true; Resolved = $resolved; Screen = $screen }
 }
 
+# Try-ConfirmPrimaryReview attempts to confirm an orch_review confirmation modal
+# when the primary is blocked on one. Returns $true if the review was confirmed,
+# $false if no review modal was found.
+function Try-ConfirmPrimaryReview {
+    $screen = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100
+    # Quick check: the review confirmation shows "Record review disposition"
+    if ($screen -notmatch 'Record review disposition') { return $false }
+    # Extract task ID from the screen text
+    $taskIdMatch = [regex]::Match($screen, 'task (orch_[a-z0-9]+)')
+    if (-not $taskIdMatch.Success) { return $false }
+    $taskId = $taskIdMatch.Groups[1].Value
+    # Extract disposition from the screen text
+    $dispMatch = [regex]::Match($screen, 'disposition "([^"]+)"')
+    if (-not $dispMatch.Success) { return $false }
+    $disposition = $dispMatch.Groups[1].Value
+    return Confirm-PrimaryReviewModal -PaneId $script:PrimaryPane `
+        -LaunchPaneId ([string](Get-Field $script:Project 'LaunchPaneID')) `
+        -TaskId $taskId -Disposition $disposition
+}
+
 function Resolve-PendingPrimaryDispositionAsks {
     param([string]$AssertionPrefix = 'V0', [double]$TimeoutSeconds = 30)
     $observed = $false
@@ -3149,6 +4199,12 @@ function Resolve-PendingPrimaryDispositionAsks {
             return [pscustomobject]@{ Resolved = $true; Observed = $observed; Screen = '' }
         }
         if ($wait.Value.Kind -ne 'ask') {
+            # The primary is blocked but no recognizable Ask was found.
+            # This could be an orch_review confirmation modal — try to confirm it.
+            if ($wait.Value.Screen -match 'Record review disposition') {
+                $confirmed = Try-ConfirmPrimaryReview
+                if ($confirmed) { continue }
+            }
             return [pscustomobject]@{ Resolved = $false; Observed = $observed; Screen = $wait.Value.Screen }
         }
 
@@ -3405,6 +4461,7 @@ function Invoke-BlockedDialog {
     # Same as the question above: the dialog is requested explicitly, so the
     # partial-report gate earlier had a Running task to work with.
     $dialogPrompt = 'ACCEPT-ASK. Call the ask tool exactly once with a single question "ACCEPT-Q-DIALOG: which contract should b.js use?" and exactly two options "keep the current contract" and "change the contract". Then stop and wait for that dialog to be answered.'
+    Set-PendingUserInteraction -Pending $true -Phase 'awaiting-worker-dialog-and-report-token'
     $dialogResult = Invoke-AgentPrompt -PaneId $paneB -Text $dialogPrompt -TimeoutSeconds 240
     Assert-True -Id 'K1.3' -What 'worker B accepts the instruction to open its dialog' -Condition ($dialogResult.ExitCode -eq 0) -TaskId $idB `
         -Command $dialogResult.CommandLine -Evidence (Protect-Text $dialogResult.Stderr 300)
@@ -3520,7 +4577,11 @@ function Invoke-BlockedDialog {
     Assert-True -Id 'K6.3' -What 'the primary delivered the exact report authorization token to worker B' `
         -Condition $reportSent -TaskId $idB -Command $reportResult.CommandLine `
         -Evidence ("code=[$($reportResult.Code)] submitted=[$($reportResult.Submitted)] tokenSeen=[$($reportTokenObserved.Ok)] workerSession=[$(Protect-Text $workerTranscript 300)]")
-    if (-not $reportSent) { throw 'the report authorization token was not proven in worker B transcript; no retry was sent' }
+    if (-not $reportSent) {
+        Preserve-ResourcesForPendingTool -AssertionId 'K6.3.resources-preserved' -Reason 'worker B did not receive the direct report token'
+        throw 'the report authorization token was not proven in worker B transcript; no retry was sent'
+    }
+    Set-PendingUserInteraction -Pending $false -Phase 'dialog-and-report-token-resolved'
 
     $stale = Invoke-BridgeAs -LaunchPaneId ([string](Get-Field $script:Project 'LaunchPaneID')) -Method 'approve_dialog' `
         -Params @{ taskId = $idB; observedDigest = [string](Get-Field $preview.Result 'digest'); keys = @('enter') }
@@ -3556,6 +4617,7 @@ function Invoke-PaneMove {
     $newWorkspace = [string](Get-Field (Get-Field $moved 'pane') 'workspace_id')
     [void]$script:CreatedPanes.Add($newPane)
     [void]$script:CreatedWorkspaces.Add($newWorkspace)
+    Save-AcceptanceRunManifest -Phase 'worker-pane-moved' -Status 'active'
 
     Assert-Equal -Id 'M2.1' -What 'the move reports the launch-time pane id as previous_pane_id' -Expected $pane -Actual ([string](Get-Field $moved 'previous_pane_id'))
     Assert-True -Id 'M2.2' -What 'the move produced a new public pane id' -Condition ($newPane -ne '' -and $newPane -ne $pane) -Evidence "new=$newPane old=$pane"
@@ -3570,6 +4632,7 @@ function Invoke-PaneMove {
     $stillThere = @((Get-JsonField $list 'workspaces' @()) | Where-Object { (Get-Field $_ 'workspace_id') -eq $sourceWorkspace })
     Assert-Equal -Id 'M3.2' -What 'the source workspace is absent from the live list' -Expected 0 -Actual $stillThere.Count
     [void]$script:CreatedWorkspaces.Remove($sourceWorkspace)
+    Save-AcceptanceRunManifest -Phase 'source-workspace-closed' -Status 'active'
 
     $wait = Wait-Until -TimeoutSeconds 240 -IntervalSeconds 5 -What 'move applied to the store' -Probe {
         $row = Get-TaskById -Id $idB
@@ -3639,13 +4702,35 @@ function Invoke-WorkerReports {
     foreach ($pair in @(@{ Name = 'A'; Fact = $script:TaskA }, @{ Name = 'B'; Fact = $script:TaskB })) {
         $fact = $pair.Fact
         $id = [string](Get-Field $fact 'ID')
+        if ($pair.Name -eq 'A') {
+            $primaryReady = Get-ReadySession -LaunchPaneId ([string](Get-Field $script:Project 'LaunchPaneID'))
+            $primaryTranscript = [string](Get-Field $primaryReady 'omp_session_file')
+            if (-not (Test-OmpTranscriptContainsLaterUserAuthorization -Path $primaryTranscript -TaskId $id `
+                -QuestionMarker 'ACCEPT-Q-A' -Token 'ACCEPT-ANSWER-A')) {
+                Block-Item -Id 'W1.A' -What 'worker A cannot report before a later user message supplies ACCEPT-ANSWER-A' `
+                    -Evidence 'the worker remains gated; no report timeout was started and no answer was injected'
+                Preserve-ResourcesForPendingTool -AssertionId 'W1.A.resources-preserved' -Reason 'worker A remains gated on its direct user token'
+                continue
+            }
+        }
+        $liveBeforeReport = Get-LiveAgent -Target ([string](Get-Field $fact 'PublicPaneID'))
+        if ($liveBeforeReport.Found -and [string](Get-Field $liveBeforeReport.Agent 'agent_status') -ieq 'blocked') {
+            Set-PendingUserInteraction -Pending $true -Phase "worker-$($pair.Name)-awaiting-user"
+        }
         $wait = Wait-ForReport -TaskId $id -TimeoutSeconds 600
         Assert-True -Id "W1.$($pair.Name)" -What "worker $($pair.Name) submitted a final result" -Condition $wait.Ok -TaskId $id `
             -Evidence ("after {0:N0}s: phase=[{1}] attention=[{2}]" -f $wait.Elapsed, [string](Get-Field (Get-Field (Get-TaskById -Id $id) 'fact' $null) 'Phase'), [string](Get-Field (Get-Field (Get-TaskById -Id $id) 'fact' $null) 'Attention'))
         if (-not $wait.Ok) {
             $screen = Get-PaneScreen -PaneId ([string](Get-Field $fact 'PublicPaneID')) -Source 'recent-unwrapped' -Lines 120
             Block-Item -Id "W1.$($pair.Name)-screen" -What "worker $($pair.Name) terminal content at timeout" -Evidence (Protect-Text $screen 800)
+            $liveAtTimeout = Get-LiveAgent -Target ([string](Get-Field $fact 'PublicPaneID'))
+            if ($liveAtTimeout.Found -and [string](Get-Field $liveAtTimeout.Agent 'agent_status') -ieq 'blocked') {
+                Preserve-ResourcesForPendingTool -AssertionId "W1.$($pair.Name).resources-preserved" -Reason 'worker report wait ended while the worker remained blocked'
+            }
             continue
+        }
+        if ($script:PendingUserInteraction) {
+            Set-PendingUserInteraction -Pending $false -Phase "worker-$($pair.Name)-report-observed"
         }
         $reported = $wait.Value
         if ($pair.Name -eq 'A') { $script:TaskA = $reported } else { $script:TaskB = $reported }
@@ -3675,9 +4760,13 @@ function Invoke-WorkerReports {
         $headA = (Invoke-Git -Arguments @('rev-parse', 'HEAD') -Directory $pathA).Stdout.Trim()
         Assert-True -Id 'W4.A-changed' -What 'worker A really committed a change on its branch' -Condition ($headA -ne $script:BaseRevision) -TaskId ([string](Get-Field $script:TaskA 'ID')) -Evidence "head=$headA base=$($script:BaseRevision)"
         $report = Get-Field $script:TaskA 'Report'
-        $joined = (@(Get-Field $report 'Evidence' @()) + @(Get-Field $report 'Checks' @())) -join ' '
-        Assert-True -Id 'W4.A-evidence-true' -What "worker A's evidence names its real commit or the file it changed" `
-            -Condition (($joined -match [regex]::Escape($headA.Substring(0, 12))) -or ($joined -match 'a\.js')) -TaskId ([string](Get-Field $script:TaskA 'ID')) -Evidence (Protect-Text $joined 400)
+        if ($null -eq $report) {
+            Block-Item -Id 'W4.A-evidence-true' -What "worker A's evidence cannot be checked before an authorized report exists" -Evidence 'the result-report gate was not satisfied'
+        } else {
+            $joined = (@(Get-Field $report 'Evidence' @()) + @(Get-Field $report 'Checks' @())) -join ' '
+            Assert-True -Id 'W4.A-evidence-true' -What "worker A's evidence names its real commit or the file it changed" `
+                -Condition (($joined -match [regex]::Escape($headA.Substring(0, 12))) -or ($joined -match 'a\.js')) -TaskId ([string](Get-Field $script:TaskA 'ID')) -Evidence (Protect-Text $joined 400)
+        }
     }
     if ($script:TaskB) {
         $pathB = [string](Get-Field $script:TaskB 'WorktreePath')
@@ -3686,7 +4775,7 @@ function Invoke-WorkerReports {
     }
 
     $primaryScreen = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'recent-unwrapped' -Lines 300
-    if ($primaryScreen -match 'worker result' -or $primaryScreen -match 'orchestrator:') {
+    if ($primaryScreen -match 'worker result') {
         Assert-True -Id 'W5.1' -What 'the result notes were delivered into the primary session by the plugin' -Condition $true
     } else {
         Block-Item -Id 'W5.1' -What 'the result notes were delivered into the primary session by the plugin' `
@@ -3756,6 +4845,7 @@ function Invoke-Board {
     Assert-NonEmpty -Id 'A1.2' -What 'the board pane has an id' -Value $boardPane -Evidence (Protect-Text (Get-Json $opened) 400)
     if (-not $boardPane) { Block-Item -Id 'A1.2b' -What 'the board pane could not be identified' -Evidence (Protect-Text (Get-Json $payload) 500); return }
     [void]$script:CreatedPanes.Add($boardPane)
+    Save-AcceptanceRunManifest -Phase 'board-pane-created' -Status 'active'
     $script:BoardPane = $boardPane
     Assert-Equal -Id 'A1.3' -What 'the board pane is the declared plugin entrypoint' -Expected 'board' -Actual ([string](Get-Field $pluginPane 'entrypoint'))
     Assert-Equal -Id 'A1.4' -What 'the board pane belongs to this plugin' -Expected $script:PluginId -Actual ([string](Get-Field $pluginPane 'plugin_id'))
@@ -3828,6 +4918,7 @@ function Invoke-Board {
     $gone = Invoke-Herdr -Arguments @('pane', 'get', $boardPane) -TimeoutSeconds 60
     Assert-True -Id 'A5.2' -What 'the board pane is gone' -Condition ($gone.ExitCode -ne 0) -Evidence (Protect-Text $gone.Stderr 200)
     [void]$script:CreatedPanes.Remove($boardPane)
+    Save-AcceptanceRunManifest -Phase 'board-pane-closed' -Status 'active'
     # Put the session back exactly where the phase found it (the board action
     # legitimately moved focus to its own pane): the captured focused workspace is
     # restored, and the whole projection - which now includes the focused workspace
@@ -3852,8 +4943,10 @@ function Invoke-Reviews {
     $idB = if ($script:TaskB) { [string](Get-Field $script:TaskB 'ID') } else { '' }
     if (-not $idA -or -not $idB) { Block-Item -Id 'V0.0' -What 'dispositions' -Evidence 'one or both tasks never reported'; return }
 
+    Set-PendingUserInteraction -Pending $true -Phase 'resolving-primary-disposition-asks'
     $pending = Resolve-PendingPrimaryDispositionAsks -AssertionPrefix 'V0' -TimeoutSeconds 60
     if (-not $pending.Resolved) {
+        Preserve-ResourcesForPendingTool -AssertionId 'V0.ask-blocked.resources-preserved' -Reason 'a primary disposition Ask was not safely resolved'
         Block-Item -Id 'V0.ask-blocked' -What 'the primary disposition Ask could not be safely resolved' -Evidence (Protect-Text $pending.Screen 600)
         return
     }
@@ -3867,6 +4960,7 @@ function Invoke-Reviews {
         $fact = Get-Field $row 'fact'
         if ($null -eq (Get-Field $fact 'Report' $null)) {
             Block-Item -Id "V0.report/$($item.id)" -What "task $($item.id) has no final report to review" -Evidence (Protect-Text (Get-Json $fact) 500)
+            Preserve-ResourcesForPendingTool -AssertionId "V0.report/$($item.id).resources-preserved" -Reason 'the worker has no final report yet, so its task remains unresolved'
             return
         }
         if ([string]::IsNullOrWhiteSpace([string](Get-Field $fact 'Disposition'))) {
@@ -3884,11 +4978,13 @@ function Invoke-Reviews {
                 -Command $result.CommandLine -Evidence ("code=[$($result.Code)] blocked=[$($result.Blocked)] submitted=[$($result.Submitted)] stderr=[" + (Protect-Text $result.Stderr 300) + "] screen=[" + (Protect-Text $result.Screen 500) + "]")
             if (-not $result.Submitted) {
                 Block-Item -Id "V1.submit-blocked/$($reviewTask.marker)" -What "the review prompt for $($reviewTask.label) was not submitted" -Evidence (Protect-Text $result.Screen 500)
+                Preserve-ResourcesForPendingTool -AssertionId "V1.submit-blocked/$($reviewTask.marker).resources-preserved" -Reason 'a review Ask may still be active'
                 return
             }
             $resolvedAsk = Resolve-PrimaryDispositionAsk -Marker $reviewTask.marker -AskId $reviewTask.askId -TaskId $reviewTask.id -AssertionId "V1.ask/$($reviewTask.marker)"
             if (-not $resolvedAsk.Resolved -or -not $resolvedAsk.Observed) {
                 Block-Item -Id "V1.ask-blocked/$($reviewTask.marker)" -What "the primary Ask for $($reviewTask.label) was not safely resolved" -Evidence (Protect-Text $resolvedAsk.Screen 600)
+                Preserve-ResourcesForPendingTool -AssertionId "V1.ask-blocked/$($reviewTask.marker).resources-preserved" -Reason 'the review disposition Ask was not observed to resolve'
                 return
             }
         }
@@ -3908,6 +5004,11 @@ function Invoke-Reviews {
     }
     Assert-True -Id 'V1.2' -What 'both tasks carry a recorded disposition' -Condition $done.Ok `
         -Evidence ("after {0:N0}s" -f $done.Elapsed)
+    if ($done.Ok) {
+        Set-PendingUserInteraction -Pending $false -Phase 'dispositions-recorded'
+    } else {
+        Preserve-ResourcesForPendingTool -AssertionId 'V1.2.resources-preserved' -Reason 'one or more review dispositions were not recorded'
+    }
     foreach ($id in @($idA, $idB)) {
         $row = Get-TaskById -Id $id
         $fact = Get-Field $row 'fact'
@@ -3937,6 +5038,11 @@ function Invoke-CleanupRefusals {
     $fact = Get-TaskById -Id ([string](Get-Field $script:TaskB 'ID'))
     $idB = [string](Get-Field $script:TaskB 'ID')
     $script:TaskB = Get-Field $fact 'fact'
+    if (-not (Test-TaskIsReviewedDone -Fact $script:TaskB)) {
+        Block-Item -Id 'C0.not-reviewed' -What 'cleanup refusal checks require the worker report to be reviewed first' `
+            -Evidence 'the task has no recorded final disposition; no cleanup-preview/removal probes were sent'
+        return
+    }
     $path = [string](Get-Field $script:TaskB 'WorktreePath')
     $branch = [string](Get-Field $script:TaskB 'Branch')
     $primaryLaunch = [string](Get-Field $script:Project 'LaunchPaneID')
@@ -3983,6 +5089,7 @@ function Invoke-CleanupRefusals {
     Assert-Equal -Id 'C6.1' -What 'the worker pane this run created closes' -Expected 0 -Actual $close.ExitCode -Evidence (Protect-Text $close.Stderr 300)
     [void]$script:CreatedPanes.Remove($pane)
     [void]$script:CreatedWorkspaces.Remove([string](Get-Field $script:TaskB 'CurrentWorkspaceID'))
+    Save-AcceptanceRunManifest -Phase 'worker-workspace-closed' -Status 'active'
     $dead = Wait-Until -TimeoutSeconds 120 -IntervalSeconds 5 -What 'worker gone' -Probe {
         $live = Get-LiveAgent -Target $pane
         if (-not $live.Found) { return $true }
@@ -4172,20 +5279,21 @@ function Get-ProjectFacts {
 }
 
 function Get-IdentityProjection {
-    # Stable project/task facts must survive a restart. Inbox contents are checked
-    # separately because delivery recovery may advance a note and startup may add
-    # new worker-activity notes.
+    # Herdr may assign a restored process a new pane ID. The restart check below
+    # verifies any current pane against the binding's recorded OMP session.
+    # Inbox contents are checked separately because delivery recovery may advance
+    # a note and startup may add new worker-activity notes.
     param($Facts)
     $parts = New-Object System.Collections.ArrayList
     $p = $Facts.Project
     if ($p) {
-        foreach ($field in @('Key', 'AgentName', 'LaunchPaneID', 'OMPSessionID', 'RepoWorkspaceID')) {
+        foreach ($field in @('Key', 'AgentName', 'OMPSessionID', 'RepoWorkspaceID')) {
             [void]$parts.Add("project/$field=$([string](Get-Field $p $field))")
         }
     }
     foreach ($row in @($Facts.Tasks)) {
         $f = Get-Field $row 'fact'
-        foreach ($field in @('ID', 'ProjectKey', 'Title', 'Branch', 'BaseRevision', 'WorktreePath', 'WorktreeWorkspaceID', 'LaunchPaneID', 'OMPSessionID', 'Phase', 'Blocker', 'Attention', 'Disposition', 'CurrentWorkspaceID')) {
+        foreach ($field in @('ID', 'ProjectKey', 'Title', 'Branch', 'BaseRevision', 'WorktreePath', 'WorktreeWorkspaceID', 'OMPSessionID', 'Phase', 'Blocker', 'Attention', 'Disposition', 'CurrentWorkspaceID')) {
             [void]$parts.Add("task/$([string](Get-Field $f 'ID'))/$field=$([string](Get-Field $f $field))")
         }
         $report = Get-Field $f 'Report' $null
@@ -4281,8 +5389,38 @@ function Invoke-Restart {
     $projectionAfterParts = @($projectionAfter -split ';')
     $projectionDifferences = @(Compare-Object -ReferenceObject $projectionBeforeParts -DifferenceObject $projectionAfterParts -CaseSensitive |
         ForEach-Object { "$($_.SideIndicator) $($_.InputObject)" })
-    Assert-True -Id 'T5.1' -What 'identities, stages, reports and dispositions survive the restart' `
+    Assert-True -Id 'T5.1' -What 'stable identities, stages, reports and dispositions survive the restart' `
         -Condition ($projectionDifferences.Count -eq 0) -Evidence (Protect-Text ($projectionDifferences -join ' | ') 1600)
+    $restoredProjectPane = [string](Get-Field $after.Project 'LaunchPaneID')
+    $restoredProjectReady = Get-ReadySession -LaunchPaneId $restoredProjectPane
+    $restoredProjectAgent = Get-LiveAgent -Target $restoredProjectPane
+    $restoredProjectSession = [string](Get-Field (Get-Field $restoredProjectAgent.Agent 'agent_session') 'value')
+    $restoredProjectSnapshot = @(Get-Field (Get-Snapshot) 'panes' @() | Where-Object { (Get-Field $_ 'pane_id') -ceq $restoredProjectPane })
+    Assert-True -Id 'T5.project-session' -What 'the restored primary pane still proves the recorded OMP session and terminal' `
+        -Condition ($restoredProjectAgent.Found -and $restoredProjectSnapshot.Count -eq 1 -and
+            [int](Get-Field $restoredProjectReady 'verified' 0) -eq 1 -and
+            (Test-SessionIdentity -Left ([string](Get-Field $after.Project 'OMPSessionID')) -Right $restoredProjectSession -Ready $restoredProjectReady) -and
+            (Test-SamePath -A ([string](Get-Field $after.Project 'Key')) -B ([string](Get-Field $restoredProjectAgent.Agent 'cwd'))) -and
+            [string](Get-Field $restoredProjectSnapshot[0] 'terminal_id') -ceq [string](Get-Field $after.Project 'TerminalID')) `
+        -Evidence ("pane=$restoredProjectPane session=$restoredProjectSession terminal=$([string](Get-Field $restoredProjectSnapshot[0] 'terminal_id'))")
+    foreach ($row in @($after.Tasks)) {
+        $fact = Get-Field $row 'fact'
+        $pane = [string](Get-Field $fact 'LaunchPaneID')
+        $session = [string](Get-Field $fact 'OMPSessionID')
+        if (-not $pane -or -not $session) { continue }
+        $ready = Get-ReadySession -LaunchPaneId $pane
+        $agent = Get-LiveAgent -Target $pane
+        $liveSession = [string](Get-Field (Get-Field $agent.Agent 'agent_session') 'value')
+        $paneSnapshot = @(Get-Field (Get-Snapshot) 'panes' @() | Where-Object { (Get-Field $_ 'pane_id') -ceq $pane })
+        Assert-True -Id "T5.session/$([string](Get-Field $fact 'ID'))" `
+            -What "the restored pane for $([string](Get-Field $fact 'ID')) still proves its recorded OMP session and terminal" `
+            -Condition ($agent.Found -and $paneSnapshot.Count -eq 1 -and
+                [int](Get-Field $ready 'verified' 0) -eq 1 -and
+                (Test-SessionIdentity -Left $session -Right $liveSession -Ready $ready) -and
+                (Test-SamePath -A ([string](Get-Field $fact 'WorktreePath')) -B ([string](Get-Field $agent.Agent 'cwd'))) -and
+                [string](Get-Field $paneSnapshot[0] 'terminal_id') -ceq [string](Get-Field $fact 'TerminalID')) `
+            -TaskId ([string](Get-Field $fact 'ID')) -Evidence ("pane=$pane session=$liveSession terminal=$([string](Get-Field $paneSnapshot[0] 'terminal_id'))")
+    }
     $beforeInboxIds = @($before.Inbox | ForEach-Object { [string](Get-Field $_ 'id') })
     $afterInboxIds = @($after.Inbox | ForEach-Object { [string](Get-Field $_ 'id') })
     $missingInboxIds = @($beforeInboxIds | Where-Object { $_ -notin $afterInboxIds })
@@ -4336,9 +5474,13 @@ function Invoke-Restart {
         $idA = if ($script:TaskA) { [string](Get-Field $script:TaskA 'ID') } else { '' }
         if ($idA) {
             $beforeReview = Get-Field (Get-TaskById -Id $idA) 'fact'
-            $recordedDisposition = [string](Get-Field $beforeReview 'Disposition')
-            Assert-NonEmpty -Id 'T8.precondition' -What 'task A already has a recorded disposition before restore probe' -Value $recordedDisposition -TaskId $idA
-            $restoredDisposition = 'ACCEPT-TOOLS-RESTORED-' + $script:RunId
+            if (-not (Test-TaskIsReviewedDone -Fact $beforeReview)) {
+                Block-Item -Id 'T8.precondition' -What 'restore review probe requires a final report with a recorded disposition' `
+                    -TaskId $idA -Evidence 'no review tool prompt or confirmation was sent'
+            } else {
+                $recordedDisposition = [string](Get-Field $beforeReview 'Disposition')
+                Assert-NonEmpty -Id 'T8.precondition' -What 'task A already has a recorded disposition before restore probe' -Value $recordedDisposition -TaskId $idA
+                $restoredDisposition = 'ACCEPT-TOOLS-RESTORED-' + $script:RunId
             $probe = 'ACCEPT-TOOLS-RESTORED. The user already decided task "' + $idA + '". To prove your primary tools survived restore, call orch_review with taskId "' + $idA + '" and disposition "' + $restoredDisposition + '". Show the stored report and confirmation; the backend must refuse to rewrite the first decision. If the tool is unavailable, reply exactly NOTOOLHERE.'
             $result = Invoke-PrimaryPromptNoWaitAfterDispositionAsks -PaneId $script:RestoredPrimaryPane -Text $probe -TimeoutSeconds 300 -AssertionPrefix 'T8'
             Assert-True -Id 'T8.1' -What 'the restored primary session accepts a prompt' -Condition ($result.Submitted -and ($result.ExitCode -eq 0 -or $result.Blocked)) -Command $result.CommandLine -Evidence ("code=[$($result.Code)] blocked=[$($result.Blocked)] stderr=[" + (Protect-Text $result.Stderr 300) + "] screen=[" + (Protect-Text $result.Screen 500) + "]")
@@ -4364,6 +5506,7 @@ function Invoke-Restart {
                 -Condition ($toolRan.Ok -and [string](Get-Field $afterReview 'Disposition') -ceq $recordedDisposition -and
                     [long](Get-Field $afterReview 'Revision' 0) -eq [long](Get-Field $beforeReview 'Revision' 0)) -TaskId $idA `
                 -Evidence (Protect-Text (Get-PaneScreen -PaneId $script:RestoredPrimaryPane -Source 'recent-unwrapped' -Lines 80) 600)
+            }
         }
     } else {
         Block-Item -Id 'T8.1' -What 'the restored session role tools' -Evidence 'no restored primary pane was identified after the restart'
@@ -4430,6 +5573,7 @@ function Get-RunLaunchPanes {
 
 function Invoke-Cleanup {
     Write-Step 'Phase 20: cleanup, isolation proof and restoration'
+    if ($script:RunManifest) { Save-AcceptanceRunManifest -Phase 'cleanup-started' -Status 'cleanup' }
 
     # 0. Capture the session files this run materialized BEFORE any state row is
     # deleted, so the preservation check below can still name them afterwards.
@@ -4585,9 +5729,15 @@ function Invoke-Cleanup {
         -Condition (-not (Test-ProjectionMentions -Projection $defaultProjection -Path $script:WorkRoot)) `
         -Evidence (Protect-Text $defaultProjection 500)
     $defaultSocket = [string](Get-Field $script:DefaultSessionRecord 'Socket')
-    Assert-True -Id 'Z6.1c' -What 'this run used its own server, not the default session socket' `
-        -Condition ($script:SessionSocket -and $defaultSocket -and ((ConvertTo-NormalPath $script:SessionSocket) -ine (ConvertTo-NormalPath $defaultSocket))) `
-        -Evidence "run=$(Protect-Text $script:SessionSocket 200) default=$(Protect-Text $defaultSocket 200)"
+    $socketIsolation = Test-SessionSocketSeparation -ServerStarted $script:ServerStartedByScript `
+        -RunSocket $script:SessionSocket -DefaultSocket $defaultSocket
+    if ($null -eq $socketIsolation) {
+        Add-Assertion -Id 'Z6.1c' -What 'isolated-server socket check was not applicable because this run never started its server' -Status 'INFO' `
+            -Evidence 'preflight or setup stopped before the run socket was captured'
+    } else {
+        Assert-True -Id 'Z6.1c' -What 'this run used its own server, not the default session socket' `
+            -Condition $socketIsolation -Evidence "run=$(Protect-Text $script:SessionSocket 200) default=$(Protect-Text $defaultSocket 200)"
+    }
 
     $pluginList = Get-HerdrJson -Arguments @('plugin', 'list', '--json', '--plugin', $script:PluginId) -NoSessionScope
     $plugin = @((Get-JsonField $pluginList 'plugins' @()) | Where-Object { (Get-Field $_ 'plugin_id') -eq $script:PluginId })
@@ -4617,16 +5767,28 @@ function Invoke-Cleanup {
     }
 
     if (-not $KeepResources) {
+        $removeError = ''
         if (Test-Path -LiteralPath $script:WorkRoot) {
-            Get-ChildItem -LiteralPath $script:WorkRoot -Force | Where-Object { $_.Name -notin @('report.json', 'report.txt') } | ForEach-Object {
-                Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+            try { Remove-Item -LiteralPath $script:WorkRoot -Recurse -Force -ErrorAction Stop } catch {
+                $removeError = $_.Exception.Message
+                Add-Assertion -Id 'Z7.ERR' -What 'working temp root removal' -Status 'FAIL' -Evidence (Protect-Text $removeError 500)
             }
         }
-        $left = @(Get-ChildItem -LiteralPath $script:WorkRoot -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -notin @('report.json', 'report.txt') })
-        Assert-Equal -Id 'Z7.1' -What 'the temporary run root holds nothing but the report' -Expected 0 -Actual $left.Count -Evidence (Protect-Text (Get-Json @($left | ForEach-Object { $_.Name })) 300)
+        Assert-True -Id 'Z7.1' -What 'the temporary working root is gone after cleanup' `
+            -Condition (-not (Test-Path -LiteralPath $script:WorkRoot)) -Evidence (Protect-Text $removeError 300)
     } else {
         Add-Assertion -Id 'Z7.1' -What 'resources were intentionally kept (-KeepResources)' -Status 'INFO' -Evidence $script:WorkRoot
     }
+    $stateHelperGone = $true
+    $stateHelperError = ''
+    if (Test-Path -LiteralPath $script:StateHelper) {
+        try { Remove-Item -LiteralPath $script:StateHelper -Force -ErrorAction Stop } catch {
+            $stateHelperGone = $false
+            $stateHelperError = $_.Exception.Message
+        }
+    }
+    Assert-True -Id 'Z7.2' -What 'the temporary SQLite helper is removed from the report archive' `
+        -Condition ($stateHelperGone -and -not (Test-Path -LiteralPath $script:StateHelper)) -Evidence (Protect-Text $stateHelperError 300)
 }
 
 function Write-Report {
@@ -4635,13 +5797,17 @@ function Write-Report {
         session      = $script:SessionName
         startedAt    = $script:StartedAt
         finishedAt   = (Get-Date).ToUniversalTime().ToString('o')
-        passed       = $script:Passed
-        failed       = $script:Failures
-        blocked      = $script:Blocked
-        exitCode     = 0
-        projectKey   = if ($script:Project) { [string](Get-Field $script:Project 'Key') } elseif (Test-Path -LiteralPath $script:ReportJson) { [string]$script:RepoPath } else { '' }
-        serverVersion = $script:SessionServerVersion
-        assertions   = @($script:Assertions)
+        passed                  = $script:Passed
+        failed                  = $script:Failures
+        blocked                 = $script:Blocked
+        exitCode                = 0
+        projectKey              = if ($script:Project) { [string](Get-Field $script:Project 'Key') } elseif ($script:RunManifest) { [string]$script:RepoPath } else { '' }
+        workRoot                = $script:WorkRoot
+        manifestPath            = $script:RunManifestPath
+        serverVersion           = $script:SessionServerVersion
+        keepResourcesRequested  = $script:KeepResourcesRequested
+        resourcesPreserved      = [bool]$KeepResources
+        assertions              = @($script:Assertions)
     }
     $code = if ($script:Failures -gt 0) { 1 } elseif ($script:Blocked -gt 0) { 2 } else { 0 }
     $summary.exitCode = $code
@@ -4676,6 +5842,11 @@ function Step-Phase {
     try {
         & $Body
     } catch {
+        if (Test-IsBlockedPrimaryDispositionPrerequisite -PhaseId $Id -Message $_.Exception.Message) {
+            $script:BlockedRunAbort = $true
+            Preserve-ResourcesForPendingTool -AssertionId 'K0.resources-preserved' -Reason (Protect-Text $_.Exception.Message 600)
+            throw
+        }
         Add-Assertion -Id "$Id.ERR" -What "$Name raised an error" -Status 'FAIL' -Evidence (Protect-Text ($_.Exception.Message + ' ' + $_.ScriptStackTrace) 800)
         if ($Critical) {
             if ($Id -eq 'K0') {
@@ -4688,12 +5859,23 @@ function Step-Phase {
 
 $script:StartedAt = (Get-Date).ToUniversalTime().ToString('o')
 $script:Aborted = $false
-New-Item -ItemType Directory -Path $script:WorkRoot -Force | Out-Null
-$script:TempRootCreated = $true
+$script:BlockedRunAbort = $false
+$script:KeepResources = [bool]$KeepResources
+$script:RunLockStateDb = Get-AcceptanceStateDbPath
+$script:StateDb = $script:RunLockStateDb
+$script:RunLockPath = Get-AcceptanceRunLockPath -StateDb $script:RunLockStateDb
+$script:RunManifest = New-AcceptanceRunManifest
+$script:RunLockStream = Initialize-AcceptanceRun -LockPath $script:RunLockPath `
+    -RecordDir $script:RunRecordDir -Manifest $script:RunManifest
+if (-not $script:RunLockStream) {
+    Write-Host 'Another acceptance run for this Herdr state store is active; no new working temp root was created.' -ForegroundColor Yellow
+    exit 3
+}
+Save-AcceptanceRunManifest -Phase 'preflight' -Status 'active'
 Set-Content -LiteralPath $script:ReportText -Value "acceptance run $($script:RunId) starting at $($script:StartedAt)" -Encoding UTF8
 Write-Host "herdr OMP orchestrator acceptance run $($script:RunId)" -ForegroundColor White
 Write-Host "plugin root : $($script:RepoRoot)"
-Write-Host "run root    : $($script:WorkRoot)"
+Write-Host "run root    : $($script:WorkRoot) (created only after preflight)"
 Write-Host "session     : $($script:SessionName)"
 
 try {
@@ -4721,14 +5903,47 @@ try {
     Step-Phase -Id 'T0' -Name 'restart' -Body { Invoke-Restart }
 } catch {
     $script:Aborted = $true
-    Add-Assertion -Id 'RUN.ABORT' -What 'the run stopped at a prerequisite failure' -Status 'FAIL' -Evidence (Protect-Text $_.Exception.Message 800)
+    if (-not $script:BlockedRunAbort) {
+        Add-Assertion -Id 'RUN.ABORT' -What 'the run stopped at a prerequisite failure' -Status 'FAIL' -Evidence (Protect-Text $_.Exception.Message 800)
+    }
 } finally {
+    if ($script:PendingUserInteraction -and -not $KeepResources) {
+        Preserve-ResourcesForPendingTool -AssertionId 'RUN.pending-interaction-preserved' -Reason 'the final journal still records an unresolved user interaction'
+    }
     try { Invoke-Cleanup } catch {
         Add-Assertion -Id 'Z0.ERR' -What 'cleanup raised an error' -Status 'FAIL' -Evidence (Protect-Text ($_.Exception.Message + ' ' + $_.ScriptStackTrace) 800)
     }
 }
 
-$exit = Write-Report
+$exit = 1
+try {
+    $cleanupFailure = @($script:Assertions | Where-Object {
+        $_.status -in @('FAIL', 'BLOCKED') -and $_.id -match '^Z([0-5]|7)(\.|$)'
+    }).Count -gt 0
+    $workRootGone = -not (Test-Path -LiteralPath $script:WorkRoot)
+    $sessionGone = $true
+    if ($script:ServerStartedByScript) {
+        try {
+            $sessionGone = @((Get-Sessions) | Where-Object { (Get-Field $_ 'name') -eq $script:SessionName }).Count -eq 0
+        } catch { $sessionGone = $false }
+    }
+    $runStatus = if ($KeepResources) { 'preserved' } elseif ($workRootGone -and $sessionGone -and -not $cleanupFailure) { 'complete' } else { 'incomplete' }
+    Save-AcceptanceRunManifest -Phase 'finished' -Status $runStatus
+    try {
+        Prune-RunReportArchive -Root $script:RunArchiveRoot -KeepCount 20 -RetentionDays 30
+    } catch {
+        Add-Assertion -Id 'Z8.ERR' -What 'report archive retention cleanup' -Status 'FAIL' -Evidence (Protect-Text $_.Exception.Message 500)
+        $runStatus = 'incomplete'
+        Save-AcceptanceRunManifest -Phase 'finished' -Status $runStatus
+    }
+    $exit = Write-Report
+    Save-AcceptanceRunManifest -Phase 'finished' -Status $runStatus
+} finally {
+    if ($script:RunLockStream) {
+        Exit-AcceptanceRunLock -Lock $script:RunLockStream
+        $script:RunLockStream = $null
+    }
+}
 Write-Host ''
 Write-Host "passed=$($script:Passed) failed=$($script:Failures) blocked=$($script:Blocked)"
 Write-Host "report: $($script:ReportJson)"
@@ -4739,7 +5954,7 @@ if ($script:Blocked -gt 0) {
 if ($script:Failures -gt 0) {
     Write-Host "FAILED items:" -ForegroundColor Red
     foreach ($record in @($script:Assertions | Where-Object { $_.status -eq 'FAIL' })) {
-        Write-Host ("  - {0} {1}" -f $record.id, $record.what) -ForegroundColor Red
+        Write-Host ("  - {0} {1}: {2}" -f $record.id, $record.what, $record.evidence) -ForegroundColor Red
     }
 }
 exit $exit
