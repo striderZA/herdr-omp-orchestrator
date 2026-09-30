@@ -36,6 +36,27 @@
       13. Everything the run created is removed by exact identity, and nothing
           else in the machine was touched.
 
+    SCENARIOS
+      Full (default) runs the complete workflow above.
+      SingleWorker reuses the same isolated setup and teardown, then exercises
+      one real task from primary dispatch through worker result report, board
+      projection, and explicit user disposition. Its behavior phases have a
+      separate wall-clock budget; setup and safety cleanup remain bounded by
+      their own operation timeouts.
+
+    PRE-RUN CLEANUP
+      Before starting the new scenario, the script retires earlier acceptance
+      runs only when their manifest, project key, exact temp root, session
+      identity, dead owner and server process identity are verified.
+      After stopping/deleting that exact Herdr session, it kills the recorded
+      server PID only if its start time still matches. Version 2 journals also
+      require the executable path; legacy journals require an exact PID/start
+      match and a Herdr process name. Missing launch records are accepted only
+      when a version 2 journal proves the server was never started.
+      Preserved and pending-interaction runs are included; live or unverifiable
+      owners, mismatched paths, shared state, or unexpected workspaces fail closed.
+      The user's default session and OMP session-history files are never deleted.
+
     ISOLATION AND SAFETY
       * The whole scenario runs inside a DEDICATED named Herdr session
         (`--session orch-acc-<hex>`) whose server this script starts and owns
@@ -68,6 +89,8 @@
     USAGE
       powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\acceptance_windows.ps1
       powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\acceptance_windows.ps1 -TimeoutScale 2
+      powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\acceptance_windows.ps1 -Scenario SingleWorker
+      powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\acceptance_windows.ps1 -Scenario SingleWorker -ScenarioTimeoutSeconds 600
       powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\acceptance_windows.ps1 -KeepResources
       powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\acceptance_windows.ps1 -RetireStaleAcceptanceRunId 1ad8af22
 #>
@@ -76,10 +99,16 @@ param(
     # Multiplies every bounded wait. Raise it on a slow machine or when the
     # configured OMP model is under load.
     [double]$TimeoutScale = 1.0,
-    # Leave everything this run created in place for inspection: the isolated
-    # session and its server, its workspaces and panes, the temporary repository
-    # and checkouts, and the rows in the plugin's state store. The script then
-    # reports what is still there instead of pretending it was removed.
+    # The focused path exercises one task from dispatch through report and review.
+    [ValidateSet('Full', 'SingleWorker')]
+    [string]$Scenario = 'Full',
+    # Wall-clock budget for the SingleWorker behavior phases (setup and cleanup
+    # remain separately bounded). The run still cleans up after budget exhaustion.
+    [ValidateRange(120, 3600)]
+    [int]$ScenarioTimeoutSeconds = 600,
+    # Leave this run's isolated resources in place for inspection after it exits.
+    # The next run automatically retires them after verifying this run's owner
+    # process has exited and its manifest still identifies only acceptance resources.
     [switch]$KeepResources,
     # Do everything else, but keep the plugin's state rows (the store keeps the
     # task facts that explain what the run observed).
@@ -171,6 +200,93 @@ function Test-RunOwnerAlive {
         return $false
     }
 }
+function Get-AcceptanceProcessDisposition {
+    param([Parameter(Mandatory)][int]$ProcessId, [Parameter(Mandatory)][string]$StartedAt)
+    $expected = [DateTime]::MinValue
+    if ($ProcessId -le 0 -or -not [DateTime]::TryParse($StartedAt, [ref]$expected)) { return 'unverified' }
+    $process = $null
+    try {
+        $process = Get-Process -Id $ProcessId -ErrorAction Stop
+    } catch {
+        if ($_.CategoryInfo.Category -eq 'ObjectNotFound') { return 'dead' }
+        return 'unverified'
+    }
+    try {
+        $actual = $process.StartTime.ToUniversalTime()
+        if ([math]::Abs(($actual - $expected.ToUniversalTime()).TotalSeconds) -lt 2) { return 'active' }
+        return 'dead' # The PID was reused after the recorded process exited.
+    } catch {
+        return 'unverified'
+    } finally {
+        if ($process) { $process.Dispose() }
+    }
+}
+
+function Stop-VerifiedAcceptanceServerProcess {
+    param(
+        [Parameter(Mandatory)][string]$RunId,
+        [Parameter(Mandatory)]$Manifest,
+        [Parameter(Mandatory)][ValidateSet('stopped', 'absent')][string]$SessionDisposition
+    )
+    if ($RunId -notmatch '^[0-9a-f]{8}$') { throw "invalid acceptance server identity: $RunId" }
+    if ((Get-Field $Manifest 'runId') -cne $RunId -or
+        (Get-Field $Manifest 'session') -cne "orch-acc-$RunId") {
+        throw "refusing to stop a server whose manifest identity does not match $RunId"
+    }
+    $processId = 0
+    if (-not [int]::TryParse([string](Get-Field $Manifest 'serverPid'), [ref]$processId) -or $processId -le 0) {
+        $schemaVersion = 0
+        [void][int]::TryParse([string](Get-Field $Manifest 'schemaVersion'), [ref]$schemaVersion)
+        $attemptedProperty = $Manifest.PSObject.Properties['serverStartAttempted']
+        $neverStarted = ($schemaVersion -ge 2 -and $null -ne $attemptedProperty -and
+            $attemptedProperty.Value -is [bool] -and -not $attemptedProperty.Value -and
+            [string](Get-Field $Manifest 'phase') -in @('initializing', 'preflight', 'temp-root-creating', 'temp-root-created') -and
+            [string]::IsNullOrWhiteSpace([string](Get-Field $Manifest 'serverStartedAt')) -and
+            [string]::IsNullOrWhiteSpace([string](Get-Field $Manifest 'sessionDir')))
+        if ($SessionDisposition -eq 'absent' -and $neverStarted) { return 'not-recorded' }
+        throw "refusing to clean ${RunId}: server process identity was never recorded after launch"
+    }
+    $startedAt = [string](Get-Field $Manifest 'serverStartedAt')
+    $disposition = Get-AcceptanceProcessDisposition -ProcessId $processId -StartedAt $startedAt
+    if ($disposition -eq 'unverified') { throw "refusing to clean ${RunId}: server PID/start-time identity is unverifiable" }
+    if ($disposition -eq 'dead') { return 'already-exited' }
+    if ($processId -eq $PID) { throw "refusing to clean ${RunId}: server PID identifies the current cleanup process" }
+
+    $process = $null
+    try {
+        $process = Get-Process -Id $processId -ErrorAction Stop
+        $actual = $process.StartTime.ToUniversalTime()
+        $expected = [DateTime]::Parse($startedAt).ToUniversalTime()
+        if ([math]::Abs(($actual - $expected).TotalSeconds) -ge 2) { return 'already-exited' }
+        $schemaVersion = 0
+        [void][int]::TryParse([string](Get-Field $Manifest 'schemaVersion'), [ref]$schemaVersion)
+        if ($schemaVersion -ge 2) {
+            $expectedExecutable = [string](Get-Field $Manifest 'serverExecutable')
+            if ([string]::IsNullOrWhiteSpace($expectedExecutable)) {
+                throw "refusing to clean ${RunId}: server executable identity is missing"
+            }
+            try { $actualExecutable = [string]$process.MainModule.FileName } catch {
+                throw "refusing to clean ${RunId}: server executable path cannot be verified"
+            }
+            if (-not (Test-SamePath -A $actualExecutable -B $expectedExecutable)) {
+                throw "refusing to clean ${RunId}: server PID belongs to a different executable"
+            }
+        } elseif ([string]$process.ProcessName -ine 'herdr') {
+            throw "refusing to clean ${RunId}: legacy server PID does not identify a Herdr process"
+        }
+        if (-not $process.HasExited) { $process.Kill() }
+        if (-not $process.WaitForExit(15000)) { throw "verified stale server process $processId did not exit after Kill" }
+    } catch {
+        $after = Get-AcceptanceProcessDisposition -ProcessId $processId -StartedAt $startedAt
+        if ($after -eq 'dead') { return 'already-exited' }
+        throw
+    } finally {
+        if ($process) { $process.Dispose() }
+    }
+    $after = Get-AcceptanceProcessDisposition -ProcessId $processId -StartedAt $startedAt
+    if ($after -ne 'dead') { throw "verified stale server process $processId remains after Kill" }
+    return 'killed'
+}
 
 function Enter-AcceptanceRunLock {
     param([Parameter(Mandatory)][string]$Path)
@@ -236,7 +352,7 @@ function Initialize-AcceptanceRun {
 
 function New-AcceptanceRunManifest {
     return [ordered]@{
-        schemaVersion = 1
+        schemaVersion = 2
         runId = $script:RunId
         session = $script:SessionName
         projectKey = $script:RepoPath
@@ -249,6 +365,8 @@ function New-AcceptanceRunManifest {
         ownerStartedAt = $script:OwnerProcessStartedAt
         serverPid = 0
         serverStartedAt = ''
+        serverExecutable = [string]$script:HerdrExe
+        serverStartAttempted = [bool]$script:ServerStartAttempted
         sessionDir = ''
         phase = 'initializing'
         status = 'active'
@@ -278,6 +396,8 @@ function Save-AcceptanceRunManifest {
     $script:RunManifest.stateDb = $script:RunLockStateDb
     $script:RunManifest.ownerPid = $PID
     $script:RunManifest.ownerStartedAt = $script:OwnerProcessStartedAt
+    $script:RunManifest.serverExecutable = [string]$script:HerdrExe
+    $script:RunManifest.serverStartAttempted = [bool]$script:ServerStartAttempted
     if ($script:ServerProcess) {
         $script:RunManifest.serverPid = $script:ServerProcess.Id
         try { $script:RunManifest.serverStartedAt = $script:ServerProcess.StartTime.ToUniversalTime().ToString('o') } catch { }
@@ -376,7 +496,8 @@ $script:LifecyclePhase = 'initializing'
 $script:PendingUserInteraction = $false
 $script:OwnerProcessStartedAt = (Get-Process -Id $PID).StartTime.ToUniversalTime().ToString('o')
 $script:SessionDir = $null
-$script:ServerStartedByScript = $false
+    $script:ServerStartedByScript = $false
+    $script:ServerStartAttempted = $false
 $script:HerdrExe = $null
 $script:TempRootCreated = $false
 $script:CreatedWorkspaces = New-Object System.Collections.ArrayList
@@ -421,6 +542,7 @@ $script:MovedCleanupRefused = $null
 $script:ExtensionFileHashAfter = ''
 $script:BriefA = ''
 $script:BriefB = ''
+$script:ScenarioDeadline = $null
 
 function ConvertTo-ScaledSeconds {
     param([double]$Seconds)
@@ -501,6 +623,7 @@ function Invoke-Native {
         [string]$StandardInputText = $null,
         [switch]$AllowNonZero
     )
+    $TimeoutSeconds = Get-ScenarioBoundedTimeoutSeconds -Requested $TimeoutSeconds
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $File
     $commandLine = (ConvertTo-ArgumentLiteral $File)
@@ -860,6 +983,22 @@ function Write-Step {
         Add-Content -LiteralPath $script:ReportText -Value ("--- step: {0} {1}" -f (Get-Date).ToUniversalTime().ToString('o'), $Text) -ErrorAction SilentlyContinue
     } catch { }
 }
+function Get-ScenarioBoundedTimeoutSeconds {
+    param([Parameter(Mandatory)][double]$Requested)
+    if (-not $script:ScenarioDeadline) { return $Requested }
+    $remaining = ($script:ScenarioDeadline - (Get-Date)).TotalSeconds
+    if ($remaining -le 0) {
+        throw 'acceptance scenario behavior budget expired'
+    }
+    return [math]::Max(0.25, [math]::Min($Requested, $remaining))
+}
+function Get-AcceptanceScenarioPhases {
+    param([ValidateSet('Full', 'SingleWorker')][string]$Scenario)
+    if ($Scenario -eq 'SingleWorker') {
+        return @('SW0', 'SW1', 'A0', 'V0')
+    }
+    return @('N7', 'D0', 'PR0', 'Q0', 'K0', 'M0', 'W0', 'A0', 'V0', 'C0', 'G0', 'T0')
+}
 
 function Wait-Until {
     <#
@@ -873,9 +1012,13 @@ function Wait-Until {
         [double]$IntervalSeconds = 3,
         [string]$What = 'condition'
     )
+    $timeout = Get-ScenarioBoundedTimeoutSeconds -Requested $TimeoutSeconds
     $start = Get-Date
     $last = $null
-    while (((Get-Date) - $start).TotalSeconds -lt $TimeoutSeconds) {
+    while (((Get-Date) - $start).TotalSeconds -lt $timeout) {
+        if ($script:ScenarioDeadline -and (Get-Date) -ge $script:ScenarioDeadline) {
+            throw 'acceptance scenario behavior budget expired'
+        }
         try { $last = & $Probe } catch { $last = $null }
         if ($last) {
             return [pscustomobject]@{ Ok = $true; Value = $last; Elapsed = ((Get-Date) - $start).TotalSeconds }
@@ -1165,21 +1308,33 @@ function Read-AcceptanceRunIdentity {
 function Get-AcceptanceRecoveryDisposition {
     param([Parameter(Mandatory)]$Manifest, [Parameter(Mandatory)][string]$SessionDisposition)
     if ($SessionDisposition -notin @('running', 'stopped', 'absent')) { return 'confirm' }
-    $status = [string](Get-Field $Manifest 'status')
     $ownerPid = 0
-    $ownerIdentityValid = ([int]::TryParse([string](Get-Field $Manifest 'ownerPid'), [ref]$ownerPid) -and
-        $ownerPid -gt 0 -and -not [string]::IsNullOrWhiteSpace([string](Get-Field $Manifest 'ownerStartedAt')))
-    if ($ownerIdentityValid -and
-        (Test-RunOwnerAlive -OwnerPid $ownerPid -OwnerStartedAt ([string](Get-Field $Manifest 'ownerStartedAt')))) {
-        return 'active'
+    $ownerStartedAt = [DateTime]::MinValue
+    if (-not [int]::TryParse([string](Get-Field $Manifest 'ownerPid'), [ref]$ownerPid) -or
+        $ownerPid -le 0 -or
+        -not [DateTime]::TryParse([string](Get-Field $Manifest 'ownerStartedAt'), [ref]$ownerStartedAt)) {
+        return 'unverified'
     }
-    if ($status -ceq 'cleanup' -and $ownerIdentityValid -and
-        (Test-JsonBool -Object $Manifest -Name 'retirementAuthorized') -eq $true) { return 'recover' }
-    if ((Test-JsonBool -Object $Manifest -Name 'pendingUserInteraction') -ne $false -or
-        (Test-JsonBool -Object $Manifest -Name 'resourcesPreserved') -ne $false -or
-        (Test-JsonBool -Object $Manifest -Name 'keepResourcesRequested') -ne $false) { return 'confirm' }
+    try {
+        $ownerProcess = Get-Process -Id $ownerPid -ErrorAction Stop
+    } catch {
+        if ($_.CategoryInfo.Category -ne 'ObjectNotFound') { return 'unverified' }
+        $ownerProcess = $null
+    }
+    if ($ownerProcess) {
+        try {
+            $actualStartedAt = $ownerProcess.StartTime.ToUniversalTime()
+        } catch {
+            return 'unverified'
+        }
+        if ([math]::Abs(($actualStartedAt - $ownerStartedAt.ToUniversalTime()).TotalSeconds) -lt 2) {
+            return 'active'
+        }
+        # The PID was reused. The process recorded by the manifest has exited.
+    }
+    $status = [string](Get-Field $Manifest 'status')
+    if ($status -notin @('active', 'cleanup', 'incomplete', 'preserved', 'complete')) { return 'confirm' }
     if ($SessionDisposition -ne 'running' -and $status -eq 'complete') { return 'not-running' }
-    if ($status -notin @('active', 'cleanup', 'incomplete') -or -not $ownerIdentityValid) { return 'confirm' }
     return 'recover'
 }
 
@@ -1205,7 +1360,7 @@ function Start-AcceptanceRunCleanup {
     }
     $now = [DateTime]::UtcNow.ToString('o')
     $manifest = [ordered]@{
-        schemaVersion = 1
+        schemaVersion = [int](Get-Field $Identity 'schemaVersion' 1)
         runId = $RunId
         session = "orch-acc-$RunId"
         projectKey = $ProjectKey
@@ -1220,6 +1375,8 @@ function Start-AcceptanceRunCleanup {
         ownerStartedAt = $script:OwnerProcessStartedAt
         serverPid = [int](Get-Field $Identity 'serverPid' 0)
         serverStartedAt = [string](Get-Field $Identity 'serverStartedAt')
+        serverExecutable = [string](Get-Field $Identity 'serverExecutable')
+        serverStartAttempted = Test-JsonBool -Object $Identity -Name 'serverStartAttempted'
         sessionDir = [string](Get-Field $Identity 'sessionDir')
         phase = 'stale-cleanup'
         status = 'cleanup'
@@ -1434,7 +1591,9 @@ function Recover-ManifestOnlyAcceptanceRun {
     }
     $disposition = Get-StaleAcceptanceSessionDisposition -RunId $RunId -Sessions $Sessions -SessionsRoot $SessionsRoot
     $recoveryMode = Get-AcceptanceRecoveryDisposition -Manifest $manifest -SessionDisposition $disposition
-    if ($recoveryMode -eq 'active') { throw "refusing manifest-only recovery for ${RunId}: its owner process is still alive" }
+    if ($recoveryMode -in @('active', 'unverified')) {
+        throw "refusing manifest-only recovery for ${RunId}: its owner process is live or cannot be verified"
+    }
     $explicit = $script:RetireStaleAcceptanceRunId -ceq $RunId
     if ($recoveryMode -eq 'confirm' -and -not $explicit) {
         throw "refusing to retire preserved manifest-only acceptance run $RunId; pass -RetireStaleAcceptanceRunId $RunId after resolving its user interaction"
@@ -1481,9 +1640,14 @@ function Recover-ManifestOnlyAcceptanceRun {
         $delete = Invoke-Herdr -Arguments @('session', 'delete', "orch-acc-$RunId") -NoSessionScope -TimeoutSeconds 60
         if ($delete.ExitCode -ne 0 -or
             (Get-StaleAcceptanceSessionDisposition -RunId $RunId -Sessions @(Get-Sessions) -SessionsRoot $SessionsRoot) -ne 'absent') {
-            throw "failed to delete verified manifest-only session orch-acc-$RunId"
+            throw "failed to retire stopped manifest-only session orch-acc-$RunId"
         }
     }
+    $serverProcessResult = Stop-VerifiedAcceptanceServerProcess -RunId $RunId `
+        -Manifest $manifest -SessionDisposition 'absent'
+    $serverProcessStatus = if ($serverProcessResult -eq 'not-recorded') { 'INFO' } else { 'PASS' }
+    Add-Assertion -Id "P1.12f-$RunId" -What 'the manifest-recorded Herdr server process is absent or terminated' `
+        -Status $serverProcessStatus -Evidence $serverProcessResult
     Remove-StaleAcceptanceRunRoot -RunId $RunId -ProjectKey $projectKey -TempRoot $TempRoot
     Complete-AcceptanceRunCleanup -RunId $RunId
     Add-Assertion -Id "P1.12e-$RunId" -What 'manifest-only interrupted run was safely retired by its recorded identity' -Status 'INFO' `
@@ -1529,17 +1693,15 @@ function Clear-StaleAcceptanceState {
         $keepLabel = if ($null -eq $priorKeepRequested) { 'unknown/not recorded' } else { [string]$priorKeepRequested }
         $preservedLabel = if ($null -eq $priorResourcesPreserved) { 'unknown/not recorded' } else { [string]$priorResourcesPreserved }
         if ($script:RetireStaleAcceptanceRunId -ceq $item.RunId) { $retirementTargetFound = $true }
-        $requiresConsent = ($priorKeepRequested -ne $false -or $priorResourcesPreserved -ne $false -or
-            $recoveryMode -in @('confirm', 'active'))
-        if ($requiresConsent) {
-            Write-Host ("Verified stale acceptance run {0}: session={1} recovery={2} keepResources={3} resourcesPreserved={4}" -f `
-                $sessionName, $disposition, $recoveryMode, $keepLabel, $preservedLabel) -ForegroundColor Yellow
+        if ($recoveryMode -eq 'confirm') {
+            Write-Host ("Verified stale acceptance run {0}: session={1} recovery={2}" -f `
+                $sessionName, $disposition, $recoveryMode) -ForegroundColor Yellow
             if ($script:RetireStaleAcceptanceRunId -cne $item.RunId) {
                 throw "refusing to retire $sessionName; pass -RetireStaleAcceptanceRunId $($item.RunId) to authorize only this verified run"
             }
         }
-        if ($recoveryMode -eq 'active' -and $script:RetireStaleAcceptanceRunId -cne $item.RunId) {
-            throw "refusing stale cleanup for ${sessionName}: its recorded owner process is still alive"
+        if ($recoveryMode -in @('active', 'unverified')) {
+            throw "refusing stale cleanup for ${sessionName}: its owner process is live or cannot be verified"
         }
         $projectTasks = @($dump.tables.tasks | Where-Object { $_.project_key -eq $item.Key })
         $projectFact = Get-Field $item.Row 'fact'
@@ -1720,6 +1882,11 @@ function Clear-StaleAcceptanceState {
             }
             $sessions = @(Get-Sessions)
         }
+        $serverProcessResult = Stop-VerifiedAcceptanceServerProcess -RunId $item.RunId `
+            -Manifest $priorRecord -SessionDisposition 'absent'
+        $serverProcessStatus = if ($serverProcessResult -eq 'not-recorded') { 'INFO' } else { 'PASS' }
+        Add-Assertion -Id "P1.12f-$($item.RunId)" -What 'the manifest-recorded Herdr server process is absent or terminated' `
+            -Status $serverProcessStatus -Evidence $serverProcessResult
         Remove-StaleAcceptanceRunRoot -RunId $item.RunId -ProjectKey $item.Key
         $deleted = Invoke-State -Operation 'delete-scoped' -Arguments @($item.Key, $paneArgument)
         if (-not (Get-Flag $deleted 'ok') -or -not (Get-Flag $deleted 'others_identical')) {
@@ -2892,6 +3059,8 @@ function Start-RunServer {
         behind). The server's own lines therefore appear inline in this console;
         nothing in the run depends on capturing them.
     #>
+    $script:ServerStartAttempted = $true
+    Save-AcceptanceRunManifest -Phase 'server-starting' -Status 'active'
     $proc = New-Object System.Diagnostics.Process
     $proc.StartInfo = New-RunServerStartInfo
     [void]$proc.Start()
@@ -3508,6 +3677,60 @@ function Invoke-Dispatch {
         $common = Invoke-Git -Arguments @('rev-parse', '--git-common-dir') -Directory $path
         Assert-True -Id "D5.sameRepo/$id" -What "the checkout of $id belongs to the temp repository" `
             -Condition (Test-Below -Root (Join-Path $script:RepoPath '.git') -Path $common.Stdout.Trim()) -Evidence "common=$($common.Stdout.Trim())"
+    }
+}
+
+function Invoke-SingleWorkerDispatch {
+    Write-Step 'SingleWorker: dispatch one deterministic change through the real primary tools'
+    $brief = @"
+$($script:MarkerPrefix)SINGLE-WORKER. You are in your own Git worktree of a disposable test repository. Do exactly this:
+1. Edit a.js to also export ``function subtract(a, b) { return a - b; }``; keep the existing export.
+2. Run ``git add a.js``, ``git commit -m "ACCEPT single-worker change"``, and ``git rev-parse HEAD``.
+3. Immediately call orch_report with kind "result", summary "ACCEPT-SINGLE: a.js now exports subtract", branch from ``git branch --show-current``, evidence ["commit <full SHA from git rev-parse HEAD>"], checks ["git log -1 --format=%H"], and risk "ACCEPT-SINGLE-RISK: none".
+Do not ask a question, wait for another message, modify other files, merge, or clean up the checkout.
+"@
+    $prompt = @"
+$($script:MarkerPrefix)SINGLE-DISPATCH. Call orch_dispatch exactly once with title "ACCEPT SINGLE: helper in a.js", the following brief unchanged, checks ["git log -1 --format=%H"], dependencies [], reservedPaths ["a.js"], and baseRevision "$($script:BaseRevision)". Do no implementation work yourself. Reply with the new task id only.
+BRIEF: $brief
+"@
+    $result = Invoke-PrimaryPrompt -PaneId $script:PrimaryPane -Text $prompt -TimeoutSeconds 300
+    Assert-True -Id 'SW0.1' -What 'the real primary accepts the single-worker dispatch prompt' `
+        -Condition ($result.ExitCode -eq 0) -Command $result.CommandLine `
+        -Evidence ("code=[$($result.Code)] blocked=[$($result.Blocked)] stderr=[" + (Protect-Text $result.Stderr 300) + "]")
+    if ($result.ExitCode -ne 0) { throw 'single-worker dispatch prompt was not accepted' }
+
+    $wait = Wait-ForTasks -Count 1 -TimeoutSeconds 300
+    Assert-True -Id 'SW0.2' -What 'exactly one task was created for the bound project' `
+        -Condition ($wait.Ok -and @($wait.Value).Count -eq 1) `
+        -Evidence ("after {0:N0}s tasks={1}" -f $wait.Elapsed, @($wait.Value).Count)
+    if (-not $wait.Ok -or @($wait.Value).Count -ne 1) { throw 'the single-worker task was not created' }
+
+    $script:Tasks = @($wait.Value)
+    $script:TaskA = Get-Field $script:Tasks[0] 'fact'
+    $id = [string](Get-Field $script:TaskA 'ID')
+    Assert-Match -Id 'SW0.3' -What 'the worker task has a generated task id' -Pattern '^orch_[0-9a-f]{12}$' -Actual $id
+    Assert-Match -Id 'SW0.4' -What 'the task owns a generated worker branch' -Pattern '^orch/[0-9a-f]{12}$' `
+        -Actual ([string](Get-Field $script:TaskA 'Branch')) -TaskId $id
+    Assert-True -Id 'SW0.5' -What 'the task has its own recorded worktree and public pane' `
+        -Condition (([string](Get-Field $script:TaskA 'WorktreePath') -ne '') -and ([string](Get-Field $script:TaskA 'PublicPaneID') -ne '')) `
+        -TaskId $id -Evidence ("worktree=$(Get-Field $script:TaskA 'WorktreePath') pane=$(Get-Field $script:TaskA 'PublicPaneID')")
+    $live = Get-LiveAgent -Target ([string](Get-Field $script:TaskA 'PublicPaneID'))
+    $handshake = Get-ReadySession -LaunchPaneId ([string](Get-Field $script:TaskA 'LaunchPaneID'))
+    Assert-True -Id 'SW0.6' -What 'Herdr reports a live worker on its recorded pane' `
+        -Condition $live.Found -TaskId $id -Evidence (Protect-Text (Get-Json $live.Agent) 400)
+    if ($live.Found) {
+        Assert-Equal -Id 'SW0.7' -What 'the task pane runs an OMP agent named for this task' `
+            -Expected 'omp' -Actual ([string](Get-Field $live.Agent 'agent')) -TaskId $id -CaseInsensitive
+        Assert-Equal -Id 'SW0.8' -What 'the worker agent name matches the task id' `
+            -Expected $id -Actual ([string](Get-Field $live.Agent 'name')) -TaskId $id
+        Assert-SamePath -Id 'SW0.9' -What 'the worker runs inside its recorded worktree' `
+            -Expected ([string](Get-Field $script:TaskA 'WorktreePath')) -Actual ([string](Get-Field $live.Agent 'cwd')) -TaskId $id
+        $ref = Get-Field $live.Agent 'agent_session'
+        Assert-True -Id 'SW0.10' -What 'the task and Herdr identify the same OMP session through the confirmed handshake' `
+            -Condition ($null -ne $handshake -and [int](Get-Field $handshake 'verified') -eq 1 -and
+                (Test-SessionIdentity -Left ([string](Get-Field $script:TaskA 'OMPSessionID')) `
+                    -Right ([string](Get-Field $ref 'value')) -Ready $handshake)) `
+            -TaskId $id -Evidence ("task=$(Get-Field $script:TaskA 'OMPSessionID') herdr=$(Get-Field $ref 'value') handshake=$(Protect-Text (Get-Json $handshake) 300)")
     }
 }
 
@@ -4698,11 +4921,13 @@ function Wait-ForReport {
 }
 
 function Invoke-WorkerReports {
-    Write-Step 'Phase 14: two complete reports with evidence and checks'
+    $isSingle = $Scenario -eq 'SingleWorker'
+    Write-Step $(if ($isSingle) { 'SingleWorker: wait for one final result report' } else { 'Phase 14: two complete reports with evidence and checks' })
     foreach ($pair in @(@{ Name = 'A'; Fact = $script:TaskA }, @{ Name = 'B'; Fact = $script:TaskB })) {
         $fact = $pair.Fact
+        if (-not $fact) { continue }
         $id = [string](Get-Field $fact 'ID')
-        if ($pair.Name -eq 'A') {
+        if (-not $isSingle -and $pair.Name -eq 'A') {
             $primaryReady = Get-ReadySession -LaunchPaneId ([string](Get-Field $script:Project 'LaunchPaneID'))
             $primaryTranscript = [string](Get-Field $primaryReady 'omp_session_file')
             if (-not (Test-OmpTranscriptContainsLaterUserAuthorization -Path $primaryTranscript -TaskId $id `
@@ -4717,7 +4942,8 @@ function Invoke-WorkerReports {
         if ($liveBeforeReport.Found -and [string](Get-Field $liveBeforeReport.Agent 'agent_status') -ieq 'blocked') {
             Set-PendingUserInteraction -Pending $true -Phase "worker-$($pair.Name)-awaiting-user"
         }
-        $wait = Wait-ForReport -TaskId $id -TimeoutSeconds 600
+        $reportTimeout = if ($isSingle) { 300 } else { 600 }
+        $wait = Wait-ForReport -TaskId $id -TimeoutSeconds $reportTimeout
         Assert-True -Id "W1.$($pair.Name)" -What "worker $($pair.Name) submitted a final result" -Condition $wait.Ok -TaskId $id `
             -Evidence ("after {0:N0}s: phase=[{1}] attention=[{2}]" -f $wait.Elapsed, [string](Get-Field (Get-Field (Get-TaskById -Id $id) 'fact' $null) 'Phase'), [string](Get-Field (Get-Field (Get-TaskById -Id $id) 'fact' $null) 'Attention'))
         if (-not $wait.Ok) {
@@ -4727,6 +4953,7 @@ function Invoke-WorkerReports {
             if ($liveAtTimeout.Found -and [string](Get-Field $liveAtTimeout.Agent 'agent_status') -ieq 'blocked') {
                 Preserve-ResourcesForPendingTool -AssertionId "W1.$($pair.Name).resources-preserved" -Reason 'worker report wait ended while the worker remained blocked'
             }
+            if ($isSingle) { throw 'single-worker final result was not observed before its report timeout' }
             continue
         }
         if ($script:PendingUserInteraction) {
@@ -4938,10 +5165,14 @@ function Invoke-Board {
 # ---------------------------------------------------------------------------
 
 function Invoke-Reviews {
-    Write-Step 'Phase 16: explicit dispositions (nothing merges automatically)'
+    $isSingle = $Scenario -eq 'SingleWorker'
+    Write-Step $(if ($isSingle) { 'SingleWorker: record one explicit review disposition' } else { 'Phase 16: explicit dispositions (nothing merges automatically)' })
     $idA = if ($script:TaskA) { [string](Get-Field $script:TaskA 'ID') } else { '' }
     $idB = if ($script:TaskB) { [string](Get-Field $script:TaskB 'ID') } else { '' }
-    if (-not $idA -or -not $idB) { Block-Item -Id 'V0.0' -What 'dispositions' -Evidence 'one or both tasks never reported'; return }
+    $reviewIds = @(@($idA, $idB) | Where-Object { $_ })
+    if (($isSingle -and $reviewIds.Count -eq 0) -or (-not $isSingle -and (-not $idA -or -not $idB))) {
+        Block-Item -Id 'V0.0' -What 'dispositions' -Evidence 'the required worker reports were not dispatched'; return
+    }
 
     Set-PendingUserInteraction -Pending $true -Phase 'resolving-primary-disposition-asks'
     $pending = Resolve-PendingPrimaryDispositionAsks -AssertionPrefix 'V0' -TimeoutSeconds 60
@@ -4952,10 +5183,12 @@ function Invoke-Reviews {
     }
 
     $reviewTasks = New-Object System.Collections.ArrayList
-    foreach ($item in @(
+    $reviewTargets = @(
         @{ id = $idA; marker = 'ACCEPT-A'; askId = 'task_a_review'; label = 'Task A' },
         @{ id = $idB; marker = 'ACCEPT-B'; askId = 'task_b_review'; label = 'Task B' }
-    )) {
+    )
+    foreach ($item in $reviewTargets) {
+        if (-not $item.id) { continue }
         $row = Get-TaskById -Id $item.id
         $fact = Get-Field $row 'fact'
         if ($null -eq (Get-Field $fact 'Report' $null)) {
@@ -4995,21 +5228,22 @@ function Invoke-Reviews {
 
 
     $done = Wait-Until -TimeoutSeconds 300 -IntervalSeconds 8 -What 'dispositions recorded' -Probe {
-        $a = Get-TaskById -Id $idA
-        $b = Get-TaskById -Id $idB
-        if (-not $a -or -not $b) { return $null }
-        if ([string]::IsNullOrWhiteSpace([string](Get-Field (Get-Field $a 'fact') 'Disposition'))) { return $null }
-        if ([string]::IsNullOrWhiteSpace([string](Get-Field (Get-Field $b 'fact') 'Disposition'))) { return $null }
-        return @($a, $b)
+        $rows = @()
+        foreach ($id in $reviewIds) {
+            $row = Get-TaskById -Id $id
+            if (-not $row -or [string]::IsNullOrWhiteSpace([string](Get-Field (Get-Field $row 'fact') 'Disposition'))) { return $null }
+            $rows += $row
+        }
+        return $rows
     }
-    Assert-True -Id 'V1.2' -What 'both tasks carry a recorded disposition' -Condition $done.Ok `
-        -Evidence ("after {0:N0}s" -f $done.Elapsed)
+    Assert-True -Id 'V1.2' -What 'each task carries its recorded disposition' -Condition $done.Ok `
+        -Evidence ("after {0:N0}s tasks={1}" -f $done.Elapsed, $reviewIds.Count)
     if ($done.Ok) {
         Set-PendingUserInteraction -Pending $false -Phase 'dispositions-recorded'
     } else {
         Preserve-ResourcesForPendingTool -AssertionId 'V1.2.resources-preserved' -Reason 'one or more review dispositions were not recorded'
     }
-    foreach ($id in @($idA, $idB)) {
+    foreach ($id in $reviewIds) {
         $row = Get-TaskById -Id $id
         $fact = Get-Field $row 'fact'
         Assert-Equal -Id "V2.$id-stage" -What "task $id is Done only because a disposition was recorded" -Expected 'done' -Actual (Get-TaskStage -Fact $fact) -TaskId $id
@@ -5018,7 +5252,7 @@ function Invoke-Reviews {
     }
 
     $branches = (Invoke-Git -Arguments @('branch', '--format=%(refname:short)') -Directory $script:RepoPath).Stdout
-    foreach ($id in @($idA, $idB)) {
+    foreach ($id in $reviewIds) {
         $fact = Get-Field (Get-TaskById -Id $id) 'fact'
         $branch = [string](Get-Field $fact 'Branch')
         Assert-Match -Id "V3.$id-branch" -What "branch $branch is preserved after the review" -Pattern ([regex]::Escape($branch)) -Actual $branches -TaskId $id
@@ -5701,12 +5935,17 @@ function Invoke-Cleanup {
             return $true
         }
         Assert-True -Id 'Z5.1' -What 'the isolated session server is stopped' -Condition $stopped.Ok
-        if ($script:ServerProcess -and -not $script:ServerProcess.HasExited) {
-            try { $script:ServerProcess.Kill() } catch { }
-        }
         $delete = Invoke-Herdr -Arguments @('session', 'delete', $script:SessionName) -NoSessionScope -TimeoutSeconds 60
         Assert-Equal -Id 'Z5.2' -What 'the isolated session is deleted' -Expected 0 -Actual $delete.ExitCode -Evidence (Protect-Text $delete.Stderr 300)
-        Assert-Equal -Id 'Z5.3' -What 'this run session is gone from the session list' -Expected 0 -Actual @(Get-Sessions | Where-Object { (Get-Field $_ 'name') -eq $script:SessionName }).Count
+        $remainingSessionCount = @((Get-Sessions) | Where-Object { (Get-Field $_ 'name') -eq $script:SessionName }).Count
+        Assert-Equal -Id 'Z5.3' -What 'this run session is gone from the session list' -Expected 0 -Actual $remainingSessionCount
+        if ($delete.ExitCode -ne 0 -or $remainingSessionCount -ne 0) {
+            throw "refusing to kill the server process for $($script:SessionName): its session was not verified absent"
+        }
+        $serverProcessResult = Stop-VerifiedAcceptanceServerProcess -RunId $script:RunId `
+            -Manifest $script:RunManifest -SessionDisposition 'absent'
+        Assert-True -Id 'Z5.server-process' -What 'the exact isolated Herdr server process exited after session deletion' `
+            -Condition ($serverProcessResult -in @('already-exited', 'killed')) -Evidence $serverProcessResult
     }
 
     # 6. Prove nothing of the user's was changed.
@@ -5800,6 +6039,8 @@ function Write-Report {
         passed                  = $script:Passed
         failed                  = $script:Failures
         blocked                 = $script:Blocked
+        scenario                = $Scenario
+        scenarioTimeoutSeconds  = $ScenarioTimeoutSeconds
         exitCode                = 0
         projectKey              = if ($script:Project) { [string](Get-Field $script:Project 'Key') } elseif ($script:RunManifest) { [string]$script:RepoPath } else { '' }
         workRoot                = $script:WorkRoot
@@ -5840,6 +6081,7 @@ function Step-Phase {
         [switch]$Critical
     )
     try {
+        [void](Get-ScenarioBoundedTimeoutSeconds -Requested 1)
         & $Body
     } catch {
         if (Test-IsBlockedPrimaryDispositionPrerequisite -PhaseId $Id -Message $_.Exception.Message) {
@@ -5889,24 +6131,35 @@ try {
     Step-Phase -Id 'R0' -Name 'temp repository' -Critical -Body { Invoke-TempRepo }
     Step-Phase -Id 'U0' -Name 'setup action' -Critical -Body { Invoke-SetupAction }
     Step-Phase -Id 'N0' -Name 'bind' -Critical -Body { Invoke-Bind }
-    Step-Phase -Id 'N7' -Name 'primary turn' -Body { Invoke-PrimaryTurn }
-    Step-Phase -Id 'D0' -Name 'dispatch' -Critical -Body { Invoke-Dispatch }
-    Step-Phase -Id 'PR0' -Name 'partial report rejection' -Body { Invoke-PartialReportRejection }
-    Step-Phase -Id 'Q0' -Name 'question relay' -Body { Invoke-QuestionRelay }
-    Step-Phase -Id 'K0' -Name 'blocked dialog' -Critical -Body { Invoke-BlockedDialog }
-    Step-Phase -Id 'M0' -Name 'pane move' -Body { Invoke-PaneMove }
-    Step-Phase -Id 'W0' -Name 'worker reports' -Body { Invoke-WorkerReports }
-    Step-Phase -Id 'A0' -Name 'board' -Body { Invoke-Board }
-    Step-Phase -Id 'V0' -Name 'reviews' -Body { Invoke-Reviews }
-    Step-Phase -Id 'C0' -Name 'cleanup refusals' -Body { Invoke-CleanupRefusals }
-    Step-Phase -Id 'G0' -Name 'ambiguous prompt' -Body { Invoke-AmbiguousPrompt }
-    Step-Phase -Id 'T0' -Name 'restart' -Body { Invoke-Restart }
+    if ($Scenario -eq 'SingleWorker') {
+        $script:ScenarioDeadline = (Get-Date).AddSeconds($ScenarioTimeoutSeconds)
+    }
+    foreach ($phase in (Get-AcceptanceScenarioPhases -Scenario $Scenario)) {
+        switch ($phase) {
+            'N7' { Step-Phase -Id 'N7' -Name 'primary turn' -Body { Invoke-PrimaryTurn }; break }
+            'D0' { Step-Phase -Id 'D0' -Name 'dispatch' -Critical -Body { Invoke-Dispatch }; break }
+            'PR0' { Step-Phase -Id 'PR0' -Name 'partial report rejection' -Body { Invoke-PartialReportRejection }; break }
+            'Q0' { Step-Phase -Id 'Q0' -Name 'question relay' -Body { Invoke-QuestionRelay }; break }
+            'K0' { Step-Phase -Id 'K0' -Name 'blocked dialog' -Critical -Body { Invoke-BlockedDialog }; break }
+            'M0' { Step-Phase -Id 'M0' -Name 'pane move' -Body { Invoke-PaneMove }; break }
+            'W0' { Step-Phase -Id 'W0' -Name 'worker reports' -Body { Invoke-WorkerReports }; break }
+            'SW0' { Step-Phase -Id 'SW0' -Name 'single-worker dispatch' -Critical -Body { Invoke-SingleWorkerDispatch }; break }
+            'SW1' { Step-Phase -Id 'SW1' -Name 'single-worker report' -Critical -Body { Invoke-WorkerReports }; break }
+            'A0' { Step-Phase -Id 'A0' -Name 'board' -Body { Invoke-Board }; break }
+            'V0' { Step-Phase -Id 'V0' -Name 'reviews' -Body { Invoke-Reviews }; break }
+            'C0' { Step-Phase -Id 'C0' -Name 'cleanup refusals' -Body { Invoke-CleanupRefusals }; break }
+            'G0' { Step-Phase -Id 'G0' -Name 'ambiguous prompt' -Body { Invoke-AmbiguousPrompt }; break }
+            'T0' { Step-Phase -Id 'T0' -Name 'restart' -Body { Invoke-Restart }; break }
+            default { throw "unknown acceptance phase '$phase' for scenario '$Scenario'" }
+        }
+    }
 } catch {
     $script:Aborted = $true
     if (-not $script:BlockedRunAbort) {
         Add-Assertion -Id 'RUN.ABORT' -What 'the run stopped at a prerequisite failure' -Status 'FAIL' -Evidence (Protect-Text $_.Exception.Message 800)
     }
 } finally {
+    $script:ScenarioDeadline = $null
     if ($script:PendingUserInteraction -and -not $KeepResources) {
         Preserve-ResourcesForPendingTool -AssertionId 'RUN.pending-interaction-preserved' -Reason 'the final journal still records an unresolved user interaction'
     }

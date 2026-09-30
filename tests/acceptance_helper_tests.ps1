@@ -74,6 +74,28 @@ function Check {
     $script:checks++
     if ($Ok) { Write-Host "ok   $Name" } else { Write-Host "FAIL $Name :: $Detail" -ForegroundColor Red; $script:fails++ }
 }
+# --- scenario selection ------------------------------------------------------
+$phasePlanCommand = Get-Command Get-AcceptanceScenarioPhases -ErrorAction SilentlyContinue
+Check 'single-worker scenario phase plan exists' ($null -ne $phasePlanCommand) 'missing scenario plan'
+if ($phasePlanCommand) {
+    $singlePhases = @(Get-AcceptanceScenarioPhases -Scenario 'SingleWorker')
+    Check 'single-worker scenario keeps only one-worker lifecycle phases' `
+        (($singlePhases -join ',') -ceq 'SW0,SW1,A0,V0') ($singlePhases -join ',')
+    $fullPhases = @(Get-AcceptanceScenarioPhases -Scenario 'Full')
+    Check 'full scenario retains the broad regression phases' `
+        (($fullPhases -join ',') -ceq 'N7,D0,PR0,Q0,K0,M0,W0,A0,V0,C0,G0,T0') ($fullPhases -join ',')
+    Check 'scenario timeout leaves unrelated bounded waits unchanged' `
+        ((Get-ScenarioBoundedTimeoutSeconds -Requested 7) -eq 7) 'ordinary timeout changed'
+    $script:ScenarioDeadline = (Get-Date).AddSeconds(2)
+    $boundedTimeout = Get-ScenarioBoundedTimeoutSeconds -Requested 60
+    Check 'scenario timeout clamps long operations to the remaining budget' `
+        ($boundedTimeout -gt 0 -and $boundedTimeout -le 2) $boundedTimeout
+    $script:ScenarioDeadline = (Get-Date).AddSeconds(-1)
+    $expiredScenarioRefused = $false
+    try { [void](Get-ScenarioBoundedTimeoutSeconds -Requested 60) } catch { $expiredScenarioRefused = $true }
+    Check 'expired scenario budget stops new operations' $expiredScenarioRefused 'expired operation was allowed'
+    $script:ScenarioDeadline = $null
+}
 $savedAssertions = $script:Assertions
 $savedUndriven = $script:Undriven
 $script:Assertions = New-Object System.Collections.ArrayList
@@ -116,6 +138,17 @@ Check 'Invoke-Native writes stdin' ($r2.Stdout.Trim() -eq 'hello-json-body') $r2
 # --- timeout kills ----------------------------------------------------------
 $r3 = Invoke-Native -File $py -Arguments @('-c', 'import time;time.sleep(30)') -TimeoutSeconds 3
 Check 'Invoke-Native times out and kills' ($r3.TimedOut -and $r3.ExitCode -eq -1) "timedout=$($r3.TimedOut) exit=$($r3.ExitCode)"
+$script:ScenarioDeadline = (Get-Date).AddSeconds(1)
+$deadlineWatch = [System.Diagnostics.Stopwatch]::StartNew()
+try {
+    $deadlineResult = Invoke-Native -File $py -Arguments @('-c', 'import time;time.sleep(30)') -TimeoutSeconds 30
+} finally {
+    $script:ScenarioDeadline = $null
+    $deadlineWatch.Stop()
+}
+Check 'scenario deadline kills a native command within the remaining budget' `
+    ($deadlineResult.TimedOut -and $deadlineWatch.Elapsed.TotalSeconds -lt 5) `
+    "timedout=$($deadlineResult.TimedOut) elapsed=$($deadlineWatch.Elapsed.TotalSeconds)"
 
 # --- stderr separation ------------------------------------------------------
 $r4 = Invoke-Native -File $py -Arguments @('-c', 'import sys;print("out");print("err",file=sys.stderr)') -TimeoutSeconds 60
@@ -1404,7 +1437,7 @@ $manifestOnlyDb = Join-Path $script:HarnessRoot 'manifest-only.sqlite'
 $savedLockStore = $script:RunLockStateDb
 $script:RunLockStateDb = $manifestOnlyDb
 $manifestOnlyRecordData = [pscustomobject]@{
-    schemaVersion = 1
+    schemaVersion = 2
     runId = $manifestOnlyId
     session = "orch-acc-$manifestOnlyId"
     projectKey = $manifestOnlyRepo
@@ -1412,6 +1445,11 @@ $manifestOnlyRecordData = [pscustomobject]@{
     stateDb = $manifestOnlyDb
     ownerPid = 2147483647
     ownerStartedAt = '2000-01-01T00:00:00.0000000Z'
+    serverPid = 2147483647
+    serverStartedAt = '2000-01-01T00:00:00.0000000Z'
+    serverExecutable = (Get-Command herdr).Source
+    serverStartAttempted = $true
+    sessionDir = ''
     status = 'active'
     pendingUserInteraction = $false
     resourcesPreserved = $false
@@ -1441,19 +1479,21 @@ $pendingOnlyManifest.session = "orch-acc-$pendingOnlyId"
 $pendingOnlyManifest.projectKey = $pendingOnlyRepo
 $pendingOnlyManifest.workRoot = $pendingOnlyRoot
 $pendingOnlyManifest.status = 'preserved'
-$pendingOnlyManifest.pendingUserInteraction = $true
-$pendingOnlyManifest.resourcesPreserved = $true
-$pendingOnlyManifest.keepResourcesRequested = $true
-$pendingOnlyRecord = Join-Path $script:RunArchiveRoot $pendingOnlyId
-Write-AtomicRunManifest -Manifest $pendingOnlyManifest -Path (Join-Path $pendingOnlyRecord 'manifest.json')
-$pendingRecoveryRefused = $false
-try {
-    [void](Recover-ManifestOnlyAcceptanceRun -RunId $pendingOnlyId -TempRoot $manifestOnlyTemp `
-        -StateDump (Get-StateDump) -Sessions @($defaultRecordForRecovery) -SessionsRoot (Join-Path $defaultRecordForRecovery.session_dir 'sessions') `
-        -DefaultProjection '')
-} catch { $pendingRecoveryRefused = $true }
-Check 'manifest-only run with a preserved pending user interaction is never auto-retired' `
-    ($pendingRecoveryRefused -and (Test-Path -LiteralPath $pendingOnlyRoot)) 'pending manifest was removed'
+    $pendingOnlyManifest.pendingUserInteraction = $true
+    $pendingOnlyManifest.resourcesPreserved = $true
+    $pendingOnlyManifest.keepResourcesRequested = $true
+    $pendingOnlyRecord = Join-Path $script:RunArchiveRoot $pendingOnlyId
+    Write-AtomicRunManifest -Manifest $pendingOnlyManifest -Path (Join-Path $pendingOnlyRecord 'manifest.json')
+    $pendingRecoverySucceeded = $false
+    try {
+        $pendingRecoverySucceeded = Recover-ManifestOnlyAcceptanceRun -RunId $pendingOnlyId -TempRoot $manifestOnlyTemp `
+            -StateDump (Get-StateDump) -Sessions @($defaultRecordForRecovery) -SessionsRoot (Join-Path $defaultRecordForRecovery.session_dir 'sessions') `
+            -DefaultProjection ''
+    } catch { }
+    $pendingOnlyFinal = Get-Content -LiteralPath (Join-Path $pendingOnlyRecord 'manifest.json') -Raw | ConvertFrom-Json
+    Check 'new pre-run cleanup retires a preserved pending KeepResources run with a dead owner' `
+        ($pendingRecoverySucceeded -and -not (Test-Path -LiteralPath $pendingOnlyRoot) -and
+         (Get-Field $pendingOnlyFinal 'status') -ceq 'complete') (Get-Json $pendingOnlyFinal)
 $script:RunLockStateDb = $savedLockStore
 $interruptedRunId = 'eeddbb11'
 $interruptedRoot = Join-Path $script:HarnessRoot "orch-accept-$interruptedRunId"
@@ -1585,6 +1625,71 @@ Check 'run owner identity recognizes the current process' $ownerIsCurrent 'curre
 $ownerIsAbsent = $true
 try { $ownerIsAbsent = Test-RunOwnerAlive -OwnerPid 2147483647 -OwnerStartedAt '2000-01-01T00:00:00.0000000Z' } catch { }
 Check 'run owner identity treats a missing process as dead' (-not $ownerIsAbsent) 'missing PID'
+$processIdentityCommand = Get-Command Get-AcceptanceProcessDisposition -ErrorAction SilentlyContinue
+Check 'acceptance server process identity helper exists' ($null -ne $processIdentityCommand) 'missing process identity helper'
+if ($processIdentityCommand) {
+    $currentProcessStart = (Get-Process -Id $PID).StartTime.ToUniversalTime().ToString('o')
+    $liveProcessMode = Get-AcceptanceProcessDisposition -ProcessId $PID -StartedAt $currentProcessStart
+    $reusedPidMode = Get-AcceptanceProcessDisposition -ProcessId $PID -StartedAt '2000-01-01T00:00:00.0000000Z'
+    $missingProcessMode = Get-AcceptanceProcessDisposition -ProcessId 2147483647 -StartedAt '2000-01-01T00:00:00.0000000Z'
+    Check 'server process identity recognizes an exact live PID/start pair' ($liveProcessMode -eq 'active') $liveProcessMode
+    Check 'server process identity treats a reused PID as the old process exited' ($reusedPidMode -eq 'dead') $reusedPidMode
+    Check 'server process identity recognizes a missing PID as exited' ($missingProcessMode -eq 'dead') $missingProcessMode
+}
+$serverStopCommand = Get-Command Stop-VerifiedAcceptanceServerProcess -ErrorAction SilentlyContinue
+Check 'verified acceptance server stop helper exists' ($null -ne $serverStopCommand) 'missing server stop helper'
+if ($serverStopCommand) {
+    $liveServerManifest = [pscustomobject]@{
+        runId = '12345678'
+        session = 'orch-acc-12345678'
+        serverPid = $PID
+        serverStartedAt = (Get-Process -Id $PID).StartTime.ToUniversalTime().ToString('o')
+        serverExecutable = (Get-Command powershell.exe).Source
+    }
+    $liveServerRefused = $false
+    try { [void](Stop-VerifiedAcceptanceServerProcess -RunId '12345678' -Manifest $liveServerManifest -SessionDisposition 'stopped') } catch {
+        $liveServerRefused = $true
+    }
+    Check 'stale-server cleanup refuses to kill the current PowerShell process' `
+        ($liveServerRefused -and (Get-Process -Id $PID -ErrorAction SilentlyContinue)) 'current process was not protected'
+
+    $reusedServerManifest = [pscustomobject]@{
+        runId = '12345678'
+        session = 'orch-acc-12345678'
+        serverPid = $PID
+        serverStartedAt = '2000-01-01T00:00:00.0000000Z'
+        serverExecutable = (Get-Command powershell.exe).Source
+    }
+    $reusedServerResult = Stop-VerifiedAcceptanceServerProcess -RunId '12345678' `
+        -Manifest $reusedServerManifest -SessionDisposition 'stopped'
+    Check 'stale-server cleanup never kills a reused PID' `
+        ($reusedServerResult -eq 'already-exited' -and (Get-Process -Id $PID -ErrorAction SilentlyContinue)) $reusedServerResult
+    $neverStartedManifest = [pscustomobject]@{
+        schemaVersion = 2
+        runId = '12345678'
+        session = 'orch-acc-12345678'
+        serverPid = 0
+        serverStartedAt = ''
+        serverExecutable = (Get-Command herdr).Source
+        serverStartAttempted = $false
+        sessionDir = ''
+        phase = 'temp-root-created'
+    }
+    $notRecordedResult = Stop-VerifiedAcceptanceServerProcess -RunId '12345678' `
+        -Manifest $neverStartedManifest -SessionDisposition 'absent'
+    Check 'a missing server PID is accepted only when a version-2 manifest proves it never started' `
+        ($notRecordedResult -eq 'not-recorded') $notRecordedResult
+    $uncertainStartManifest = $neverStartedManifest.PSObject.Copy()
+    $uncertainStartManifest.phase = 'server-starting'
+    $uncertainStartManifest.serverStartAttempted = $true
+    $uncertainStartRefused = $false
+    try { [void](Stop-VerifiedAcceptanceServerProcess -RunId '12345678' -Manifest $uncertainStartManifest -SessionDisposition 'absent') } catch {
+        $uncertainStartRefused = $true
+    }
+    Check 'a missing server PID after launch was attempted blocks cleanup' `
+        $uncertainStartRefused 'server start attempt was treated as no process'
+}
+
 $safeInterruptedManifest = [pscustomobject]@{
     ownerPid = 2147483647
     ownerStartedAt = '2000-01-01T00:00:00.0000000Z'
@@ -1604,11 +1709,18 @@ $unknownOwnerManifest = $safeInterruptedManifest.PSObject.Copy()
 $unknownOwnerManifest.ownerPid = 0
 $unknownRecoveryMode = 'unknown'
 try { $unknownRecoveryMode = Get-AcceptanceRecoveryDisposition -Manifest $unknownOwnerManifest -SessionDisposition 'absent' } catch { }
-Check 'absent session with unknown owner metadata still requires exact confirmation' ($unknownRecoveryMode -eq 'confirm') $unknownRecoveryMode
-$pendingRecoveryManifest.pendingUserInteraction = $true
-$pendingRecoveryMode = 'unknown'
-try { $pendingRecoveryMode = Get-AcceptanceRecoveryDisposition -Manifest $pendingRecoveryManifest -SessionDisposition 'running' } catch { }
-Check 'pending user interaction requires explicit retirement, never automatic recovery' ($pendingRecoveryMode -eq 'confirm') $pendingRecoveryMode
+Check 'absent session with unknown owner metadata is not eligible for automatic cleanup' ($unknownRecoveryMode -eq 'unverified') $unknownRecoveryMode
+    $pendingRecoveryManifest.pendingUserInteraction = $true
+    $pendingRecoveryMode = 'unknown'
+    try { $pendingRecoveryMode = Get-AcceptanceRecoveryDisposition -Manifest $pendingRecoveryManifest -SessionDisposition 'running' } catch { }
+    Check 'dead acceptance run with a pending interaction is recoverable under the pre-run cleanup instruction' `
+        ($pendingRecoveryMode -eq 'recover') $pendingRecoveryMode
+    $keptRecoveryManifest = $pendingRecoveryManifest.PSObject.Copy()
+    $keptRecoveryManifest.keepResourcesRequested = $true
+    $keptRecoveryMode = 'unknown'
+    try { $keptRecoveryMode = Get-AcceptanceRecoveryDisposition -Manifest $keptRecoveryManifest -SessionDisposition 'running' } catch { }
+    Check 'a dead owner with an explicit KeepResources request remains eligible for the next-run cleanup' `
+        ($keptRecoveryMode -eq 'recover') $keptRecoveryMode
 $authorizedCleanupManifest = $pendingRecoveryManifest.PSObject.Copy()
 $authorizedCleanupManifest.status = 'cleanup'
 Add-Member -InputObject $authorizedCleanupManifest -NotePropertyName retirementAuthorized -NotePropertyValue $true
@@ -1633,7 +1745,7 @@ $unknownAuthorizedCleanup.status = 'cleanup'
 Add-Member -InputObject $unknownAuthorizedCleanup -NotePropertyName retirementAuthorized -NotePropertyValue $true
 $unknownAuthorizedMode = 'unknown'
 try { $unknownAuthorizedMode = Get-AcceptanceRecoveryDisposition -Manifest $unknownAuthorizedCleanup -SessionDisposition 'absent' } catch { }
-Check 'persisted cleanup authorization never overrides a missing owner identity' ($unknownAuthorizedMode -eq 'confirm') $unknownAuthorizedMode
+Check 'persisted cleanup authorization never overrides a missing owner identity' ($unknownAuthorizedMode -eq 'unverified') $unknownAuthorizedMode
 $liveRecoveryManifest = $safeInterruptedManifest.PSObject.Copy()
 $liveRecoveryManifest.ownerPid = $PID
 $liveRecoveryManifest.ownerStartedAt = (Get-Process -Id $PID).StartTime.ToUniversalTime().ToString('o')
@@ -1798,6 +1910,7 @@ $preflightTempRoot = Join-Path $script:HarnessRoot 'preflight-temp'
 New-Item -ItemType Directory -Path $preflightTempRoot -Force | Out-Null
 $env:TEMP = $preflightTempRoot
 try {
+    $script:PreflightServerProcess = $null
     $script:StateDb = Join-Path $script:HarnessRoot 'preflight.sqlite'
     [void](Invoke-Native -File $script:Python -Arguments @($seedPath, $script:StateDb) -TimeoutSeconds 60)
     $preflightRunId = 'fedcba12'
@@ -1902,15 +2015,71 @@ con.commit()
     $script:RetireStaleAcceptanceRunId = ''
     $liveError = ''
     try { Clear-StaleAcceptanceState } catch { $liveError = $_.Exception.Message }
-    Check 'live preflight refuses without an exact run-id authorization' `
-        ($liveError -match 'RetireStaleAcceptanceRunId' -and $script:PreflightSessionForTest.running -and
+    Check 'preflight refuses stale acceptance state whose owner identity is unverifiable' `
+        ($liveError -match 'cannot be verified' -and $script:PreflightSessionForTest.running -and
          (Test-Path -LiteralPath $preflightRoot) -and @((Get-StateDump).tables.projects | Where-Object { $_.key -eq $preflightRepo }).Count -eq 1) $liveError
+    $script:RetireStaleAcceptanceRunId = $preflightRunId
+    $unverifiedAuthorizationError = ''
+    try { Clear-StaleAcceptanceState } catch { $unverifiedAuthorizationError = $_.Exception.Message }
+    Check 'an exact run-id opt-in cannot override unverifiable owner identity' `
+        ($unverifiedAuthorizationError -match 'cannot be verified' -and $script:PreflightSessionForTest.running -and
+         -not $script:PreflightStopTarget -and (Test-Path -LiteralPath $preflightRoot)) $unverifiedAuthorizationError
     $script:RetireStaleAcceptanceRunId = 'ffffffff'
     $wrongAuthorizationError = ''
     try { Clear-StaleAcceptanceState } catch { $wrongAuthorizationError = $_.Exception.Message }
     Check 'live preflight rejects authorization for a different run id' `
         ($wrongAuthorizationError -match 'RetireStaleAcceptanceRunId' -and $script:PreflightSessionForTest.running -and
          (Test-Path -LiteralPath $preflightRoot)) $wrongAuthorizationError
+    $script:PreflightServerProcess = Start-Process -FilePath (Get-Command powershell.exe).Source `
+        -ArgumentList @('-NoProfile', '-Command', 'Start-Sleep -Seconds 120') -PassThru -WindowStyle Hidden
+    $wrongExecutableManifest = [pscustomobject]@{
+        runId = $preflightRunId
+        session = "orch-acc-$preflightRunId"
+        serverPid = $script:PreflightServerProcess.Id
+        serverStartedAt = $script:PreflightServerProcess.StartTime.ToUniversalTime().ToString('o')
+        serverExecutable = (Get-Command cmd.exe).Source
+    }
+    $wrongExecutableRefused = $false
+    try { [void](Stop-VerifiedAcceptanceServerProcess -RunId $preflightRunId -Manifest $wrongExecutableManifest -SessionDisposition 'stopped') } catch {
+        $wrongExecutableRefused = $true
+    }
+    Check 'verified PID with a different executable path is never killed' `
+        ($wrongExecutableRefused -and -not $script:PreflightServerProcess.HasExited) 'wrong executable path was accepted'
+    $preservedManifest = [pscustomobject]@{
+        schemaVersion = 2
+        runId = $preflightRunId
+        session = "orch-acc-$preflightRunId"
+        projectKey = $preflightRepo
+        workRoot = $preflightRoot
+        stateDb = $script:StateDb
+        ownerPid = 2147483647
+        ownerStartedAt = '2000-01-01T00:00:00.0000000Z'
+        sessionDir = $script:PreflightSessionForTest.session_dir
+        serverPid = $script:PreflightServerProcess.Id
+        serverStartedAt = $script:PreflightServerProcess.StartTime.ToUniversalTime().ToString('o')
+        serverExecutable = (Get-Command powershell.exe).Source
+        serverStartAttempted = $true
+        phase = 'finished'
+        status = 'preserved'
+        pendingUserInteraction = $true
+        resourcesPreserved = $true
+        keepResourcesRequested = $true
+        createdWorkspaces = @('w8', 'w9', 'w10')
+        createdPanes = @('w8:p8', 'w8:p9', 'w10:p1')
+    }
+    Write-AtomicRunManifest -Manifest $preservedManifest -Path (Join-Path (Join-Path $script:RunArchiveRoot $preflightRunId) 'manifest.json')
+    $liveOwnerManifest = $preservedManifest.PSObject.Copy()
+    $liveOwnerManifest.ownerPid = $PID
+    $liveOwnerManifest.ownerStartedAt = (Get-Process -Id $PID).StartTime.ToUniversalTime().ToString('o')
+    $preservedManifestPath = Join-Path (Join-Path $script:RunArchiveRoot $preflightRunId) 'manifest.json'
+    Write-AtomicRunManifest -Manifest $liveOwnerManifest -Path $preservedManifestPath
+    $script:RetireStaleAcceptanceRunId = $preflightRunId
+    $liveOwnerError = ''
+    try { Clear-StaleAcceptanceState } catch { $liveOwnerError = $_.Exception.Message }
+    Check 'even an exact run-id opt-in never retires a live acceptance owner' `
+        ($liveOwnerError -match 'owner process is live' -and $script:PreflightSessionForTest.running -and
+         -not $script:PreflightStopTarget -and (Test-Path -LiteralPath $preflightRoot)) $liveOwnerError
+    Write-AtomicRunManifest -Manifest $preservedManifest -Path $preservedManifestPath
     $script:RetireStaleAcceptanceRunId = $preflightRunId
     $script:PreflightUntrackedWorkspaces = $true
     $untrackedError = ''
@@ -1927,19 +2096,25 @@ con.commit()
     $script:PreflightStopArguments = @()
     $script:PreflightCloseArguments = @()
     $script:PreflightCallOrder = @()
-    $script:RetireStaleAcceptanceRunId = $preflightRunId
+    $interruptedCleanupManifestPath = Join-Path (Join-Path $script:RunArchiveRoot $preflightRunId) 'manifest.json'
+    $interruptedCleanupManifest = Get-Content -LiteralPath $interruptedCleanupManifestPath -Raw | ConvertFrom-Json
+    $interruptedCleanupManifest.ownerPid = 2147483647
+    $interruptedCleanupManifest.ownerStartedAt = '2000-01-01T00:00:00.0000000Z'
+    Write-AtomicRunManifest -Manifest $interruptedCleanupManifest -Path $interruptedCleanupManifestPath
+    $script:RetireStaleAcceptanceRunId = ''
     $cleanupError = ''
     try { Clear-StaleAcceptanceState } catch { $cleanupError = $_.Exception.Message }
     $afterPreflight = Get-StateDump
-    Check 'explicit retirement closes the run root and its recorded moved workspace before stopping/deleting its exact session' `
+    Check 'preflight automatically retires the verified preserved acceptance run and its pending interaction' `
         (-not $cleanupError -and $script:PreflightStopTarget -eq "orch-acc-$preflightRunId" -and
          (@($script:PreflightCloseCalls) -join '|') -ceq 'workspace close w8 --group|workspace close w10 --group' -and
          (@($script:PreflightStopArguments) -join ' ') -ceq 'server stop' -and
          (@($script:PreflightCallOrder) -join '|') -ceq 'workspace close|workspace list|workspace close|workspace list|server stop|session delete' -and
          -not $script:PreflightSessionForTest -and -not (Test-Path -LiteralPath $preflightRoot) -and
+         $script:PreflightServerProcess.HasExited -and
          @($afterPreflight.tables.projects).Count -eq 2 -and @($afterPreflight.tables.tasks).Count -eq 3 -and
          @($afterPreflight.tables.inbox).Count -eq 2 -and @($afterPreflight.tables.ready_sessions).Count -eq 2) `
-        ("error=$cleanupError closeCalls=$(@($script:PreflightCloseCalls) -join '|') stopTarget=$($script:PreflightStopTarget) stopArgs=$(@($script:PreflightStopArguments) -join ' ') order=$(@($script:PreflightCallOrder) -join '|') projects=$(@($afterPreflight.tables.projects).Count)")
+        ("error=$cleanupError serverProcessExited=$($script:PreflightServerProcess.HasExited) closeCalls=$(@($script:PreflightCloseCalls) -join '|') stopTarget=$($script:PreflightStopTarget) stopArgs=$(@($script:PreflightStopArguments) -join ' ') order=$(@($script:PreflightCallOrder) -join '|') projects=$(@($afterPreflight.tables.projects).Count)")
     $script:RetireStaleAcceptanceRunId = ''
     $absentRunId = '11223344'
     $script:RetireStaleAcceptanceRunId = $absentRunId
@@ -1948,6 +2123,25 @@ $absentRoot = Join-Path $env:TEMP "orch-accept-$absentRunId"
     New-Item -ItemType Directory -Path $absentRepo -Force | Out-Null
     @{ runId = $absentRunId; session = "orch-acc-$absentRunId"; projectKey = $absentRepo; keepResourcesRequested = $false; resourcesPreserved = $false } |
         ConvertTo-Json | Set-Content -LiteralPath (Join-Path $absentRoot 'report.json')
+    $absentManifest = [pscustomobject]@{
+        schemaVersion = 1
+        runId = $absentRunId
+        session = "orch-acc-$absentRunId"
+        projectKey = $absentRepo
+        workRoot = $absentRoot
+        stateDb = $script:StateDb
+        ownerPid = 2147483647
+        ownerStartedAt = '2000-01-01T00:00:00.0000000Z'
+        status = 'active'
+        pendingUserInteraction = $false
+        serverPid = 2147483647
+        serverStartedAt = '2000-01-01T00:00:00.0000000Z'
+        serverExecutable = (Get-Command herdr).Source
+        serverStartAttempted = $true
+        resourcesPreserved = $false
+        keepResourcesRequested = $false
+    }
+    Write-AtomicRunManifest -Manifest $absentManifest -Path (Join-Path (Join-Path $script:RunArchiveRoot $absentRunId) 'manifest.json')
     $absentWorktree = Join-Path $absentRoot 'worktrees\repo\orch-fake11223344'
     New-Item -ItemType Directory -Path $absentWorktree -Force | Out-Null
     $lockedFile = Join-Path $absentWorktree 'held-open.txt'
@@ -2017,20 +2211,26 @@ $siblingRoot = Join-Path $env:TEMP "orch-accept-$siblingRunId"
     $manifestOnlyRunRepo = Join-Path $manifestOnlyRunRoot 'repo'
     New-Item -ItemType Directory -Path $manifestOnlyRunRepo -Force | Out-Null
     $script:RunLockStateDb = $script:StateDb
-$manifestOnlyRunManifestSeed = [pscustomobject]@{
-    schemaVersion = 1
-    runId = $manifestOnlyRunId
-    session = "orch-acc-$manifestOnlyRunId"
-    projectKey = $manifestOnlyRunRepo
-    workRoot = $manifestOnlyRunRoot
-    stateDb = $script:StateDb
-    ownerPid = 2147483647
-    ownerStartedAt = '2000-01-01T00:00:00.0000000Z'
-    status = 'active'
-    pendingUserInteraction = $false
-    resourcesPreserved = $false
-    keepResourcesRequested = $false
-}
+    $manifestOnlyRunManifestSeed = [pscustomobject]@{
+        schemaVersion = 2
+        runId = $manifestOnlyRunId
+        session = "orch-acc-$manifestOnlyRunId"
+        projectKey = $manifestOnlyRunRepo
+        workRoot = $manifestOnlyRunRoot
+        stateDb = $script:StateDb
+        ownerPid = 2147483647
+        ownerStartedAt = '2000-01-01T00:00:00.0000000Z'
+        serverPid = 0
+        serverStartedAt = ''
+        serverExecutable = (Get-Command herdr).Source
+        serverStartAttempted = $false
+        sessionDir = ''
+        phase = 'temp-root-created'
+        status = 'active'
+        pendingUserInteraction = $false
+        resourcesPreserved = $false
+        keepResourcesRequested = $false
+    }
 Write-AtomicRunManifest -Manifest $manifestOnlyRunManifestSeed `
     -Path (Join-Path (Join-Path $script:RunArchiveRoot $manifestOnlyRunId) 'manifest.json')
     $script:RetireStaleAcceptanceRunId = ''
@@ -2065,6 +2265,10 @@ Write-AtomicRunManifest -Manifest $manifestOnlyRunManifestSeed `
     Check 'exact run-id recovery retries and removes only its report-verified orphan root' `
         (-not $orphanCleanupError -and -not (Test-Path -LiteralPath $orphanRoot) -and (Test-Path -LiteralPath $siblingRoot)) $orphanCleanupError
 } finally {
+    if ($script:PreflightServerProcess -and -not $script:PreflightServerProcess.HasExited) {
+        try { $script:PreflightServerProcess.Kill(); [void]$script:PreflightServerProcess.WaitForExit(5000) } catch { }
+    }
+    if ($script:PreflightServerProcess) { $script:PreflightServerProcess.Dispose() }
     $env:TEMP = $savedTemp
     $script:StateDb = $savedDb
 }
