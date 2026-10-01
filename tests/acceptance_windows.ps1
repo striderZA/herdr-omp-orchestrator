@@ -2190,6 +2190,66 @@ function Test-OmpTranscriptContains {
         elseif ($stream) { $stream.Dispose() }
     }
 }
+function Test-OmpTranscriptContainsExactUserMessage {
+    param([string]$Path, [string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Path) -or [string]::IsNullOrEmpty($Text) -or
+        -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    $stream = $null
+    $reader = $null
+    try {
+        $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        $reader = New-Object System.IO.StreamReader($stream)
+        while ($null -ne ($line = $reader.ReadLine())) {
+            try { $entry = ConvertFrom-Json -InputObject $line -ErrorAction Stop } catch { continue }
+            if ([string](Get-Field $entry 'type') -cne 'message') { continue }
+            $message = Get-Field $entry 'message'
+            if ([string](Get-Field $message 'role') -cne 'user') { continue }
+            $textParts = @()
+            foreach ($part in @(Get-Field $message 'content' @())) {
+                $partText = Get-Field $part 'text'
+                if ($partText -is [string]) { $textParts += $partText }
+            }
+            if (($textParts -join "`n") -ceq $Text) { return $true }
+        }
+    } catch {
+        return $false
+    } finally {
+        if ($reader) { $reader.Dispose() }
+        elseif ($stream) { $stream.Dispose() }
+    }
+    return $false
+}
+
+function Test-OmpTranscriptContainsAnswerToolCall {
+    param([string]$Path, [string]$TaskId, [string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Path) -or [string]::IsNullOrWhiteSpace($TaskId) -or
+        [string]::IsNullOrEmpty($Text) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    $stream = $null
+    $reader = $null
+    try {
+        $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        $reader = New-Object System.IO.StreamReader($stream)
+        while ($null -ne ($line = $reader.ReadLine())) {
+            try { $entry = ConvertFrom-Json -InputObject $line -ErrorAction Stop } catch { continue }
+            if ([string](Get-Field $entry 'type') -cne 'message') { continue }
+            $message = Get-Field $entry 'message'
+            if ([string](Get-Field $message 'role') -cne 'assistant') { continue }
+            foreach ($part in @(Get-Field $message 'content' @())) {
+                $arguments = Get-Field $part 'arguments'
+                if ([string](Get-Field $part 'name') -ceq 'orch_answer' -and
+                    [string](Get-Field $arguments 'taskId') -ceq $TaskId -and
+                    [string](Get-Field $arguments 'text') -ceq $Text) { return $true }
+            }
+        }
+    } catch {
+        return $false
+    } finally {
+        if ($reader) { $reader.Dispose() }
+        elseif ($stream) { $stream.Dispose() }
+    }
+    return $false
+}
+
 
 function Test-OmpTranscriptContainsWorkerQuestionNote {
     param([string]$Path, [string]$TaskId, [string]$QuestionMarker)
@@ -4790,20 +4850,30 @@ function Invoke-BlockedDialog {
     }
     $reportPrompt = 'ACCEPT-B-REPORT-TRIGGER. Call the orch_answer tool exactly once with taskId "' + $idB + '" and text "ACCEPT-REPORT-B". Then reply with the words report token sent.'
     $reportResult = Invoke-PrimaryPromptAfterDispositionAsks -PaneId $script:PrimaryPane -Text $reportPrompt -TimeoutSeconds 240 -AssertionPrefix 'K6'
+    $primaryReady = Get-ReadySession -LaunchPaneId ([string](Get-Field $script:Project 'LaunchPaneID'))
+    $primaryTranscript = [string](Get-Field $primaryReady 'omp_session_file')
     $workerReady = Get-ReadySession -LaunchPaneId ([string](Get-Field $script:TaskB 'LaunchPaneID'))
     $workerTranscript = [string](Get-Field $workerReady 'omp_session_file')
-    $reportTokenObserved = Wait-Until -TimeoutSeconds 300 -IntervalSeconds 3 -What 'exact B report authorization token in worker OMP transcript' -Probe {
-        if (Test-OmpTranscriptContains -Path $workerTranscript -Text 'ACCEPT-REPORT-B') { return $true }
-        return $null
+    $reportDelivery = [pscustomobject]@{ Ok = $false }
+    if ($reportResult.Submitted) {
+        $reportDelivery = Wait-Until -TimeoutSeconds 300 -IntervalSeconds 3 -What 'exact B report authorization orch_answer reached the worker transcript' -Probe {
+            $answerCall = Test-OmpTranscriptContainsAnswerToolCall -Path $primaryTranscript -TaskId $idB -Text 'ACCEPT-REPORT-B'
+            $workerMessage = Test-OmpTranscriptContainsExactUserMessage -Path $workerTranscript -Text 'ACCEPT-REPORT-B'
+            if ($answerCall -and $workerMessage) { return $true }
+            return $null
+        }
     }
-    $reportSent = $reportResult.Submitted -and $reportTokenObserved.Ok
-    Assert-True -Id 'K6.3' -What 'the primary delivered the exact report authorization token to worker B' `
+    $reportAnswerCallObserved = Test-OmpTranscriptContainsAnswerToolCall -Path $primaryTranscript -TaskId $idB -Text 'ACCEPT-REPORT-B'
+    $reportTokenObserved = Test-OmpTranscriptContainsExactUserMessage -Path $workerTranscript -Text 'ACCEPT-REPORT-B'
+    $reportSent = [bool]($reportResult.Submitted -and $reportDelivery.Ok -and $reportAnswerCallObserved -and $reportTokenObserved)
+    Assert-True -Id 'K6.3' -What 'the primary called orch_answer for worker B and the exact report token reached its transcript' `
         -Condition $reportSent -TaskId $idB -Command $reportResult.CommandLine `
-        -Evidence ("code=[$($reportResult.Code)] submitted=[$($reportResult.Submitted)] tokenSeen=[$($reportTokenObserved.Ok)] workerSession=[$(Protect-Text $workerTranscript 300)]")
+        -Evidence ("code=[$($reportResult.Code)] submitted=[$($reportResult.Submitted)] answerCall=[$reportAnswerCallObserved] tokenDelivered=[$reportTokenObserved] workerSession=[$(Protect-Text $workerTranscript 300)]")
     if (-not $reportSent) {
-        Preserve-ResourcesForPendingTool -AssertionId 'K6.3.resources-preserved' -Reason 'worker B did not receive the direct report token'
-        throw 'the report authorization token was not proven in worker B transcript; no retry was sent'
+        Preserve-ResourcesForPendingTool -AssertionId 'K6.3.resources-preserved' -Reason 'worker B report authorization delivery was not proven'
+        throw 'the exact orch_answer call and later worker user message were not proven; no retry was sent'
     }
+
     Set-PendingUserInteraction -Pending $false -Phase 'dialog-and-report-token-resolved'
 
     $stale = Invoke-BridgeAs -LaunchPaneId ([string](Get-Field $script:Project 'LaunchPaneID')) -Method 'approve_dialog' `

@@ -612,6 +612,47 @@ try {
         -QuestionMarker 'ACCEPT-Q-A' -Token 'ACCEPT-ANSWER-A' -TaskId 'task-b'
 } catch { }
 Check 'orch_answer for a different task is rejected after user authorization' (-not $wrongTaskAnswerRelay) 'wrong task relay'
+$reportAuthorizationWorkerPath = Join-Path $script:HarnessRoot 'report-authorization-worker.jsonl'
+$reportAuthorizationWorkerLines = @(
+    '{"type":"message","message":{"role":"user","content":[{"type":"text","text":"ACCEPT-TASK-B: wait for a later user message with ACCEPT-REPORT-B"}]}}'
+    '{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"I will wait for ACCEPT-REPORT-B"}]}}'
+)
+Set-Content -LiteralPath $reportAuthorizationWorkerPath -Value $reportAuthorizationWorkerLines -Encoding UTF8
+$reportTokenFromBrief = $true
+try {
+    $reportTokenFromBrief = Test-OmpTranscriptContainsExactUserMessage `
+        -Path $reportAuthorizationWorkerPath -Text 'ACCEPT-REPORT-B'
+} catch { }
+Check 'a token mention in the dispatch brief is not proof of worker delivery' (-not $reportTokenFromBrief) 'brief mention'
+$reportAuthorizationWorkerLines += '{"type":"message","message":{"role":"user","content":[{"type":"text","text":"ACCEPT-REPORT-B"}]}}'
+Add-Content -LiteralPath $reportAuthorizationWorkerPath -Value $reportAuthorizationWorkerLines[-1] -Encoding UTF8
+$reportTokenDelivered = $false
+try {
+    $reportTokenDelivered = Test-OmpTranscriptContainsExactUserMessage `
+        -Path $reportAuthorizationWorkerPath -Text 'ACCEPT-REPORT-B'
+} catch { }
+Check 'an exact later user message proves the worker received the report token' $reportTokenDelivered 'exact user message'
+
+$reportAuthorizationPrimaryPath = Join-Path $script:HarnessRoot 'report-authorization-primary.jsonl'
+$reportAuthorizationPrimaryLines = @(
+    '{"type":"message","message":{"role":"assistant","content":[{"type":"toolCall","name":"orch_answer","arguments":{"taskId":"task-other","text":"ACCEPT-REPORT-B"}}]}}'
+)
+Set-Content -LiteralPath $reportAuthorizationPrimaryPath -Value $reportAuthorizationPrimaryLines -Encoding UTF8
+$wrongTaskReportAnswer = $true
+try {
+    $wrongTaskReportAnswer = Test-OmpTranscriptContainsAnswerToolCall `
+        -Path $reportAuthorizationPrimaryPath -TaskId 'task-b' -Text 'ACCEPT-REPORT-B'
+} catch { }
+Check 'a report-token orch_answer for another task does not prove delivery' (-not $wrongTaskReportAnswer) 'wrong task'
+$reportAuthorizationPrimaryLines += '{"type":"message","message":{"role":"assistant","content":[{"type":"toolCall","name":"orch_answer","arguments":{"taskId":"task-b","text":"ACCEPT-REPORT-B"}}]}}'
+Add-Content -LiteralPath $reportAuthorizationPrimaryPath -Value $reportAuthorizationPrimaryLines[-1] -Encoding UTF8
+$exactReportAnswerCall = $false
+try {
+    $exactReportAnswerCall = Test-OmpTranscriptContainsAnswerToolCall `
+        -Path $reportAuthorizationPrimaryPath -TaskId 'task-b' -Text 'ACCEPT-REPORT-B'
+} catch { }
+Check 'the exact task-specific orch_answer call proves the primary relayed the token' $exactReportAnswerCall 'exact tool call'
+
 $unreviewedCleanupFact = [pscustomobject]@{ Report = $null; Disposition = ''; Attention = '' }
 $unreviewedWithReportFact = [pscustomobject]@{ Report = [pscustomobject]@{ Kind = 'result' }; Disposition = ''; Attention = '' }
 $partialReportWithDispositionFact = [pscustomobject]@{ Report = [pscustomobject]@{ Kind = 'partial' }; Disposition = 'Accepted'; Attention = '' }
