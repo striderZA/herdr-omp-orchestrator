@@ -256,19 +256,19 @@ const questionAttentionPrefix = "worker question: "
 // wire bodies
 // ---------------------------------------------------------------------------
 
-// ProgressParams is the orch_progress body.
+// ProgressParams is the body of a worker report whose kind is "progress".
 type ProgressParams struct {
 	Summary string `json:"summary"`
 }
 
-// QuestionParams is the orch_question body.
+// QuestionParams is the body of a worker report whose kind is "question".
 type QuestionParams struct {
 	Text string `json:"text"`
 }
 
-// ReportParams is the orch_report body. It is its own type rather than
-// task.Report because the wire spelling is lowercase and the extension, not the
-// store, owns that shape.
+// ReportParams is the body of a worker report whose kind is "result". It is its
+// own type rather than task.Report because the wire spelling is lowercase and the
+// extension, not the store, owns that shape.
 type ReportParams struct {
 	Kind     string   `json:"kind"`
 	Summary  string   `json:"summary"`
@@ -614,16 +614,16 @@ func (c *Coordinator) finalReport(ctx context.Context, st task.Task, complete ta
 
 // validateReport refuses every report that is not a complete final result.
 //
-// Only Kind "result" is final — a partial report is what orch_progress is for —
-// and a result has to carry what a reviewer needs: a summary, the branch this
-// task actually owns, changed-file or commit evidence, the checks that ran, and a
-// stated risk (including a stated absence of one).
+// Only Kind "result" is final — a partial report is what the "progress" kind is
+// for — and a result has to carry what a reviewer needs: a summary, the branch
+// this task actually owns, changed-file or commit evidence, the checks that ran,
+// and a stated risk (including a stated absence of one).
 func validateReport(report task.Report, st task.Task) (task.Report, error) {
 	invalid := func(format string, args ...any) (task.Report, error) {
 		return task.Report{}, fmt.Errorf("%w: %s", ErrReportInvalid, fmt.Sprintf(format, args...))
 	}
 	if kind := strings.TrimSpace(report.Kind); kind != "result" {
-		return invalid("kind %q is not a final result; report partial progress with orch_progress instead", report.Kind)
+		return invalid("kind %q is not a final result; report partial progress with the \"progress\" kind instead", report.Kind)
 	}
 	summary, err := textField(report.Summary, reportSummaryLimit, "the report summary")
 	if err != nil {

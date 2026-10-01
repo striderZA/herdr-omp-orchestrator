@@ -536,6 +536,15 @@ func TestReportRejectsEveryIncompleteReport(t *testing.T) {
 			if !errors.Is(err, ErrReportInvalid) {
 				t.Fatalf("FinalReport(%s) err = %v, want ErrReportInvalid", tc.name, err)
 			}
+			// The kind mismatches are the ones a worker can actually trigger by
+			// sending the wrong note, and the bridge routes an unrouted kind here
+			// too, so the message must keep naming what is wrong: "not a final
+			// result" is what the live acceptance path asserts the worker is told.
+			if tc.name == "partial kind" || tc.name == "missing kind" {
+				if !strings.Contains(err.Error(), "not a final result") {
+					t.Errorf("FinalReport(%s) message = %q, want the 'not a final result' guidance", tc.name, err.Error())
+				}
+			}
 			after := f.reload(worker.ID)
 			if after.Report != nil {
 				t.Errorf("a refused report was recorded: %+v", after.Report)

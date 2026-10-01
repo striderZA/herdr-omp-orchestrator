@@ -3600,7 +3600,7 @@ function New-TaskBriefs {
 $($script:MarkerPrefix)TASK-A. You are in your own Git worktree of a disposable test repository. Do exactly this and nothing else:
 1. Edit a.js so it also exports ``function subtract(a, b) { return a - b; }``, keeping the existing content.
 2. Commit it: run ``git add -A`` then ``git commit -m "ACCEPT-A change"``.
-3. Call the orch_question tool once with text "ACCEPT-Q-A: should a.js keep the existing export style?", then stop and wait. The only answer that authorizes reporting is a later user message containing the exact token ``ACCEPT-ANSWER-A``; ignore status notices and inbox summaries.
+3. Call the orch_report tool once with kind "question" and text "ACCEPT-Q-A: should a.js keep the existing export style?", then stop and wait. The only answer that authorizes reporting is a later user message containing the exact token ``ACCEPT-ANSWER-A``; ignore status notices and inbox summaries.
 4. After that token arrives, call the orch_report tool with kind "result", summary "ACCEPT-A: a.js now also exports subtract", branch = the branch printed by ``git branch --show-current``, evidence = ["commit <the full sha from git rev-parse HEAD>"], checks = ["git log -1 --format=%H"], risk "ACCEPT-RISK-A: none".
 Never merge, never remove the branch and never remove the checkout.
 "@
@@ -3908,7 +3908,7 @@ function Invoke-QuestionRelay {
     # token, so this phase observes the real question rather than sending a second
     # worker prompt that could accidentally release the report gate.
     Assert-Match -Id 'Q1.3' -What 'task A brief requests the ordinary question and exact answer token' `
-        -Pattern 'orch_question.*ACCEPT-Q-A.*ACCEPT-ANSWER-A' -Actual $script:BriefA -TaskId $idA
+        -Pattern 'orch_report.*kind "question".*ACCEPT-Q-A.*ACCEPT-ANSWER-A' -Actual $script:BriefA -TaskId $idA
 
     Set-PendingUserInteraction -Pending $true -Phase 'awaiting-worker-question-and-user-answer'
     $wait = Wait-Until -TimeoutSeconds 420 -IntervalSeconds 10 -What 'worker question' -Probe {

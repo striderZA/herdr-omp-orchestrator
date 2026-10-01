@@ -745,7 +745,7 @@ export default function (pi: ExtensionAPI) {
     "orch_adjudicate_dispatch",
     "orch_cleanup",
   ];
-  const workerNames = ["orch_progress", "orch_question", "orch_report"];
+  const workerNames = ["orch_report"];
   const ownNames = [...primaryNames, ...workerNames];
   let role: Role | null = null;
 
@@ -822,7 +822,7 @@ export default function (pi: ExtensionAPI) {
         ...event.systemPrompt,
         currentRole === "primary"
           ? "You are the sole user liaison. Delegate independent bounded work with orch_dispatch, avoid editing paths reserved for workers, and keep the user in the loop: relay an ordinary worker question with orch_answer, approve a blocked worker's exact dialog keys with orch_approve_dialog only after the user confirms them, record the user's decision on a reviewed report with orch_review, and remove a reviewed checkout with orch_cleanup only after the user confirms it. A worker's report is never a merge and never completes the task: only a disposition the user recorded does. Never approve keys or remove a checkout the user has not confirmed. If sending an answer or approved keys is left uncertain (a timeout), nothing else may be sent to that worker until you inspect its pane with the user and settle it with orch_settle_input."
-          : "Work only in this assigned worktree. Use orch_progress for partial progress, orch_question when you are blocked and need the primary to ask the user, and orch_report with a complete result — summary, branch, changed-file/commit evidence, checks and a stated risk — when you are finished. Only the primary records the user's disposition for your result; do not merge and do not remove the branch or the checkout.",
+          : "Work only in this assigned worktree. Use orch_report for all three notes a worker sends: kind \"progress\" for partial progress, kind \"question\" when you are blocked and need the primary to ask the user, and kind \"result\" with a complete result — summary, branch, changed-file/commit evidence, checks and a stated risk — when you are finished. Only the primary records the user's disposition for your result; do not merge and do not remove the branch or the checkout.",
       ],
     };
   });
@@ -851,49 +851,35 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool({
-    name: "orch_progress",
-    label: "Report progress",
-    defaultInactive: true,
-    description: "Report partial progress to the primary. This never completes the task.",
-    parameters: z.object({
-      summary: z.string().min(1).max(2000),
-    }),
-    async execute(_callId, params, signal, _update, ctx) {
-      const result = await callBridge("progress", params, sessionIdentity(ctx.sessionManager), signal);
-      return toolResult(result);
-    },
-  });
-
-  pi.registerTool({
-    name: "orch_question",
-    label: "Ask the primary",
-    defaultInactive: true,
-    description:
-      "Ask the primary (and the user) a question you cannot answer yourself. The task becomes Needs input until the answer is relayed back.",
-    parameters: z.object({
-      text: z.string().min(1).max(4000),
-    }),
-    async execute(_callId, params, signal, _update, ctx) {
-      const result = await callBridge("question", params, sessionIdentity(ctx.sessionManager), signal);
-      return toolResult(result);
-    },
-  });
-
+  // One worker tool, discriminated by `kind`: the three notes a worker may send
+  // are one concept to learn and one bridge method. The bridge routes each kind to
+  // the coordinator operation that already owned it, so nothing about what a note
+  // records changes here. OMP's builder has no `discriminatedUnion`, so this is a
+  // `z.union` of objects that each pin their own literal `kind`.
   pi.registerTool({
     name: "orch_report",
-    label: "Report result",
+    label: "Report to the primary",
     defaultInactive: true,
     description:
-      "Submit a complete final result for review: summary, branch, changed-file/commit evidence, checks and a stated risk. The task becomes Ready for review; only the primary's recorded disposition completes it.",
-    parameters: z.object({
-      kind: z.literal("result"),
-      summary: z.string().min(1).max(4000),
-      branch: z.string().min(1),
-      evidence: z.array(z.string().min(1).max(512)).min(1),
-      checks: z.array(z.string().min(1).max(512)).min(1),
-      risk: z.string().min(1).max(4000),
-    }),
+      "Report to the primary. kind \"progress\": partial progress — this never completes the task. kind \"question\": a question you cannot answer yourself — the task becomes Needs input until the answer is relayed back. kind \"result\": a complete final result for review — summary, branch, changed-file/commit evidence, checks and a stated risk; the task becomes Ready for review, and only the primary's recorded disposition completes it.",
+    parameters: z.union([
+      z.object({
+        kind: z.literal("progress"),
+        summary: z.string().min(1).max(2000),
+      }),
+      z.object({
+        kind: z.literal("question"),
+        text: z.string().min(1).max(4000),
+      }),
+      z.object({
+        kind: z.literal("result"),
+        summary: z.string().min(1).max(4000),
+        branch: z.string().min(1),
+        evidence: z.array(z.string().min(1).max(512)).min(1),
+        checks: z.array(z.string().min(1).max(512)).min(1),
+        risk: z.string().min(1).max(4000),
+      }),
+    ]),
     async execute(_callId, params, signal, _update, ctx) {
       const result = await callBridge("report", params, sessionIdentity(ctx.sessionManager), signal);
       return toolResult(result);

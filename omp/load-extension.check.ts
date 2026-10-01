@@ -152,8 +152,6 @@ const wantNames = [
   "orch_approve_dialog",
   "orch_cleanup",
   "orch_dispatch",
-  "orch_progress",
-  "orch_question",
   "orch_report",
   "orch_review",
   "orch_settle_input",
@@ -337,6 +335,29 @@ if (!report) {
     !tryParse(schema, { ...valid, evidence: [] }).ok,
     "orch_report accepted a report without changed-file/commit evidence",
   );
+  // One schema carries all three kinds, so each kind's own required fields must
+  // still bite: a union that accepted `progress` without a summary would let a
+  // worker send a note the coordinator cannot record.
+  check(
+    tryParse(schema, { kind: "progress", summary: "ported the lexer" }).ok,
+    "orch_report rejected a valid progress note",
+  );
+  check(
+    tryParse(schema, { kind: "question", text: "Which branch should I target?" }).ok,
+    "orch_report rejected a valid question",
+  );
+  check(
+    !tryParse(schema, { kind: "progress" }).ok,
+    "orch_report accepted progress without a summary",
+  );
+  check(
+    !tryParse(schema, { kind: "question", summary: "wrong field for this kind" }).ok,
+    "orch_report accepted a question carrying a progress field instead of its text",
+  );
+  check(
+    !tryParse(schema, { kind: "partial", summary: "halfway" }).ok,
+    "orch_report accepted an unknown kind",
+  );
 }
 
 // --- the rest of the typed tool parameters ---------------------------------
@@ -345,8 +366,14 @@ if (!report) {
 // call the model is told to make; a missing or too-loose schema is a load
 // failure waiting for the user's machine.
 const toolCalls: { name: string; params: Record<string, unknown>; bad: Record<string, unknown> }[] = [
-  { name: "orch_progress", params: { summary: "ported the lexer" }, bad: { summary: "" } },
-  { name: "orch_question", params: { text: "Which branch should I target?" }, bad: { text: "" } },
+  // orch_report is the one worker tool; each kind is a call the model is told to
+  // make, and the bad case for a kind is that kind with its own field missing.
+  { name: "orch_report", params: { kind: "progress", summary: "ported the lexer" }, bad: { kind: "progress", summary: "" } },
+  {
+    name: "orch_report",
+    params: { kind: "question", text: "Which branch should I target?" },
+    bad: { kind: "question", text: "" },
+  },
   { name: "orch_answer", params: { taskId: "orch_abc", text: "Keep the old API." }, bad: { taskId: "", text: "" } },
   {
     name: "orch_approve_dialog",

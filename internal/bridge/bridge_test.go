@@ -2568,8 +2568,6 @@ func TestReportMethodsAreRoleGated(t *testing.T) {
 		}
 	}
 	for name, field := range map[string]*func(context.Context, Principal, json.RawMessage) (any, error){
-		"progress":        &ops.Progress,
-		"question":        &ops.Question,
 		"report":          &ops.Report,
 		"answer":          &ops.Answer,
 		"dialog_preview":  &ops.DialogPreview,
@@ -2583,7 +2581,9 @@ func TestReportMethodsAreRoleGated(t *testing.T) {
 	}
 
 	primaryMethods := []string{"answer", "dialog_preview", "approve_dialog", "report_preview", "review", "cleanup_preview", "cleanup"}
-	workerMethods := []string{"progress", "question", "report"}
+	// The worker's whole surface is one method, reachable under every kind it
+	// carries: the union in the extension is a schema, not a second gate.
+	workerMethods := []string{"report"}
 
 	t.Run("a worker cannot decide", func(t *testing.T) {
 		f.asWorker()
@@ -2597,7 +2597,7 @@ func TestReportMethodsAreRoleGated(t *testing.T) {
 	t.Run("a primary cannot report", func(t *testing.T) {
 		f.asPrimary()
 		for _, method := range workerMethods {
-			wantError(t, f.callWith(method, primarySession, `{"summary":"x"}`, ops), CodeForbidden)
+			wantError(t, f.callWith(method, primarySession, `{"kind":"progress","summary":"x"}`, ops), CodeForbidden)
 		}
 		if len(calls) != 0 {
 			t.Fatalf("a primary reached %d coordinator operations", len(calls))
@@ -2605,14 +2605,14 @@ func TestReportMethodsAreRoleGated(t *testing.T) {
 	})
 	t.Run("the right role is dispatched", func(t *testing.T) {
 		f.asWorker()
-		if resp := f.callWith("progress", workerSession, `{"summary":"halfway"}`, ops); !resp.OK {
+		if resp := f.callWith("report", workerSession, `{"kind":"progress","summary":"halfway"}`, ops); !resp.OK {
 			t.Fatalf("progress failed: %+v", resp.Error)
 		}
 		f.asPrimary()
 		if resp := f.callWith("review", primarySession, `{"taskId":"t1","disposition":"accepted"}`, ops); !resp.OK {
 			t.Fatalf("review failed: %+v", resp.Error)
 		}
-		if calls["progress"] != 1 || calls["review"] != 1 {
+		if calls["report"] != 1 || calls["review"] != 1 {
 			t.Fatalf("dispatch counted %v", calls)
 		}
 	})
@@ -2634,13 +2634,13 @@ func TestReportWorkerFactsAreDurableAndHerdrActivityNeverCompletes(t *testing.T)
 	})
 	ops := CoordinatorOps(f.coordinator(t))
 
-	if resp := f.callWith("progress", workerSession, `{"summary":"ported the lexer"}`, ops); !resp.OK {
+	if resp := f.callWith("report", workerSession, `{"kind":"progress","summary":"ported the lexer"}`, ops); !resp.OK {
 		t.Fatalf("progress failed: %+v", resp.Error)
 	}
-	if resp := f.callWith("progress", workerSession, `{"summary":"ported the lexer"}`, ops); !resp.OK {
+	if resp := f.callWith("report", workerSession, `{"kind":"progress","summary":"ported the lexer"}`, ops); !resp.OK {
 		t.Fatalf("repeated progress failed: %+v", resp.Error)
 	}
-	if resp := f.callWith("question", workerSession, `{"text":"Which branch should I target?"}`, ops); !resp.OK {
+	if resp := f.callWith("report", workerSession, `{"kind":"question","text":"Which branch should I target?"}`, ops); !resp.OK {
 		t.Fatalf("question failed: %+v", resp.Error)
 	}
 
@@ -2670,7 +2670,7 @@ func TestReportWorkerFactsAreDurableAndHerdrActivityNeverCompletes(t *testing.T)
 	done := workerAgent(workerPane, workerSession, f.worktree)
 	done.AgentStatus = "done"
 	stub.setAgent(workerPane, done)
-	if resp := f.callWith("progress", workerSession, `{"summary":"still working"}`, ops); !resp.OK {
+	if resp := f.callWith("report", workerSession, `{"kind":"progress","summary":"still working"}`, ops); !resp.OK {
 		t.Fatalf("progress after Herdr reported done failed: %+v", resp.Error)
 	}
 	activity := f.task(t, "t1")
@@ -2699,6 +2699,9 @@ func TestReportRejectsAnIncompleteReportAndReadsTheResult(t *testing.T) {
 	})
 	ops := CoordinatorOps(f.coordinator(t))
 
+	// An unknown kind is a malformed *report*, not a malformed request: the body
+	// decodes, and the coordinator's result validation owns the refusal. The live
+	// acceptance path asserts the same code and message for the same body.
 	wantError(t, f.callWith("report", workerSession, f.reportPayload(t, "t1", "partial"), ops), "invalid_report")
 	wantError(t, f.callWith("report", workerSession, `{"kind":"result","summary":"done","branch":"orch/t1","evidence":[],"checks":[],"risk":"none"}`, ops), "invalid_report")
 	if after := f.task(t, "t1"); after.Report != nil || after.Revision != 1 {
@@ -2930,7 +2933,7 @@ func TestSettleInputDeliveredClosesTheQuestionItAnswered(t *testing.T) {
 	ops := CoordinatorOps(f.coordinator(t))
 
 	// The worker asks, and the answer to it may already have landed.
-	if resp := f.callWith("question", workerSession, `{"text":"Which branch should I target?"}`, ops); !resp.OK {
+	if resp := f.callWith("report", workerSession, `{"kind":"question","text":"Which branch should I target?"}`, ops); !resp.OK {
 		t.Fatalf("question failed: %+v", resp.Error)
 	}
 	f.asPrimary()
@@ -4051,7 +4054,7 @@ func TestEveryMethodTheExtensionCallsIsDispatched(t *testing.T) {
 		}
 	}
 	for _, method := range []string{
-		MethodDispatch, MethodReport, MethodProgress, MethodQuestion,
+		MethodDispatch, MethodReport,
 		MethodAnswer, MethodDialogPreview, MethodApproveDialog, MethodReportPreview,
 		MethodReview, MethodCleanupPreview, MethodCleanup,
 	} {

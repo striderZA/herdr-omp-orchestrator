@@ -69,10 +69,10 @@ const (
 	MethodResolve  = "resolve"
 	MethodReady    = "ready"
 	MethodDispatch = "dispatch"
-	MethodReport   = "report"
-	// The worker's own reports. They describe facts and never complete a task.
-	MethodProgress = "progress"
-	MethodQuestion = "question"
+	// MethodReport is the worker's whole surface: one note discriminated by the
+	// body's `kind` (progress, question or result). All three describe facts and
+	// none of them completes a task.
+	MethodReport = "report"
 	// The primary's decisions and the read-only previews they are shown first.
 	MethodAnswer        = "answer"
 	MethodDialogPreview = "dialog_preview"
@@ -90,6 +90,15 @@ const (
 	MethodAdjudicateBrief = "adjudicate_brief"
 	MethodCleanupPreview  = "cleanup_preview"
 	MethodCleanup         = "cleanup"
+)
+
+// The kinds one worker report carries, matching the extension's tool schema.
+// Each selects the coordinator operation that already existed for it, so the
+// merge is a wire surface change and not a behavior change.
+const (
+	reportKindProgress = "progress"
+	reportKindQuestion = "question"
+	reportKindResult   = "result"
 )
 
 // Reasons a resolve result is not bound. The extension only needs `bound`; the
@@ -181,15 +190,15 @@ type Principal struct {
 // and CoordinatorOps builds the whole set from one coordinator.
 type Ops struct {
 	Dispatch func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
-	// Worker role.
+	// Worker role. Report is the worker's whole surface: the body's `kind`
+	// (progress, question or result) selects which coordinator operation runs, and
+	// each of those is unchanged behind it.
 	Report func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
 	// BriefInspection and AdjudicateBrief are Task 4's brief-adjudication surface:
 	// the primary shows the evidence the inspection returns, the user decides, and
 	// the decision is recorded against that exact evidence.
 	BriefInspection func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
 	AdjudicateBrief func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
-	Progress        func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
-	Question        func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
 	// Primary role. Previews are read-only but require the same identity proof.
 	Answer         func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
 	DialogPreview  func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
@@ -231,28 +240,46 @@ func CoordinatorOps(c *coord.Coordinator) Ops {
 			return result, coordError(err)
 		},
 		Report: func(ctx context.Context, p Principal, params json.RawMessage) (any, error) {
-			var request coord.ReportParams
-			if err := decodeParams(params, &request); err != nil {
+			var envelope struct {
+				Kind string `json:"kind"`
+			}
+			if err := decodeParams(params, &envelope); err != nil {
 				return nil, err
 			}
-			result, err := c.FinalReport(ctx, p.LaunchPaneID, request.Report())
-			return result, coordError(err)
-		},
-		Progress: func(ctx context.Context, p Principal, params json.RawMessage) (any, error) {
-			var request coord.ProgressParams
-			if err := decodeParams(params, &request); err != nil {
-				return nil, err
+			// finalResult runs reportKindResult's operation. Every kind this build
+			// does not route runs it too, so the coordinator's own result validation
+			// owns that refusal: an unknown kind (including a missing one) is
+			// classified as invalid_report with the "not a final result" guidance a
+			// partial report has always received, rather than as a malformed
+			// request — the body itself decoded fine.
+			finalResult := func() (any, error) {
+				var request coord.ReportParams
+				if err := decodeParams(params, &request); err != nil {
+					return nil, err
+				}
+				result, err := c.FinalReport(ctx, p.LaunchPaneID, request.Report())
+				return result, coordError(err)
 			}
-			result, err := c.Progress(ctx, p.LaunchPaneID, request.Summary)
-			return result, coordError(err)
-		},
-		Question: func(ctx context.Context, p Principal, params json.RawMessage) (any, error) {
-			var request coord.QuestionParams
-			if err := decodeParams(params, &request); err != nil {
-				return nil, err
+			switch strings.TrimSpace(envelope.Kind) {
+			case reportKindProgress:
+				var request coord.ProgressParams
+				if err := decodeParams(params, &request); err != nil {
+					return nil, err
+				}
+				result, err := c.Progress(ctx, p.LaunchPaneID, request.Summary)
+				return result, coordError(err)
+			case reportKindQuestion:
+				var request coord.QuestionParams
+				if err := decodeParams(params, &request); err != nil {
+					return nil, err
+				}
+				result, err := c.Question(ctx, p.LaunchPaneID, request.Text)
+				return result, coordError(err)
+			case reportKindResult:
+				return finalResult()
+			default:
+				return finalResult()
 			}
-			result, err := c.Question(ctx, p.LaunchPaneID, request.Text)
-			return result, coordError(err)
 		},
 		Answer: func(ctx context.Context, p Principal, params json.RawMessage) (any, error) {
 			var request coord.AnswerParams
@@ -351,8 +378,6 @@ func UnavailableOps(cause error) Ops {
 	return Ops{
 		Dispatch:        unavailable,
 		Report:          unavailable,
-		Progress:        unavailable,
-		Question:        unavailable,
 		Answer:          unavailable,
 		DialogPreview:   unavailable,
 		ApproveDialog:   unavailable,
@@ -543,10 +568,6 @@ func run(ctx context.Context, env map[string]string, input io.Reader, opts Optio
 		return h.mutate(req, state.RolePrimary, announced, h.ops.Dispatch)
 	case MethodReport:
 		return h.mutate(req, state.RoleWorker, announced, h.ops.Report)
-	case MethodProgress:
-		return h.mutate(req, state.RoleWorker, announced, h.ops.Progress)
-	case MethodQuestion:
-		return h.mutate(req, state.RoleWorker, announced, h.ops.Question)
 	case MethodAnswer:
 		return h.mutate(req, state.RolePrimary, announced, h.ops.Answer)
 	case MethodDialogPreview:
