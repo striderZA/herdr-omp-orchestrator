@@ -5700,30 +5700,55 @@ function Invoke-Restart {
     $restoredProjectAgent = Get-LiveAgent -Target $restoredProjectPane
     $restoredProjectSession = [string](Get-Field (Get-Field $restoredProjectAgent.Agent 'agent_session') 'value')
     $restoredProjectSnapshot = @(Get-Field (Get-Snapshot) 'panes' @() | Where-Object { (Get-Field $_ 'pane_id') -ceq $restoredProjectPane })
+    # The pane can be absent after a restart, which is the case this assertion
+    # exists to catch. Indexing the empty array below would abort the whole run
+    # with "Index was outside the bounds of the array" instead of recording that
+    # failure, so the terminal id is read only when there is a row to read.
+    $restoredProjectTerminal = if ($restoredProjectSnapshot.Count -gt 0) {
+        [string](Get-Field $restoredProjectSnapshot[0] 'terminal_id')
+    } else {
+        '(no pane in the snapshot)'
+    }
     Assert-True -Id 'T5.project-session' -What 'the restored primary pane still proves the recorded OMP session and terminal' `
         -Condition ($restoredProjectAgent.Found -and $restoredProjectSnapshot.Count -eq 1 -and
             [int](Get-Field $restoredProjectReady 'verified' 0) -eq 1 -and
             (Test-SessionIdentity -Left ([string](Get-Field $after.Project 'OMPSessionID')) -Right $restoredProjectSession -Ready $restoredProjectReady) -and
             (Test-SamePath -A ([string](Get-Field $after.Project 'Key')) -B ([string](Get-Field $restoredProjectAgent.Agent 'cwd'))) -and
-            [string](Get-Field $restoredProjectSnapshot[0] 'terminal_id') -ceq [string](Get-Field $after.Project 'TerminalID')) `
-        -Evidence ("pane=$restoredProjectPane session=$restoredProjectSession terminal=$([string](Get-Field $restoredProjectSnapshot[0] 'terminal_id'))")
+            $restoredProjectTerminal -ceq [string](Get-Field $after.Project 'TerminalID')) `
+        -Evidence ("pane=$restoredProjectPane session=$restoredProjectSession terminal=$restoredProjectTerminal")
     foreach ($row in @($after.Tasks)) {
         $fact = Get-Field $row 'fact'
-        $pane = [string](Get-Field $fact 'LaunchPaneID')
+        # The pane that must exist after a restart is the task's *current* pane,
+        # not its launch-time one. The M phase moves a worker pane and by design a
+        # move never re-keys the launch id (M4.3), so the launch id names a pane
+        # that no longer exists while the live pane is the recorded public one.
+        # Here the launch id would require Herdr to restore a pane id that is gone
+        # by construction; the public id is the pane the worker is actually in.
+        $launchPane = [string](Get-Field $fact 'LaunchPaneID')
+        $publicPane = [string](Get-Field $fact 'PublicPaneID')
+        $pane = if ($publicPane) { $publicPane } else { $launchPane }
         $session = [string](Get-Field $fact 'OMPSessionID')
         if (-not $pane -or -not $session) { continue }
         $ready = Get-ReadySession -LaunchPaneId $pane
         $agent = Get-LiveAgent -Target $pane
         $liveSession = [string](Get-Field (Get-Field $agent.Agent 'agent_session') 'value')
         $paneSnapshot = @(Get-Field (Get-Snapshot) 'panes' @() | Where-Object { (Get-Field $_ 'pane_id') -ceq $pane })
+        # Same guard as the project pane above: a worker whose pane is gone must
+        # produce a failed assertion with readable evidence, not an indexing
+        # exception that ends the run before the failure is recorded.
+        $paneTerminal = if ($paneSnapshot.Count -gt 0) {
+            [string](Get-Field $paneSnapshot[0] 'terminal_id')
+        } else {
+            '(no pane in the snapshot)'
+        }
         Assert-True -Id "T5.session/$([string](Get-Field $fact 'ID'))" `
             -What "the restored pane for $([string](Get-Field $fact 'ID')) still proves its recorded OMP session and terminal" `
             -Condition ($agent.Found -and $paneSnapshot.Count -eq 1 -and
                 [int](Get-Field $ready 'verified' 0) -eq 1 -and
                 (Test-SessionIdentity -Left $session -Right $liveSession -Ready $ready) -and
                 (Test-SamePath -A ([string](Get-Field $fact 'WorktreePath')) -B ([string](Get-Field $agent.Agent 'cwd'))) -and
-                [string](Get-Field $paneSnapshot[0] 'terminal_id') -ceq [string](Get-Field $fact 'TerminalID')) `
-            -TaskId ([string](Get-Field $fact 'ID')) -Evidence ("pane=$pane session=$liveSession terminal=$([string](Get-Field $paneSnapshot[0] 'terminal_id'))")
+                $paneTerminal -ceq [string](Get-Field $fact 'TerminalID')) `
+            -TaskId ([string](Get-Field $fact 'ID')) -Evidence ("pane=$pane (launch=$launchPane) session=$liveSession terminal=$paneTerminal")
     }
     $beforeInboxIds = @($before.Inbox | ForEach-Object { [string](Get-Field $_ 'id') })
     $afterInboxIds = @($after.Inbox | ForEach-Object { [string](Get-Field $_ 'id') })
