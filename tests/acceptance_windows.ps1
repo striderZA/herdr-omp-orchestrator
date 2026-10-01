@@ -4792,16 +4792,16 @@ function Invoke-BlockedDialog {
     }
 
     $prompt = 'ACCEPT-DIALOG. I have reviewed the exact dialog for worker ' + $idB + ': question "ACCEPT-Q-DIALOG: which contract should b.js use?" with options "keep the current contract" and "change the contract". As the acceptance user, I explicitly authorize sending only enter to choose "keep the current contract" for this task. Call orch_approve_dialog with taskId "' + $idB + '" and keys ["enter"]; do not act if the confirmation UI shows a different dialog. Then reply with the word approved.'
-    $result = Invoke-PrimaryPromptAfterDispositionAsks -PaneId $script:PrimaryPane -Text $prompt -TimeoutSeconds 240 -AssertionPrefix 'K4'
+    # This prompt starts an approval tool that waits for explicit user confirmation.
+    # Submit without --wait; the transcript proves the tool call and
+    # Confirm-PrimaryModal independently gates any Enter input.
+    $result = Invoke-PrimaryPromptNoWaitAfterDispositionAsks -PaneId $script:PrimaryPane -Text $prompt -TimeoutSeconds 240 -AssertionPrefix 'K4'
     $primaryReady = Get-ReadySession -LaunchPaneId ([string](Get-Field $script:Project 'LaunchPaneID'))
     $primaryTranscript = [string](Get-Field $primaryReady 'omp_session_file')
     $approvalRequest = Wait-Until -TimeoutSeconds 120 -IntervalSeconds 3 -What 'exact worker approval call in the primary transcript' -Probe {
         if (Test-OmpApprovalToolCall -Path $primaryTranscript -TaskId $idB -Keys @('enter')) { return $true }
         return $null
     }
-    # Herdr's --wait prompt can time out while orch_approve_dialog is waiting on
-    # its user confirmation UI. The exact tool call in the OMP transcript is the
-    # submission proof; Confirm-PrimaryModal independently gates any Enter input.
     $approvalRecorded = [bool]($result.Submitted -and $approvalRequest.Ok)
     Assert-True -Id 'K4.1' -What 'the primary requested approval for this exact task and key in its OMP transcript' `
         -Condition $approvalRecorded -TaskId $idB -Command $result.CommandLine `
