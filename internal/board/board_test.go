@@ -561,8 +561,8 @@ func TestBoardNavigationMovesSelectionWithoutMutatingTasks(t *testing.T) {
 	if !m.expanded {
 		t.Fatal("enter did not open the details")
 	}
-	if !strings.Contains(m.View(), "Brief: ") {
-		t.Errorf("the expanded view shows no brief:\n%s", m.View())
+	if !strings.Contains(m.View(), "Brief") || strings.Contains(m.View(), StageLabel(task.Done)) {
+		t.Errorf("the detail page should show the brief and replace the board:\n%s", m.View())
 	}
 	press(t, m, tea.KeyMsg{Type: tea.KeyEnter})
 	if m.expanded {
