@@ -2190,6 +2190,51 @@ function Test-OmpTranscriptContains {
         elseif ($stream) { $stream.Dispose() }
     }
 }
+function Test-OmpTranscriptContainsResultNote {
+    param([string]$Path, [string]$TaskId, [string]$Summary)
+    if ([string]::IsNullOrWhiteSpace($Path) -or [string]::IsNullOrWhiteSpace($TaskId) -or
+        [string]::IsNullOrWhiteSpace($Summary) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    # Inbox note lines are capped at 400 runes; this prefix survives even for long summaries.
+    $summaryEnd = 0
+    $summaryRunes = 0
+    while ($summaryEnd -lt $Summary.Length -and $summaryRunes -lt 128) {
+        if ([char]::IsHighSurrogate($Summary[$summaryEnd]) -and
+            $summaryEnd + 1 -lt $Summary.Length -and
+            [char]::IsLowSurrogate($Summary[$summaryEnd + 1])) {
+            $summaryEnd += 2
+        } else {
+            $summaryEnd++
+        }
+        $summaryRunes++
+    }
+    $marker = $TaskId + ' [result]: ' + $Summary.Substring(0, $summaryEnd)
+    $stream = $null
+    $reader = $null
+    try {
+        $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        $reader = New-Object System.IO.StreamReader($stream)
+        while ($null -ne ($line = $reader.ReadLine())) {
+            try { $entry = ConvertFrom-Json -InputObject $line -ErrorAction Stop } catch { continue }
+            if ([string](Get-Field $entry 'type') -cne 'message') { continue }
+            $message = Get-Field $entry 'message'
+            if ([string](Get-Field $message 'role') -cne 'user') { continue }
+            $textParts = @()
+            foreach ($part in @(Get-Field $message 'content' @())) {
+                $partText = Get-Field $part 'text'
+                if ($partText -is [string]) { $textParts += $partText }
+            }
+            $text = $textParts -join "`n"
+            if ($text.StartsWith('orchestrator:', [System.StringComparison]::Ordinal) -and
+                $text.IndexOf($marker, [System.StringComparison]::Ordinal) -ge 0) { return $true }
+        }
+    } catch {
+        return $false
+    } finally {
+        if ($reader) { $reader.Dispose() }
+        elseif ($stream) { $stream.Dispose() }
+    }
+    return $false
+}
 function Test-OmpTranscriptContainsExactUserMessage {
     param([string]$Path, [string]$Text)
     if ([string]::IsNullOrWhiteSpace($Path) -or [string]::IsNullOrEmpty($Text) -or
@@ -5071,12 +5116,33 @@ function Invoke-WorkerReports {
         Assert-True -Id 'W4.B-dirty' -What "worker B's change is really present and uncommitted (the dirt the cleanup refusal relies on)" -Condition ($statusB -ne '') -TaskId ([string](Get-Field $script:TaskB 'ID')) -Evidence (Protect-Text $statusB 300)
     }
 
-    $primaryScreen = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'recent-unwrapped' -Lines 300
-    if ($primaryScreen -match 'worker result') {
-        Assert-True -Id 'W5.1' -What 'the result notes were delivered into the primary session by the plugin' -Condition $true
+    $primaryReady = Get-ReadySession -LaunchPaneId ([string](Get-Field $script:Project 'LaunchPaneID'))
+    $primaryTranscript = [string](Get-Field $primaryReady 'omp_session_file')
+    $resultNoteMarkers = @()
+    foreach ($resultTask in @($script:TaskA, $script:TaskB)) {
+        if ($null -eq $resultTask) { continue }
+        $resultReport = Get-Field $resultTask 'Report' $null
+        if ($null -eq $resultReport -or [string](Get-Field $resultReport 'Kind') -cne 'result') { continue }
+        $resultNoteMarkers += [pscustomobject]@{
+            TaskId  = [string](Get-Field $resultTask 'ID')
+            Summary = [string](Get-Field $resultReport 'Summary')
+        }
+    }
+    $delivery = Wait-Until -TimeoutSeconds 120 -IntervalSeconds 3 -What 'result notes reached the primary session' -Probe {
+        if ($resultNoteMarkers.Count -eq 0) { return $null }
+        foreach ($marker in $resultNoteMarkers) {
+            if (-not (Test-OmpTranscriptContainsResultNote -Path $primaryTranscript `
+                -TaskId $marker.TaskId -Summary $marker.Summary)) { return $null }
+        }
+        return $true
+    }
+    if ($delivery.Ok) {
+        Assert-True -Id 'W5.1' -What 'the result notes were delivered into the primary session by the plugin' `
+            -Condition $true -Evidence ("matched {0} result note(s) in the primary OMP transcript" -f $resultNoteMarkers.Count)
     } else {
+        $primaryScreen = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'recent-unwrapped' -Lines 300
         Block-Item -Id 'W5.1' -What 'the result notes were delivered into the primary session by the plugin' `
-            -Evidence ("the notes are durable in the store but not visible in the primary scrollback at inspection time: " + (Protect-Text $primaryScreen 500))
+            -Evidence ("the report markers did not reach the primary OMP transcript within 120s: " + (Protect-Text $primaryScreen 500))
     }
 }
 
@@ -5098,7 +5164,10 @@ function Get-BoardSelectionKey {
 function Invoke-Board {
     Write-Step 'Phase 15: the read-only board renders the tasks'
     $tasksBefore = @(Get-ProjectTasks -Key (Get-Field $script:Project 'Key'))
-    $jsonBefore = (@($tasksBefore | Sort-Object { Get-Field $_ 'id' } | ForEach-Object { Get-Json $_ }) -join '|')
+    # Worker-status hooks may legitimately update Activity, ActivitySeenAt and
+    # Revision while the interactive board is open; compare workflow facts only.
+    $taskWorkflowBefore = (@($tasksBefore | Sort-Object { Get-Field $_ 'id' } |
+        ForEach-Object { Get-TaskProjection -Fact (Get-Field $_ 'fact') }) -join '|')
     $focusSnapshotBefore = Get-Snapshot
     $focusBefore = Get-FocusProjection -Snapshot $focusSnapshotBefore
     $focusWorkspaceBefore = [string](Get-Field $focusSnapshotBefore 'focused_workspace_id')
@@ -5207,8 +5276,10 @@ function Invoke-Board {
         -Evidence ("focused=[$(Get-Field $boardPaneInfo 'focused')] workspace=[$(Get-Field $boardPaneInfo 'workspace_id')]")
 
     $tasksAfter = @(Get-ProjectTasks -Key (Get-Field $script:Project 'Key'))
-    $jsonAfter = (@($tasksAfter | Sort-Object { Get-Field $_ 'id' } | ForEach-Object { Get-Json $_ }) -join '|')
-    Assert-Equal -Id 'A4.1' -What 'reading the board mutated no task fact (revisions included)' -Expected $jsonBefore -Actual $jsonAfter
+    $taskWorkflowAfter = (@($tasksAfter | Sort-Object { Get-Field $_ 'id' } |
+        ForEach-Object { Get-TaskProjection -Fact (Get-Field $_ 'fact') }) -join '|')
+    Assert-Equal -Id 'A4.1' -What 'reading the board left task workflow facts unchanged (live activity/revisions excluded)' `
+        -Expected $taskWorkflowBefore -Actual $taskWorkflowAfter
 
     $close = Invoke-Herdr -Arguments @('pane', 'close', $boardPane) -TimeoutSeconds 60
     Assert-Equal -Id 'A5.1' -What 'the board pane closes cleanly' -Expected 0 -Actual $close.ExitCode -Evidence (Protect-Text $close.Stderr 300)

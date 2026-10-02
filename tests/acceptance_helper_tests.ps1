@@ -547,6 +547,98 @@ Check 'OMP transcript confirms a prompt outside the visible scrollback' $transcr
 $transcriptMissingMarker = $true
 try { $transcriptMissingMarker = Test-OmpTranscriptContains -Path $transcriptPath -Text 'ACCEPT-Q-Z' } catch { }
 Check 'OMP transcript rejects an absent prompt marker' (-not $transcriptMissingMarker) 'missing marker'
+ $resultSummary = "result with `"quotes`" and`nmultiple lines"
+ $resultNoteText = "orchestrator: 1 worker note(s)`n- orch_abc [result]: $resultSummary | evidence: commit abc"
+ $assistantResultEntry = [pscustomobject]@{
+     type = 'message'
+     message = [pscustomobject]@{ role = 'assistant'; content = @([pscustomobject]@{ type = 'text'; text = $resultNoteText }) }
+ } | ConvertTo-Json -Depth 8 -Compress
+ $wrongTaskResultEntry = [pscustomobject]@{
+     type = 'message'
+     message = [pscustomobject]@{ role = 'user'; content = @([pscustomobject]@{ type = 'text'; text = $resultNoteText.Replace('orch_abc', 'orch_other') }) }
+ } | ConvertTo-Json -Depth 8 -Compress
+ $exactResultEntry = [pscustomobject]@{
+     type = 'message'
+     message = [pscustomobject]@{ role = 'user'; content = @([pscustomobject]@{ type = 'text'; text = $resultNoteText }) }
+ } | ConvertTo-Json -Depth 8 -Compress
+ $resultTranscriptPath = Join-Path $script:HarnessRoot 'result-note-session.jsonl'
+ Set-Content -LiteralPath $resultTranscriptPath -Value @($assistantResultEntry, $wrongTaskResultEntry, $exactResultEntry) -Encoding UTF8
+ $exactResultNote = $false
+ try {
+     $exactResultNote = Test-OmpTranscriptContainsResultNote -Path $resultTranscriptPath `
+         -TaskId 'orch_abc' -Summary $resultSummary
+ } catch { }
+ Check 'result note parser decodes JSON escaping and matches the exact task/result/summary' $exactResultNote 'decoded result summary'
+ $wrongResultSummary = $true
+ try {
+     $wrongResultSummary = Test-OmpTranscriptContainsResultNote -Path $resultTranscriptPath `
+         -TaskId 'orch_abc' -Summary 'a different summary'
+ } catch { }
+ Check 'result note parser rejects a different summary' (-not $wrongResultSummary) 'wrong summary'
+$longResultSummary = 'x' * 500
+$longResultTaskId = 'orch_123456789abc'
+$longResultLine = "$longResultTaskId [result]: $longResultSummary | evidence: commit abc"
+$truncatedResultLine = $longResultLine.Substring(0, 400)
+$truncatedResultEntry = [pscustomobject]@{
+    type = 'message'
+    message = [pscustomobject]@{
+        role = 'user'
+        content = @([pscustomobject]@{ type = 'text'; text = "orchestrator: 1 worker note(s)`n- $truncatedResultLine" })
+    }
+} | ConvertTo-Json -Depth 8 -Compress
+$truncatedResultPath = Join-Path $script:HarnessRoot 'truncated-result-note.jsonl'
+Set-Content -LiteralPath $truncatedResultPath -Value $truncatedResultEntry -Encoding UTF8
+$truncatedResultDelivered = $false
+try {
+    $truncatedResultDelivered = Test-OmpTranscriptContainsResultNote -Path $truncatedResultPath `
+        -TaskId $longResultTaskId -Summary $longResultSummary
+} catch { }
+Check 'result note parser accepts the exact summary prefix preserved by the inbox line bound' `
+    $truncatedResultDelivered 'truncated summary prefix'
+$astralSummary = ('x' * 127) + [char]::ConvertFromUtf32(0x1F600) + ('y' * 500)
+$astralTaskId = 'orch_123456789abd'
+$astralLine = "$astralTaskId [result]: $astralSummary | evidence: commit abc"
+$astralEntry = [pscustomobject]@{
+    type = 'message'
+    message = [pscustomobject]@{
+        role = 'user'
+        content = @([pscustomobject]@{ type = 'text'; text = "orchestrator: 1 worker note(s)`n- $($astralLine.Substring(0, 400))" })
+    }
+} | ConvertTo-Json -Depth 8 -Compress
+$astralPath = Join-Path $script:HarnessRoot 'astral-result-note.jsonl'
+Set-Content -LiteralPath $astralPath -Value $astralEntry -Encoding UTF8
+$astralDelivered = $false
+try {
+    $astralDelivered = Test-OmpTranscriptContainsResultNote -Path $astralPath `
+        -TaskId $astralTaskId -Summary $astralSummary
+} catch { }
+Check 'result note parser keeps an astral scalar intact at the 128-rune boundary' $astralDelivered 'astral summary prefix'
+$differentAstralSummary = ('x' * 127) + [char]::ConvertFromUtf32(0x1F601) + ('y' * 500)
+$differentAstralLine = "$astralTaskId [result]: $differentAstralSummary | evidence: commit abc"
+$differentAstralEntry = [pscustomobject]@{
+    type = 'message'
+    message = [pscustomobject]@{
+        role = 'user'
+        content = @([pscustomobject]@{ type = 'text'; text = "orchestrator: 1 worker note(s)`n- $($differentAstralLine.Substring(0, 400))" })
+    }
+} | ConvertTo-Json -Depth 8 -Compress
+$differentAstralPath = Join-Path $script:HarnessRoot 'different-astral-result-note.jsonl'
+Set-Content -LiteralPath $differentAstralPath -Value $differentAstralEntry -Encoding UTF8
+$differentAstralAccepted = $true
+try {
+    $differentAstralAccepted = Test-OmpTranscriptContainsResultNote -Path $differentAstralPath `
+        -TaskId $astralTaskId -Summary $astralSummary
+} catch { }
+Check 'result note parser rejects a different astral scalar with the same leading surrogate' `
+    (-not $differentAstralAccepted) 'different astral scalar'
+ $assistantOnlyPath = Join-Path $script:HarnessRoot 'assistant-result-note.jsonl'
+ Set-Content -LiteralPath $assistantOnlyPath -Value $assistantResultEntry -Encoding UTF8
+ $assistantCountedAsDelivery = $true
+ try {
+     $assistantCountedAsDelivery = Test-OmpTranscriptContainsResultNote -Path $assistantOnlyPath `
+         -TaskId 'orch_abc' -Summary $resultSummary
+ } catch { }
+ Check 'result note parser rejects an assistant message without plugin delivery' (-not $assistantCountedAsDelivery) 'assistant is not delivery'
 $questionNoticePath = Join-Path $script:HarnessRoot 'worker-question-notice.jsonl'
 $questionNoticeLines = @(
     '{"type":"message","message":{"role":"user","content":[{"type":"text","text":"Dispatch brief contains ACCEPT-Q-A"}]}}'
