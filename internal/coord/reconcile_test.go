@@ -672,6 +672,53 @@ func parseHooks(t *testing.T, manifest string) (startups, events []manifestHook)
 // worker status hooks
 // ---------------------------------------------------------------------------
 
+func TestEventWorkerStatusDuringDispatchHandshakeDoesNotPoisonTask(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	worker := f.boundWorker(t)
+	ctx := context.Background()
+
+	// Recreate the dispatch window before the first brief has been submitted.
+	started, err := f.store.UpdateTask(ctx, worker.ID, worker.Revision, func(next *task.Task) error {
+		next.Phase = task.AgentStarted
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("move task to the dispatch window: %v", err)
+	}
+	worker = started
+
+	// RecordReady and ConfirmReady are separate writes. During that window, a
+	// status event cannot distinguish the existing worker from a replacement.
+	nextSession := task.Announcement{
+		ID:     "omp-reannounced",
+		File:   sessionFileFor("omp-reannounced"),
+		OnDisk: true,
+	}
+	if err := f.store.RecordReady(ctx, worker.LaunchPaneID, nextSession, 1); err != nil {
+		t.Fatalf("RecordReady: %v", err)
+	}
+	f.setAgentStatus(t, worker.PublicPaneID, "idle")
+	before := f.taskByID(t, worker.ID)
+
+	if err := f.coord.HandleEvent(ctx, EventAgentStatus,
+		statusEventPayload(t, worker.PublicPaneID, "idle")); err != nil {
+		t.Fatalf("HandleEvent during the unconfirmed handshake: %v", err)
+	}
+
+	after := f.taskByID(t, worker.ID)
+	if after.Revision != before.Revision || after.Attention != before.Attention ||
+		after.Activity != before.Activity || task.StageOf(after) != task.Running {
+		t.Fatalf("unconfirmed status observation changed the task: before=%+v after=%+v",
+			before, after)
+	}
+	if notes := f.notesOfKind(t, noteKindAttention); len(notes) != 0 {
+		t.Fatalf("unconfirmed status observation recorded %d attention notes: %+v", len(notes), notes)
+	}
+	if notes := f.notesOfKind(t, noteKindActivity); len(notes) != 0 {
+		t.Fatalf("unconfirmed status observation recorded %d activity notes: %+v", len(notes), notes)
+	}
+}
+
 func TestEventWorkerStatusIsRecordedOncePerTransitionAndNeverCompletes(t *testing.T) {
 	f := newCoordFixture(t, fixturePlan{})
 	worker := f.boundWorker(t)

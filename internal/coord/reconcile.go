@@ -324,15 +324,16 @@ func (c *Coordinator) handleAgentStatus(ctx context.Context, event AgentStatusEv
 	return c.observeWorkerStatus(ctx, binding.Task, status, event)
 }
 
-// observeWorkerStatus records one observed status transition for a worker the
-// pane really belongs to.
-//
-// The verification is deliberate: the pane must still be occupied by the
-// session, terminal and checkout this task was dispatched with. A pane a
-// stranger now holds is a changed occupant, and its activity is not this task's
-// fact - the task is marked for a human instead, and its binding is never
-// re-keyed here.
+// observeWorkerStatus applies a task's first status observation only after its
+// brief was submitted. Before then, agent-startup events can race the separate
+// readiness announcement and confirmation writes; dispatch itself decides
+// whether the session is valid, so those observations are ignored. After
+// submission, an unproven or contradictory session remains fail-closed: its
+// activity is not recorded and the task needs a human.
 func (c *Coordinator) observeWorkerStatus(ctx context.Context, st task.Task, status string, event AgentStatusEvent) error {
+	if st.Phase != task.PromptSubmitted {
+		return nil
+	}
 	identity, err := c.identityOf(ctx, st.LaunchPaneID, st.OMPSessionID)
 	if err != nil {
 		return fmt.Errorf("read the confirmed session of task %s: %w", st.ID, err)
