@@ -719,6 +719,165 @@ func TestEventWorkerStatusDuringDispatchHandshakeDoesNotPoisonTask(t *testing.T)
 	}
 }
 
+// TestEquivalentPathRefreshDuringAgentStartedIsIgnoredUntilConfirmed exercises
+// the RecordReady -> event -> ConfirmReady window without treating an unverified
+// same-session announcement as proof. A later confirmed event still crosses the
+// id/path boundary through the recorded handshake.
+func TestEquivalentPathRefreshDuringAgentStartedIsIgnoredUntilConfirmed(t *testing.T) {
+	ctx := context.Background()
+	f := crossFormFixture(t)
+	worker := f.boundWorker(t)
+	file := assertCrossFormRecorded(t, f, worker)
+	refreshedFile := strings.ToUpper(file)
+	if !task.SameSessionReference(task.SessionKindPath, file, refreshedFile) {
+		t.Skip("case-only session path refresh is equivalent only on Windows")
+	}
+
+	started, err := f.store.UpdateTask(ctx, worker.ID, worker.Revision, func(next *task.Task) error {
+		next.Phase = task.AgentStarted
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("move task to pre-submit phase: %v", err)
+	}
+	refreshedAnnouncement := task.Announcement{
+		ID:     worker.OMPSessionID,
+		File:   refreshedFile,
+		OnDisk: true,
+	}
+	if err := f.store.RecordReady(ctx, worker.LaunchPaneID, refreshedAnnouncement, 1); err != nil {
+		t.Fatalf("RecordReady equivalent path refresh: %v", err)
+	}
+	unverified, err := f.store.Readiness(ctx, worker.LaunchPaneID)
+	if err != nil {
+		t.Fatalf("Readiness during refresh: %v", err)
+	}
+	if !unverified.Found || unverified.StoredVerified != 0 || unverified.Verified ||
+		unverified.Announcement != refreshedAnnouncement {
+		t.Fatalf("refreshed handshake = %+v, want a present but unverified equivalent path row", unverified)
+	}
+
+	f.setAgentStatus(t, worker.PublicPaneID, "idle")
+	if err := f.coord.HandleEvent(ctx, EventAgentStatus,
+		statusEventPayload(t, worker.PublicPaneID, "idle")); err != nil {
+		t.Fatalf("status event in pre-submit refresh window: %v", err)
+	}
+	afterEarlyEvent := f.taskByID(t, worker.ID)
+	if afterEarlyEvent.Revision != started.Revision || afterEarlyEvent.Attention != "" ||
+		afterEarlyEvent.Activity != "" {
+		t.Fatalf("pre-submit observation changed the task: before=%+v after=%+v", started, afterEarlyEvent)
+	}
+
+	if err := f.store.ConfirmReady(ctx, worker.LaunchPaneID,
+		task.SessionRef{Kind: task.SessionKindPath, Value: file}); err != nil {
+		t.Fatalf("ConfirmReady after equivalent refresh: %v", err)
+	}
+	confirmed, err := f.store.Readiness(ctx, worker.LaunchPaneID)
+	if err != nil {
+		t.Fatalf("Readiness after confirmation: %v", err)
+	}
+	if confirmed.StoredVerified != 1 || !confirmed.Verified ||
+		confirmed.ConfirmedRef != (task.SessionRef{Kind: task.SessionKindPath, Value: file}) {
+		t.Fatalf("confirmed handshake = %+v, want the live path reference", confirmed)
+	}
+
+	current := f.taskByID(t, worker.ID)
+	if _, err := f.store.UpdateTask(ctx, current.ID, current.Revision, func(next *task.Task) error {
+		next.Phase = task.PromptSubmitted
+		return nil
+	}); err != nil {
+		t.Fatalf("restore submitted phase: %v", err)
+	}
+	f.setAgentStatus(t, worker.PublicPaneID, "working")
+	if err := f.coord.HandleEvent(ctx, EventAgentStatus,
+		statusEventPayload(t, worker.PublicPaneID, "working")); err != nil {
+		t.Fatalf("status event after confirmation: %v", err)
+	}
+	afterConfirmedEvent := f.taskByID(t, worker.ID)
+	if afterConfirmedEvent.Activity != "working" || afterConfirmedEvent.Attention != "" {
+		t.Fatalf("confirmed same-session observation = %+v, want activity with no attention", afterConfirmedEvent)
+	}
+}
+
+// TestSubmittedStatusDuringUnverifiedEquivalentRefreshCapturesTheHandshake tests
+// the unresolved post-submit window separately from the AgentStarted no-op. It
+// is a controlled candidate reproduction, not evidence that this spelling change
+// happened in acceptance run 5cddab6d.
+func TestSubmittedStatusDuringUnverifiedEquivalentRefreshCapturesTheHandshake(t *testing.T) {
+	ctx := context.Background()
+	f := crossFormFixture(t)
+	worker := f.boundWorker(t)
+	file := assertCrossFormRecorded(t, f, worker)
+	refreshedFile := strings.ToUpper(file)
+	if !task.SameSessionReference(task.SessionKindPath, file, refreshedFile) {
+		t.Skip("case-only session path refresh is equivalent only on Windows")
+	}
+
+	refreshedAnnouncement := task.Announcement{
+		ID:     worker.OMPSessionID,
+		File:   refreshedFile,
+		OnDisk: true,
+	}
+	if err := f.store.RecordReady(ctx, worker.LaunchPaneID, refreshedAnnouncement, 1); err != nil {
+		t.Fatalf("RecordReady equivalent path refresh: %v", err)
+	}
+	unverified, err := f.store.Readiness(ctx, worker.LaunchPaneID)
+	if err != nil {
+		t.Fatalf("Readiness during refresh: %v", err)
+	}
+	if !unverified.Found || unverified.StoredVerified != 0 || unverified.Verified ||
+		unverified.Announcement != refreshedAnnouncement {
+		t.Fatalf("refreshed handshake = %+v, want a present but unverified equivalent path row", unverified)
+	}
+
+	f.setAgentStatus(t, worker.PublicPaneID, "idle")
+	err = f.coord.HandleEvent(ctx, EventAgentStatus, statusEventPayload(t, worker.PublicPaneID, "idle"))
+	if !errors.Is(err, ErrAgentChanged) {
+		t.Fatalf("status event in the submitted refresh gap err = %v, want ErrAgentChanged", err)
+	}
+	refused := f.taskByID(t, worker.ID)
+	if refused.Phase != task.PromptSubmitted || refused.Attention == "" || refused.Activity == "idle" {
+		t.Fatalf("post-submit refresh refusal = %+v, want attention without recording activity", refused)
+	}
+	for _, want := range []string{
+		"task_phase=" + fmt.Sprintf("%q", task.PromptSubmitted),
+		"live_ref=path:" + fmt.Sprintf("%q", file),
+		"recorded_session=" + fmt.Sprintf("%q", worker.OMPSessionID),
+		"stored_verified=0",
+		"verified=false",
+		"announced_id=" + fmt.Sprintf("%q", worker.OMPSessionID),
+		"announced_file=" + fmt.Sprintf("%q", refreshedFile),
+		"confirmed_kind=\"\"",
+		"confirmed_value=\"\"",
+	} {
+		if !strings.Contains(refused.Attention, want) {
+			t.Errorf("post-submit refusal omits snapshot field %q: %s", want, refused.Attention)
+		}
+	}
+
+	if err := f.store.ConfirmReady(ctx, worker.LaunchPaneID,
+		task.SessionRef{Kind: task.SessionKindPath, Value: file}); err != nil {
+		t.Fatalf("ConfirmReady after post-submit refusal: %v", err)
+	}
+	confirmed, err := f.store.Readiness(ctx, worker.LaunchPaneID)
+	if err != nil {
+		t.Fatalf("Readiness after confirmation: %v", err)
+	}
+	if confirmed.StoredVerified != 1 || !confirmed.Verified ||
+		confirmed.ConfirmedRef != (task.SessionRef{Kind: task.SessionKindPath, Value: file}) {
+		t.Fatalf("confirmed handshake = %+v, want the live path reference", confirmed)
+	}
+
+	f.setAgentStatus(t, worker.PublicPaneID, "working")
+	if err := f.coord.HandleEvent(ctx, EventAgentStatus, statusEventPayload(t, worker.PublicPaneID, "working")); err != nil {
+		t.Fatalf("same-session event after confirmation: %v", err)
+	}
+	recovered := f.taskByID(t, worker.ID)
+	if recovered.Activity != "working" || recovered.Attention != refused.Attention {
+		t.Fatalf("same-session event after confirmation = %+v, want activity with original attention unchanged", recovered)
+	}
+}
+
 func TestEventWorkerStatusIsRecordedOncePerTransitionAndNeverCompletes(t *testing.T) {
 	f := newCoordFixture(t, fixturePlan{})
 	worker := f.boundWorker(t)
@@ -2089,7 +2248,7 @@ func TestCrossFormIdentityStillRefusesADifferentSession(t *testing.T) {
 	ctx := context.Background()
 	f := crossFormFixture(t)
 	worker := f.boundWorker(t)
-	assertCrossFormRecorded(t, f, worker)
+	file := assertCrossFormRecorded(t, f, worker)
 
 	// A different session now runs in the worker's pane. Its path is just as
 	// path-shaped as the recorded one's, so accepting a path because the binding
@@ -2106,6 +2265,23 @@ func TestCrossFormIdentityStillRefusesADifferentSession(t *testing.T) {
 	if refused.Attention == "" {
 		t.Fatalf("a different session left no attention for a human")
 	}
+	for _, want := range []string{
+		"live_ref=path:" + fmt.Sprintf("%q", sessionFileFor("someone-elses-session")),
+		"recorded_session=" + fmt.Sprintf("%q", worker.OMPSessionID),
+		"task_phase=" + fmt.Sprintf("%q", worker.Phase),
+		"readiness{present=true",
+		"stored_verified=1",
+		"verified=true",
+		"announced_id=" + fmt.Sprintf("%q", worker.OMPSessionID),
+		"announced_file=" + fmt.Sprintf("%q", file),
+		"confirmed_kind=" + fmt.Sprintf("%q", task.SessionKindPath),
+		"confirmed_value=" + fmt.Sprintf("%q", file),
+	} {
+		if !strings.Contains(refused.Attention, want) {
+			t.Errorf("identity refusal omits snapshot field %q: %s", want, refused.Attention)
+		}
+	}
+
 	if refused.Activity == "blocked" {
 		t.Fatalf("a different session's status was recorded as the worker's")
 	}
@@ -2152,6 +2328,20 @@ func TestSessionsAreProvenOnlyThroughAConfirmedHandshake(t *testing.T) {
 	}
 	if after.Attention == "" {
 		t.Fatalf("an unprovable session left no attention for a human")
+	}
+	for _, want := range []string{
+		"readiness{present=true",
+		"stored_verified=0",
+		"task_phase=" + fmt.Sprintf("%q", worker.Phase),
+		"verified=false",
+		"announced_id=" + fmt.Sprintf("%q", "reannounced"),
+		"announced_file=" + fmt.Sprintf("%q", sessionFileFor("reannounced")),
+		"confirmed_kind=\"\"",
+		"confirmed_value=\"\"",
+	} {
+		if !strings.Contains(after.Attention, want) {
+			t.Errorf("unconfirmed refusal omits snapshot field %q: %s", want, after.Attention)
+		}
 	}
 
 	// A launch pane that never announced at all proves nothing either.

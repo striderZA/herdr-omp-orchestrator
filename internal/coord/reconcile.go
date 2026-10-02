@@ -344,7 +344,7 @@ func (c *Coordinator) observeWorkerStatus(ctx context.Context, st task.Task, sta
 	}
 	switch {
 	case probe.Refutes:
-		return c.taskAttention(ctx, st, fmt.Sprintf("a %s event for pane %s describes %s", EventAgentStatus, event.PaneID, probe.Refusal))
+		return c.taskAttention(ctx, st, fmt.Sprintf("a %s event for pane %s at task_phase=%q describes %s", EventAgentStatus, event.PaneID, st.Phase, probe.Refusal))
 	case !probe.Ours:
 		// The recorded pane holds nothing this task can claim: no agent, or no
 		// pane at all. Nothing is recorded from a terminal that cannot be proven
@@ -668,10 +668,13 @@ type recordedIdentity struct {
 	// Session is the session value the binding recorded.
 	Session string
 	// LaunchPaneID is the pane whose confirmed handshake relates that value to
-	// whichever form Herdr reports now.
+	// whichever native form Herdr reports now.
 	LaunchPaneID string
 	// Announced is the confirmed handshake of the binding's launch pane.
 	Announced task.Announcement
+	// Handshake is the exact one-row snapshot used to decide whether the proof
+	// was available. It is retained for refusal diagnostics only.
+	Handshake state.HandshakeSnapshot
 	// Proven reports whether that handshake was found and confirmed.
 	Proven bool
 }
@@ -688,28 +691,26 @@ func (id recordedIdentity) proves(ref task.SessionRef) bool {
 // identityOf joins the session a binding recorded to the confirmed handshake of
 // its launch pane.
 //
-// It reads that handshake in **one** store read (Store.VerifiedAnnouncement),
-// which returns the row's announcement only when the same row's confirmation
-// describes it. Reading the announcement and the confirmation separately would
-// let a concurrent re-announcement refresh the row in between: the pair a caller
-// held would then combine an earlier announcement with a later confirmation, and
-// an id the store no longer knows could be accepted for the pane Herdr reports
-// now. A pane with no row, an unverified row, or a row whose confirmation does
-// not describe its own announcement yields an unproven identity: nothing may be
-// proven from it, and a caller that needs a proof refuses instead of guessing.
+// It reads the announcement, confirmation, and update time in one state.Readiness
+// snapshot. Only a verified row participates in the identity proof; an unverified
+// announcement is retained solely to explain a refusal. A pane with no row, an
+// unverified row, or a row whose confirmation does not describe its announcement
+// yields an unproven identity: nothing may be proven from it, and a caller that
+// needs proof refuses instead of guessing.
 func (c *Coordinator) identityOf(ctx context.Context, launchPaneID, session string) (recordedIdentity, error) {
 	identity := recordedIdentity{Session: strings.TrimSpace(session), LaunchPaneID: strings.TrimSpace(launchPaneID)}
 	if identity.Session == "" || identity.LaunchPaneID == "" {
 		return identity, nil
 	}
-	announced, verified, err := c.store.VerifiedAnnouncement(ctx, identity.LaunchPaneID)
+	handshake, err := c.store.Readiness(ctx, identity.LaunchPaneID)
 	if err != nil {
 		return recordedIdentity{}, err
 	}
-	if !verified {
+	identity.Handshake = handshake
+	if !handshake.Verified {
 		return identity, nil
 	}
-	identity.Announced, identity.Proven = announced, true
+	identity.Announced, identity.Proven = handshake.Announcement, true
 	return identity, nil
 }
 
@@ -1707,8 +1708,12 @@ func (c *Coordinator) probePane(ctx context.Context, paneID string, identity rec
 		probe.Refusal = fmt.Sprintf("the pane reports a session reference this build cannot read (%v)", view.RefErr)
 	case recordedSession != "" && view.HasRef && !matched:
 		probe.Refutes = true
-		probe.Refusal = fmt.Sprintf("the pane reports %s session %q, which the confirmed handshake of the binding does not relate to the recorded %q",
-			view.Ref.Kind, view.Ref.Value, recordedSession)
+		probe.Refusal = fmt.Sprintf("the pane reports %s session %q, which does not prove recorded_session=%q; live_ref=%s:%q readiness{present=%t stored_verified=%d verified=%t seen_at=%d announced_id=%q announced_file=%q on_disk=%t confirmed_kind=%q confirmed_value=%q}",
+			view.Ref.Kind, view.Ref.Value, recordedSession, view.Ref.Kind, view.Ref.Value,
+			identity.Handshake.Found, identity.Handshake.StoredVerified, identity.Handshake.Verified, identity.Handshake.SeenAt,
+			identity.Handshake.Announcement.ID, identity.Handshake.Announcement.File,
+			identity.Handshake.Announcement.OnDisk, identity.Handshake.ConfirmedRef.Kind,
+			identity.Handshake.ConfirmedRef.Value)
 	case recordedSession != "" && !view.HasRef:
 		// Herdr published no reference for this pane, so the session the binding
 		// recorded cannot be proven - not even on the recorded terminal. A probe
