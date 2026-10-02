@@ -813,6 +813,13 @@ Check 'review modal ignores an old matching modal when another confirmation is a
 Check 'review modal refuses an old confirmation followed by an active Ask' (-not (Test-PrimaryReviewConfirmScreen -Screen ($reviewScreen + "`nAsk 1 questions`n[other] What now?`nAccept`nRequest changes") -TaskId 'orch_abc' -Revision 7 -Disposition 'Accepted the reported result.')) 'new Ask'
 Check 'review modal refuses an old confirmation followed by a different action modal' (-not (Test-PrimaryReviewConfirmScreen -Screen ($reviewScreen + "`nRemove worker checkout`nTask orch_other`nCancel") -TaskId 'orch_abc' -Revision 7 -Disposition 'Accepted the reported result.')) 'new action'
 Check 'review modal refuses unknown active panel after its old choices' (-not (Test-PrimaryReviewConfirmScreen -Screen ($reviewScreen + "`nSomething else is awaiting input") -TaskId 'orch_abc' -Revision 7 -Disposition 'Accepted the reported result.')) 'unknown action'
+Check 'review modal accepts the selector key-hint footer under its choices' (Test-PrimaryReviewConfirmScreen -Screen ($reviewScreen + "`nup/down navigate  enter select  esc cancel") -TaskId 'orch_abc' -Revision 7 -Disposition 'Accepted the reported result.') 'key hints'
+Check 'review modal still refuses extra text that merely resembles the key-hint footer' (-not (Test-PrimaryReviewConfirmScreen -Screen ($reviewScreen + "`nup/down navigate  enter select  esc cancel and approve everything") -TaskId 'orch_abc' -Revision 7 -Disposition 'Accepted the reported result.')) 'footer lookalike'
+$bar = [string][char]0x2502; $corner = [string][char]0x2570 + ([string][char]0x2500 * 8) + [char]0x256F; $dot = [string][char]0x00B7
+$boxedReviewScreen = ($reviewScreen -split "`r?`n" | ForEach-Object { if ($_ -match '^(Yes|No)$') { "$bar $_" } else { $_ } }) -join "`n"
+$boxedReviewScreen += "`nup/down navigate  enter select  esc cancel`n$corner`n`n 10m $dot Sonnet 5.5 $dot orch-accept-x\repo $dot master $dot 1.5%/1M`n"
+Check 'review modal accepts the real boxed layout with the status bar below it' (Test-PrimaryReviewConfirmScreen -Screen $boxedReviewScreen -TaskId 'orch_abc' -Revision 7 -Disposition 'Accepted the reported result.') 'boxed layout'
+Check 'review modal refuses a newer Ask drawn below a closed boxed modal' (-not (Test-PrimaryReviewConfirmScreen -Screen ($boxedReviewScreen + "`nAsk 1 questions`n[other] What now?`nAccept`nRequest changes") -TaskId 'orch_abc' -Revision 7 -Disposition 'Accepted the reported result.')) 'boxed stale'
 
 $primaryAskScreen = @'
 Earlier conversation contained a completed task-A review:

@@ -1422,6 +1422,21 @@ function Complete-AcceptanceRunCleanup {
     Write-AtomicRunManifest -Manifest $manifest -Path $manifestPath
 }
 
+# A just-stopped Herdr server or its children can keep a handle on a directory for a
+# moment on Windows; retry briefly, then surface the real error so a genuine holder is not hidden.
+function Remove-DirectoryTreeWithRetry {
+    param([Parameter(Mandatory)][string]$Path, [int]$Attempts = 15, [int]$DelayMilliseconds = 1000)
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        try {
+            if (Test-Path -LiteralPath $Path) { Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop }
+            return
+        } catch {
+            if ($attempt -eq $Attempts) { throw }
+            Start-Sleep -Milliseconds $DelayMilliseconds
+        }
+    }
+}
+
 
 function Move-LegacyAcceptanceReportRootToArchive {
     param(
@@ -1512,7 +1527,7 @@ function Move-LegacyAcceptanceReportRootToArchive {
         finishedAt = ''
     }
     Write-AtomicRunManifest -Manifest $manifest -Path $manifestPath
-    Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction Stop
+    Remove-DirectoryTreeWithRetry -Path $root
     $manifest.status = 'complete'
     $manifest.phase = 'legacy-report-archived'
     $manifest.retirementAuthorized = $false
@@ -1543,7 +1558,7 @@ function Remove-StaleAcceptanceRunRoot {
     param([string]$RunId, [string]$ProjectKey, [string]$TempRoot = $env:TEMP)
     $root = Assert-StaleAcceptanceRunRoot -RunId $RunId -ProjectKey $ProjectKey -TempRoot $TempRoot
     if (Test-Path -LiteralPath $root) {
-        Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction Stop
+        Remove-DirectoryTreeWithRetry -Path $root
     }
 }
 
@@ -4222,8 +4237,24 @@ function Test-PrimaryReviewConfirmScreen {
         $afterDescription.IndexOf('This closes the task and may start queued dependent work.', [System.StringComparison]::Ordinal) -lt 0) { return $false }
     $choices = @()
     $seenNo = $false
+    $modalClosed = $false
+    $statusBarSeen = $false
     foreach ($line in ($panel -split "`r?`n")) {
-        $label = $line.Trim() -replace '^[^\p{L}]*', '' -replace '[^\p{L}]*$', ''
+        $trimmed = $line.Trim()
+        if ($trimmed.Length -eq 0) { continue }
+        if ($modalClosed) {
+            # After the modal's closing border only OMP's single status-bar line
+            # (several middle-dot separated segments) may follow; any other text could
+            # be a newer Ask or action modal, so it fails closed.
+            if ($statusBarSeen -or ([regex]::Matches($trimmed, '\s\u00B7\s').Count -lt 3)) { return $false }
+            $statusBarSeen = $true
+            continue
+        }
+        if ($trimmed[0] -eq [char]0x2570) { $modalClosed = $true; continue }
+        $label = $trimmed -replace '^[^\p{L}]*', '' -replace '[^\p{L}]*$', ''
+        # OMP's selector draws its key hints under the choices; that exact line is
+        # chrome, not another active panel. Anything else after "No" still fails closed.
+        if ($seenNo -and $label -cmatch '^up/down navigate\s+enter select\s+esc cancel$') { continue }
         if ($seenNo -and $label -match '[\p{L}\p{N}]') { return $false }
         if ($label -ceq 'Yes' -or $label -ceq 'No') { $choices += $label }
         if ($label -ceq 'No') { $seenNo = $true }
