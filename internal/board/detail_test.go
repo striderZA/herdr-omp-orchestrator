@@ -111,8 +111,15 @@ func TestDetailPageNeverExceedsTheTerminalHeight(t *testing.T) {
 	for height := 1; height <= 12; height++ {
 		m.Update(tea.WindowSizeMsg{Width: 30, Height: height})
 		press(t, m, tea.KeyMsg{Type: tea.KeyEnd})
-		if got := len(strings.Split(m.View(), "\n")); got > height {
-			t.Errorf("height %d: page is %d lines:\n%s", height, got, m.View())
+		view := m.View()
+		if got := len(strings.Split(view, "\n")); got > height {
+			t.Errorf("height %d: page is %d lines:\n%s", height, got, view)
+		}
+		for _, line := range strings.Split(view, "\n") {
+			var from, to, total int
+			if n, _ := fmt.Sscanf(line, "%d-%d/%d", &from, &to, &total); n == 3 && (from < 1 || to < from || to > total) {
+				t.Errorf("height %d: impossible range in %q", height, line)
+			}
 		}
 	}
 }

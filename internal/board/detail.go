@@ -137,7 +137,7 @@ func RenderPage(b *Board, d Detail, width, height int, th Theme) string {
 		lines = append(lines, notice)
 	}
 	help := "Esc back, f focus, q close"
-	if len(body) < len(all) {
+	if len(body) > 0 && len(body) < len(all) {
 		help = fmt.Sprintf("%d-%d/%d up/down scroll, %s", scroll+1, scroll+len(body), len(all), help)
 	}
 	if rule {
