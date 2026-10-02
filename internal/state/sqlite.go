@@ -581,28 +581,57 @@ func (s *Store) ConfirmReady(ctx context.Context, launchPaneID string, ref task.
 // confirmation whose kind this build cannot read, and a confirmation left behind
 // by an earlier announcement all report false.
 func (s *Store) VerifiedAnnouncement(ctx context.Context, launchPaneID string) (task.Announcement, bool, error) {
-	if strings.TrimSpace(launchPaneID) == "" {
-		return task.Announcement{}, false, fmt.Errorf("%w: launch pane is required", ErrInvalid)
-	}
-	recorded, found, err := s.readyRecord(ctx, launchPaneID)
-	if err != nil || !found {
+	snapshot, err := s.Readiness(ctx, launchPaneID)
+	if err != nil {
 		return task.Announcement{}, false, err
 	}
-	announced, _, ok := recorded.verifiedRef()
-	return announced, ok, nil
+	if !snapshot.Verified {
+		return task.Announcement{}, false, nil
+	}
+	return snapshot.Announcement, true, nil
 }
 
-// Ready reports whether an announced identity passed the handshake for a launch
-// pane. The recorded confirmation decides which form is compared: an id is
-// trimmed and compared case-insensitively, a path with the platform's path rules.
-// A record that was never confirmed, or a confirmation whose kind this build does
-// not understand, is never ready.
-//
-// This is the form for a caller that already holds an announcement — the bridge
-// receives one from the process that made the request — and it compares that
-// announcement's identity in the confirmed kind. A caller that reads the
-// announcement from the store must use VerifiedAnnouncement instead, which reads
-// the row once.
+// HandshakeSnapshot is one launch pane's stored readiness row.
+// StoredVerified preserves the raw database flag; Verified is the effective
+// verifiedRef result used by identity checks. They can differ for malformed or
+// legacy rows, which is diagnostic evidence—not permission to relax a proof.
+type HandshakeSnapshot struct {
+	Announcement   task.Announcement
+	ConfirmedRef   task.SessionRef
+	Found          bool
+	StoredVerified int
+	Verified       bool
+	SeenAt         int64
+}
+
+// Readiness reads the announcement, confirmation and update time from one row.
+// It retains an unverified announcement so a refusal can distinguish “no proof”
+// from “a different confirmed session” without composing two racing reads.
+func (s *Store) Readiness(ctx context.Context, launchPaneID string) (HandshakeSnapshot, error) {
+	if strings.TrimSpace(launchPaneID) == "" {
+		return HandshakeSnapshot{}, fmt.Errorf("%w: launch pane is required", ErrInvalid)
+	}
+	recorded, found, err := s.readyRecord(ctx, launchPaneID)
+	if err != nil {
+		return HandshakeSnapshot{}, err
+	}
+	if !found {
+		return HandshakeSnapshot{}, nil
+	}
+	snapshot := HandshakeSnapshot{
+		Announcement:   recorded.announcement,
+		Found:          true,
+		StoredVerified: recorded.storedVerified,
+		SeenAt:         recorded.seenAt,
+	}
+	_, confirmed, verified := recorded.verifiedRef()
+	if verified {
+		snapshot.ConfirmedRef = confirmed
+		snapshot.Verified = true
+	}
+	return snapshot, nil
+}
+
 func (s *Store) Ready(ctx context.Context, launchPaneID string, announced task.Announcement) (bool, error) {
 	identity, ok := task.NewAnnouncement(announced.ID, announced.File, announced.OnDisk)
 	if !ok {
@@ -642,9 +671,11 @@ func (s *Store) AnnouncedSession(ctx context.Context, launchPaneID string) (task
 
 // readyRecord is the stored handshake of one launch pane.
 type readyRecord struct {
-	announcement  task.Announcement
-	verifiedKind  string
-	verifiedValue string
+	announcement   task.Announcement
+	verifiedKind   string
+	verifiedValue  string
+	storedVerified int
+	seenAt         int64
 }
 
 // verifiedRef reports the reference this row's confirmation recorded, but only
@@ -669,12 +700,13 @@ func (r readyRecord) verifiedRef() (task.Announcement, task.SessionRef, bool) {
 
 func (s *Store) readyRecord(ctx context.Context, launchPaneID string) (readyRecord, bool, error) {
 	var row readyRecord
-	var onDisk int
+	var onDisk, storedVerified int
 	err := s.db.QueryRowContext(ctx,
-		`SELECT omp_session_id, omp_session_file, omp_session_on_disk, verified_kind, verified_value
+		`SELECT omp_session_id, omp_session_file, omp_session_on_disk, verified_kind, verified_value, verified, seen_at
 		 FROM ready_sessions WHERE launch_pane_id = ?`, launchPaneID).
-		Scan(&row.announcement.ID, &row.announcement.File, &onDisk, &row.verifiedKind, &row.verifiedValue)
+		Scan(&row.announcement.ID, &row.announcement.File, &onDisk, &row.verifiedKind, &row.verifiedValue, &storedVerified, &row.seenAt)
 	row.announcement.OnDisk = onDisk == 1
+	row.storedVerified = storedVerified
 	if errors.Is(err, sql.ErrNoRows) {
 		return readyRecord{}, false, nil
 	}

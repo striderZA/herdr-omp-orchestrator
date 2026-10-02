@@ -375,3 +375,95 @@ func TestStoreVerifiedAnnouncementChecksTheRowItReturns(t *testing.T) {
 		}
 	})
 }
+
+func TestStoreReadinessSnapshotCarriesOneAnnouncementAndConfirmation(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	s := open(t, dir)
+
+	absent, err := s.Readiness(ctx, launchPane)
+	if err != nil || absent.Found || absent.StoredVerified != 0 || absent.Verified {
+		t.Fatalf("Readiness(no row) = (%+v, %v), want an absent unverified snapshot", absent, err)
+	}
+
+	announced := task.Announcement{ID: sessionOne, File: sessionFile, OnDisk: true}
+	if err := s.RecordReady(ctx, launchPane, announced, 1); err != nil {
+		t.Fatalf("RecordReady: %v", err)
+	}
+	if err := s.ConfirmReady(ctx, launchPane,
+		task.SessionRef{Kind: task.SessionKindPath, Value: sessionFile}); err != nil {
+		t.Fatalf("ConfirmReady: %v", err)
+	}
+	confirmed, err := s.Readiness(ctx, launchPane)
+	if err != nil {
+		t.Fatalf("Readiness(confirmed): %v", err)
+	}
+	if !confirmed.Found || confirmed.StoredVerified != 1 || !confirmed.Verified || confirmed.Announcement != announced ||
+		confirmed.ConfirmedRef != (task.SessionRef{Kind: task.SessionKindPath, Value: sessionFile}) ||
+		confirmed.SeenAt == 0 {
+		t.Fatalf("confirmed snapshot = %+v, want announcement, path confirmation and seen_at", confirmed)
+	}
+	raw, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "orchestrator.sqlite")))
+	if err != nil {
+		t.Fatalf("open raw state database: %v", err)
+	}
+	if _, err := raw.ExecContext(ctx, "UPDATE ready_sessions SET verified = 0 WHERE launch_pane_id = ?", launchPane); err != nil {
+		_ = raw.Close()
+		t.Fatalf("clear only the stored verified flag: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close raw state database: %v", err)
+	}
+	flagMismatch, err := s.Readiness(ctx, launchPane)
+	if err != nil {
+		t.Fatalf("Readiness(stored flag mismatch): %v", err)
+	}
+	if flagMismatch.StoredVerified != 0 || !flagMismatch.Verified ||
+		flagMismatch.ConfirmedRef != confirmed.ConfirmedRef {
+		t.Fatalf("snapshot = %+v, want the raw false flag distinct from the still-coherent confirmation", flagMismatch)
+	}
+	legacyAnnouncement, stillProven, err := s.VerifiedAnnouncement(ctx, launchPane)
+	if err != nil || !stillProven || legacyAnnouncement != announced {
+		t.Fatalf("VerifiedAnnouncement after raw-flag change = (%+v, %v, %v), want the unchanged effective proof", legacyAnnouncement, stillProven, err)
+	}
+
+	refreshedAnnouncement := task.Announcement{ID: sessionTwo, File: sessionFile + ".new", OnDisk: true}
+	if err := s.RecordReady(ctx, launchPane, refreshedAnnouncement, 1); err != nil {
+		t.Fatalf("RecordReady(refresh): %v", err)
+	}
+	refreshed, err := s.Readiness(ctx, launchPane)
+	if err != nil {
+		t.Fatalf("Readiness(refreshed): %v", err)
+	}
+	if !refreshed.Found || refreshed.StoredVerified != 0 || refreshed.Verified || refreshed.Announcement != refreshedAnnouncement ||
+		refreshed.ConfirmedRef != (task.SessionRef{}) || refreshed.SeenAt == 0 {
+		t.Fatalf("refreshed snapshot = %+v, want current unverified announcement without old confirmation", refreshed)
+	}
+	raw, err = sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "orchestrator.sqlite")))
+	if err != nil {
+		t.Fatalf("reopen raw state database: %v", err)
+	}
+	if _, err := raw.ExecContext(ctx,
+		"UPDATE ready_sessions SET verified = 1, verified_kind = ?, verified_value = ? WHERE launch_pane_id = ?",
+		task.SessionKindPath, sessionFile, launchPane); err != nil {
+		_ = raw.Close()
+		t.Fatalf("set stale confirmation with raw verified flag: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close raw state database after stale confirmation: %v", err)
+	}
+	staleConfirmation, err := s.Readiness(ctx, launchPane)
+	if err != nil {
+		t.Fatalf("Readiness(stale confirmation): %v", err)
+	}
+	if !staleConfirmation.Found || staleConfirmation.StoredVerified != 1 ||
+		staleConfirmation.Verified || staleConfirmation.ConfirmedRef != (task.SessionRef{}) ||
+		staleConfirmation.Announcement != refreshedAnnouncement {
+		t.Fatalf("snapshot = %+v, want raw verified=1 but no effective proof for stale confirmation", staleConfirmation)
+	}
+	staleAnnouncement, staleProven, err := s.VerifiedAnnouncement(ctx, launchPane)
+	if err != nil || staleProven || staleAnnouncement != (task.Announcement{}) {
+		t.Fatalf("VerifiedAnnouncement(stale confirmation) = (%+v, %v, %v), want zero/false/nil", staleAnnouncement, staleProven, err)
+	}
+
+}
