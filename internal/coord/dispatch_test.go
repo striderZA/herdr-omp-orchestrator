@@ -2341,6 +2341,88 @@ func TestBriefAttemptWriteFailurePreventsPrompt(t *testing.T) {
 	}
 }
 
+func TestResumeDoesNotPromptAReplacedWorkerSession(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	worker := f.mustDispatch("one", "brief one")
+
+	started, err := f.store.UpdateTask(context.Background(), worker.ID, worker.Revision, func(next *task.Task) error {
+		next.Phase = task.AgentStarted
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("move task back to the pre-submit phase: %v", err)
+	}
+	f.coord.releaseStep(context.Background(), started)
+	f.rewriteState(func(current *fixtureState) {
+		current.Agents[worker.PublicPaneID].Session = "someone-elses-session"
+	})
+	beforeCalls := f.countCalls("agent prompt")
+	beforePrompts := len(f.prompts(worker.PublicPaneID))
+
+	resumed, err := f.resume(started.ID)
+	if !errors.Is(err, ErrAgentChanged) {
+		t.Fatalf("ResumeDispatch err = %v, want ErrAgentChanged", err)
+	}
+	if resumed.Phase != task.AgentStarted || resumed.Blocker == "" || task.StageOf(resumed) != task.NeedsInput {
+		t.Fatalf("replaced session left task at phase %q, blocker %q, stage %q; want a blocked pre-submit task",
+			resumed.Phase, resumed.Blocker, task.StageOf(resumed))
+	}
+	if got := f.countCalls("agent prompt"); got != beforeCalls {
+		t.Fatalf("agent prompt calls = %d, want unchanged at %d", got, beforeCalls)
+	}
+	if got := len(f.prompts(worker.PublicPaneID)); got != beforePrompts {
+		t.Fatalf("prompts on the replaced worker pane = %d, want unchanged at %d", got, beforePrompts)
+	}
+}
+
+func TestResumeAgentStartedAfterMoveUsesLaunchPaneHandshake(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	worker := f.mustDispatch("one", "brief one")
+	ctx := context.Background()
+	started, err := f.store.UpdateTask(ctx, worker.ID, worker.Revision, func(next *task.Task) error {
+		next.Phase = task.AgentStarted
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("move task back to the pre-submit phase: %v", err)
+	}
+	f.coord.releaseStep(ctx, started)
+	f.rewriteState(func(current *fixtureState) {
+		current.Agents[worker.PublicPaneID].Prompted = 0
+		current.Prompts[worker.PublicPaneID] = nil
+	})
+
+	move := f.moveResult(t, worker.PublicPaneID)
+	newPane, _ := move["pane"].(map[string]any)["pane_id"].(string)
+	if newPane == "" {
+		t.Fatalf("move result names no public pane: %v", move)
+	}
+	f.mustHandle(t, EventPaneMoved, eventFromMoveResult(t, move))
+	moved := f.taskByID(t, worker.ID)
+	if moved.PublicPaneID != newPane || moved.LaunchPaneID != worker.LaunchPaneID {
+		t.Fatalf("moved task panes = launch %q/public %q, want launch %q/public %q",
+			moved.LaunchPaneID, moved.PublicPaneID, worker.LaunchPaneID, newPane)
+	}
+
+	// Readiness remains keyed by the launch pane inherited by the worker. Do not
+	// let the fixture create a second, misleading row for the moved public pane.
+	f.updatePlan(func(plan *fixturePlan) { plan.SuppressReady = true })
+	beforeCalls := f.countCalls("agent prompt")
+	resumed, err := f.resume(moved.ID)
+	if err != nil {
+		t.Fatalf("resume moved AgentStarted worker: %v", err)
+	}
+	if resumed.Phase != task.PromptSubmitted {
+		t.Fatalf("resumed phase = %q, want %q", resumed.Phase, task.PromptSubmitted)
+	}
+	if got := f.countCalls("agent prompt"); got != beforeCalls+1 {
+		t.Fatalf("agent prompt calls = %d, want one new brief after readiness confirmation", got)
+	}
+	if prompts := f.prompts(newPane); len(prompts) != 1 {
+		t.Fatalf("prompts to moved pane = %v, want exactly one brief", prompts)
+	}
+}
+
 func TestRetryRestartedWorkerSessionIsNotPrompted(t *testing.T) {
 	f := newCoordFixture(t, fixturePlan{RestartBeforeReady: true})
 	st, err := f.dispatch("one", "brief one", []string{"go test ./... ok"}, nil, nil, f.base)

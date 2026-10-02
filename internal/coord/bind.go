@@ -297,7 +297,7 @@ func (c *Coordinator) Bind(ctx context.Context, repo, workspaceID, rootPaneID st
 			return project, c.settleProject(ctx, root, true, err)
 		}
 	}
-	view, err := c.awaitAgentReady(ctx, paneID, root, nil, func(view agentView) error {
+	view, err := c.awaitAgentReady(ctx, paneID, paneID, root, nil, func(view agentView) error {
 		return c.store.UpdateProject(ctx, root, func(next *task.Project) error {
 			if next.LaunchPaneID != paneID {
 				return fmt.Errorf("%w: the primary binding changed to pane %q while the agent was starting",
@@ -380,7 +380,7 @@ func (c *Coordinator) reopenPrimary(ctx context.Context, existing task.Project) 
 		existing.AgentName = name
 	}
 	workspaces := nonEmpty(existing.RepoWorkspaceID, existing.CurrentWorkspaceID)
-	view, err := c.awaitAgentReady(ctx, paneID, existing.Key, workspaces, func(view agentView) error {
+	view, err := c.awaitAgentReady(ctx, paneID, paneID, existing.Key, workspaces, func(view agentView) error {
 		return c.store.UpdateProject(ctx, existing.Key, func(next *task.Project) error {
 			if next.LaunchPaneID != paneID {
 				return fmt.Errorf("%w: the primary binding changed to pane %q", ErrPrimaryNotLive, next.LaunchPaneID)
@@ -836,9 +836,9 @@ func liveAgentName(view agentView) string {
 	return ""
 }
 
-// awaitAgentReady waits until Herdr reports the pane's native session reference
-// *and* the extension has announced a session that the store can confirm against
-// that reference.
+// awaitAgentReady waits until Herdr reports the current pane's native session
+// reference and the extension has announced a session under readyPaneID that
+// the store can confirm against that reference.
 //
 // Herdr reports session identity asynchronously after the agent starts, so the
 // reference may be absent for a while: that is a normal state and is polled with
@@ -850,7 +850,7 @@ func liveAgentName(view agentView) string {
 // sent. write records a first-seen reference on the binding (it never overwrites).
 func (c *Coordinator) awaitAgentReady(
 	ctx context.Context,
-	paneID, checkout string,
+	paneID, readyPaneID, checkout string,
 	workspaces []string,
 	write func(agentView) error,
 ) (agentView, error) {
@@ -890,7 +890,7 @@ func (c *Coordinator) awaitAgentReady(
 						}
 					}
 				}
-				stateErr := c.confirmReference(ctx, paneID, view.Ref)
+				stateErr := c.confirmReference(ctx, readyPaneID, view.Ref)
 				switch {
 				case stateErr == nil:
 					return view, nil

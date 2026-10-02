@@ -1076,7 +1076,7 @@ func (c *Coordinator) recordAgentStart(ctx context.Context, st task.Task, paneID
 		use = next
 		return nil
 	}
-	if _, err := c.awaitAgentReady(ctx, paneID, st.WorktreePath, workspaces, write); err != nil {
+	if _, err := c.awaitAgentReady(ctx, paneID, st.LaunchPaneID, st.WorktreePath, workspaces, write); err != nil {
 		return c.failTask(ctx, use, "confirm the worker's OMP session", isTerminal(err), err)
 	}
 	return use, nil
@@ -1140,6 +1140,17 @@ func (c *Coordinator) submitBrief(ctx context.Context, st task.Task) (task.Task,
 	}, "record the brief attempt before submission")
 	if err != nil {
 		return c.refuseBriefBeforeSend(ctx, st, "record the durable brief attempt before sending it", err)
+	}
+	// The startup check is a snapshot: the pane can change before the brief is
+	// sent. Reconfirm readiness, then prove it is still the session this task
+	// recorded. This also completes an interrupted AgentStarted handshake without
+	// relying on an unconfirmed same-form guess.
+	workspaces := nonEmpty(pending.WorktreeWorkspaceID, pending.CurrentWorkspaceID)
+	if _, err := c.awaitAgentReady(ctx, paneID, pending.LaunchPaneID, pending.WorktreePath, workspaces, nil); err != nil {
+		return c.failTask(ctx, pending, "confirm the worker session before submitting the brief", isTerminal(err), err)
+	}
+	if _, _, err := c.workerOccupant(ctx, pending); err != nil {
+		return c.failTask(ctx, pending, "verify the worker session before submitting the brief", isTerminal(err), err)
 	}
 
 	callCtx, cancel := c.callContext(ctx)
