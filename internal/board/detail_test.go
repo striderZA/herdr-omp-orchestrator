@@ -123,3 +123,38 @@ func TestDetailPageNeverExceedsTheTerminalHeight(t *testing.T) {
 		}
 	}
 }
+
+// TestDetailPageScrollIsReclampedWhenTheViewportGrows guards against a stale
+// offset: after the terminal grows, the first Up must move the visible page.
+func TestDetailPageScrollIsReclampedWhenTheViewportGrows(t *testing.T) {
+	f := newBoardFixture(t, fixturePlan{})
+	f.seed(t, sampleTask("orch_d4", func(x *task.Task) { x.Brief = longBrief() }))
+	m := f.model(t, Options{})
+	m.Update(tea.WindowSizeMsg{Width: 40, Height: 6})
+	press(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	press(t, m, tea.KeyMsg{Type: tea.KeyEnd})
+	m.Update(tea.WindowSizeMsg{Width: 40, Height: 30})
+	max := len(pageLines(mustCard(t, m), m.width, m.opts.Theme)) - 28
+	if max < 0 {
+		max = 0
+	}
+	if m.scroll > max {
+		t.Fatalf("scroll %d exceeds the new maximum %d", m.scroll, max)
+	}
+	before := m.View()
+	if max > 0 {
+		press(t, m, tea.KeyMsg{Type: tea.KeyUp})
+		if m.View() == before {
+			t.Error("Up after a resize did not move the page")
+		}
+	}
+}
+
+func mustCard(t *testing.T, m *Model) Card {
+	t.Helper()
+	card, ok := m.board.Find(m.selected)
+	if !ok {
+		t.Fatal("selected task missing")
+	}
+	return card
+}

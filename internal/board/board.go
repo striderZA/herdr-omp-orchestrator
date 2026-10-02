@@ -141,6 +141,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if typed.Height > 0 {
 			m.height = typed.Height
 		}
+		m.scrollBy(0)
 		return m, nil
 
 	case tea.KeyMsg:
@@ -158,6 +159,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.notice = "Focused " + typed.pane
 			m.noticeErr = false
 		}
+		m.scrollBy(0)
 		return m, nil
 	}
 	return m, nil
@@ -248,7 +250,12 @@ func (m *Model) refresh() {
 	}
 	m.loadErr = nil
 	m.board = NewBoard(cards)
+	before := m.selected
 	m.reselect()
+	if m.selected != before {
+		m.scroll = 0
+	}
+	m.scrollBy(0)
 }
 
 // reselect keeps the selected task selected when it still exists, and otherwise
