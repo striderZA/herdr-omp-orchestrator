@@ -6,3 +6,7 @@
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
+
+# Planning and specs
+*superpowers*
+*superpowers/*
