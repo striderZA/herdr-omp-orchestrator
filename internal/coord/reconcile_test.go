@@ -25,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	"herdr-omp-orchestrator/internal/herdr"
 	"herdr-omp-orchestrator/internal/task"
 )
 
@@ -1143,6 +1144,38 @@ func TestMoveRejectsMismatchedTerminalSessionOrCheckout(t *testing.T) {
 // ---------------------------------------------------------------------------
 // startup reconciliation
 // ---------------------------------------------------------------------------
+
+func TestReconcileRefusesAnUnsupportedHerdrProtocol(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	worker := f.boundWorker(t)
+	before := f.taskByID(t, worker.ID)
+
+	// Herdr is upgraded to a protocol this plugin was never verified against.
+	f.updatePlan(func(p *fixturePlan) { p.SnapshotProtocol = 23 })
+
+	err := f.coord.Reconcile(context.Background())
+	if !errors.Is(err, herdr.ErrUnsupportedProtocol) {
+		t.Fatalf("Reconcile err = %v, want ErrUnsupportedProtocol", err)
+	}
+	if after := f.taskByID(t, worker.ID); after.Revision != before.Revision {
+		t.Fatalf("a refused pass changed the task revision from %d to %d", before.Revision, after.Revision)
+	}
+}
+
+func TestPaneRecoveryRefusesAnUnsupportedHerdrProtocol(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	worker := f.boundWorker(t)
+	st := f.taskByID(t, worker.ID)
+
+	// With the supported protocol the recorded checkout resolves to its pane.
+	if pane, err := f.coord.paneForTask(context.Background(), st); err != nil || pane == "" {
+		t.Fatalf("paneForTask on the supported protocol = %q, %v", pane, err)
+	}
+	f.updatePlan(func(p *fixturePlan) { p.SnapshotProtocol = 23 })
+	if pane, err := f.coord.paneForTask(context.Background(), st); !errors.Is(err, herdr.ErrUnsupportedProtocol) {
+		t.Fatalf("paneForTask on protocol 23 = %q, %v, want ErrUnsupportedProtocol", pane, err)
+	}
+}
 
 func TestReconcileRecoversAMissedMoveFromTheSnapshot(t *testing.T) {
 	f := newCoordFixture(t, fixturePlan{})
