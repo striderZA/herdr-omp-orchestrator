@@ -231,6 +231,8 @@ type Detail struct {
 	SelectedID string
 	// Expanded asks for the task's full facts instead of the one-line summary.
 	Expanded bool
+	// Scroll is the first visible line of the dedicated detail page.
+	Scroll int
 	// Notice is one actionable line about the last board action (for example a
 	// refused focus). Err marks it as a failure.
 	Notice string

@@ -79,6 +79,8 @@ type Model struct {
 	stage    int
 	selected string
 	expanded bool
+	scroll   int
+	height   int
 
 	width     int
 	notice    string
@@ -136,6 +138,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if typed.Width > 0 {
 			m.width = typed.Width
 		}
+		if typed.Height > 0 {
+			m.height = typed.Height
+		}
+		m.scrollBy(0)
 		return m, nil
 
 	case tea.KeyMsg:
@@ -153,6 +159,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.notice = "Focused " + typed.pane
 			m.noticeErr = false
 		}
+		m.scrollBy(0)
 		return m, nil
 	}
 	return m, nil
@@ -168,28 +175,50 @@ func (m *Model) key(key tea.KeyMsg) tea.Cmd {
 	case tea.KeyEsc:
 		if m.expanded {
 			m.expanded = false
+			m.scroll = 0
 			return nil
 		}
 		return tea.Quit
 
 	case tea.KeyTab:
-		m.selectStage(m.stage + 1)
+		if !m.expanded {
+			m.selectStage(m.stage + 1)
+		}
 		return nil
 
 	case tea.KeyShiftTab:
-		m.selectStage(m.stage - 1)
+		if !m.expanded {
+			m.selectStage(m.stage - 1)
+		}
 		return nil
 
 	case tea.KeyUp:
-		m.moveCursor(-1)
+		m.step(-1)
 		return nil
 
 	case tea.KeyDown:
-		m.moveCursor(1)
+		m.step(1)
+		return nil
+
+	case tea.KeyPgUp:
+		m.scrollBy(-m.pageSize())
+		return nil
+
+	case tea.KeyPgDown:
+		m.scrollBy(m.pageSize())
+		return nil
+
+	case tea.KeyHome:
+		m.scrollBy(-1 << 30)
+		return nil
+
+	case tea.KeyEnd:
+		m.scrollBy(1 << 30)
 		return nil
 
 	case tea.KeyEnter:
 		m.expanded = !m.expanded
+		m.scroll = 0
 		return nil
 
 	case tea.KeyRunes:
@@ -197,9 +226,9 @@ func (m *Model) key(key tea.KeyMsg) tea.Cmd {
 		case "q":
 			return tea.Quit
 		case "k":
-			m.moveCursor(-1)
+			m.step(-1)
 		case "j":
-			m.moveCursor(1)
+			m.step(1)
 		case "f":
 			return m.focus()
 		case "r":
@@ -221,7 +250,12 @@ func (m *Model) refresh() {
 	}
 	m.loadErr = nil
 	m.board = NewBoard(cards)
+	before := m.selected
 	m.reselect()
+	if m.selected != before {
+		m.scroll = 0
+	}
+	m.scrollBy(0)
 }
 
 // reselect keeps the selected task selected when it still exists, and otherwise
@@ -258,6 +292,49 @@ func (m *Model) selectStage(index int) {
 	m.stage = ((index % len(Columns)) + len(Columns)) % len(Columns)
 	m.selected = m.cardAt(m.stage, m.cursors[m.stage])
 	m.expanded = false
+	m.scroll = 0
+}
+
+// step moves the card cursor on the board and scrolls the detail page when it
+// is open, so the arrows always act on what the reader is looking at.
+func (m *Model) step(delta int) {
+	if m.expanded {
+		m.scrollBy(delta)
+		return
+	}
+	m.moveCursor(delta)
+}
+
+// pageSize is how far PgUp/PgDn move the detail page.
+func (m *Model) pageSize() int {
+	rows, _, _ := pageChrome(m.height, strings.TrimSpace(m.notice) != "")
+	if rows > 1 {
+		return rows - 1
+	}
+	return 1
+}
+
+// scrollBy moves the detail page, clamped to its extent.
+func (m *Model) scrollBy(delta int) {
+	if !m.expanded {
+		return
+	}
+	card, ok := m.board.Find(m.selected)
+	if !ok {
+		return
+	}
+	total := len(pageLines(card, m.width, m.opts.Theme))
+	max := 0
+	if rows, _, _ := pageChrome(m.height, strings.TrimSpace(m.notice) != ""); rows >= 0 && total > rows {
+		max = total - rows
+	}
+	m.scroll += delta
+	if m.scroll > max {
+		m.scroll = max
+	}
+	if m.scroll < 0 {
+		m.scroll = 0
+	}
 }
 
 // moveCursor walks the board's cards in column order and stops at either end.
@@ -348,12 +425,17 @@ func (m *Model) View() string {
 			clip("r retry, q close", m.width),
 		}, "\n")
 	}
-	return Render(m.board, Detail{
+	d := Detail{
 		SelectedID: m.selected,
 		Expanded:   m.expanded,
+		Scroll:     m.scroll,
 		Notice:     m.notice,
 		Err:        m.noticeErr,
-	}, m.width, m.opts.Theme)
+	}
+	if m.expanded {
+		return RenderPage(m.board, d, m.width, m.height, m.opts.Theme)
+	}
+	return Render(m.board, d, m.width, m.opts.Theme)
 }
 
 // Run opens the board as a keyboard-driven Bubble Tea program and blocks until
