@@ -51,7 +51,7 @@ func TestHistoryRecordsOrderedTransitions(t *testing.T) {
 		{"stage", "queued", "running"}, {"phase", "intent", "prompt_submitted"},
 		{"stage", "running", "needs_input"}, {"attention", "", "need a call"},
 		{"stage", "needs_input", "running"}, {"attention", "need a call", ""},
-		{"report", "", "partial"}, {"report", "partial", "partial"},
+		{"report", "", "partial"}, {"report", "partial", "partial (revised: summary)"},
 		{"stage", "running", "ready_for_review"}, {"report", "partial", "result"},
 		{"stage", "ready_for_review", "done"}, {"outcome", "", task.OutcomeIntegrated}, {"disposition", "", "merged"},
 	}
@@ -120,5 +120,29 @@ func TestHistoryRecordsPublicPaneMoveAndClaim(t *testing.T) {
 	want := [][3]string{{"created", "", "queued"}, {"public_pane", launchPane, "w2:p3"}}
 	if got := kindsAndValues(h); !reflect.DeepEqual(got, want) {
 		t.Errorf("history = %v, want %v", got, want)
+	}
+}
+
+func TestHistoryRefusedNoteAndStalePaneMoveLeaveNoRows(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	s := open(t, dir)
+	if err := s.CreateTask(ctx, seedTask("t1")); err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	raw := rawState(t, dir)
+	if _, err := raw.Exec(`CREATE TRIGGER refuse_inbox BEFORE INSERT ON inbox BEGIN SELECT RAISE(ABORT, 'no'); END`); err != nil {
+		t.Fatalf("trigger: %v", err)
+	}
+	note := task.Inbox{ID: "i1", ProjectKey: "repo-a", TaskID: "t1", Kind: "blocker", Summary: "x", Delivery: "pending"}
+	if _, _, err := s.UpdateTaskWithNote(ctx, "t1", 1, func(x *task.Task) error { x.Attention = "help"; return nil }, note); err == nil {
+		t.Fatal("update with a refused note succeeded")
+	}
+	if err := s.MovePublicPane(ctx, launchPane, "w9:p9", "w2:p3"); !errors.Is(err, state.ErrConflict) {
+		t.Fatalf("stale pane move err = %v, want ErrConflict", err)
+	}
+	h, _ := s.History(ctx, "t1")
+	if len(h) != 1 || h[0].Kind != "created" {
+		t.Errorf("history = %v, want only creation", kindsAndValues(h))
 	}
 }

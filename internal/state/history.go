@@ -28,7 +28,11 @@ const (
 // historySchema is the append-only transition log. It is separate from the
 // current facts: a task row says where a task is, this says how it got there.
 // Triggers refuse UPDATE and DELETE so a row, once written, is never rewritten.
-// Rows are small, one per changed fact, and are kept for the life of the state
+// Tasks recorded before this table existed have no creation row: their history
+// starts at their first change after the upgrade. Free text (blocker, attention,
+// disposition) is stored verbatim, because clipping it would lose the very fact
+// being audited; if row size ever matters, decide on a bounded encoding then.
+// Rows are one per changed fact and are kept for the life of the state
 // database: nothing else reads them for correctness, so there is no retention to
 // get wrong.
 const historySchema = `
@@ -70,6 +74,30 @@ func reportLabel(r *task.Report) string {
 	return r.Kind
 }
 
+// reportDelta names the report fields that differ between two reports of the
+// same kind.
+func reportDelta(a, b *task.Report) []string {
+	if a == nil || b == nil {
+		return []string{"report"}
+	}
+	var out []string
+	for _, f := range []struct {
+		name string
+		same bool
+	}{
+		{"summary", a.Summary == b.Summary},
+		{"branch", a.Branch == b.Branch},
+		{"evidence", reflect.DeepEqual(a.Evidence, b.Evidence)},
+		{"checks", reflect.DeepEqual(a.Checks, b.Checks)},
+		{"risk", a.Risk == b.Risk},
+	} {
+		if !f.same {
+			out = append(out, f.name)
+		}
+	}
+	return out
+}
+
 // diffTransitions lists the recorded-fact changes between two revisions. Free
 // text (blocker, attention, disposition) is stored as written; the stage and
 // phase are the closed vocabularies of the model.
@@ -83,7 +111,13 @@ func diffTransitions(prev, next task.Task) []historyEntry {
 	add(HistoryStage, string(task.StageOf(prev)), string(task.StageOf(next)))
 	add(HistoryPhase, string(prev.Phase), string(next.Phase))
 	if !reflect.DeepEqual(prev.Report, next.Report) {
-		out = append(out, historyEntry{HistoryReport, reportLabel(prev.Report), reportLabel(next.Report)})
+		from, to := reportLabel(prev.Report), reportLabel(next.Report)
+		if from == to {
+			// Same kind, so the label alone would read as no change: name the
+			// fields that differ (a bounded list, never the report text).
+			to += " (revised: " + strings.Join(reportDelta(prev.Report, next.Report), ", ") + ")"
+		}
+		out = append(out, historyEntry{HistoryReport, from, to})
 	}
 	add(HistoryBlocker, prev.Blocker, next.Blocker)
 	add(HistoryAttention, prev.Attention, next.Attention)
