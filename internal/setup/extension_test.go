@@ -720,6 +720,10 @@ func TestCanonicalExtensionSourceIsTheSubstitutionTemplate(t *testing.T) {
 		`spawn(PLUGIN_EXECUTABLE, ["bridge", method]`,
 		`name: "orch_dispatch"`,
 		`name: "orch_report"`,
+		`name: "orch_ticket_create"`,
+		`name: "orch_ticket_list"`,
+		`name: "orch_ticket_move"`,
+		`name: "orch_ticket_review"`,
 	} {
 		if !strings.Contains(source, want) {
 			t.Errorf("omp/herdr-orchestrator.ts is missing %q", want)
