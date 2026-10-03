@@ -134,10 +134,15 @@ const minRuledHeight = 4
 
 // RenderPage draws the dedicated detail page for one task, replacing the board.
 // Esc returns to the board; scroll moves through a page taller than height.
+//
+// The primary marker leads the page body, so opening a task does not hide that
+// the primary is unverified. It is part of the scrollable body (pageLinesOf
+// measures it too), not extra chrome, so render and scroll clamp still agree.
 func RenderPage(b *Board, d Detail, width, height int, th Theme) string {
 	if width < 1 {
 		width = 1
 	}
+	marker := primaryMarkerBlock(b, width, th)
 	var all []string
 	help := "Esc back, f focus, q close"
 	if ticket, isTicket := b.FindTicket(d.SelectedID); isTicket {
@@ -147,8 +152,9 @@ func RenderPage(b *Board, d Detail, width, height int, th Theme) string {
 	} else if card, ok := b.Find(d.SelectedID); ok {
 		all = pageLines(card, width, th)
 	} else {
-		return strings.Join([]string{clip("The task is no longer on this board.", width), clip("Esc back, q close", width)}, "\n")
+		return strings.Join(append(marker, clip("The task is no longer on this board.", width), clip("Esc back, q close", width)), "\n")
 	}
+	all = append(append([]string{}, marker...), all...)
 	notice := noticeLine(d, th, width)
 	rows, rule, showNotice := pageChrome(height, notice != "")
 	body, scroll := pageWindow(all, d.Scroll, rows)

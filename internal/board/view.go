@@ -13,6 +13,11 @@
 // re-reading the task and proving against Herdr that the pane, terminal,
 // checkout and OMP session are still the recorded ones.
 //
+// A primary that is absent or unproven is marked at the head of the board. The
+// marker is the PrimaryAttention fact on task.Project (written by reconciliation
+// and the paths that probe the primary), read from the store like every other
+// fact: it makes no Herdr call and moves no card.
+//
 // Herdr's own activity (working, idle, blocked, done, unknown) is shown on the
 // card as a separate indicator. A terminal that stopped is not a task that
 // finished, so activity never moves a card between columns.
@@ -221,6 +226,10 @@ type Board struct {
 	tickets         []TicketCard
 	unplacedTickets []TicketCard
 	ticketsByStage  map[task.TicketStage][]TicketCard
+
+	// primaryAttention is why the project's primary is not verified (see
+	// primary.go); empty draws no marker.
+	primaryAttention string
 }
 
 // NewBoard groups cards into columns. Cards() is in column order; a card whose
@@ -322,7 +331,9 @@ func Render(b *Board, d Detail, width int, th Theme) string {
 	if width < 1 {
 		width = 1
 	}
-	var lines []string
+	// The primary's absence heads the board in every layout, above the columns, so
+	// it is the first thing a reader meets.
+	lines := primaryMarkerBlock(b, width, th)
 	if len(b.Cards()) == 0 && !b.hasTickets() && !d.TicketWrites {
 		lines = append(lines, wrap(noTasksMessage, width)...)
 		lines = append(lines, "")
