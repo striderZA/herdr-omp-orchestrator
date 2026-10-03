@@ -398,3 +398,74 @@ func TestReconcileAloneRecordsAnAbsentPrimaryWhenNothingIsQueued(t *testing.T) {
 		})
 	}
 }
+
+// applyPrimaryPane is the reconcile pass's own writer. Its project is a snapshot
+// taken at the start of the pass, and a hook in another process may have changed
+// the stored row since, so it must decide inside the store's transaction.
+func TestApplyPrimaryPaneDecidesAgainstTheStoredRow(t *testing.T) {
+	livePrimary := func(t *testing.T, f *coordFixture, snapshot task.Project) paneProbe {
+		t.Helper()
+		probe, err := f.coord.probePrimary(context.Background(), snapshot)
+		if err != nil || !probe.Ours {
+			t.Fatalf("probePrimary = (%+v, %v), want a verified primary", probe, err)
+		}
+		return probe
+	}
+
+	t.Run("an unchanged identity still clears an absence a hook recorded after the snapshot", func(t *testing.T) {
+		f := newCoordFixture(t, fixturePlan{})
+		f.boundWorker(t)
+		snapshot := f.boundProject(t)
+		probe := livePrimary(t, f, snapshot)
+		f.setPrimaryAttention(t, "the recorded primary cannot be verified: recorded by another process")
+
+		if err := f.coord.applyPrimaryPane(context.Background(), snapshot, probe); err != nil {
+			t.Fatalf("applyPrimaryPane: %v", err)
+		}
+		if got := f.boundProject(t).PrimaryAttention; got != "" {
+			t.Fatalf("PrimaryAttention = %q after a verified live pass, want it cleared", got)
+		}
+	})
+
+	t.Run("a pass that predates a move neither rewrites the old pane nor clears the fact", func(t *testing.T) {
+		f := newCoordFixture(t, fixturePlan{})
+		f.boundWorker(t)
+		snapshot := f.boundProject(t)
+		probe := livePrimary(t, f, snapshot)
+		probe.Pane.WorkspaceID = "w9" // the verified pane differs from the snapshot, so this pass would write
+		const moved, reason = "w404:p1", "the recorded primary cannot be verified: left by the move"
+		if err := f.store.UpdateProject(context.Background(), f.projectKey(), func(p *task.Project) error {
+			p.PublicPaneID = moved
+			p.PrimaryAttention = reason
+			return nil
+		}); err != nil {
+			t.Fatalf("record the move: %v", err)
+		}
+		recorded := f.boundProject(t)
+
+		if err := f.coord.applyPrimaryPane(context.Background(), snapshot, probe); err != nil {
+			t.Fatalf("applyPrimaryPane: %v", err)
+		}
+		if after := f.boundProject(t); after != recorded {
+			t.Fatalf("a stale reconcile overwrote a newer move:\n got %+v\nwant %+v", after, recorded)
+		}
+	})
+
+	t.Run("a changed identity is recorded and clears the fact in the same write", func(t *testing.T) {
+		f := newCoordFixture(t, fixturePlan{})
+		f.boundWorker(t)
+		snapshot := f.boundProject(t)
+		probe := livePrimary(t, f, snapshot)
+		probe.Pane.WorkspaceID = "w9"
+		f.setPrimaryAttention(t, "the recorded primary cannot be verified: stale")
+		snapshot.PrimaryAttention = "the recorded primary cannot be verified: stale"
+
+		if err := f.coord.applyPrimaryPane(context.Background(), snapshot, probe); err != nil {
+			t.Fatalf("applyPrimaryPane: %v", err)
+		}
+		after := f.boundProject(t)
+		if after.CurrentWorkspaceID != "w9" || after.PrimaryAttention != "" {
+			t.Fatalf("project = %+v, want workspace w9 recorded and the fact cleared", after)
+		}
+	})
+}

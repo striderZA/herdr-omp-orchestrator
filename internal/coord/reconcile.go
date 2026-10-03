@@ -1420,7 +1420,16 @@ func (c *Coordinator) reconcileExit(ctx context.Context, project task.Project, s
 
 // applyPrimaryPane records the public identity a verified primary pane has now,
 // adopting a new launch id only for a verified restored session in a new
-// terminal.
+// terminal, and retires any recorded absence of the primary.
+//
+// project is this pass's snapshot, and a hook in another process may have changed
+// the stored row since. So nothing is decided from the snapshot's copy of the
+// record: when the pane identity needs no change the attention is still cleared
+// inside the store's transaction, and when it does change the write is a
+// compare-and-swap on both the launch and the public pane. A move keeps the launch
+// pane and advances the public one, so a binding or public pane that has moved on
+// means a newer observation owns the row and this one is dropped - for the pane
+// and for the attention alike.
 func (c *Coordinator) applyPrimaryPane(ctx context.Context, project task.Project, probe paneProbe) error {
 	next := project
 	if adoptsLaunchID(project.LaunchPaneID, probe) {
@@ -1431,20 +1440,22 @@ func (c *Coordinator) applyPrimaryPane(ctx context.Context, project task.Project
 	if terminal := strings.TrimSpace(probe.Pane.TerminalID); terminal != "" {
 		next.TerminalID = terminal
 	}
-	// The pane is verified live, so any recorded absence of the primary ends here,
-	// in the same write that records where it is.
-	next.PrimaryAttention = ""
-	if next == project {
-		return nil
+	if next.LaunchPaneID == project.LaunchPaneID && next.PublicPaneID == project.PublicPaneID &&
+		next.CurrentWorkspaceID == project.CurrentWorkspaceID && next.TerminalID == project.TerminalID {
+		// The recorded identity is already the verified one. The pane is live, so
+		// any recorded absence ends here.
+		return c.clearPrimaryAttention(ctx, project)
 	}
 	err := c.store.UpdateProject(ctx, project.Key, func(record *task.Project) error {
-		if record.LaunchPaneID != project.LaunchPaneID {
+		if record.LaunchPaneID != project.LaunchPaneID || record.PublicPaneID != project.PublicPaneID {
 			return errSuperseded
 		}
 		record.LaunchPaneID = next.LaunchPaneID
 		record.PublicPaneID = next.PublicPaneID
 		record.CurrentWorkspaceID = next.CurrentWorkspaceID
 		record.TerminalID = next.TerminalID
+		// The pane is verified live, so a recorded absence of the primary ends in
+		// the same write that records where it is.
 		record.PrimaryAttention = ""
 		return nil
 	})
