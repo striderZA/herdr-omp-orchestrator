@@ -51,8 +51,47 @@ type Task struct {
 	Phase                                               Phase
 	Report                                              *Report
 	Blocker, Attention, Disposition                     string
-	Activity                                            string
-	Revision, CreatedAt, UpdatedAt, ActivitySeenAt      int64
+	// Outcome is the structured kind of the user's decision; Disposition carries
+	// its free-text note. A closed task with an empty Outcome is a legacy row.
+	Outcome                                        string
+	Activity                                       string
+	Revision, CreatedAt, UpdatedAt, ActivitySeenAt int64
+}
+
+// The kinds of decision a primary can record. Every kind closes the task, frees
+// its slot and releases its reserved paths; only an accepting kind also releases
+// the tasks that depend on it.
+const (
+	OutcomeIntegrated = "integrated"
+	OutcomeKept       = "kept"
+	OutcomeRejected   = "rejected"
+	OutcomeSuperseded = "superseded"
+	OutcomeAbandoned  = "abandoned"
+)
+
+// Outcomes lists every recordable outcome in display order.
+func Outcomes() []string {
+	return []string{OutcomeIntegrated, OutcomeKept, OutcomeRejected, OutcomeSuperseded, OutcomeAbandoned}
+}
+
+// ValidOutcome reports whether kind is a recordable outcome.
+func ValidOutcome(kind string) bool {
+	for _, o := range Outcomes() {
+		if o == kind {
+			return true
+		}
+	}
+	return false
+}
+
+// Accepted reports whether a closed task released its dependents. A legacy row
+// (disposition text, no outcome) predates the contract and keeps the behaviour
+// it was recorded under, so it counts as accepted.
+func (x Task) Accepted() bool {
+	if x.Disposition == "" {
+		return false
+	}
+	return x.Outcome == "" || x.Outcome == OutcomeIntegrated || x.Outcome == OutcomeKept
 }
 
 // Project is the durable record of one primary checkout the plugin dispatches from.

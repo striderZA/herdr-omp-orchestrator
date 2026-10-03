@@ -1679,6 +1679,44 @@ func TestDispatchWaitsForDependenciesUntilTheDispositionIsRecorded(t *testing.T)
 	}
 }
 
+func TestDependentsReleaseOnlyOnAcceptingOutcomes(t *testing.T) {
+	cases := []struct {
+		outcome, disposition string
+		released             bool
+	}{
+		{task.OutcomeIntegrated, "integrated", true},
+		{task.OutcomeKept, "kept", true},
+		{task.OutcomeRejected, "rejected", false},
+		{task.OutcomeSuperseded, "superseded", false},
+		{task.OutcomeAbandoned, "abandoned", false},
+		{"", "legacy free text", true}, // rows recorded before the contract
+	}
+	for _, tc := range cases {
+		dep := task.Task{ID: "dep", Disposition: tc.disposition, Outcome: tc.outcome}
+		waiting := task.Task{ID: "waiting", Dependencies: []string{"dep"}}
+		reason := unsatisfiedDependency([]task.Task{dep, waiting}, waiting)
+		if released := reason == ""; released != tc.released {
+			t.Errorf("outcome %q: released=%v (reason %q), want %v", tc.outcome, released, reason, tc.released)
+		}
+		if task.StageOf(dep) != task.Done {
+			t.Errorf("outcome %q must still close the task", tc.outcome)
+		}
+	}
+}
+
+func TestDecisionOfIsTheSingleValidationPoint(t *testing.T) {
+	if _, _, err := decisionOf("", "accepted"); !errors.Is(err, ErrInvalidRequest) {
+		t.Errorf("empty outcome err = %v, want ErrInvalidRequest", err)
+	}
+	if _, _, err := decisionOf("merged", "x"); !errors.Is(err, ErrInvalidRequest) {
+		t.Errorf("unknown outcome err = %v, want ErrInvalidRequest", err)
+	}
+	kind, note, err := decisionOf(" Rejected ", "")
+	if err != nil || kind != task.OutcomeRejected || note != "rejected" {
+		t.Errorf("decisionOf = (%q, %q, %v), want rejected with the outcome as the default note", kind, note, err)
+	}
+}
+
 func TestDispatchRechecksDependencyAfterCreatingTheIntent(t *testing.T) {
 	f := newCoordFixture(t, fixturePlan{})
 	prerequisite := f.mustDispatch("prerequisite", "Prerequisite result.")
@@ -3322,7 +3360,7 @@ func TestAFinalReportAloneDoesNotUnlockADependent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read the bound project: %v", err)
 	}
-	result, err := f.coord.Review(ctx, project.LaunchPaneID, prereq.ID, "accepted: the user kept the branch")
+	result, err := f.coord.Review(ctx, project.LaunchPaneID, prereq.ID, "integrated", "accepted: the user kept the branch")
 	if err != nil {
 		t.Fatalf("Review: %v", err)
 	}

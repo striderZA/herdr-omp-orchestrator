@@ -325,9 +325,11 @@ func normalizeReservedPath(path string) (string, error) {
 // The concurrency budget is deliberately not decided here: it is decided by the
 // durable gate (Store.ClaimTask / Store.ClaimProvisioningSlot), in the same
 // transaction that records the task or claims its slot, so two coordinator
-// processes cannot both pass this check and provision past the limit. Dependencies
-// are monotone — a dependency only ever reaches a disposition — so a stale read
-// can only queue a task that could have run, never the other way around.
+// processes cannot both pass this check and provision past the limit. A
+// satisfied dependency never becomes unsatisfied (a recorded decision is final),
+// so a stale read can only queue a task that could have run, never the other way
+// around. A dependency closed with a non-accepting outcome never becomes
+// satisfied: its dependents stay queued for good unless the primary re-plans.
 func (c *Coordinator) dispatchable(existing []task.Task, st task.Task) (bool, string) {
 	if reason := unsatisfiedDependency(existing, st); reason != "" {
 		return false, reason
@@ -335,14 +337,16 @@ func (c *Coordinator) dispatchable(existing []task.Task, st task.Task) (bool, st
 	return true, ""
 }
 
-// unsatisfiedDependency names the first dependency that the primary has not closed
-// with a disposition.
+// unsatisfiedDependency names the first dependency that has not released its
+// dependents. Closure and acceptance are distinct: any recorded outcome closes a
+// task, but only an accepting one (integrated, kept, or a legacy disposition)
+// satisfies a dependency.
 //
-// The gate is the disposition and nothing else: a worker's final report only says
-// its worker stopped and makes the dependency ready for review, which is not a
+// The gate is the recorded decision and nothing else: a worker's final report only
+// says its worker stopped and makes the dependency ready for review, which is not a
 // decision about the work. A dependent task therefore stays queued until the primary
-// records its review disposition (Review), which is the moment the work it depends
-// on is accepted — and the moment the reviewer has actually seen it.
+// records an accepting outcome (Review) — the moment the reviewer has actually seen
+// the work it depends on.
 func unsatisfiedDependency(existing []task.Task, st task.Task) string {
 	for _, dependency := range st.Dependencies {
 		dep, ok := findTask(existing, dependency)
@@ -351,6 +355,9 @@ func unsatisfiedDependency(existing []task.Task, st task.Task) string {
 		}
 		if stage := task.StageOf(dep); stage != task.Done {
 			return fmt.Sprintf("dependency %s is %s, not closed by a disposition yet", dependency, stage)
+		}
+		if !dep.Accepted() {
+			return fmt.Sprintf("dependency %s was closed as %s, which does not release its dependents; the primary must re-plan and re-dispatch this task without that dependency", dependency, dep.Outcome)
 		}
 	}
 	return ""

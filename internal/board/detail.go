@@ -29,6 +29,12 @@ func pageLines(card Card, width int, th Theme) []string {
 		add("Last observation", observed)
 	}
 
+	if len(card.DependencyBlocks) > 0 {
+		section("Needs a human")
+		for _, reason := range card.DependencyBlocks {
+			add("Blocked", reason)
+		}
+	}
 	if question := card.Attention(); question != "" {
 		section("Needs a human")
 		label := "Attention"
@@ -56,7 +62,7 @@ func pageLines(card Card, width int, th Theme) []string {
 		}
 	}
 
-	if len(t.Checks) > 0 || len(t.Dependencies) > 0 || len(t.ReservedPaths) > 0 || strings.TrimSpace(t.Disposition) != "" {
+	if len(t.Checks) > 0 || len(t.Dependencies) > 0 || len(t.ReservedPaths) > 0 || strings.TrimSpace(t.Disposition) != "" || strings.TrimSpace(t.Outcome) != "" {
 		section("Plan")
 		for _, item := range t.Checks {
 			out = append(out, wrap("Required check: "+singleLine(item), width)...)
@@ -66,6 +72,11 @@ func pageLines(card Card, width int, th Theme) []string {
 		}
 		for _, item := range t.ReservedPaths {
 			out = append(out, wrap("Reserved path: "+singleLine(item), width)...)
+		}
+		if o := singleLine(t.Outcome); o != "" {
+			add("Outcome", o)
+		} else if strings.TrimSpace(t.Disposition) != "" {
+			add("Outcome", "legacy (counted as accepted)")
 		}
 		if d := singleLine(t.Disposition); d != "" {
 			add("Disposition", d)
