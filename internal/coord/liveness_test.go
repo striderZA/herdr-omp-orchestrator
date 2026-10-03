@@ -495,3 +495,24 @@ func TestRaiseLivenessRefusesTasksThatAreNotSubmittedWorkers(t *testing.T) {
 		}
 	}
 }
+
+func TestFinalReportRetiresALivenessAttention(t *testing.T) {
+	f := newReportFixture(t)
+	_, worker := f.seed()
+	ctx := context.Background()
+	f.update(worker, func(next *task.Task) error {
+		next.Attention = absentAttention
+		return nil
+	})
+
+	if _, err := f.coord.FinalReport(ctx, worker.LaunchPaneID, f.completeReport(f.reload(worker.ID))); err != nil {
+		t.Fatalf("FinalReport: %v", err)
+	}
+	after := f.reload(worker.ID)
+	if after.Attention != "" {
+		t.Fatalf("attention = %q survived a verified final report", after.Attention)
+	}
+	if stage := task.StageOf(after); stage != task.ReadyForReview {
+		t.Fatalf("stage = %q, want %q: a stale absent marker must not hide a reported task", stage, task.ReadyForReview)
+	}
+}

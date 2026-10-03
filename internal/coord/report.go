@@ -580,7 +580,7 @@ func (c *Coordinator) finalReport(ctx context.Context, st task.Task, complete ta
 	note := c.noteFor(st, "result", reportNote(complete), "worker result")
 	recorded := st
 	inserted := false
-	if st.Report == nil || !sameReport(*st.Report, complete) || isQuestionAttention(st.Attention) {
+	if st.Report == nil || !sameReport(*st.Report, complete) || isQuestionAttention(st.Attention) || isLivenessAttention(st.Attention) {
 		updated, insertedNote, err := c.recordWithNote(ctx, st, func(next *task.Task) error {
 			// Re-checked on every attempt: the disposition is final, and a
 			// Review can land between workerTask and this write.
@@ -592,7 +592,10 @@ func (c *Coordinator) finalReport(ctx context.Context, st task.Task, complete ta
 			if !sameBranch(next.Branch, complete.Branch) {
 				return fmt.Errorf("%w: the task now owns branch %q, not the reported %q", ErrReportInvalid, next.Branch, complete.Branch)
 			}
-			if isQuestionAttention(next.Attention) {
+			// The worker's own verified report is proof it is live, and a recorded
+			// result outranks an absent or unknown state: either marker would
+			// otherwise hide a task that is ready for review.
+			if isQuestionAttention(next.Attention) || isLivenessAttention(next.Attention) {
 				next.Attention = ""
 			}
 			next.Report = &complete
