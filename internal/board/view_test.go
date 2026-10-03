@@ -449,6 +449,71 @@ func TestNarrowLayoutUsesOneSectionPerStageAtEightyColumns(t *testing.T) {
 	}
 }
 
+func TestDependentOfANonAcceptingOutcomeIsShownBlocked(t *testing.T) {
+	f := newBoardFixture(t, fixturePlan{})
+	rejected := sampleTask("orch_d1", func(x *task.Task) { x.Outcome = task.OutcomeRejected; x.Disposition = "rejected" })
+	kept := sampleTask("orch_d2", func(x *task.Task) { x.Outcome = task.OutcomeKept; x.Disposition = "kept" })
+	stuck := sampleTask("orch_q3", func(x *task.Task) { x.Phase = task.Intent; x.Dependencies = []string{rejected.ID} })
+	free := sampleTask("orch_q4", func(x *task.Task) { x.Phase = task.Intent; x.Dependencies = []string{kept.ID} })
+	f.seed(t, rejected, kept, stuck, free)
+
+	cards, err := ProjectCards(context.Background(), f.store, f.project)
+	if err != nil {
+		t.Fatalf("ProjectCards: %v", err)
+	}
+	board := NewBoard(cards)
+	th := Theme{Profile: termenv.Ascii}
+	out := Render(board, Detail{SelectedID: stuck.ID}, 100, th)
+	if want := "Blocked: dependency orch_d1 was closed as rejected"; !strings.Contains(out, want) {
+		t.Errorf("the blocked dependent does not show %q:\n%s", want, out)
+	}
+	if out := Render(board, Detail{SelectedID: free.ID}, 100, th); strings.Contains(out, "Blocked:") {
+		t.Errorf("a dependent of a kept task is shown blocked:\n%s", out)
+	}
+	if out := Render(board, Detail{SelectedID: stuck.ID, Expanded: true}, 100, th); !strings.Contains(out, "Blocked: dependency orch_d1 was closed as rejected") {
+		t.Errorf("the expanded detail does not show the blocked dependent:\n%s", out)
+	}
+	if page := strings.Join(pageLines(cardByID(t, cards, stuck.ID), 100, th), "\n"); !strings.Contains(page, "Blocked: dependency orch_d1 was closed as rejected") {
+		t.Errorf("the detail page does not show the blocked dependent:\n%s", page)
+	}
+	if page := strings.Join(pageLines(cardByID(t, cards, rejected.ID), 100, th), "\n"); !strings.Contains(page, "Outcome: rejected") {
+		t.Errorf("the detail page does not show the explicit outcome:\n%s", page)
+	}
+}
+
+func cardByID(t *testing.T, cards []Card, id string) Card {
+	t.Helper()
+	for _, c := range cards {
+		if c.ID() == id {
+			return c
+		}
+	}
+	t.Fatalf("no card %s", id)
+	return Card{}
+}
+
+func TestOpenPrerequisiteIsWaitingNotBlockedAndLegacyIsAccepted(t *testing.T) {
+	f := newBoardFixture(t, fixturePlan{})
+	open := sampleTask("orch_r1", nil)
+	legacy := sampleTask("orch_d2", func(x *task.Task) { x.Disposition = "merged by hand" })
+	waiting := sampleTask("orch_q3", func(x *task.Task) { x.Phase = task.Intent; x.Dependencies = []string{open.ID} })
+	released := sampleTask("orch_q4", func(x *task.Task) { x.Phase = task.Intent; x.Dependencies = []string{legacy.ID} })
+	f.seed(t, open, legacy, waiting, released)
+	cards, err := ProjectCards(context.Background(), f.store, f.project)
+	if err != nil {
+		t.Fatalf("ProjectCards: %v", err)
+	}
+	for _, id := range []string{waiting.ID, released.ID} {
+		if got := cardByID(t, cards, id).DependencyBlocks; len(got) != 0 {
+			t.Errorf("%s shown blocked: %v", id, got)
+		}
+	}
+	page := strings.Join(pageLines(cardByID(t, cards, legacy.ID), 100, Theme{Profile: termenv.Ascii}), "\n")
+	if !strings.Contains(page, "Outcome: legacy") || !strings.Contains(page, "Disposition: merged by hand") {
+		t.Errorf("a legacy disposition is not shown as such:\n%s", page)
+	}
+}
+
 // TestNarrowLayoutBoundsEveryLineAtSmallWidths keeps the bound when the
 // terminal is too narrow even for a heading.
 func TestNarrowLayoutBoundsEveryLineAtSmallWidths(t *testing.T) {

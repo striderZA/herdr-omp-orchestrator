@@ -109,6 +109,8 @@ func (t Theme) separator() string {
 type Card struct {
 	Task  task.Task
 	Stage task.Stage
+	// DependencyBlocks lists dependencies closed with a non-accepting outcome.
+	DependencyBlocks []string
 }
 
 // ID is the card's identity. The board selects, focuses and drills down by this
@@ -164,9 +166,28 @@ func ProjectCards(ctx context.Context, store *state.Store, projectKey string) ([
 	}
 	cards := make([]Card, 0, len(tasks))
 	for _, fact := range tasks {
-		cards = append(cards, Card{Task: fact, Stage: task.StageOf(fact)})
+		cards = append(cards, Card{Task: fact, Stage: task.StageOf(fact), DependencyBlocks: dependencyBlocks(tasks, fact)})
 	}
 	return cards, nil
+}
+
+// dependencyBlocks derives, from persisted dependencies and outcomes, why a
+// queued task cannot start: a dependency closed with a non-accepting outcome
+// never releases it. Nothing is stored; a dependency that is merely not done
+// yet is waiting, not blocked.
+func dependencyBlocks(all []task.Task, fact task.Task) []string {
+	if task.StageOf(fact) != task.Queued {
+		return nil
+	}
+	var out []string
+	for _, id := range fact.Dependencies {
+		for _, dep := range all {
+			if dep.ID == id && dep.Disposition != "" && !dep.Accepted() {
+				out = append(out, fmt.Sprintf("dependency %s was closed as %s", dep.ID, dep.Outcome))
+			}
+		}
+	}
+	return out
 }
 
 // Board is the renderable projection: cards grouped into their five columns.
@@ -401,6 +422,9 @@ func detailLines(b *Board, d Detail, width int, th Theme) []string {
 
 	if d.Expanded {
 		out = append(out, wrap("Brief: "+orNone(singleLine(card.Task.Brief), "none"), width)...)
+		if len(card.DependencyBlocks) > 0 {
+			out = append(out, wrap("Blocked: "+singleLine(strings.Join(card.DependencyBlocks, "; ")), width)...)
+		}
 		if question := card.Attention(); question != "" {
 			label := "Attention: "
 			if strings.TrimSpace(card.Task.Blocker) != "" {
@@ -439,6 +463,9 @@ func detailLines(b *Board, d Detail, width int, th Theme) []string {
 // cardSummary is the one line the collapsed details show: what needs a human
 // first, then what the worker reported, then what it was asked to do.
 func cardSummary(card Card) string {
+	if len(card.DependencyBlocks) > 0 {
+		return "Blocked: " + singleLine(strings.Join(card.DependencyBlocks, "; "))
+	}
 	if question := card.Attention(); question != "" {
 		if strings.TrimSpace(card.Task.Blocker) != "" {
 			return "Blocked: " + singleLine(question)
