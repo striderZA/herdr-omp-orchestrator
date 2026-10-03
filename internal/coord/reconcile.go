@@ -629,6 +629,9 @@ func (c *Coordinator) applyProjectMove(ctx context.Context, project task.Project
 		}
 		next.PublicPaneID = pane.PaneID
 		next.CurrentWorkspaceID = pane.WorkspaceID
+		// The moved pane was proven to be the primary, strictly: that is a
+		// verified live primary, so it retires any recorded absence.
+		next.PrimaryAttention = ""
 		return nil
 	})
 	if errors.Is(err, errSuperseded) {
@@ -770,13 +773,30 @@ func (c *Coordinator) taskAttention(ctx context.Context, st task.Task, reason st
 }
 
 // projectAttention records a durable attention note for a project. A project has
-// no attention field of its own - its facts are the binding - so the inbox note
-// is where a human reads it.
+// no task to carry it, so the inbox note is where a human reads it; the refusal is
+// returned to the caller.
+//
+// It does not decide whether the primary is absent. The findings it reports from a
+// pane move are about the moved pane, not proof the primary is gone, so they stay
+// a note and a refusal; the project's recorded primary attention (see
+// primaryUnverified) is written only where the primary itself was searched for.
 func (c *Coordinator) projectAttention(ctx context.Context, project task.Project, reason string) error {
 	if err := c.notify(ctx, project.Key, "", noteKindAttention, reason, reconcileDelivery); err != nil {
 		return errors.Join(refusal(ErrPrimaryNotLive, project.Key, reason), err)
 	}
 	return refusal(ErrPrimaryNotLive, project.Key, reason)
+}
+
+// primaryUnverified is projectAttention for a finding of a pass that searched for
+// the primary and could not prove it: the same note and refusal, and the reason
+// is also persisted on the project for the board. A failure to persist it is
+// returned with the refusal rather than hidden.
+func (c *Coordinator) primaryUnverified(ctx context.Context, project task.Project, reason string) error {
+	err := c.projectAttention(ctx, project, reason)
+	if recordErr := c.recordPrimaryAttention(ctx, project, reason, true); recordErr != nil {
+		return errors.Join(err, recordErr)
+	}
+	return err
 }
 
 // refusal renders one stable refusal naming the recorded identity and the
@@ -847,16 +867,32 @@ func (c *Coordinator) FlushInbox(ctx context.Context, projectKey string) error {
 	if err != nil {
 		return err
 	}
-	if len(pending) == 0 {
-		// Nothing queued: no prompt, so a status event can never become a notice
-		// about itself.
+	if len(pending) == 0 && project.PrimaryAttention == "" {
+		// Nothing queued and no marker to retire: no probe and no prompt, so a
+		// status event can never become a notice about itself.
 		return nil
 	}
 	probe, err := c.probePrimary(ctx, project)
 	if err != nil {
 		return err
 	}
-	if !probe.Ours || !probe.Idle {
+	// The probe is fresh evidence about the primary whether or not anything is
+	// queued, so it also keeps the project's recorded primary attention true: a
+	// verified primary retires it, and an unverified one is recorded. A failed
+	// write is reported after the delivery and never prevents it - the fact is
+	// informational, the notes are not.
+	attentionErr := c.settlePrimaryAttention(ctx, project, probe)
+	err = c.deliverVerified(ctx, pending, probe)
+	if attentionErr != nil {
+		return errors.Join(err, attentionErr)
+	}
+	return err
+}
+
+// deliverVerified claims and submits one batch of pending notes, and only to a
+// primary the probe proved and found idle.
+func (c *Coordinator) deliverVerified(ctx context.Context, pending []task.Inbox, probe paneProbe) error {
+	if len(pending) == 0 || !probe.Ours || !probe.Idle {
 		return nil
 	}
 	// The batch is chosen before anything is claimed: a note is claimed only when
@@ -1192,7 +1228,10 @@ func reconciles(st task.Task) bool {
 //
 // A primary that is not found is left alone: re-establishing a lost primary is
 // the user's explicit launch action, and nothing here may substitute a different
-// session for the one the user was talking to.
+// session for the one the user was talking to. It is not hidden either: the
+// project records why the primary is absent or unproven, so the board can say so
+// while the workers and the inbox carry on, and a pass that proves the primary
+// again retires the record. Recording it adds no inbox note and changes no task.
 func (c *Coordinator) reconcilePrimary(ctx context.Context, project task.Project, snapshot *snapshotView) error {
 	identity, err := c.identityOf(ctx, project.LaunchPaneID, project.OMPSessionID)
 	if err != nil {
@@ -1207,15 +1246,18 @@ func (c *Coordinator) reconcilePrimary(ctx context.Context, project task.Project
 	case len(ours) == 1:
 		return c.applyPrimaryPane(ctx, project, ours[0])
 	case len(ours) > 1:
-		return c.projectAttention(ctx, project, fmt.Sprintf(
+		return c.primaryUnverified(ctx, project, fmt.Sprintf(
 			"%d panes report the primary session of project %s (%s); the binding was not re-keyed",
 			len(ours), project.Key, strings.Join(paneIDs(ours), ", ")))
 	}
 	if refuted := refutedOnly(probes); len(refuted) > 0 {
-		return c.projectAttention(ctx, project, fmt.Sprintf("pane %s is not the primary of project %s: %s",
+		return c.primaryUnverified(ctx, project, fmt.Sprintf("pane %s is not the primary of project %s: %s",
 			refuted[0].Pane.PaneID, project.Key, refuted[0].Refusal))
 	}
-	return nil
+	// No pane proves the primary and none refutes it: it is gone, or Herdr cannot
+	// show it. That is not a failure of this pass - nothing was substituted and the
+	// queue is not held back - but it is a fact the board has to be able to show.
+	return c.recordPrimaryAttention(ctx, project, snapshotPrimaryReason(project, probes), true)
 }
 
 // taskReconcile is what the identity pass decided about one unfinished task.
@@ -1389,6 +1431,9 @@ func (c *Coordinator) applyPrimaryPane(ctx context.Context, project task.Project
 	if terminal := strings.TrimSpace(probe.Pane.TerminalID); terminal != "" {
 		next.TerminalID = terminal
 	}
+	// The pane is verified live, so any recorded absence of the primary ends here,
+	// in the same write that records where it is.
+	next.PrimaryAttention = ""
 	if next == project {
 		return nil
 	}
@@ -1400,6 +1445,7 @@ func (c *Coordinator) applyPrimaryPane(ctx context.Context, project task.Project
 		record.PublicPaneID = next.PublicPaneID
 		record.CurrentWorkspaceID = next.CurrentWorkspaceID
 		record.TerminalID = next.TerminalID
+		record.PrimaryAttention = ""
 		return nil
 	})
 	if errors.Is(err, errSuperseded) {
