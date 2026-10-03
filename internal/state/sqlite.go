@@ -1114,11 +1114,18 @@ func (s *Store) ClaimTask(ctx context.Context, t task.Task, budget int) (bool, t
 	if err := checkPaneFree(ctx, tx, t.LaunchPaneID, t.ID); err != nil {
 		return false, task.Task{}, 0, err
 	}
+	// The tasks of the project are read once, inside this write transaction, for
+	// both gates below: a repeat of work an open task holds is answered before
+	// anything else (an identical request is a repeat, not a second worker that
+	// wants the same files), and only then are reserved paths compared.
+	existing, err := queryFacts[task.Task](ctx, tx, `SELECT data FROM tasks WHERE project_key = ?`, t.ProjectKey)
+	if err != nil {
+		return false, task.Task{}, 0, fmt.Errorf("read the tasks of %q: %w", t.ProjectKey, err)
+	}
+	if holder, ok := task.OpenHolderOf(existing, t); ok {
+		return false, task.Task{}, 0, &DuplicateError{Existing: holder}
+	}
 	if len(t.ReservedPaths) > 0 {
-		existing, err := queryFacts[task.Task](ctx, tx, `SELECT data FROM tasks WHERE project_key = ?`, t.ProjectKey)
-		if err != nil {
-			return false, task.Task{}, 0, fmt.Errorf("read the tasks of %q: %w", t.ProjectKey, err)
-		}
 		if owner, mine, theirs, ok := reservedConflict(existing, t.ReservedPaths); ok {
 			return false, task.Task{}, 0, fmt.Errorf("%w: task %s reserved %q (requested %q)",
 				ErrReservedConflict, owner, theirs, mine)

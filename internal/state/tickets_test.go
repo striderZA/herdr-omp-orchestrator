@@ -273,7 +273,11 @@ func TestClaimTaskAcceptsABacklogTicket(t *testing.T) {
 	if err := s.CreateTask(ctx, ticketTask("t1", "tkt_a", 1)); err != nil {
 		t.Fatalf("CreateTask for a backlog ticket: %v", err)
 	}
-	if _, linked, _, err := s.ClaimTask(ctx, ticketTask("t2", "tkt_a", 2), 3); err != nil || linked.TicketID != "tkt_a" {
+	// Identical work would be answered as a repeat of t1 (issue #4); this test is
+	// about the ticket, so the second task is a different piece of work.
+	second := ticketTask("t2", "tkt_a", 2)
+	second.Title = "a second piece of work for the ticket"
+	if _, linked, _, err := s.ClaimTask(ctx, second, 3); err != nil || linked.TicketID != "tkt_a" {
 		t.Fatalf("ClaimTask for a backlog ticket = %+v, %v", linked, err)
 	}
 	for _, id := range []string{"t1", "t2"} {
