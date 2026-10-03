@@ -1386,8 +1386,12 @@ func TestReconcileQueuesAnExitForAVanishedWorkerWithoutRespawning(t *testing.T) 
 		t.Fatalf("phase = %q, want the recorded %q", after.Phase, worker.Phase)
 	case after.WorktreePath != worker.WorktreePath || after.Branch != worker.Branch:
 		t.Fatalf("an exited worker lost its checkout provenance: path %q branch %q", after.WorktreePath, after.Branch)
-	case after.Attention != "" || after.Blocker != "":
-		t.Fatalf("a vanished worker raised attention=%q blocker=%q", after.Attention, after.Blocker)
+	case after.Blocker != "":
+		t.Fatalf("a vanished worker raised blocker=%q: a blocker is the worker's to record", after.Blocker)
+	case !strings.HasPrefix(after.Attention, absentAttentionPrefix):
+		t.Fatalf("a vanished worker's attention = %q, want the absent-worker marker %q", after.Attention, absentAttentionPrefix)
+	case task.StageOf(after) != task.NeedsInput:
+		t.Fatalf("stage = %q, want %q: a worker that is gone is not Running", task.StageOf(after), task.NeedsInput)
 	}
 	if f.countCalls("agent start") != startsBefore {
 		t.Fatalf("startup started an agent in a vanished worker's pane: %d start calls before, %d after", startsBefore, f.countCalls("agent start"))
@@ -1399,12 +1403,16 @@ func TestReconcileQueuesAnExitForAVanishedWorkerWithoutRespawning(t *testing.T) 
 	if !strings.Contains(notes[0].Summary, worker.ID) {
 		t.Fatalf("exit note = %q, want it to name the task", notes[0].Summary)
 	}
-	// Queued once: a second startup pass does not repeat it.
+	// Queued once: a second startup pass neither repeats the note nor rewrites
+	// the task.
 	if err := f.coord.Reconcile(context.Background()); err != nil {
 		t.Fatalf("second Reconcile: %v", err)
 	}
 	if notes := f.notesOfKind(t, noteKindExit); len(notes) != 1 {
 		t.Fatalf("exit notes after a repeated pass = %d, want 1", len(notes))
+	}
+	if again := f.taskByID(t, worker.ID); again.Revision != after.Revision {
+		t.Fatalf("a repeated pass rewrote the task: revision %d -> %d", after.Revision, again.Revision)
 	}
 }
 
