@@ -795,8 +795,8 @@ $reviewScreen = @'
 Earlier confirmation: Record review disposition
 Task orch_old; Accepted the reported result.
 Record review disposition
-Confirm that you reviewed the worker's final report for task orch_abc and chose this disposition:
-Accepted the reported result.
+Confirm that you reviewed the worker's final report for task orch_abc and chose this outcome: integrated
+Note: Accepted the reported result.
 Stored report (revision 7):
 Summary: "Added subtract to a.js"
 Branch: "orch/abc"
@@ -824,6 +824,18 @@ $boxedReviewScreen = ($reviewScreen -split "`r?`n" | ForEach-Object { if ($_ -ma
 $boxedReviewScreen += "`nup/down navigate  enter select  esc cancel`n$corner`n`n 10m $dot Sonnet 5.5 $dot orch-accept-x\repo $dot master $dot 1.5%/1M`n"
 Check 'review modal accepts the real boxed layout with the status bar below it' (Test-PrimaryReviewConfirmScreen -Screen $boxedReviewScreen -TaskId 'orch_abc' -Revision 7 -Disposition 'Accepted the reported result.') 'boxed layout'
 Check 'review modal refuses a newer Ask drawn below a closed boxed modal' (-not (Test-PrimaryReviewConfirmScreen -Screen ($boxedReviewScreen + "`nAsk 1 questions`n[other] What now?`nAccept`nRequest changes") -TaskId 'orch_abc' -Revision 7 -Disposition 'Accepted the reported result.')) 'boxed stale'
+# The outcome is part of the dialog's shape (recordReviewWithConsent names it first and
+# the note on its own line): the same note under another decision, an outcome that only
+# starts with the expected one, or the pre-outcome wording are different confirmations.
+$rejectedBody = 'This closes the task and frees its slot and paths, but tasks that depend on it stay queued.'
+$rejectedScreen = ($reviewScreen -replace 'chose this outcome: integrated', 'chose this outcome: rejected') -replace 'This closes the task and may start queued dependent work\.', $rejectedBody
+Check 'review modal refuses a dialog whose outcome is not the expected one' (-not (Test-PrimaryReviewConfirmScreen -Screen $rejectedScreen -TaskId 'orch_abc' -Revision 7 -Disposition 'Accepted the reported result.')) 'wrong outcome'
+Check 'review modal accepts a non-accepting outcome with its own closing sentence' (Test-PrimaryReviewConfirmScreen -Screen $rejectedScreen -TaskId 'orch_abc' -Revision 7 -Disposition 'Accepted the reported result.' -Outcome 'rejected') 'rejected outcome'
+Check 'review modal refuses a non-accepting outcome that still says it releases dependents' (-not (Test-PrimaryReviewConfirmScreen -Screen ($reviewScreen -replace 'chose this outcome: integrated', 'chose this outcome: rejected') -TaskId 'orch_abc' -Revision 7 -Disposition 'Accepted the reported result.' -Outcome 'rejected')) 'release claim'
+Check 'review modal refuses an accepting outcome that says dependents stay queued' (-not (Test-PrimaryReviewConfirmScreen -Screen ($reviewScreen -replace 'This closes the task and may start queued dependent work\.', $rejectedBody) -TaskId 'orch_abc' -Revision 7 -Disposition 'Accepted the reported result.')) 'queued claim'
+Check 'review modal refuses an outcome that merely starts with the expected one' (-not (Test-PrimaryReviewConfirmScreen -Screen ($reviewScreen -replace 'chose this outcome: integrated', 'chose this outcome: integrated-later') -TaskId 'orch_abc' -Revision 7 -Disposition 'Accepted the reported result.')) 'prefix outcome'
+Check 'review modal refuses the old wording that has no outcome' (-not (Test-PrimaryReviewConfirmScreen -Screen ($reviewScreen -replace 'chose this outcome: integrated\r?\nNote: ', 'chose this disposition: ') -TaskId 'orch_abc' -Revision 7 -Disposition 'Accepted the reported result.')) 'old wording'
+Check 'review modal refuses a note that is the outcome word in disguise' (-not (Test-PrimaryReviewConfirmScreen -Screen ($reviewScreen -replace 'Note: Accepted the reported result\.', 'Note: integrated') -TaskId 'orch_abc' -Revision 7 -Disposition 'Accepted the reported result.')) 'wrong note'
 
 $primaryAskScreen = @'
 Earlier conversation contained a completed task-A review:

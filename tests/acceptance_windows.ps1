@@ -4222,20 +4222,35 @@ function Test-PrimaryWorkerQuestionAskForTask {
 }
 
 function Test-PrimaryReviewConfirmScreen {
-    param([string]$Screen, [string]$TaskId, [long]$Revision, [string]$Disposition)
+    <#
+        True only when the primary's ACTIVE confirmation is the review dialog of
+        recordReviewWithConsent (omp/herdr-orchestrator.ts) for exactly this task,
+        report revision, outcome and note: the dialog names the outcome first, then
+        the note on its own line, then the stored report, and ends with the sentence
+        its outcome implies (an accepting outcome may start queued dependent work,
+        any other keeps dependents queued). The outcome is the one the harness
+        expects the real orch_review call to carry (Test-OmpReviewToolCall checks the
+        transcript for the same value), so a dialog for a different decision refuses.
+    #>
+    param([string]$Screen, [string]$TaskId, [long]$Revision, [string]$Disposition, [string]$Outcome = 'integrated')
     if ([string]::IsNullOrWhiteSpace($Screen) -or [string]::IsNullOrWhiteSpace($TaskId) -or
-        [string]::IsNullOrWhiteSpace($Disposition) -or $Revision -le 0) { return $false }
+        [string]::IsNullOrWhiteSpace($Disposition) -or [string]::IsNullOrWhiteSpace($Outcome) -or $Revision -le 0) { return $false }
     $start = $Screen.LastIndexOf('Record review disposition', [System.StringComparison]::Ordinal)
     if ($start -lt 0) { return $false }
     $panel = $Screen.Substring($start)
     $normalized = ($panel -replace '[\s\u2502\u00B3|]+', ' ').Trim()
-    $description = "Confirm that you reviewed the worker's final report for task $TaskId and chose this disposition:"
+    $description = "Confirm that you reviewed the worker's final report for task $TaskId and chose this outcome:"
     $descriptionIndex = $normalized.IndexOf($description, [System.StringComparison]::Ordinal)
     if ($descriptionIndex -lt 0) { return $false }
     $afterDescription = $normalized.Substring($descriptionIndex + $description.Length).TrimStart()
-    $expectedDecision = ($Disposition -replace '\s+', ' ').Trim() + " Stored report (revision ${Revision}):"
+    $expectedDecision = $Outcome.Trim() + ' Note: ' + ($Disposition -replace '\s+', ' ').Trim() + " Stored report (revision ${Revision}):"
+    $closing = if ($Outcome -ceq 'integrated' -or $Outcome -ceq 'kept') {
+        'This closes the task and may start queued dependent work.'
+    } else {
+        'This closes the task and frees its slot and paths, but tasks that depend on it stay queued.'
+    }
     if (-not $afterDescription.StartsWith($expectedDecision, [System.StringComparison]::Ordinal) -or
-        $afterDescription.IndexOf('This closes the task and may start queued dependent work.', [System.StringComparison]::Ordinal) -lt 0) { return $false }
+        $afterDescription.IndexOf($closing, [System.StringComparison]::Ordinal) -lt 0) { return $false }
     $choices = @()
     $seenNo = $false
     $modalClosed = $false
@@ -4303,7 +4318,8 @@ function Confirm-PrimaryReviewModal {
         [Parameter(Mandatory)][string]$PaneId,
         [Parameter(Mandatory)][string]$LaunchPaneId,
         [Parameter(Mandatory)][string]$TaskId,
-        [Parameter(Mandatory)][string]$Disposition
+        [Parameter(Mandatory)][string]$Disposition,
+        [string]$Outcome = 'integrated'
     )
     $wait = Wait-Until -TimeoutSeconds 120 -IntervalSeconds 2 -What "review confirmation for task $TaskId" -Probe {
         $fact = Get-Field (Get-TaskById -Id $TaskId) 'fact'
@@ -4312,7 +4328,7 @@ function Confirm-PrimaryReviewModal {
         $live = Get-LiveAgent -Target $PaneId
         if (-not $live.Found -or [string](Get-Field $live.Agent 'agent_status') -ne 'blocked') { return $null }
         $screen = Get-PaneScreen -PaneId $PaneId -Source 'visible' -Lines 100
-        if (Test-PrimaryReviewConfirmScreen -Screen $screen -TaskId $TaskId -Revision $revision -Disposition $Disposition) {
+        if (Test-PrimaryReviewConfirmScreen -Screen $screen -TaskId $TaskId -Revision $revision -Disposition $Disposition -Outcome $Outcome) {
             return [pscustomobject]@{ Kind = 'modal'; Screen = $screen; Revision = $revision }
         }
         return $null
@@ -4322,14 +4338,14 @@ function Confirm-PrimaryReviewModal {
     $revision = [long]$wait.Value.Revision
     $ready = Get-ReadySession -LaunchPaneId $LaunchPaneId
     $transcript = [string](Get-Field $ready 'omp_session_file')
-    if (-not (Test-OmpReviewToolCall -Path $transcript -TaskId $TaskId -Disposition $Disposition)) { return $false }
+    if (-not (Test-OmpReviewToolCall -Path $transcript -TaskId $TaskId -Disposition $Disposition -Outcome $Outcome)) { return $false }
     $screen = Get-PaneScreen -PaneId $PaneId -Source 'visible' -Lines 100
-    if (-not (Test-PrimaryReviewConfirmScreen -Screen $screen -TaskId $TaskId -Revision $revision -Disposition $Disposition)) { return $false }
+    if (-not (Test-PrimaryReviewConfirmScreen -Screen $screen -TaskId $TaskId -Revision $revision -Disposition $Disposition -Outcome $Outcome)) { return $false }
     $fact = Get-Field (Get-TaskById -Id $TaskId) 'fact'
     if ([long](Get-Field $fact 'Revision' 0) -ne $revision -or $null -eq (Get-Field $fact 'Report' $null)) { return $false }
     $screen = Get-PaneScreen -PaneId $PaneId -Source 'visible' -Lines 100
-    if (-not (Test-PrimaryReviewConfirmScreen -Screen $screen -TaskId $TaskId -Revision $revision -Disposition $Disposition)) { return $false }
-    if (-not (Test-OmpReviewToolCall -Path $transcript -TaskId $TaskId -Disposition $Disposition)) { return $false }
+    if (-not (Test-PrimaryReviewConfirmScreen -Screen $screen -TaskId $TaskId -Revision $revision -Disposition $Disposition -Outcome $Outcome)) { return $false }
+    if (-not (Test-OmpReviewToolCall -Path $transcript -TaskId $TaskId -Disposition $Disposition -Outcome $Outcome)) { return $false }
     $sent = Send-AgentKeys -PaneId $PaneId -Keys @('enter')
     [void]($script:PrimarySendKeysUsed += 'enter')
     return ($sent.ExitCode -eq 0)
