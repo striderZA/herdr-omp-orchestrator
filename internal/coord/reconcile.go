@@ -357,7 +357,7 @@ func (c *Coordinator) observeWorkerStatus(ctx context.Context, st task.Task, sta
 	}
 
 	previous := strings.TrimSpace(st.Activity)
-	note := c.activityNote(st, previous, status, eventDigest(event))
+	note := c.activityNote(st, previous, status, eventDigest(event), "")
 	updated, _, err := c.recordWithNote(ctx, st, func(next *task.Task) error {
 		next.Activity = status
 		next.ActivitySeenAt = time.Now().UnixMilli()
@@ -390,7 +390,7 @@ func eventDigest(event AgentStatusEvent) string {
 // transition starts at the previous observation - its value and when it was
 // seen - so a replay is the same note while the worker's next idle -> working
 // cycle, seen from a different observation, is news again.
-func (c *Coordinator) activityNote(st task.Task, previous, status, digest string) task.Inbox {
+func (c *Coordinator) activityNote(st task.Task, previous, status, digest, effect string) task.Inbox {
 	sum := sha256.Sum256([]byte(strings.Join([]string{
 		noteKindActivity, st.ID, previous, fmt.Sprint(st.ActivitySeenAt), status, digest,
 	}, "\x00")))
@@ -399,19 +399,24 @@ func (c *Coordinator) activityNote(st task.Task, previous, status, digest string
 		ProjectKey: st.ProjectKey,
 		TaskID:     st.ID,
 		Kind:       noteKindActivity,
-		Summary:    activitySummary(previous, status),
+		Summary:    activitySummary(previous, status, effect),
 		Delivery:   activityDelivery,
 	}
 }
 
 // activitySummary renders one transition for a human, saying plainly that Herdr
-// observed terminal activity and that no task stage moved.
-func activitySummary(previous, status string) string {
+// observed terminal activity. effect says what the observation did to the task's
+// attention; without one, no task stage moved. It is not part of the note's
+// identity, so describing a transition more precisely never makes it news twice.
+func activitySummary(previous, status, effect string) string {
 	from := previous
 	if from == "" {
 		from = "unobserved"
 	}
-	return fmt.Sprintf("worker status %s -> %s (Herdr activity only; the task's stage is unchanged)", from, status)
+	if effect == "" {
+		effect = "the task's stage is unchanged"
+	}
+	return fmt.Sprintf("worker status %s -> %s (Herdr activity only; %s)", from, status, effect)
 }
 
 // ---------------------------------------------------------------------------
@@ -1309,11 +1314,18 @@ func taskPaneCandidate(pane snapshotPane, st task.Task) bool {
 }
 
 // reconcileExit queues one deduplicated note for a worker that is no longer
-// running, and changes nothing else.
+// running, and records that its task needs a human.
 //
 // The task keeps its facts - the checkout, the branch, the phase it reached - so
 // a human can inspect or resume it deliberately. Nothing is started in the
 // vanished pane, and a worker whose final report is already recorded is not news.
+//
+// A worker whose brief was submitted is a worker the task was waiting on, so its
+// absence is recorded as attention in the same transaction as the note: a board
+// that showed it as Running would hide the one thing that needs a human. The
+// attention yields to a blocker or a worker question that is already recorded,
+// and a later verified live observation retires it. A task that never submitted
+// its brief gets the note alone: the dispatch step machine owns its recovery.
 func (c *Coordinator) reconcileExit(ctx context.Context, project task.Project, st task.Task) error {
 	if isReviewed(st) {
 		return nil
@@ -1327,8 +1339,21 @@ func (c *Coordinator) reconcileExit(ctx context.Context, project task.Project, s
 	summary := fmt.Sprintf(
 		"worker %s is no longer running: its pane is absent from Herdr's snapshot; the task was left at phase %s and nothing was started in its place",
 		st.ID, st.Phase)
-	if _, err := c.store.AddInbox(ctx, c.noteFor(st, noteKindExit, summary, reconcileDelivery)); err != nil {
-		return fmt.Errorf("queue the exit note of task %s: %w", st.ID, err)
+	note := c.noteFor(st, noteKindExit, summary, reconcileDelivery)
+	if probe := st; !raiseLiveness(&probe, absentAttention) {
+		// Nothing to record on the task: it is not a submitted worker, it already
+		// needs a human (for this or another reason), or it is closed. Only the
+		// deduplicated note remains, which is also all a repeated pass writes.
+		if _, err := c.store.AddInbox(ctx, note); err != nil {
+			return fmt.Errorf("queue the exit note of task %s: %w", st.ID, err)
+		}
+		return nil
+	}
+	if _, _, err := c.recordWithNote(ctx, st, func(next *task.Task) error {
+		raiseLiveness(next, absentAttention)
+		return nil
+	}, note, "record the exit of the worker"); err != nil {
+		return fmt.Errorf("record the exit of task %s: %w", st.ID, err)
 	}
 	return nil
 }
@@ -1424,10 +1449,15 @@ func (c *Coordinator) applyTaskPane(ctx context.Context, st task.Task, probe pan
 		next.PublicPaneID != st.PublicPaneID ||
 		next.CurrentWorkspaceID != st.CurrentWorkspaceID ||
 		next.TerminalID != st.TerminalID
-	if !identityChanged && (activity == "" || activity == st.Activity) {
+	// A verified live pane is also what retires the attention a vanished or
+	// unknown worker left behind, and what raises it for an unknown activity.
+	settled := st
+	attentionMoves := settleLiveness(&settled, activity)
+	activityMoves := activity != "" && activity != st.Activity
+	if !identityChanged && !activityMoves && !attentionMoves {
 		return nil
 	}
-	_, err := c.record(ctx, st, func(record *task.Task) error {
+	mutate := func(record *task.Task) error {
 		if record.LaunchPaneID != st.LaunchPaneID {
 			return errSuperseded
 		}
@@ -1443,8 +1473,21 @@ func (c *Coordinator) applyTaskPane(ctx context.Context, st task.Task, probe pan
 			record.Activity = activity
 			record.ActivitySeenAt = time.Now().UnixMilli()
 		}
+		settleLiveness(record, activity)
 		return nil
-	}, "reconcile the worker's pane binding")
+	}
+	const what = "reconcile the worker's pane binding"
+	var err error
+	if activityMoves && activity == "unknown" {
+		// An unknown activity can raise attention, which the primary has to hear
+		// about: the note shares the event path's identity for the same
+		// observation, so whichever path saw it first is the one that wrote it.
+		digest := eventDigest(AgentStatusEvent{PaneID: probe.Pane.PaneID, WorkspaceID: probe.Pane.WorkspaceID, AgentStatus: activity})
+		note := c.activityNote(st, strings.TrimSpace(st.Activity), activity, digest, livenessEffect(st, settled))
+		_, _, err = c.recordWithNote(ctx, st, mutate, note, what)
+	} else {
+		_, err = c.record(ctx, st, mutate, what)
+	}
 	if errors.Is(err, errSuperseded) {
 		return nil
 	}
