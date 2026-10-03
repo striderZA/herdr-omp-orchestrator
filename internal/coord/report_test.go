@@ -674,10 +674,10 @@ func TestReportOnlyAPrimaryDispositionMovesATaskToDone(t *testing.T) {
 
 	// An empty outcome is not a decision.
 	if _, err := f.coord.Review(ctx, project.LaunchPaneID, worker.ID, "   ", "accepted"); !errors.Is(err, ErrInvalidRequest) {
-		t.Fatalf("Review(empty disposition) err = %v, want ErrInvalidRequest", err)
+		t.Fatalf("Review(empty outcome) err = %v, want ErrInvalidRequest", err)
 	}
 	if after := f.reload(worker.ID); after.Disposition != "" {
-		t.Fatalf("an empty disposition was recorded: %q", after.Disposition)
+		t.Fatalf("an empty outcome was recorded: %q", after.Disposition)
 	}
 
 	disposition := "accepted: the user kept the branch and merged it by hand"

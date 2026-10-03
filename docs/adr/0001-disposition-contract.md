@@ -1,6 +1,6 @@
 # ADR 0001: Disposition contract (structured outcome + note)
 
-Status: Accepted (issue #5). Decided by the maintainer before the code was finalised; this record was written after the first code edits, which was a sequencing miss against the issue's acceptance criterion.
+Status: Accepted (issue #5). The maintainer decided the contract before the code was finalised; this record was written after the first code edits, so the ADR trails the implementation rather than preceding it.
 
 ## Context
 

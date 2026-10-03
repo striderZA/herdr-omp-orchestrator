@@ -357,7 +357,7 @@ func unsatisfiedDependency(existing []task.Task, st task.Task) string {
 			return fmt.Sprintf("dependency %s is %s, not closed by a disposition yet", dependency, stage)
 		}
 		if !dep.Accepted() {
-			return fmt.Sprintf("dependency %s was closed as %s, which does not release its dependents", dependency, dep.Outcome)
+			return fmt.Sprintf("dependency %s was closed as %s, which does not release its dependents; the primary must re-plan and re-dispatch this task without that dependency", dependency, dep.Outcome)
 		}
 	}
 	return ""

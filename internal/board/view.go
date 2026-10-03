@@ -183,7 +183,7 @@ func dependencyBlocks(all []task.Task, fact task.Task) []string {
 	for _, id := range fact.Dependencies {
 		for _, dep := range all {
 			if dep.ID == id && dep.Disposition != "" && !dep.Accepted() {
-				out = append(out, fmt.Sprintf("dependency %s was closed as %s", dep.ID, dep.Outcome))
+				out = append(out, fmt.Sprintf("dependency %s was closed as %s; the primary must re-plan and re-dispatch this task without that dependency", dep.ID, dep.Outcome))
 			}
 		}
 	}
