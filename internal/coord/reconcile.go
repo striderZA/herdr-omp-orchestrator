@@ -350,17 +350,35 @@ func (c *Coordinator) observeWorkerStatus(ctx context.Context, st task.Task, sta
 		// pane at all. Nothing is recorded from a terminal that cannot be proven
 		// to be the worker's.
 		return nil
-	case strings.TrimSpace(st.Activity) == status:
-		// The same observation, already recorded: replaying an event changes
-		// nothing, which is what makes a retried hook harmless.
-		return nil
 	}
 
 	previous := strings.TrimSpace(st.Activity)
-	note := c.activityNote(st, previous, status, eventDigest(event), "")
+	// What this observation does to the attention a liveness finding owns is
+	// decided on a copy first, so the note can say it; the write decides again on
+	// the task as it is then, because the revision it builds on may have moved.
+	settled := st
+	attentionMoves := settleLiveness(&settled, status)
+	if previous == status {
+		if !attentionMoves {
+			// The same observation, already recorded: replaying an event changes
+			// nothing, which is what makes a retried hook harmless.
+			return nil
+		}
+		// No transition, so no activity note: a worker seen live again in the very
+		// state it was last recorded in still retires the attention a vanished or
+		// unknown worker left behind.
+		_, err := c.record(ctx, st, func(next *task.Task) error {
+			settleLiveness(next, status)
+			return nil
+		}, "settle the worker's liveness attention")
+		return err
+	}
+
+	note := c.activityNote(st, previous, status, eventDigest(event), livenessEffect(st, settled))
 	updated, _, err := c.recordWithNote(ctx, st, func(next *task.Task) error {
 		next.Activity = status
 		next.ActivitySeenAt = time.Now().UnixMilli()
+		settleLiveness(next, status)
 		return nil
 	}, note, "record the observed worker status")
 	if err != nil {

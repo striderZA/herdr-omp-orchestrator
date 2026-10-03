@@ -300,6 +300,110 @@ func TestReconcileLeavesReviewedAndProvisioningTasksAlone(t *testing.T) {
 	})
 }
 
+func TestEventUnknownActivityNeedsInputUntilTheWorkerIsObservableAgain(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	worker := f.boundWorker(t)
+	pane := worker.PublicPaneID
+
+	f.setAgentStatus(t, pane, "working")
+	f.mustHandle(t, EventAgentStatus, statusEventPayload(t, pane, "working"))
+	working := f.taskByID(t, worker.ID)
+	if working.Attention != "" {
+		t.Fatalf("a working worker raised attention %q", working.Attention)
+	}
+
+	f.setAgentStatus(t, pane, "unknown")
+	f.mustHandle(t, EventAgentStatus, statusEventPayload(t, pane, "unknown"))
+	unknown := f.taskByID(t, worker.ID)
+	switch {
+	case unknown.Activity != "unknown":
+		t.Fatalf("activity = %q, want unknown", unknown.Activity)
+	case !strings.HasPrefix(unknown.Attention, unknownAttentionPrefix):
+		t.Fatalf("attention = %q, want the unknown-state marker", unknown.Attention)
+	case task.StageOf(unknown) != task.NeedsInput:
+		t.Fatalf("stage = %q, want %q", task.StageOf(unknown), task.NeedsInput)
+	case unknown.Phase != task.PromptSubmitted || unknown.Report != nil || unknown.Disposition != "":
+		t.Fatalf("an unknown activity changed more than attention: %+v", unknown)
+	}
+	if got := f.boardStageOf(t, worker.ID); got != task.NeedsInput {
+		t.Fatalf("the board places the unknown worker in %q, want %q", got, task.NeedsInput)
+	}
+	notes := f.notesOfKind(t, noteKindActivity)
+	if len(notes) != 2 {
+		t.Fatalf("activity notes = %d, want 2 (working, unknown)", len(notes))
+	}
+	if last := notes[len(notes)-1].Summary; !strings.Contains(last, "needs input") {
+		t.Fatalf("the unknown note = %q, want it to say the task now needs input", last)
+	}
+
+	// Replaying the event is the same fact: no write, no second note.
+	f.mustHandle(t, EventAgentStatus, statusEventPayload(t, pane, "unknown"))
+	if replayed := f.taskByID(t, worker.ID); replayed.Revision != unknown.Revision {
+		t.Fatalf("replaying the event moved the revision from %d to %d", unknown.Revision, replayed.Revision)
+	}
+	if got := len(f.notesOfKind(t, noteKindActivity)); got != 2 {
+		t.Fatalf("activity notes after a replay = %d, want 2", got)
+	}
+
+	// A verified status that shows the worker live again retires exactly it.
+	f.setAgentStatus(t, pane, "idle")
+	f.mustHandle(t, EventAgentStatus, statusEventPayload(t, pane, "idle"))
+	live := f.taskByID(t, worker.ID)
+	if live.Attention != "" || live.Activity != "idle" {
+		t.Fatalf("after a live status: attention %q activity %q, want it cleared and idle", live.Attention, live.Activity)
+	}
+	if stage := task.StageOf(live); stage != task.Running {
+		t.Fatalf("stage = %q, want %q: Herdr idle is never completion", stage, task.Running)
+	}
+}
+
+func TestEventUnknownActivityNeverReplacesOrClearsAWorkerQuestion(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	worker := f.boundWorker(t)
+	pane := worker.PublicPaneID
+	asked := f.block(worker, func(next *task.Task) { next.Attention = questionAttention("Which branch?") })
+
+	f.setAgentStatus(t, pane, "unknown")
+	f.mustHandle(t, EventAgentStatus, statusEventPayload(t, pane, "unknown"))
+	if got := f.taskByID(t, worker.ID); got.Attention != asked.Attention || got.Activity != "unknown" {
+		t.Fatalf("attention %q activity %q, want the question kept and the activity recorded", got.Attention, got.Activity)
+	}
+
+	f.setAgentStatus(t, pane, "idle")
+	f.mustHandle(t, EventAgentStatus, statusEventPayload(t, pane, "idle"))
+	if got := f.taskByID(t, worker.ID); got.Attention != asked.Attention {
+		t.Fatalf("attention = %q, want the worker question kept after a live status", got.Attention)
+	}
+}
+
+func TestEventLiveStatusInTheRecordedStateRetiresAnAbsentWorkersAttention(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	worker := f.boundWorker(t)
+	pane := worker.PublicPaneID
+
+	f.setAgentStatus(t, pane, "working")
+	f.mustHandle(t, EventAgentStatus, statusEventPayload(t, pane, "working"))
+	agent := f.vanish(t, pane, true)
+	f.mustReconcile(t)
+	if got := f.taskByID(t, worker.ID); !strings.HasPrefix(got.Attention, absentAttentionPrefix) {
+		t.Fatalf("attention = %q, want the absent-worker marker", got.Attention)
+	}
+	notesBefore := len(f.notesOfKind(t, noteKindActivity))
+
+	// The worker comes back reporting the very activity last recorded, so the
+	// event is not a transition - but it is a verified live observation.
+	f.restore(pane, agent)
+	f.mustHandle(t, EventAgentStatus, statusEventPayload(t, pane, "working"))
+
+	back := f.taskByID(t, worker.ID)
+	if back.Attention != "" {
+		t.Fatalf("attention = %q, want it cleared by a verified live status", back.Attention)
+	}
+	if got := len(f.notesOfKind(t, noteKindActivity)); got != notesBefore {
+		t.Fatalf("activity notes = %d, want %d: no transition happened", got, notesBefore)
+	}
+}
+
 func TestReconcileTreatsAnUnknownActivityAsAttentionUntilItIsLive(t *testing.T) {
 	f := newCoordFixture(t, fixturePlan{})
 	worker := f.boundWorker(t)
