@@ -1,12 +1,17 @@
-// Package board is the read-only terminal projection of the orchestrator's task
-// facts.
+// Package board is the terminal projection of the orchestrator's facts: tasks in
+// their five stages, and the tickets that have not started in two columns
+// before them.
 //
-// The board derives every card's stage through task.StageOf and reads through
+// The board is read-only for tasks. It derives every card's stage through
+// task.StageOf (a ticket's through task.TicketStageOf) and reads through
 // state.Store's read methods only: it never writes a task, never dispatches,
-// reassigns, approves, merges or cleans anything up. Its one side-effecting key
-// focuses a worker pane, and only after re-reading the task and proving against
-// Herdr that the pane, terminal, checkout and OMP session are still the recorded
-// ones.
+// reassigns, approves, merges or cleans anything up. Its only writes are the two
+// the human asks for with a keypress, creating a ticket and moving a backlog
+// ticket to todo, and they go through the injected TicketOps interface (the
+// coordinator, in the executable): never to the store from here, and never to
+// Herdr. Its one other side-effecting key focuses a worker pane, and only after
+// re-reading the task and proving against Herdr that the pane, terminal,
+// checkout and OMP session are still the recorded ones.
 //
 // Herdr's own activity (working, idle, blocked, done, unknown) is shown on the
 // card as a separate indicator. A terminal that stopped is not a task that
@@ -18,6 +23,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/mattn/go-runewidth"
 	"github.com/muesli/termenv"
@@ -111,6 +117,10 @@ type Card struct {
 	Stage task.Stage
 	// DependencyBlocks lists dependencies closed with a non-accepting outcome.
 	DependencyBlocks []string
+	// Ticket is the ticket this task was dispatched for, when it names one: its
+	// title and derived stage, so the task's detail can say where the ticket
+	// stands even once the ticket is no longer a card.
+	Ticket TicketRef
 }
 
 // ID is the card's identity. The board selects, focuses and drills down by this
@@ -160,13 +170,23 @@ func ProjectCards(ctx context.Context, store *state.Store, projectKey string) ([
 	if store == nil {
 		return nil, fmt.Errorf("board: no store")
 	}
-	tasks, err := store.Tasks(ctx, strings.TrimSpace(projectKey))
+	key := strings.TrimSpace(projectKey)
+	tasks, err := store.Tasks(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	refs, err := ticketRefs(ctx, store, key, tasks)
 	if err != nil {
 		return nil, err
 	}
 	cards := make([]Card, 0, len(tasks))
 	for _, fact := range tasks {
-		cards = append(cards, Card{Task: fact, Stage: task.StageOf(fact), DependencyBlocks: dependencyBlocks(tasks, fact)})
+		cards = append(cards, Card{
+			Task:             fact,
+			Stage:            task.StageOf(fact),
+			DependencyBlocks: dependencyBlocks(tasks, fact),
+			Ticket:           refs[fact.TicketID],
+		})
 	}
 	return cards, nil
 }
@@ -190,18 +210,30 @@ func dependencyBlocks(all []task.Task, fact task.Task) []string {
 	return out
 }
 
-// Board is the renderable projection: cards grouped into their five columns.
+// Board is the renderable projection: task cards grouped into their five
+// columns, and the tickets that have not started yet grouped into their two. A
+// ticket column is its own kind, never a sixth and seventh task stage.
 type Board struct {
 	cards    []Card
 	unplaced []Card
 	byStage  map[task.Stage][]Card
+
+	tickets         []TicketCard
+	unplacedTickets []TicketCard
+	ticketsByStage  map[task.TicketStage][]TicketCard
 }
 
 // NewBoard groups cards into columns. Cards() is in column order; a card whose
 // stage is not one of the five columns is kept and rendered separately, so a
 // card this build cannot place is never silently dropped.
-func NewBoard(cards []Card) *Board {
-	b := &Board{byStage: map[task.Stage][]Card{}}
+func NewBoard(cards []Card) *Board { return NewBoardWithTickets(cards, nil) }
+
+// NewBoardWithTickets is NewBoard plus the tickets that have not started. A
+// ticket whose stage has no ticket column is kept and rendered separately, for
+// the same reason: nothing is silently dropped. With no tickets the board is
+// exactly NewBoard's.
+func NewBoardWithTickets(cards []Card, tickets []TicketCard) *Board {
+	b := &Board{byStage: map[task.Stage][]Card{}, ticketsByStage: map[task.TicketStage][]TicketCard{}}
 	for _, card := range cards {
 		if _, ok := stageLabels[card.Stage]; ok {
 			b.byStage[card.Stage] = append(b.byStage[card.Stage], card)
@@ -213,6 +245,16 @@ func NewBoard(cards []Card) *Board {
 		b.cards = append(b.cards, b.byStage[stage]...)
 	}
 	b.cards = append(b.cards, b.unplaced...)
+	for _, card := range tickets {
+		if ticketColumnIndex(card.Stage) >= 0 {
+			b.ticketsByStage[card.Stage] = append(b.ticketsByStage[card.Stage], card)
+			continue
+		}
+		b.unplacedTickets = append(b.unplacedTickets, card)
+	}
+	for _, stage := range TicketColumns {
+		b.tickets = append(b.tickets, b.ticketsByStage[stage]...)
+	}
 	return b
 }
 
@@ -258,6 +300,10 @@ type Detail struct {
 	// refused focus). Err marks it as a failure.
 	Notice string
 	Err    bool
+	// TicketWrites says the board can create and move tickets in this session. It
+	// only affects what is drawn: the empty ticket columns are shown so a new
+	// ticket has somewhere to appear.
+	TicketWrites bool
 }
 
 // columnMinWidth is the narrowest usable card cell, so the five columns only
@@ -277,31 +323,45 @@ func Render(b *Board, d Detail, width int, th Theme) string {
 		width = 1
 	}
 	var lines []string
-	if len(b.Cards()) == 0 {
-		lines = append(lines, wrap("No tasks yet. Ask your primary to delegate a task", width)...)
+	if len(b.Cards()) == 0 && !b.hasTickets() && !d.TicketWrites {
+		lines = append(lines, wrap(noTasksMessage, width)...)
 		lines = append(lines, "")
-		if notice := noticeLine(d, th); notice != "" {
+		if notice := noticeLine(d, th, width); notice != "" {
 			lines = append(lines, notice)
 		}
 		return strings.Join(append(lines, clip("q close", width)), "\n")
 	}
-	if width >= MinWideWidth {
+	if b.showsTickets(d) {
+		lines = append(lines, ticketColumnLines(b, d, width, th)...)
+		lines = append(lines, "")
+	}
+	switch {
+	case len(b.Cards()) == 0:
+		lines = append(lines, wrap(noTasksMessage, width)...)
+	case width >= MinWideWidth:
 		lines = append(lines, wideColumns(b, d, width, th)...)
-	} else {
+	default:
 		lines = append(lines, narrowSections(b, d, width, th)...)
 	}
-	if len(b.unplaced) > 0 {
+	if b != nil && (len(b.unplaced) > 0 || len(b.unplacedTickets) > 0) {
 		// Unreachable through ProjectCards (task.StageOf returns only the five
 		// columns), but a card this build cannot place is still shown.
 		lines = append(lines, "", clip("Not placed by this build:", width))
 		for _, card := range b.unplaced {
 			lines = append(lines, clip(cardText(card, card.ID() == d.SelectedID), width))
 		}
+		for _, card := range b.unplacedTickets {
+			lines = append(lines, clip(ticketText(card, card.ID() == d.SelectedID), width))
+		}
 	}
 	lines = append(lines, strings.Repeat(th.rule(), width))
 	lines = append(lines, detailLines(b, d, width, th)...)
 	return strings.Join(lines, "\n")
 }
+
+// noTasksMessage is what a board with no task says; it is also drawn under the
+// ticket columns when there are tickets but no tasks.
+const noTasksMessage = "No tasks yet. Ask your primary to delegate a task"
 
 // wideColumns draws the five stage columns side by side, each cell clipped to
 // its own width so no line is wider than the terminal.
@@ -399,26 +459,49 @@ func cardText(card Card, selected bool) string {
 }
 
 // singleLine collapses a human-entered value onto one line. A title or branch
-// with a newline in it must not become two board lines.
+// with a newline in it must not become two board lines. Stored text is also
+// written by agents, and a human acts on what the board shows, so what must never
+// reach a terminal is dropped here (see unsafeRune).
 func singleLine(text string) string {
-	return strings.Join(strings.Fields(text), " ")
+	return strings.Join(strings.Fields(strings.Map(unsafeRune, text)), " ")
+}
+
+// unsafeRune drops control characters (an escape sequence can move the cursor,
+// retitle the window or hide text) and the bidirectional overrides and isolates
+// (they reorder what the reader sees). Whitespace stays so that a tab, a carriage
+// return or a next-line character still separates words; Fields folds it. Every
+// other rune, including non-ASCII spaces and emoji joiners, is kept.
+func unsafeRune(r rune) rune {
+	if unicode.IsSpace(r) {
+		return r
+	}
+	if unicode.IsControl(r) || (r >= 0x202A && r <= 0x202E) || (r >= 0x2066 && r <= 0x2069) {
+		return -1
+	}
+	return r
 }
 
 // detailLines draws the selected task's facts and the board's keys.
 func detailLines(b *Board, d Detail, width int, th Theme) []string {
+	if ticket, ok := b.FindTicket(d.SelectedID); ok {
+		return ticketDetailLines(ticket, d, width, th)
+	}
 	card, ok := b.Find(d.SelectedID)
 	if d.SelectedID == "" || !ok {
 		out := []string{clip("No task selected. tab picks a stage, up/down a card.", width)}
-		if notice := noticeLine(d, th); notice != "" {
+		if notice := noticeLine(d, th, width); notice != "" {
 			out = append(out, notice)
 		}
-		return append(out, clip("q close", width), clip("", width))
+		return append(out, clip(noSelectionHelp(d), width), clip("", width))
 	}
 
 	sep := th.separator()
 	header := "Selected " + card.ID() + sep + "branch " + orNone(singleLine(card.Branch()), "none") +
 		sep + strings.ToLower(StageLabel(card.Stage)) + sep + "worker " + orNone(singleLine(card.Pane()), "none")
 	out := []string{th.paint(Ink, clip(header, width))}
+	if line := ticketLine(card); line != "" {
+		out = append(out, wrap(line, width)...)
+	}
 
 	if d.Expanded {
 		out = append(out, wrap("Brief: "+orNone(singleLine(card.Task.Brief), "none"), width)...)
@@ -453,7 +536,7 @@ func detailLines(b *Board, d Detail, width int, th Theme) []string {
 		}
 	}
 
-	if notice := noticeLine(d, th); notice != "" {
+	if notice := noticeLine(d, th, width); notice != "" {
 		out = append(out, notice)
 	}
 	out = append(out, clip(helpLine(d), width))
@@ -480,24 +563,39 @@ func cardSummary(card Card) string {
 	return singleLine(card.Task.Brief)
 }
 
+// noSelectionHelp is the help when nothing is selected: only the keys that act
+// without a selection. n is the way forward on an empty board, so it is offered
+// whenever ticket writes are enabled; a read-only board offers only q.
+func noSelectionHelp(d Detail) string {
+	if d.TicketWrites {
+		return "n new ticket, q close"
+	}
+	return "q close"
+}
+
 // helpLine is the short keyboard help: the board has no other chrome.
 func helpLine(d Detail) string {
 	if d.Expanded {
 		return "Esc collapse, f focus, q close"
 	}
+	if d.TicketWrites {
+		return "Enter details, f focus, n new ticket, q close"
+	}
 	return "Enter details, f focus, q close"
 }
 
-// noticeLine renders the last action's outcome, if it said anything.
-func noticeLine(d Detail, th Theme) string {
-	notice := strings.TrimSpace(d.Notice)
+// noticeLine renders the last action's outcome, if it said anything, as one line
+// that fits the terminal: the text is free-form (a refusal carries whatever the
+// coordinator or Herdr said), so it is folded and clipped like every other line.
+func noticeLine(d Detail, th Theme, width int) string {
+	notice := singleLine(d.Notice)
 	if notice == "" {
 		return ""
 	}
 	if d.Err {
-		return th.paint(Failure, "Error: "+notice)
+		return th.paint(Failure, clip("Error: "+notice, width))
 	}
-	return th.paint(Success, notice)
+	return th.paint(Success, clip(notice, width))
 }
 
 // padded puts text in a cell of exactly width columns. The text is painted
@@ -561,12 +659,14 @@ func clip(text string, width int) string {
 }
 
 // wrap folds text onto lines of at most width columns. A single word wider than
-// the line is cut, because the board is bounded on any terminal.
+// the line is cut, because the board is bounded on any terminal. It drops what
+// must never reach a terminal (see unsafeRune), so text that is wrapped without
+// first going through singleLine, such as a ticket body, is covered too.
 func wrap(text string, width int) []string {
 	if width <= 0 {
 		return nil
 	}
-	words := strings.Fields(text)
+	words := strings.Fields(strings.Map(unsafeRune, text))
 	if len(words) == 0 {
 		return []string{""}
 	}

@@ -25,6 +25,9 @@ func pageLines(card Card, width int, th Theme) []string {
 	add("Title", t.Title)
 	add("Branch", t.Branch)
 	add("Worker", card.Pane())
+	if line := ticketLine(card); line != "" {
+		out = append(out, wrap(line, width)...)
+	}
 	if observed := card.Observation(); observed != "" {
 		add("Last observation", observed)
 	}
@@ -135,19 +138,24 @@ func RenderPage(b *Board, d Detail, width, height int, th Theme) string {
 	if width < 1 {
 		width = 1
 	}
-	card, ok := b.Find(d.SelectedID)
-	if !ok {
+	var all []string
+	help := "Esc back, f focus, q close"
+	if ticket, isTicket := b.FindTicket(d.SelectedID); isTicket {
+		all = ticketPageLines(ticket, width, th)
+		// A ticket has no worker pane, so there is nothing to focus.
+		help = strings.Join(append(append([]string{"Esc back"}, ticketWriteKeys(ticket, d)...), "q close"), ", ")
+	} else if card, ok := b.Find(d.SelectedID); ok {
+		all = pageLines(card, width, th)
+	} else {
 		return strings.Join([]string{clip("The task is no longer on this board.", width), clip("Esc back, q close", width)}, "\n")
 	}
-	notice := noticeLine(d, th)
+	notice := noticeLine(d, th, width)
 	rows, rule, showNotice := pageChrome(height, notice != "")
-	all := pageLines(card, width, th)
 	body, scroll := pageWindow(all, d.Scroll, rows)
 	lines := append([]string{}, body...)
 	if showNotice {
 		lines = append(lines, notice)
 	}
-	help := "Esc back, f focus, q close"
 	if len(body) > 0 && len(body) < len(all) {
 		help = fmt.Sprintf("%d-%d/%d up/down scroll, %s", scroll+1, scroll+len(body), len(all), help)
 	}
