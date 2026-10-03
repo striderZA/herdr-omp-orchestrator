@@ -1520,6 +1520,9 @@ func (c *Coordinator) snapshotView(ctx context.Context) (*snapshotView, error) {
 	if strings.TrimSpace(res.Snapshot.Version) == "" {
 		return nil, &herdr.IdentityError{Op: "api snapshot", Field: "snapshot.version", Detail: "snapshot carries no server version"}
 	}
+	if err := herdr.CheckProtocol("api snapshot", res.Snapshot.Protocol, res.Snapshot.Version); err != nil {
+		return nil, err
+	}
 	for i, pane := range res.Snapshot.Panes {
 		for _, field := range []struct{ name, value string }{
 			{"pane_id", pane.PaneID},

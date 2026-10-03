@@ -102,6 +102,9 @@ type fixturePlan struct {
 	// announced session while `agent start` is still answering, which is what
 	// bumps the task's revision between the coordinator's read and its write.
 	AdoptDuringStart bool `json:"adopt_during_start"`
+	// SnapshotProtocol overrides the socket protocol `api snapshot` reports;
+	// zero reports the supported protocol.
+	SnapshotProtocol int `json:"snapshot_protocol"`
 	// PromptAmbiguous makes `agent prompt` report Herdr's own timeout code after
 	// recording the submission, the way a real CLI timeout does.
 	PromptAmbiguous bool `json:"prompt_ambiguous"`
@@ -765,7 +768,7 @@ func sessionSnapshotResult(plan fixturePlan, state fixtureState) map[string]any 
 		"type": "session_snapshot",
 		"snapshot": map[string]any{
 			"version":              "0.9.1-preview",
-			"protocol":             22,
+			"protocol":             snapshotProtocol(plan),
 			"focused_pane_id":      "",
 			"focused_tab_id":       "",
 			"focused_workspace_id": "",
@@ -773,6 +776,13 @@ func sessionSnapshotResult(plan fixturePlan, state fixtureState) map[string]any 
 			"panes":                panes,
 		},
 	}
+}
+
+func snapshotProtocol(plan fixturePlan) int {
+	if plan.SnapshotProtocol != 0 {
+		return plan.SnapshotProtocol
+	}
+	return herdr.SupportedProtocol
 }
 
 // sessionInfo renders Herdr's AgentSessionInfo: a typed reference, captured from

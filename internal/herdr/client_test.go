@@ -1403,6 +1403,24 @@ func TestCLIUninterpretableResponseOnReadOnlyCommandStaysDefinite(t *testing.T) 
 			},
 		},
 		{
+			name:    "snapshot from an unsupported protocol",
+			payload: `{"id":"cli:api:snapshot","result":{"snapshot":{"agents":[],"panes":[],"protocol":23,"version":"0.10.0","workspaces":[]},"type":"session_snapshot"}}`,
+			want:    ErrUnsupportedProtocol,
+			call: func(ctx context.Context, c *Client) error {
+				_, err := c.Snapshot(ctx)
+				return err
+			},
+		},
+		{
+			name:    "snapshot that reports no protocol",
+			payload: `{"id":"cli:api:snapshot","result":{"snapshot":{"agents":[],"panes":[],"version":"0.9.1-preview","workspaces":[]},"type":"session_snapshot"}}`,
+			want:    ErrUnsupportedProtocol,
+			call: func(ctx context.Context, c *Client) error {
+				_, err := c.Snapshot(ctx)
+				return err
+			},
+		},
+		{
 			name:    "worktree list with an absent source root",
 			payload: `{"id":"cli:worktree:list","result":{"source":{},"type":"worktree_list","worktrees":[]}}`,
 			want:    ErrIdentity,

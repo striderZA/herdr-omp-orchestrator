@@ -116,7 +116,27 @@ var (
 	ErrAmbiguous = errors.New("herdr: command outcome is ambiguous")
 	// ErrCLI reports any error envelope returned by the Herdr CLI.
 	ErrCLI = errors.New("herdr: CLI returned an error")
+	// ErrUnsupportedProtocol reports a Herdr server whose socket protocol is
+	// not the one this client's decoders were verified against. It is the
+	// fail-closed answer to a Herdr upgrade: see docs/herdr-facts.md.
+	ErrUnsupportedProtocol = errors.New("herdr: unsupported Herdr protocol")
 )
+
+// SupportedProtocol is the Herdr socket protocol the typed decoders, the
+// fixtures under testdata and the facts in docs/herdr-facts.md were verified
+// against. Only `herdr api snapshot` reports a protocol, so that is where it is
+// compared; any other value, including an absent (zero) one, is refused.
+const SupportedProtocol = 22
+
+// CheckProtocol returns nil only when got is SupportedProtocol. version is the
+// server version reported next to it, used for the message alone.
+func CheckProtocol(op string, got int, version string) error {
+	if got == SupportedProtocol {
+		return nil
+	}
+	return fmt.Errorf("%w: %s: Herdr %q speaks protocol %d, this plugin supports protocol %d",
+		ErrUnsupportedProtocol, op, version, got, SupportedProtocol)
+}
 
 var agentNamePattern = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,31}$`)
 
@@ -1649,6 +1669,9 @@ func (c *Client) Snapshot(ctx context.Context) (*Snapshot, error) {
 	}
 	if strings.TrimSpace(res.Snapshot.Version) == "" {
 		return nil, &IdentityError{Op: op, Field: "snapshot.version", Detail: "snapshot carries no server version"}
+	}
+	if err := CheckProtocol(op, res.Snapshot.Protocol, res.Snapshot.Version); err != nil {
+		return nil, err
 	}
 	for i, agent := range res.Snapshot.Agents {
 		if err := validateAgent(op, agent); err != nil {
