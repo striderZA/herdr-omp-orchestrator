@@ -102,6 +102,13 @@ CREATE TABLE IF NOT EXISTS ready_sessions (
 	verified_value TEXT NOT NULL DEFAULT '',
 	seen_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS tickets (
+	id TEXT PRIMARY KEY,
+	project_key TEXT NOT NULL,
+	revision INTEGER NOT NULL,
+	data JSON NOT NULL
+);
+CREATE INDEX IF NOT EXISTS tickets_project_key ON tickets (project_key);
 `
 
 // readySessionColumns are the columns a ready record needs beyond its first
@@ -288,6 +295,9 @@ func (s *Store) CreateTask(ctx context.Context, t task.Task) error {
 	} else if taken {
 		return fmt.Errorf("%w: task %q already exists", ErrConflict, t.ID)
 	}
+	if err := checkTicketUsable(ctx, tx, t); err != nil {
+		return err
+	}
 	if err := checkPaneFree(ctx, tx, t.LaunchPaneID, t.ID); err != nil {
 		return err
 	}
@@ -415,6 +425,9 @@ func updateTask(ctx context.Context, tx *tx, id string, expectedRevision int64, 
 	}
 	if next.ID != current.ID || next.ProjectKey != current.ProjectKey {
 		return task.Task{}, fmt.Errorf("%w: task %q id and project key are immutable", ErrInvalid, id)
+	}
+	if next.TicketID != current.TicketID {
+		return task.Task{}, fmt.Errorf("%w: task %q ticket id is immutable", ErrInvalid, id)
 	}
 	if next.LaunchPaneID != current.LaunchPaneID {
 		if err := checkPaneFree(ctx, tx, next.LaunchPaneID, id); err != nil {
@@ -1094,6 +1107,9 @@ func (s *Store) ClaimTask(ctx context.Context, t task.Task, budget int) (bool, t
 		return false, task.Task{}, 0, err
 	} else if taken {
 		return false, task.Task{}, 0, fmt.Errorf("%w: task %q already exists", ErrConflict, t.ID)
+	}
+	if err := checkTicketUsable(ctx, tx, t); err != nil {
+		return false, task.Task{}, 0, err
 	}
 	if err := checkPaneFree(ctx, tx, t.LaunchPaneID, t.ID); err != nil {
 		return false, task.Task{}, 0, err

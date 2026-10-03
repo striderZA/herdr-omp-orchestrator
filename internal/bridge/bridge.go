@@ -92,6 +92,19 @@ const (
 	MethodCleanup         = "cleanup"
 )
 
+// Tickets. Every one is a primary-only method: a ticket is a fact the primary
+// writes on the user's behalf, and a worker has no ticket surface at all. They
+// are additive, so the protocol version is unchanged.
+const (
+	MethodTicketCreate = "ticket_create"
+	MethodTicketList   = "ticket_list"
+	// MethodTicketMovePreview is the read-only read a move or a decision is
+	// confirmed against: it returns the ticket and the digest those two need.
+	MethodTicketMovePreview = "ticket_move_preview"
+	MethodTicketMove        = "ticket_move"
+	MethodTicketReview      = "ticket_review"
+)
+
 // The kinds one worker report carries, matching the extension's tool schema.
 // Each selects the coordinator operation that already existed for it, so the
 // merge is a wire surface change and not a behavior change.
@@ -208,6 +221,12 @@ type Ops struct {
 	SettleInput    func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
 	CleanupPreview func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
 	Cleanup        func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
+	// Tickets (primary role). The project comes from the verified principal.
+	TicketCreate      func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
+	TicketList        func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
+	TicketMovePreview func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
+	TicketMove        func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
+	TicketReview      func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
 }
 
 // Options carries what the caller observed before reading the request.
@@ -362,6 +381,46 @@ func CoordinatorOps(c *coord.Coordinator) Ops {
 			result, err := c.Cleanup(ctx, p.LaunchPaneID, request.TaskID)
 			return result, coordError(err)
 		},
+		TicketCreate: func(ctx context.Context, p Principal, params json.RawMessage) (any, error) {
+			var request coord.TicketCreateParams
+			if err := decodeParams(params, &request); err != nil {
+				return nil, err
+			}
+			result, err := c.CreateTicketFor(ctx, p.ProjectKey, request)
+			return result, coordError(err)
+		},
+		TicketList: func(ctx context.Context, p Principal, params json.RawMessage) (any, error) {
+			var request struct{}
+			if err := decodeParams(params, &request); err != nil {
+				return nil, err
+			}
+			result, err := c.ListTicketsFor(ctx, p.ProjectKey)
+			return result, coordError(err)
+		},
+		TicketMovePreview: func(ctx context.Context, p Principal, params json.RawMessage) (any, error) {
+			var request coord.TicketRefParams
+			if err := decodeParams(params, &request); err != nil {
+				return nil, err
+			}
+			result, err := c.TicketPreviewFor(ctx, p.ProjectKey, request.TicketID)
+			return result, coordError(err)
+		},
+		TicketMove: func(ctx context.Context, p Principal, params json.RawMessage) (any, error) {
+			var request coord.TicketMoveParams
+			if err := decodeParams(params, &request); err != nil {
+				return nil, err
+			}
+			result, err := c.MoveTicketFor(ctx, p.ProjectKey, request.TicketID, request.Digest)
+			return result, coordError(err)
+		},
+		TicketReview: func(ctx context.Context, p Principal, params json.RawMessage) (any, error) {
+			var request coord.TicketReviewParams
+			if err := decodeParams(params, &request); err != nil {
+				return nil, err
+			}
+			result, err := c.ReviewTicketFor(ctx, p.ProjectKey, request)
+			return result, coordError(err)
+		},
 	}
 }
 
@@ -376,18 +435,23 @@ func UnavailableOps(cause error) Ops {
 		return nil, &Error{Code: CodeHerdrUnavailable, Message: "the coordinator is unavailable: " + cause.Error()}
 	}
 	return Ops{
-		Dispatch:        unavailable,
-		Report:          unavailable,
-		Answer:          unavailable,
-		DialogPreview:   unavailable,
-		ApproveDialog:   unavailable,
-		BriefInspection: unavailable,
-		AdjudicateBrief: unavailable,
-		Review:          unavailable,
-		ReportPreview:   unavailable,
-		CleanupPreview:  unavailable,
-		SettleInput:     unavailable,
-		Cleanup:         unavailable,
+		Dispatch:          unavailable,
+		Report:            unavailable,
+		Answer:            unavailable,
+		DialogPreview:     unavailable,
+		ApproveDialog:     unavailable,
+		BriefInspection:   unavailable,
+		AdjudicateBrief:   unavailable,
+		Review:            unavailable,
+		ReportPreview:     unavailable,
+		CleanupPreview:    unavailable,
+		SettleInput:       unavailable,
+		Cleanup:           unavailable,
+		TicketCreate:      unavailable,
+		TicketList:        unavailable,
+		TicketMovePreview: unavailable,
+		TicketMove:        unavailable,
+		TicketReview:      unavailable,
 	}
 }
 
@@ -449,6 +513,12 @@ func coordErrorCode(err error) string {
 		return "step_in_flight"
 	case errors.Is(err, coord.ErrAgentChanged):
 		return "agent_changed"
+	case errors.Is(err, coord.ErrTicketUnknown):
+		return "ticket_unknown"
+	case errors.Is(err, coord.ErrTicketChanged):
+		return "ticket_changed"
+	case errors.Is(err, coord.ErrTicketOpen):
+		return "ticket_open"
 	case errors.Is(err, coord.ErrProjectUnknown):
 		return "project_unknown"
 	case errors.Is(err, coord.ErrPrimaryNotLive):
@@ -588,6 +658,16 @@ func run(ctx context.Context, env map[string]string, input io.Reader, opts Optio
 		return h.mutate(req, state.RolePrimary, announced, h.ops.SettleInput)
 	case MethodCleanup:
 		return h.mutate(req, state.RolePrimary, announced, h.ops.Cleanup)
+	case MethodTicketCreate:
+		return h.mutate(req, state.RolePrimary, announced, h.ops.TicketCreate)
+	case MethodTicketList:
+		return h.mutate(req, state.RolePrimary, announced, h.ops.TicketList)
+	case MethodTicketMovePreview:
+		return h.mutate(req, state.RolePrimary, announced, h.ops.TicketMovePreview)
+	case MethodTicketMove:
+		return h.mutate(req, state.RolePrimary, announced, h.ops.TicketMove)
+	case MethodTicketReview:
+		return h.mutate(req, state.RolePrimary, announced, h.ops.TicketReview)
 	default:
 		return nil, fail(CodeUnsupportedMethod, "unknown bridge method %q", req.Method)
 	}

@@ -182,6 +182,20 @@ interface ReportPreview {
   risk: string;
 }
 
+// A ticket as the primary-only ticket_move_preview bridge operation returns it:
+// the facts the user is shown and the digest that ties a move or a decision to
+// exactly those facts (ticket id, revision and title). Nothing the model types is
+// used for confirmation.
+interface TicketPreview {
+  ticketId: string;
+  title: string;
+  column: "backlog" | "todo";
+  stage: "backlog" | "todo" | "in_progress" | "ready_for_review" | "done";
+  revision: number;
+  digest: string;
+  taskIds: string[];
+}
+
 // BriefInspection is the evidence a primary shows before deciding an ambiguous
 // brief submission: the task and its phase and blocker, the pane that was read, the
 // revision the decision must be tied to, and the digest of the terminal text shown.
@@ -263,6 +277,27 @@ export function readReportPreview(value: unknown): ReportPreview | null {
     return null;
   }
   return { taskId, revision, stage, summary, branch, evidence, checks, risk };
+}
+
+// readTicketPreview trusts a bridge answer only when every fact the confirmation
+// shows and the digest it sends is present and well formed. A ticket with no
+// linked tasks is normal (an empty list); a missing list is not.
+export function readTicketPreview(value: unknown): TicketPreview | null {
+  if (typeof value !== "object" || value === null) return null;
+  const ticketId = previewText(value, "ticketId");
+  const title = previewText(value, "title");
+  const digest = previewText(value, "digest");
+  const column = previewText(value, "column");
+  const stage = previewText(value, "stage");
+  const revision = previewNumber(value, "revision");
+  const taskIds = "taskIds" in value ? value.taskIds : null;
+  if (!ticketId || !title || !digest || !Number.isSafeInteger(revision) || revision <= 0 ||
+    (column !== "backlog" && column !== "todo") ||
+    (stage !== "backlog" && stage !== "todo" && stage !== "in_progress" && stage !== "ready_for_review" && stage !== "done") ||
+    !Array.isArray(taskIds) || !taskIds.every((item) => typeof item === "string")) {
+    return null;
+  }
+  return { ticketId, title, column, stage, revision, digest, taskIds };
 }
 
 // dialogConfirmRequest is the confirmation one blocked worker's dialog needs: the
@@ -460,6 +495,71 @@ export function recordReviewWithConsent<T>(
   };
   return confirmThen(gate, request, () => send({
     taskId: preview.taskId, outcome, disposition, expectedRevision: preview.revision,
+  }));
+}
+
+// A ticket move and a ticket decision are the user's, like a review. Both send
+// the digest of exactly the ticket that was previewed, so a ticket that changed
+// after the user looked is refused by the coordinator rather than moved or closed.
+//
+// A move that could not be honored is refused before the user is asked: the
+// coordinator has no success path for a repeated move, so nothing is lost. A
+// decision is different. Repeating the recorded decision succeeds and returns the
+// same view, which is what makes a lost response safe to retry; a different one
+// is refused as already_decided; a ticket with an open linked task is refused as
+// ticket_open. The preview does carry a decided ticket's outcome and note (this
+// reader just does not use them), so the helper could tell some of these apart.
+// It deliberately does not: a refusal decided here, from a preview that can be
+// stale by the time the user answers, would be a second authority beside the
+// coordinator, which re-reads the ticket on the call that counts. The helper
+// never refuses on the ticket's stage; it asks the user and lets the coordinator
+// decide. The known cost is that the user can be asked to confirm a decision the
+// coordinator then refuses; the refusal is shown to them and nothing is recorded.
+export async function recordTicketMoveWithConsent<T>(
+  gate: UIGate,
+  preview: TicketPreview,
+  send: (params: { ticketId: string; digest: string }) => Promise<T>,
+): Promise<GateOutcome<T>> {
+  if (preview.stage === "done") {
+    return { ok: false, reason: `ticket ${preview.ticketId} is already decided, so it cannot be moved and nothing was done` };
+  }
+  if (preview.column !== "backlog") {
+    return { ok: false, reason: `ticket ${preview.ticketId} is already in ${preview.column}, so there is nothing to move and nothing was done` };
+  }
+  const request = {
+    title: "Move ticket to todo",
+    message:
+      `Confirm moving ticket ${preview.ticketId} to todo.\n` +
+      `Title: ${JSON.stringify(preview.title)}\n` +
+      `Now: ${preview.column} (stage ${preview.stage}), revision ${preview.revision}\n` +
+      "In this version a move only records the ticket as ready for work; it starts nothing. " +
+      "No task, worktree or agent is created, and dispatching work for the ticket is a separate step.",
+  };
+  return confirmThen(gate, request, () => send({ ticketId: preview.ticketId, digest: preview.digest }));
+}
+
+export async function recordTicketReviewWithConsent<T>(
+  gate: UIGate,
+  preview: TicketPreview,
+  outcome: ReviewOutcome,
+  disposition: string,
+  send: (params: { ticketId: string; digest: string; outcome: ReviewOutcome; disposition: string }) => Promise<T>,
+): Promise<GateOutcome<T>> {
+  const request = {
+    title: "Record ticket decision",
+    message:
+      `Confirm closing ticket ${preview.ticketId} with this outcome: ${outcome}\n` +
+      `Title: ${JSON.stringify(preview.title)}\n` +
+      `Note: ${disposition}\n` +
+      `Ticket: revision ${preview.revision}, stage ${preview.stage}; linked tasks: ${preview.taskIds.length > 0 ? preview.taskIds.join(", ") : "none"}\n` +
+      (preview.stage === "done"
+        ? "This ticket is already decided: repeating the same decision changes nothing, and a different one is refused. "
+        : "") +
+      "This records your decision on the ticket only: it changes no task and merges nothing. " +
+      "A ticket cannot be closed while any of its linked tasks is still open.",
+  };
+  return confirmThen(gate, request, () => send({
+    ticketId: preview.ticketId, digest: preview.digest, outcome, disposition,
   }));
 }
 
@@ -752,6 +852,10 @@ export default function (pi: ExtensionAPI) {
     "orch_settle_input",
     "orch_adjudicate_dispatch",
     "orch_cleanup",
+    "orch_ticket_create",
+    "orch_ticket_list",
+    "orch_ticket_move",
+    "orch_ticket_review",
   ];
   const workerNames = ["orch_report"];
   const ownNames = [...primaryNames, ...workerNames];
@@ -829,7 +933,7 @@ export default function (pi: ExtensionAPI) {
       systemPrompt: [
         ...event.systemPrompt,
         currentRole === "primary"
-          ? "You are the sole user liaison. Delegate independent bounded work with orch_dispatch, avoid editing paths reserved for workers, and keep the user in the loop: relay an ordinary worker question with orch_answer, approve a blocked worker's exact dialog keys with orch_approve_dialog only after the user confirms them, record the user's decision on a reviewed report with orch_review, and remove a reviewed checkout with orch_cleanup only after the user confirms it. A worker's report is never a merge and never completes the task: only a disposition the user recorded does. Never approve keys or remove a checkout the user has not confirmed. If sending an answer or approved keys is left uncertain (a timeout), nothing else may be sent to that worker until you inspect its pane with the user and settle it with orch_settle_input."
+          ? "You are the sole user liaison. Delegate independent bounded work with orch_dispatch, avoid editing paths reserved for workers, and keep the user in the loop: relay an ordinary worker question with orch_answer, approve a blocked worker's exact dialog keys with orch_approve_dialog only after the user confirms them, record the user's decision on a reviewed report with orch_review, and remove a reviewed checkout with orch_cleanup only after the user confirms it. A worker's report is never a merge and never completes the task: only a disposition the user recorded does. Never approve keys or remove a checkout the user has not confirmed. If sending an answer or approved keys is left uncertain (a timeout), nothing else may be sent to that worker until you inspect its pane with the user and settle it with orch_settle_input. The user's backlog is a list of tickets: record one with orch_ticket_create when the user asks, review them with orch_ticket_list, move one to todo with orch_ticket_move only after the user confirms it (a move records a fact and starts nothing), name the ticket in orch_dispatch (ticketId) when you dispatch work for it, and close it with orch_ticket_review only after the user confirms it; a ticket cannot be closed while any of its tasks is still open."
           : "Work only in this assigned worktree. Use orch_report for all three notes a worker sends: kind \"progress\" for partial progress, kind \"question\" when you are blocked and need the primary to ask the user, and kind \"result\" with a complete result — summary, branch, changed-file/commit evidence, checks and a stated risk — when you are finished. Only the primary records the user's disposition for your result; do not merge and do not remove the branch or the checkout.",
       ],
     };
@@ -852,6 +956,9 @@ export default function (pi: ExtensionAPI) {
       dependencies: z.array(z.string()).default(() => []),
       reservedPaths: z.array(z.string()).default(() => []),
       baseRevision: z.string().min(7),
+      // Optional: the ticket this work is for. The coordinator refuses an id that is
+      // not a ticket of this project or is already decided.
+      ticketId: z.string().min(1).optional(),
     }),
     async execute(_callId, params, signal, _update, ctx) {
       const result = await callBridge("dispatch", params, sessionIdentity(ctx.sessionManager), signal);
@@ -957,6 +1064,85 @@ export default function (pi: ExtensionAPI) {
       if (!preview || preview.taskId !== params.taskId) return toolRefusal("the persisted report could not be verified for this task");
       const gated = await recordReviewWithConsent(gate, preview, params.outcome, params.disposition, (confirmed) =>
         callBridge("review", confirmed, identity, signal),
+      );
+      if (!gated.ok) return toolRefusal(gated.reason);
+      return toolResult(gated.value);
+    },
+  });
+
+  // Tickets. Creating and listing record or read inert facts and need no
+  // confirmation; moving or closing a ticket is the user's decision, so those two
+  // refuse a session with no UI, read the ticket from the bridge (never from what
+  // the model typed) and send the digest of exactly what the user confirmed.
+  pi.registerTool({
+    name: "orch_ticket_create",
+    label: "Record ticket",
+    defaultInactive: true,
+    description:
+      "Record a new ticket in the project's backlog. A ticket is a note of intended work: creating one starts nothing. Give it a short title and, optionally, a body with the details.",
+    parameters: z.object({
+      title: z.string().min(1).max(160),
+      body: z.string().max(16000).default(""),
+    }),
+    async execute(_callId, params, signal, _update, ctx) {
+      return toolResult(await callBridge("ticket_create", params, sessionIdentity(ctx.sessionManager), signal));
+    },
+  });
+
+  pi.registerTool({
+    name: "orch_ticket_list",
+    label: "List tickets",
+    defaultInactive: true,
+    description:
+      "List this project's tickets, oldest first, with each ticket's column, derived stage and linked task ids. A ticket's stage comes from its tasks and the user's decision, never from terminal activity.",
+    parameters: z.object({}),
+    async execute(_callId, _params, signal, _update, ctx) {
+      return toolResult(await callBridge("ticket_list", {}, sessionIdentity(ctx.sessionManager), signal));
+    },
+  });
+
+  pi.registerTool({
+    name: "orch_ticket_move",
+    label: "Move ticket to todo",
+    defaultInactive: true,
+    description:
+      "Ask the user to confirm moving a backlog ticket to todo. In this version a move only records the ticket as ready for work: it starts no task, so dispatch with orch_dispatch (ticketId) as a separate step.",
+    parameters: z.object({
+      ticketId: z.string().min(1),
+    }),
+    async execute(_callId, params, signal, _update, ctx) {
+      const gate = uiGate(ctx);
+      if (!gate.hasUI) return toolRefusal("this session has no interactive UI, so the user could not confirm and nothing was done");
+      const identity = sessionIdentity(ctx.sessionManager);
+      const preview = readTicketPreview(await callBridge("ticket_move_preview", { ticketId: params.ticketId }, identity, signal));
+      if (!preview || preview.ticketId !== params.ticketId) return toolRefusal("the persisted ticket could not be verified");
+      const gated = await recordTicketMoveWithConsent(gate, preview, (confirmed) =>
+        callBridge("ticket_move", confirmed, identity, signal),
+      );
+      if (!gated.ok) return toolRefusal(gated.reason);
+      return toolResult(gated.value);
+    },
+  });
+
+  pi.registerTool({
+    name: "orch_ticket_review",
+    label: "Record ticket decision",
+    defaultInactive: true,
+    description:
+      "Ask the user to confirm closing a ticket with an outcome and a note. A ticket cannot be closed while any of its linked tasks is still open, and the decision changes no task.",
+    parameters: z.object({
+      ticketId: z.string().min(1),
+      outcome: z.enum(REVIEW_OUTCOMES),
+      disposition: z.string().max(200).default(""),
+    }),
+    async execute(_callId, params, signal, _update, ctx) {
+      const gate = uiGate(ctx);
+      if (!gate.hasUI) return toolRefusal("this session has no interactive UI, so the user could not confirm and nothing was done");
+      const identity = sessionIdentity(ctx.sessionManager);
+      const preview = readTicketPreview(await callBridge("ticket_move_preview", { ticketId: params.ticketId }, identity, signal));
+      if (!preview || preview.ticketId !== params.ticketId) return toolRefusal("the persisted ticket could not be verified");
+      const gated = await recordTicketReviewWithConsent(gate, preview, params.outcome, params.disposition, (confirmed) =>
+        callBridge("ticket_review", confirmed, identity, signal),
       );
       if (!gated.ok) return toolRefusal(gated.reason);
       return toolResult(gated.value);

@@ -7,6 +7,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/muesli/termenv"
@@ -43,6 +45,10 @@ type Options struct {
 	// RefreshInterval is how often the store is re-read. A negative value
 	// disables the tick.
 	RefreshInterval time.Duration
+	// Tickets is the board's only write path: creating a ticket and moving a
+	// backlog ticket to todo. A nil value keeps the board fully read-only, and the
+	// board then says so instead of offering the keys.
+	Tickets TicketOps
 }
 
 func (o Options) withDefaults() Options {
@@ -65,6 +71,25 @@ type focusMsg struct {
 	err    error
 }
 
+// ticketWriteMsg is the outcome of one ticket write, which runs off the UI
+// goroutine like a focus does. Either way the board re-reads the store afterwards.
+type ticketWriteMsg struct {
+	success string
+	failure string
+	err     error
+	// moved is the ticket a move write is for; it is empty for a create.
+	moved string
+}
+
+const (
+	// ticketTitleLimit mirrors the coordinator's title bound (160 bytes). The
+	// board imports nothing from the coordinator, so the prompt keeps its own copy;
+	// the coordinator stays the authority and refuses anything longer.
+	ticketTitleLimit = 160
+
+	ticketWritesUnavailable = "Ticket writes are unavailable in this session"
+)
+
 // Model is the keyboard-driven board. Its selection is a task ID: nothing about
 // the display can rename a task into another task.
 type Model struct {
@@ -74,18 +99,36 @@ type Model struct {
 	opts    Options
 	ctx     context.Context
 
-	board    *Board
-	cursors  []int
-	stage    int
-	selected string
-	expanded bool
-	scroll   int
-	height   int
+	board   *Board
+	cursors []int
+	stage   int
+	// inTickets says the reader is in the ticket area (the ticket columns, drawn
+	// before the five task columns when they are shown); ticketStage and
+	// ticketCursors are its position there, as stage and cursors are for tasks.
+	inTickets     bool
+	ticketStage   int
+	ticketCursors []int
+	selected      string
+	expanded      bool
+	scroll        int
+	height        int
 
 	width     int
 	notice    string
 	noticeErr bool
 	loadErr   error
+
+	// promptOpen says the new-ticket title prompt is open. While it is, every key
+	// edits promptText and nothing navigates, focuses, writes or quits.
+	promptOpen bool
+	promptText string
+
+	// moving is the set of tickets a move write is in flight for. While a ticket is
+	// in it, m on that ticket starts nothing: a repeat would lose the
+	// compare-and-swap and its refusal would replace the notice of the move that
+	// succeeded. Each ticket is tracked on its own, so a move for another ticket
+	// neither is blocked by it nor makes the model forget it.
+	moving map[string]bool
 }
 
 // NewModel opens the board on one project. It performs the first read itself,
@@ -111,6 +154,10 @@ func NewModel(ctx context.Context, store *state.Store, client Herdr, projectKey 
 		opts:    opts.withDefaults(),
 		ctx:     ctx,
 		cursors: make([]int, len(Columns)),
+		// The reader starts in the ticket area. Without tickets to show it falls back
+		// to the first task column on the first read.
+		ticketCursors: make([]int, len(TicketColumns)),
+		inTickets:     true,
 		// A width is assumed until the terminal reports its own, so the first
 		// frame is already bounded.
 		width: minWideWidthFallback,
@@ -161,13 +208,31 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.scrollBy(0)
 		return m, nil
+
+	case ticketWriteMsg:
+		if typed.moved != "" {
+			delete(m.moving, typed.moved)
+		}
+		if typed.err != nil {
+			m.notice = typed.failure + ": " + shortError(typed.err)
+			m.noticeErr = true
+		} else {
+			m.notice = typed.success
+			m.noticeErr = false
+		}
+		m.refresh()
+		return m, nil
 	}
 	return m, nil
 }
 
-// key applies one keystroke. Only "f" may change anything outside this model,
-// and it can only focus a pane FocusVerified proved.
+// key applies one keystroke. Outside this model only two things can change: "f"
+// focuses a pane FocusVerified proved, and "n" and "m" create or move a ticket
+// through Options.Tickets, which is the human's own keypress and nothing else.
 func (m *Model) key(key tea.KeyMsg) tea.Cmd {
+	if m.promptOpen {
+		return m.promptKey(key)
+	}
 	switch key.Type {
 	case tea.KeyCtrlC:
 		return tea.Quit
@@ -182,13 +247,13 @@ func (m *Model) key(key tea.KeyMsg) tea.Cmd {
 
 	case tea.KeyTab:
 		if !m.expanded {
-			m.selectStage(m.stage + 1)
+			m.walkColumns(1)
 		}
 		return nil
 
 	case tea.KeyShiftTab:
 		if !m.expanded {
-			m.selectStage(m.stage - 1)
+			m.walkColumns(-1)
 		}
 		return nil
 
@@ -231,6 +296,10 @@ func (m *Model) key(key tea.KeyMsg) tea.Cmd {
 			m.step(1)
 		case "f":
 			return m.focus()
+		case "n":
+			return m.openPrompt()
+		case "m":
+			return m.moveTicket()
 		case "r":
 			m.notice = ""
 			m.noticeErr = false
@@ -248,8 +317,13 @@ func (m *Model) refresh() {
 		m.loadErr = err
 		return
 	}
+	tickets, err := ProjectTickets(m.ctx, m.store, m.project)
+	if err != nil {
+		m.loadErr = err
+		return
+	}
 	m.loadErr = nil
-	m.board = NewBoard(cards)
+	m.board = NewBoardWithTickets(cards, tickets)
 	before := m.selected
 	m.reselect()
 	if m.selected != before {
@@ -258,14 +332,28 @@ func (m *Model) refresh() {
 	m.scrollBy(0)
 }
 
-// reselect keeps the selected task selected when it still exists, and otherwise
-// picks the first card of the stage the reader is looking at, or the first card
-// of the board.
+// reselect keeps the selected card selected when it still exists, and otherwise
+// picks the first card of the column the reader is looking at, or the first card
+// of the board. A ticket keeps its selection when it moves columns, and the
+// reader's position follows it.
 func (m *Model) reselect() {
+	if !m.showsTickets() {
+		m.inTickets = false
+	}
 	if _, ok := m.board.Find(m.selected); ok {
 		return
 	}
-	if cards := m.board.Column(Columns[m.stage]); len(cards) > 0 {
+	if ticket, ok := m.board.FindTicket(m.selected); ok && m.showsTickets() {
+		m.followTicket(ticket)
+		return
+	}
+	if m.inTickets {
+		if cards := m.board.TicketColumn(TicketColumns[m.ticketStage]); len(cards) > 0 {
+			m.ticketCursors[m.ticketStage] = 0
+			m.selected = cards[0].ID()
+			return
+		}
+	} else if cards := m.board.Column(Columns[m.stage]); len(cards) > 0 {
 		m.cursors[m.stage] = 0
 		m.selected = cards[0].ID()
 		return
@@ -273,8 +361,38 @@ func (m *Model) reselect() {
 	m.selectFirstCard()
 }
 
-// selectFirstCard selects the first card of the first column that has one.
+// followTicket puts the reader's position on the column a ticket is in now.
+func (m *Model) followTicket(card TicketCard) {
+	stage := ticketColumnIndex(card.Stage)
+	if stage < 0 {
+		return
+	}
+	m.inTickets = true
+	m.ticketStage = stage
+	for i, inColumn := range m.board.TicketColumn(card.Stage) {
+		if inColumn.ID() == card.ID() {
+			m.ticketCursors[stage] = i
+			break
+		}
+	}
+}
+
+// selectFirstCard selects the first card in display order: the first ticket when
+// the ticket columns are shown, otherwise the first task of the first column that
+// has one.
 func (m *Model) selectFirstCard() {
+	if m.showsTickets() {
+		for stage, column := range TicketColumns {
+			if cards := m.board.TicketColumn(column); len(cards) > 0 {
+				m.inTickets = true
+				m.ticketStage = stage
+				m.ticketCursors[stage] = 0
+				m.selected = cards[0].ID()
+				return
+			}
+		}
+	}
+	m.inTickets = false
 	for stage := range Columns {
 		if column := m.board.Column(Columns[stage]); len(column) > 0 {
 			m.stage = stage
@@ -286,13 +404,48 @@ func (m *Model) selectFirstCard() {
 	m.selected = ""
 }
 
-// selectStage moves to another column, wrapping at both ends, and selects the
-// card the reader last had there.
-func (m *Model) selectStage(index int) {
-	m.stage = ((index % len(Columns)) + len(Columns)) % len(Columns)
-	m.selected = m.cardAt(m.stage, m.cursors[m.stage])
+// showsTickets reports whether the ticket columns are part of the board the
+// reader sees, and so of the cursor space.
+func (m *Model) showsTickets() bool { return m.board.showsTickets(m.detail()) }
+
+// walkColumns moves the reader one column through the cursor space: the ticket
+// columns when they are shown, then the five task columns, wrapping at both
+// ends. It selects the card the reader last had there.
+func (m *Model) walkColumns(delta int) {
+	ticketColumns := 0
+	if m.showsTickets() {
+		ticketColumns = len(TicketColumns)
+	}
+	total := ticketColumns + len(Columns)
+	at := ticketColumns + m.stage
+	if m.inTickets && ticketColumns > 0 {
+		at = m.ticketStage
+	}
+	at = ((at+delta)%total + total) % total
+	if at < ticketColumns {
+		m.inTickets = true
+		m.ticketStage = at
+		m.selected = m.ticketAt(at, m.ticketCursors[at])
+	} else {
+		m.inTickets = false
+		m.stage = at - ticketColumns
+		m.selected = m.cardAt(m.stage, m.cursors[m.stage])
+	}
 	m.expanded = false
 	m.scroll = 0
+}
+
+// detail is what the board is asked to draw: the selection, the open page, the
+// last notice, and whether ticket writes are enabled.
+func (m *Model) detail() Detail {
+	return Detail{
+		SelectedID:   m.selected,
+		Expanded:     m.expanded,
+		Scroll:       m.scroll,
+		Notice:       m.notice,
+		Err:          m.noticeErr,
+		TicketWrites: m.opts.Tickets != nil,
+	}
 }
 
 // step moves the card cursor on the board and scrolls the detail page when it
@@ -319,11 +472,11 @@ func (m *Model) scrollBy(delta int) {
 	if !m.expanded {
 		return
 	}
-	card, ok := m.board.Find(m.selected)
+	lines, ok := pageLinesOf(m.board, m.selected, m.width, m.opts.Theme)
 	if !ok {
 		return
 	}
-	total := len(pageLines(card, m.width, m.opts.Theme))
+	total := len(lines)
 	max := 0
 	if rows, _, _ := pageChrome(m.height, strings.TrimSpace(m.notice) != ""); rows >= 0 && total > rows {
 		max = total - rows
@@ -337,18 +490,19 @@ func (m *Model) scrollBy(delta int) {
 	}
 }
 
-// moveCursor walks the board's cards in column order and stops at either end.
-// The reader's stage follows the card, so tab continues from where the arrows
-// left off.
+// moveCursor walks the board's cards in display order (the tickets that have a
+// column when the ticket columns are shown, then the tasks by column) and stops
+// at either end. The reader's column follows the card, so tab continues from
+// where the arrows left off.
 func (m *Model) moveCursor(delta int) {
-	order := m.board.Cards()
+	order := m.order()
 	if len(order) == 0 {
 		m.selected = ""
 		return
 	}
 	index := 0
-	for i, card := range order {
-		if card.ID() == m.selected {
+	for i, id := range order {
+		if id == m.selected {
 			index = i
 			break
 		}
@@ -360,8 +514,13 @@ func (m *Model) moveCursor(delta int) {
 	if index >= len(order) {
 		index = len(order) - 1
 	}
-	card := order[index]
-	m.selected = card.ID()
+	m.selected = order[index]
+	if ticket, ok := m.board.FindTicket(m.selected); ok {
+		m.followTicket(ticket)
+		return
+	}
+	m.inTickets = false
+	card, _ := m.board.Find(m.selected)
 	if stage := stageIndex(card.Stage); stage >= 0 {
 		m.stage = stage
 		for i, inColumn := range m.board.Column(card.Stage) {
@@ -371,6 +530,20 @@ func (m *Model) moveCursor(delta int) {
 			}
 		}
 	}
+}
+
+// order is every selectable card's ID in display order.
+func (m *Model) order() []string {
+	var ids []string
+	if m.showsTickets() {
+		for _, card := range m.board.Tickets() {
+			ids = append(ids, card.ID())
+		}
+	}
+	for _, card := range m.board.Cards() {
+		ids = append(ids, card.ID())
+	}
+	return ids
 }
 
 // stageIndex is a stage's column position, or -1 for a stage this build does
@@ -397,6 +570,20 @@ func (m *Model) cardAt(stage, cursor int) string {
 	return cards[cursor].ID()
 }
 
+// ticketAt is the ticket at one position in a ticket column, or "" when the
+// column is empty.
+func (m *Model) ticketAt(stage, cursor int) string {
+	cards := m.board.TicketColumn(TicketColumns[stage])
+	if len(cards) == 0 {
+		return ""
+	}
+	if cursor < 0 || cursor >= len(cards) {
+		cursor = 0
+		m.ticketCursors[stage] = 0
+	}
+	return cards[cursor].ID()
+}
+
 // SelectedID is the selected task's ID, or "" when no card is selected.
 func (m *Model) SelectedID() string { return m.selected }
 
@@ -407,6 +594,12 @@ func (m *Model) focus() tea.Cmd {
 	id := m.selected
 	if id == "" {
 		m.notice = "No task is selected, so there is no worker pane to focus"
+		m.noticeErr = true
+		return nil
+	}
+	if _, isTicket := m.board.FindTicket(id); isTicket {
+		// A ticket is not a worker: there is no pane to focus and nothing to ask Herdr.
+		m.notice = "Tickets have no pane to focus"
 		m.noticeErr = true
 		return nil
 	}
@@ -425,17 +618,154 @@ func (m *Model) View() string {
 			clip("r retry, q close", m.width),
 		}, "\n")
 	}
-	d := Detail{
-		SelectedID: m.selected,
-		Expanded:   m.expanded,
-		Scroll:     m.scroll,
-		Notice:     m.notice,
-		Err:        m.noticeErr,
-	}
+	d := m.detail()
+	var out string
 	if m.expanded {
-		return RenderPage(m.board, d, m.width, m.height, m.opts.Theme)
+		out = RenderPage(m.board, d, m.width, m.height, m.opts.Theme)
+	} else {
+		out = Render(m.board, d, m.width, m.opts.Theme)
 	}
-	return Render(m.board, d, m.width, m.opts.Theme)
+	if m.promptOpen {
+		out += "\n" + strings.Join(m.promptLines(), "\n")
+	}
+	return out
+}
+
+// openPrompt opens the new-ticket title prompt. The prompt belongs to the board,
+// not to a page, so an open details page is closed first.
+func (m *Model) openPrompt() tea.Cmd {
+	if m.opts.Tickets == nil {
+		m.notice = ticketWritesUnavailable
+		m.noticeErr = true
+		return nil
+	}
+	m.expanded = false
+	m.scroll = 0
+	m.promptOpen = true
+	m.promptText = ""
+	m.notice = ""
+	m.noticeErr = false
+	return nil
+}
+
+// promptKey is every key while the prompt is open: enter submits, esc (or ctrl+c)
+// cancels, backspace deletes, and everything else is typed, including the keys
+// that mean something on the board (q, j, tab). Nothing here navigates or quits.
+func (m *Model) promptKey(key tea.KeyMsg) tea.Cmd {
+	switch key.Type {
+	case tea.KeyEsc, tea.KeyCtrlC:
+		m.promptOpen = false
+		m.promptText = ""
+	case tea.KeyEnter:
+		return m.submitPrompt()
+	case tea.KeyBackspace:
+		if runes := []rune(m.promptText); len(runes) > 0 {
+			m.promptText = string(runes[:len(runes)-1])
+		}
+	case tea.KeyTab:
+		m.typeIntoPrompt("\t")
+	case tea.KeySpace:
+		m.typeIntoPrompt(" ")
+	case tea.KeyRunes:
+		m.typeIntoPrompt(string(key.Runes))
+	}
+	return nil
+}
+
+// typeIntoPrompt appends text, up to the title bound and never in the middle of a
+// rune. A tab key is kept as typed (the prompt shows it as ^I). Any other control
+// whitespace (newline, carriage return, vertical tab, form feed, next-line) cannot
+// be part of a one-line title, so it becomes a space; every other control
+// character, such as a pasted escape sequence, and every bidirectional override is
+// dropped (see unsafeRune). Text that is merely not ASCII, such as a joiner or a
+// no-break space, is kept.
+func (m *Model) typeIntoPrompt(text string) {
+	for _, r := range text {
+		switch {
+		case r == '\t':
+		case unicode.IsControl(r) && unicode.IsSpace(r):
+			r = ' '
+		case unsafeRune(r) < 0:
+			continue
+		}
+		if len(m.promptText)+utf8.RuneLen(r) > ticketTitleLimit {
+			break
+		}
+		m.promptText += string(r)
+	}
+}
+
+// submitPrompt writes the typed title through Options.Tickets, once. A blank
+// title is refused with the prompt still open; a real one closes the prompt
+// before the write starts, so a second enter cannot submit it again.
+func (m *Model) submitPrompt() tea.Cmd {
+	title := strings.TrimSpace(m.promptText)
+	if title == "" {
+		m.notice = "A ticket needs a title"
+		m.noticeErr = true
+		return nil
+	}
+	m.promptOpen = false
+	m.promptText = ""
+	ops, ctx, project := m.opts.Tickets, m.ctx, m.project
+	return func() tea.Msg {
+		return ticketWriteMsg{
+			success: "Created a ticket",
+			failure: "Cannot create the ticket",
+			err:     ops.CreateTicket(ctx, project, title),
+		}
+	}
+}
+
+// moveTicket moves the selected backlog ticket to todo, sending the digest of the
+// card exactly as the board displays it: if the ticket changed since the board
+// last read it, the coordinator refuses and the board says so. Anything other
+// than a backlog ticket is refused here, before a write is attempted.
+func (m *Model) moveTicket() tea.Cmd {
+	if m.opts.Tickets == nil {
+		m.notice = ticketWritesUnavailable
+		m.noticeErr = true
+		return nil
+	}
+	card, ok := m.board.FindTicket(m.selected)
+	if !ok || card.Stage != task.TicketBacklog {
+		m.notice = "Select a backlog ticket to move it to todo"
+		m.noticeErr = true
+		return nil
+	}
+	ops, ctx, project := m.opts.Tickets, m.ctx, m.project
+	id, digest := card.ID(), card.Ticket.Digest()
+	if m.moving[id] {
+		return nil
+	}
+	if m.moving == nil {
+		m.moving = map[string]bool{}
+	}
+	m.moving[id] = true
+	return func() tea.Msg {
+		return ticketWriteMsg{
+			success: "Moved " + id + " to todo",
+			failure: "Cannot move " + id,
+			moved:   id,
+			err:     ops.MoveTicketToTodo(ctx, project, id, digest),
+		}
+	}
+}
+
+// promptLines is the prompt as drawn under the board. A tab in the title is
+// shown as ^I so no raw tab reaches the terminal.
+func (m *Model) promptLines() []string {
+	shown := strings.ReplaceAll(m.promptText, "\t", "^I")
+	return []string{
+		m.opts.Theme.paint(Focus, clip("New ticket title: "+shown+"_", m.width)),
+		clip("Enter create, Esc cancel", m.width),
+	}
+}
+
+// shortError is one bounded line of a failure for a notice. The coordinator's
+// refusals carry ids and prose; the notice keeps the start, which names the cause.
+func shortError(err error) string {
+	return clip(singleLine(err.Error()), 120)
 }
 
 // Run opens the board as a keyboard-driven Bubble Tea program and blocks until

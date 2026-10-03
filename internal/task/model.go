@@ -56,6 +56,10 @@ type Task struct {
 	Outcome                                        string
 	Activity                                       string
 	Revision, CreatedAt, UpdatedAt, ActivitySeenAt int64
+	// TicketID names the ticket this task was dispatched for. It is set when the
+	// task is created and never changes, so work cannot be linked to a ticket
+	// after the fact; a task without one reads as unlinked.
+	TicketID string
 }
 
 // The kinds of decision a primary can record. Every kind closes the task, frees

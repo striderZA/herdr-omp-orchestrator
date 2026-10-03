@@ -26,7 +26,10 @@ import extension, {
   dialogConfirmRequest,
   refreshIdentity,
   readReportPreview,
+  readTicketPreview,
   recordReviewWithConsent,
+  recordTicketMoveWithConsent,
+  recordTicketReviewWithConsent,
   refreshReady,
   settleConfirmRequest,
   uiGate,
@@ -155,6 +158,10 @@ const wantNames = [
   "orch_report",
   "orch_review",
   "orch_settle_input",
+  "orch_ticket_create",
+  "orch_ticket_list",
+  "orch_ticket_move",
+  "orch_ticket_review",
 ];
 check(
   names.join(",") === wantNames.join(","),
@@ -285,6 +292,21 @@ if (!dispatch) {
     !tryParse(schema, { title: "", brief: "", checks: [], baseRevision: "x" }).ok,
     "orch_dispatch accepted an empty title/brief/checks/baseRevision",
   );
+  // A ticket id is optional: absent it, the parsed call carries none; given, it
+  // survives parsing; an empty one is refused.
+  const linked = tryParse(schema, { ...payload, ticketId: "tkt_abc" });
+  check(linked.ok, `orch_dispatch rejected a call naming a ticket: ${linked.ok ? "" : linked.error}`);
+  check(
+    linked.ok && typeof linked.value === "object" && linked.value !== null && "ticketId" in linked.value &&
+      linked.value.ticketId === "tkt_abc",
+    "orch_dispatch dropped the ticketId it was given",
+  );
+  check(
+    first.ok && typeof first.value === "object" && first.value !== null &&
+      (!("ticketId" in first.value) || first.value.ticketId === undefined),
+    "orch_dispatch invented a ticketId for a call that named none",
+  );
+  check(!tryParse(schema, { ...payload, ticketId: "" }).ok, "orch_dispatch accepted an empty ticketId");
 }
 
 // --- orch_report ------------------------------------------------------------
@@ -365,7 +387,7 @@ if (!report) {
 // Every tool the two roles use has to build under OMP's builder and accept the
 // call the model is told to make; a missing or too-loose schema is a load
 // failure waiting for the user's machine.
-const toolCalls: { name: string; params: Record<string, unknown>; bad: Record<string, unknown> }[] = [
+const toolCalls: { name: string; params: Record<string, unknown>; bad: Record<string, unknown> | null }[] = [
   // orch_report is the one worker tool; each kind is a call the model is told to
   // make, and the bad case for a kind is that kind with its own field missing.
   { name: "orch_report", params: { kind: "progress", summary: "ported the lexer" }, bad: { kind: "progress", summary: "" } },
@@ -392,6 +414,18 @@ const toolCalls: { name: string; params: Record<string, unknown>; bad: Record<st
     bad: { taskId: "orch_abc", decision: "maybe" },
   },
   { name: "orch_cleanup", params: { taskId: "orch_abc" }, bad: {} },
+  // The ticket tools: creating and listing are inert facts, moving and closing a
+  // ticket are user decisions. `orch_ticket_list` takes no arguments, so it has
+  // no empty call to refuse.
+  { name: "orch_ticket_create", params: { title: "Add search" }, bad: { title: "" } },
+  { name: "orch_ticket_list", params: {}, bad: null },
+  { name: "orch_ticket_move", params: { ticketId: "tkt_abc" }, bad: { ticketId: "" } },
+  {
+    name: "orch_ticket_review",
+    params: { ticketId: "tkt_abc", outcome: "abandoned", disposition: "not needed" },
+    bad: { ticketId: "tkt_abc", outcome: "merged" },
+  },
+  { name: "orch_ticket_review", params: { ticketId: "tkt_abc", outcome: "kept" }, bad: { ticketId: "", outcome: "kept" } },
 ];
 
 for (const call of toolCalls) {
@@ -406,9 +440,33 @@ for (const call of toolCalls) {
   const parsed = tryParse(schema, call.params);
   check(parsed.ok, `${call.name} rejected the call its description tells the model to make: ${parsed.ok ? "" : parsed.error}`);
   check(
-    !tryParse(schema, call.bad).ok,
+    call.bad === null || !tryParse(schema, call.bad).ok,
     `${call.name} accepted an empty ${JSON.stringify(call.bad)}`,
   );
+}
+// Bounds and defaults the ticket schemas promise.
+const ticketCreate = tools.find((tool) => tool.name === "orch_ticket_create");
+if (ticketCreate) {
+  const schema = requireSchema(ticketCreate);
+  const minimal = tryParse(schema, { title: "x" });
+  check(
+    minimal.ok && typeof minimal.value === "object" && minimal.value !== null && "body" in minimal.value && minimal.value.body === "",
+    "orch_ticket_create body does not default to an empty string",
+  );
+  check(tryParse(schema, { title: "t".repeat(160), body: "b".repeat(16000) }).ok, "orch_ticket_create refused the largest valid call");
+  check(!tryParse(schema, { title: "t".repeat(161) }).ok, "orch_ticket_create accepted a title over 160 characters");
+  check(!tryParse(schema, { title: "x", body: "b".repeat(16001) }).ok, "orch_ticket_create accepted a body over 16000 characters");
+}
+const ticketReview = tools.find((tool) => tool.name === "orch_ticket_review");
+if (ticketReview) {
+  const schema = requireSchema(ticketReview);
+  const minimal = tryParse(schema, { ticketId: "tkt_abc", outcome: "kept" });
+  check(
+    minimal.ok && typeof minimal.value === "object" && minimal.value !== null && "disposition" in minimal.value &&
+      minimal.value.disposition === "",
+    "orch_ticket_review disposition does not default to an empty string",
+  );
+  check(!tryParse(schema, { ticketId: "tkt_abc", outcome: "kept", disposition: "n".repeat(201) }).ok, "orch_ticket_review accepted a note over 200 characters");
 }
 // A review is a user decision, not a model decision. Refusing the UI or
 // declining the exact task/disposition must stop before the bridge is spawned.
@@ -477,8 +535,29 @@ async function checkReviewConsent(): Promise<void> {
     preview.evidence[0], preview.checks[0], preview.risk, params.disposition]) {
     check(request.message.includes(fact), `review confirmation did not show ${JSON.stringify(fact)}`);
   }
+  // The acceptance harness (tests/acceptance_windows.ps1, Test-PrimaryReviewConfirmScreen)
+  // waits for exactly this shape: the outcome first, the note on its own line, then
+  // the stored report, ending with the sentence the outcome implies. A reworded
+  // dialog must fail here, not in a live run; change the matcher and its helper
+  // fixture together with this text.
+  check(request.title === "Record review disposition", `the review dialog title changed: ${JSON.stringify(request.title)}`);
+  check(
+    request.message === [
+      `Confirm that you reviewed the worker's final report for task ${preview.taskId} and chose this outcome: rejected`,
+      `Note: ${params.disposition}`,
+      "Stored report (revision 7):",
+      `Summary: ${JSON.stringify(preview.summary)}`,
+      `Branch: ${JSON.stringify(preview.branch)}`,
+      `Evidence: ${JSON.stringify(preview.evidence)}`,
+      `Checks: ${JSON.stringify(preview.checks)}`,
+      `Risk: ${JSON.stringify(preview.risk)}`,
+      "This closes the task and frees its slot and paths, but tasks that depend on it stay queued. Decline if you have not reviewed the report.",
+    ].join("\n"),
+    `the non-accepting review dialog changed shape:\n${request.message}`,
+  );
+  let approvedRequest = { title: "", message: "" };
   const approved = await recordReviewWithConsent(
-    { hasUI: true, confirm: async () => true },
+    { hasUI: true, confirm: async (title, message) => { approvedRequest = { title, message }; return true; } },
     preview,
     "integrated",
     params.disposition,
@@ -490,9 +569,262 @@ async function checkReviewConsent(): Promise<void> {
       sent[0]?.disposition === params.disposition && sent[0]?.expectedRevision === preview.revision,
     `the approved review sent ${JSON.stringify(sent)}, want the exact preview revision and decision`,
   );
+  check(
+    approvedRequest.message.startsWith(
+      `Confirm that you reviewed the worker's final report for task ${preview.taskId} and chose this outcome: integrated\nNote: ${params.disposition}\nStored report (revision 7):\n`,
+    ) && approvedRequest.message.endsWith(
+      "This closes the task and may start queued dependent work. Decline if you have not reviewed the report.",
+    ),
+    `the accepting review dialog changed shape:\n${approvedRequest.message}`,
+  );
 }
 
 await checkReviewConsent();
+
+// Moving or closing a ticket is a user decision. The helpers refuse without a UI,
+// stop when the user declines, show the exact facts being confirmed, and send the
+// digest of precisely the ticket that was previewed.
+async function checkTicketConsent(): Promise<void> {
+  const preview = {
+    ticketId: "tkt_abc123",
+    title: "Add search",
+    column: "backlog",
+    stage: "backlog",
+    revision: 4,
+    digest: "d".repeat(64),
+    taskIds: ["orch_a1"],
+  };
+  check(readTicketPreview(preview)?.digest === preview.digest, "a valid ticket preview was refused");
+  check(readTicketPreview({ ...preview, taskIds: [] })?.taskIds.length === 0, "a ticket preview with no linked tasks was refused");
+  const untrusted: Record<string, unknown> = {
+    "no digest": { ...preview, digest: "" },
+    "no revision": { ...preview, revision: 0 },
+    "no id": { ...preview, ticketId: "" },
+    "no title": { ...preview, title: "" },
+    "an unknown column": { ...preview, column: "archive" },
+    "an unknown stage": { ...preview, stage: "lost" },
+    "task ids that are not strings": { ...preview, taskIds: [1] },
+    "no task ids": { ...preview, taskIds: undefined },
+    "a non-object body": "tkt_abc123",
+    "a null body": null,
+  };
+  for (const [name, value] of Object.entries(untrusted)) {
+    check(readTicketPreview(value) === null, `a ticket preview with ${name} was trusted`);
+  }
+
+  const moves: Array<{ ticketId: string; digest: string }> = [];
+  const sendMove = async (confirmed: { ticketId: string; digest: string }) => {
+    moves.push(confirmed);
+    return { column: "todo" };
+  };
+  const trustedPreview = readTicketPreview(preview);
+  if (trustedPreview === null) return;
+
+  let request = { title: "", message: "" };
+  const declinedMove = await recordTicketMoveWithConsent(
+    { hasUI: true, confirm: async (title, message) => { request = { title, message }; return false; } },
+    trustedPreview,
+    sendMove,
+  );
+  check(!declinedMove.ok && moves.length === 0, "a declined ticket move reached the bridge mutation");
+  for (const fact of [preview.ticketId, preview.title, "backlog", "todo", "revision 4", "starts nothing"]) {
+    check(request.message.includes(fact), `the move confirmation did not show ${JSON.stringify(fact)}`);
+  }
+  // Test-PrimaryTicketConfirmScreen in the acceptance harness waits for exactly
+  // these sentences; change both together.
+  check(request.title === "Move ticket to todo", `the move dialog title changed: ${JSON.stringify(request.title)}`);
+  check(
+    request.message === [
+      `Confirm moving ticket ${preview.ticketId} to todo.`,
+      `Title: ${JSON.stringify(preview.title)}`,
+      `Now: ${preview.column} (stage ${preview.stage}), revision ${preview.revision}`,
+      "In this version a move only records the ticket as ready for work; it starts nothing. No task, worktree or agent is created, and dispatching work for the ticket is a separate step.",
+    ].join("\n"),
+    `the ticket move dialog changed shape:\n${request.message}`,
+  );
+  let prompts = 0;
+  const noUiMove = await recordTicketMoveWithConsent(
+    { hasUI: false, confirm: async () => { prompts++; return true; } },
+    trustedPreview,
+    sendMove,
+  );
+  check(!noUiMove.ok && prompts === 0 && moves.length === 0, "a ticket move proceeded or prompted without an interactive UI");
+  const approvedMove = await recordTicketMoveWithConsent({ hasUI: true, confirm: async () => true }, trustedPreview, sendMove);
+  check(approvedMove.ok, "an approved ticket move did not return its bridge result");
+  check(
+    moves.length === 1 && moves[0]?.ticketId === preview.ticketId && moves[0]?.digest === preview.digest,
+    `the approved move sent ${JSON.stringify(moves)}, want the previewed ticket id and digest`,
+  );
+  // A move that could not be honored is refused before the user is asked.
+  let asked = 0;
+  for (const [name, impossible] of Object.entries({
+    "already in todo": { ...preview, column: "todo", stage: "todo" },
+    "already decided": { ...preview, stage: "done" },
+  })) {
+    const trusted = readTicketPreview(impossible);
+    if (trusted === null) {
+      failures.push(`the ${name} preview was not readable`);
+      continue;
+    }
+    const refused = await recordTicketMoveWithConsent(
+      { hasUI: true, confirm: async () => { asked++; return true; } },
+      trusted,
+      sendMove,
+    );
+    check(!refused.ok && asked === 0 && moves.length === 1, `a ticket ${name} was offered to the user or sent`);
+  }
+
+  const reviews: Array<{ ticketId: string; digest: string; outcome: string; disposition: string }> = [];
+  const sendReview = async (confirmed: { ticketId: string; digest: string; outcome: string; disposition: string }) => {
+    reviews.push(confirmed);
+    return { stage: "done" };
+  };
+  const note = "Superseded by tkt_def456.";
+  request = { title: "", message: "" };
+  const declinedReview = await recordTicketReviewWithConsent(
+    { hasUI: true, confirm: async (title, message) => { request = { title, message }; return false; } },
+    trustedPreview,
+    "superseded",
+    note,
+    sendReview,
+  );
+  check(!declinedReview.ok && reviews.length === 0, "a declined ticket review reached the bridge mutation");
+  for (const fact of [preview.ticketId, preview.title, "superseded", note, "revision 4", "orch_a1", "cannot be closed while"]) {
+    check(request.message.includes(fact), `the ticket review confirmation did not show ${JSON.stringify(fact)}`);
+  }
+  check(request.title === "Record ticket decision", `the ticket decision dialog title changed: ${JSON.stringify(request.title)}`);
+  check(
+    request.message === [
+      `Confirm closing ticket ${preview.ticketId} with this outcome: superseded`,
+      `Title: ${JSON.stringify(preview.title)}`,
+      `Note: ${note}`,
+      `Ticket: revision ${preview.revision}, stage ${preview.stage}; linked tasks: ${preview.taskIds.join(", ")}`,
+      "This records your decision on the ticket only: it changes no task and merges nothing. A ticket cannot be closed while any of its linked tasks is still open.",
+    ].join("\n"),
+    `the ticket decision dialog changed shape:\n${request.message}`,
+  );
+  prompts = 0;
+  const noUiReview = await recordTicketReviewWithConsent(
+    { hasUI: false, confirm: async () => { prompts++; return true; } },
+    trustedPreview,
+    "kept",
+    note,
+    sendReview,
+  );
+  check(!noUiReview.ok && prompts === 0 && reviews.length === 0, "a ticket review proceeded or prompted without an interactive UI");
+  // "rejected" differs from every other outcome used above, so a helper that sent
+  // a fixed or earlier outcome could not pass.
+  const approvedReview = await recordTicketReviewWithConsent(
+    { hasUI: true, confirm: async () => true },
+    trustedPreview,
+    "rejected",
+    note,
+    sendReview,
+  );
+  check(approvedReview.ok, "an approved ticket review did not return its bridge result");
+  check(
+    reviews.length === 1 && reviews[0]?.ticketId === preview.ticketId && reviews[0]?.digest === preview.digest &&
+      reviews[0]?.outcome === "rejected" && reviews[0]?.disposition === note,
+    `the approved review sent ${JSON.stringify(reviews)}, want the previewed digest and the exact decision`,
+  );
+
+  // A done preview is not refused by the helper, by design: the coordinator is the
+  // authority on whether a decision is a retry of the recorded one (it answers with
+  // the same view, which is what makes a lost response safe to retry) or a
+  // conflicting one (already_decided). The helper asks the user and sends, with the
+  // digest of the ticket as it stands. (The preview here has no outcome; the real
+  // bridge's does carry one, which this helper deliberately does not act on.)
+  const donePreview = readTicketPreview({ ...preview, stage: "done", revision: 5, digest: "e".repeat(64) });
+  if (donePreview === null) {
+    failures.push("the done ticket preview was not readable");
+  } else {
+    let doneAsked = 0;
+    let doneRequest = { title: "", message: "" };
+    const declinedRetry = await recordTicketReviewWithConsent(
+      { hasUI: true, confirm: async (title, message) => { doneAsked++; doneRequest = { title, message }; return false; } },
+      donePreview,
+      "rejected",
+      note,
+      sendReview,
+    );
+    check(
+      !declinedRetry.ok && doneAsked === 1 && reviews.length === 1,
+      "a declined retry on a done ticket must ask once and send nothing",
+    );
+    check(doneRequest.message.includes("stage done"), "the retry confirmation did not show that the ticket is already done");
+    const retry = await recordTicketReviewWithConsent(
+      { hasUI: true, confirm: async () => { doneAsked++; return true; } },
+      donePreview,
+      "rejected",
+      note,
+      sendReview,
+    );
+    check(doneAsked === 2, "a confirmed retry on a done ticket was not put to the user");
+    check(
+      retry.ok && retry.value.stage === "done",
+      "a confirmed retry on a done ticket did not return the coordinator's answer",
+    );
+    check(
+      reviews.length === 2 && reviews[1]?.ticketId === preview.ticketId && reviews[1]?.digest === donePreview.digest &&
+        reviews[1]?.outcome === "rejected" && reviews[1]?.disposition === note,
+      `the confirmed retry sent ${JSON.stringify(reviews[1])}, want the done preview's own digest and the same decision`,
+    );
+    // A different decision for the same done ticket is sent too: the coordinator
+    // refuses it as already_decided; the helper never decides that from a preview.
+    const conflicting = await recordTicketReviewWithConsent(
+      { hasUI: true, confirm: async () => true },
+      donePreview,
+      "kept",
+      note,
+      sendReview,
+    );
+    check(
+      conflicting.ok && reviews.length === 3 && reviews[2]?.outcome === "kept",
+      "a different decision on a done ticket must reach the coordinator, which refuses it, not be guessed at by the helper",
+    );
+  }
+
+  // The tools themselves refuse a session with no UI before they read or send
+  // anything, exactly as orch_review does.
+  for (const [name, params] of [
+    ["orch_ticket_move", { ticketId: "tkt_abc123" }],
+    ["orch_ticket_review", { ticketId: "tkt_abc123", outcome: "kept", disposition: "" }],
+  ] as const) {
+    const tool = tools.find((candidate) => candidate.name === name) as
+      | (RegisteredTool & {
+          execute: (
+            callId: string,
+            params: Record<string, unknown>,
+            signal: AbortSignal,
+            update: undefined,
+            ctx: unknown,
+          ) => Promise<{ isError?: boolean; content: Array<{ text: string }> }>;
+        })
+      | undefined;
+    if (!tool) {
+      failures.push(`${name} was not registered`);
+      continue;
+    }
+    let toolPrompts = 0;
+    try {
+      const outcome = await tool.execute(`${name}-no-ui`, params, new AbortController().signal, undefined, {
+        hasUI: false,
+        ui: { confirm: async () => { toolPrompts++; return true; } },
+        sessionManager: {
+          getSessionId: () => "sess-1",
+          getSessionFile: () => "C:/session.jsonl",
+          isSessionOnDisk: () => true,
+        },
+      });
+      check(outcome.isError === true, `${name} proceeded without an interactive UI`);
+      check(toolPrompts === 0, `${name} asked for confirmation without an interactive UI`);
+    } catch (error) {
+      failures.push(`${name} reached the bridge without a UI: ${String(error)}`);
+    }
+  }
+}
+
+await checkTicketConsent();
 
 
 // --- the user-confirmed gates ----------------------------------------------

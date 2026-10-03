@@ -227,8 +227,9 @@ func runEvent(env map[string]string, stdout, stderr io.Writer) int {
 	return emit(stdout, stderr, map[string]any{"ok": true, "event": eventName})
 }
 
-// runBoard is the `[[panes]]` route: the read-only board for the project the
-// pane was opened in, running in this terminal until the reader closes it.
+// runBoard is the `[[panes]]` route: the board for the project the pane was
+// opened in, read-only for tasks, running in this terminal until the reader
+// closes it.
 //
 // The pane route reads the state store and the Herdr binary the invocation was
 // started with; it resolves its own project from the injected workspace or
@@ -257,10 +258,40 @@ func runBoard(env map[string]string, stdout, stderr io.Writer) int {
 	}
 	// The board owns the terminal until it is closed; no timeout applies, and
 	// Bubble Tea is left with the process's own stdio.
-	if err := board.Run(context.Background(), store, client, project.Key, board.Options{}); err != nil {
+	if err := board.Run(context.Background(), store, client, project.Key, boardOptions(store, client)); err != nil {
 		return emit(stdout, stderr, failureBody("internal", err.Error()))
 	}
 	return 0
+}
+
+// boardOptions gives the board its one write path. The board creates and moves
+// tickets only through board.TicketOps, and in this executable that is the
+// coordinator, so the same project check, digest check and decision rules apply
+// as for the primary's bridge calls. The project key the board passes is the one
+// runBoard resolved from the pane's own context, never one the board chose.
+//
+// A coordinator that cannot be built does not stop the board from opening: it is
+// returned read-only, and says so when a ticket key is pressed.
+func boardOptions(store *state.Store, client *herdr.Client) board.Options {
+	coordinator, err := coord.New(store, client, coord.Options{})
+	if err != nil {
+		return board.Options{}
+	}
+	return board.Options{Tickets: ticketWriter{coordinator: coordinator}}
+}
+
+// ticketWriter is board.TicketOps over the coordinator's project-keyed ticket
+// operations. The board package imports nothing from coord; this is the seam.
+type ticketWriter struct{ coordinator *coord.Coordinator }
+
+func (w ticketWriter) CreateTicket(ctx context.Context, projectKey, title string) error {
+	_, err := w.coordinator.CreateTicketFor(ctx, projectKey, coord.TicketCreateParams{Title: title})
+	return err
+}
+
+func (w ticketWriter) MoveTicketToTodo(ctx context.Context, projectKey, ticketID, digest string) error {
+	_, err := w.coordinator.MoveTicketFor(ctx, projectKey, ticketID, digest)
+	return err
 }
 
 // runOpenBoard is the `[[actions]]` route: it opens the board pane for the bound

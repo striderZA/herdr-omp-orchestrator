@@ -83,7 +83,7 @@ if ($phasePlanCommand) {
         (($singlePhases -join ',') -ceq 'SW0,SW1,A0,V0') ($singlePhases -join ',')
     $fullPhases = @(Get-AcceptanceScenarioPhases -Scenario 'Full')
     Check 'full scenario retains the broad regression phases' `
-        (($fullPhases -join ',') -ceq 'N7,D0,PR0,Q0,K0,M0,W0,A0,V0,C0,G0,T0') ($fullPhases -join ',')
+        (($fullPhases -join ',') -ceq 'N7,D0,PR0,Q0,K0,M0,W0,A0,V0,TK0,C0,G0,T0') ($fullPhases -join ',')
     Check 'scenario timeout leaves unrelated bounded waits unchanged' `
         ((Get-ScenarioBoundedTimeoutSeconds -Requested 7) -eq 7) 'ordinary timeout changed'
     $script:ScenarioDeadline = (Get-Date).AddSeconds(2)
@@ -308,6 +308,8 @@ CREATE TABLE IF NOT EXISTS ready_sessions (launch_pane_id TEXT PRIMARY KEY, omp_
   verified INTEGER NOT NULL DEFAULT 0, verified_kind TEXT NOT NULL DEFAULT '', verified_value TEXT NOT NULL DEFAULT '',
   seen_at INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS inbox_pending ON inbox (project_key, delivery_state);
+CREATE TABLE IF NOT EXISTS tickets (id TEXT PRIMARY KEY, project_key TEXT NOT NULL, revision INTEGER NOT NULL, data JSON NOT NULL);
+CREATE INDEX IF NOT EXISTS tickets_project_key ON tickets (project_key);
 """)
 key = "C:\\temp\\run\\repo"
 cur.execute("INSERT INTO projects VALUES (?,?)", (key, json.dumps({"Key": key, "AgentName": "orch_p_x", "OMPSessionID": "sess-1"})))
@@ -317,6 +319,10 @@ cur.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?)", ("orch_bbbb33334444", key,
   json.dumps({"ID": "orch_bbbb33334444", "ProjectKey": key, "Branch": "orch/bbbb33334444"})))
 cur.execute("INSERT INTO inbox VALUES (?,?,?,?,?,?,?,?)", ("q1", key, "orch_aaaa11112222", "question", "hi", "worker question", "delivered", "ok"))
 cur.execute("INSERT INTO ready_sessions VALUES (?,?,?,?,?,?,?,?,?)", ("w1:p1", "sess-1", "", 0, 1, 1, "path", "C:\\s.jsonl", 1))
+cur.execute("INSERT INTO tickets VALUES (?,?,?,?)", ("tkt_aaaa11112222", key, 2,
+  json.dumps({"ID": "tkt_aaaa11112222", "ProjectKey": key, "Title": "ACCEPT TICKET: one", "Column": "todo", "Revision": 2, "Outcome": "", "Disposition": ""})))
+cur.execute("INSERT INTO tickets VALUES (?,?,?,?)", ("tkt_bbbb33334444", key, 1,
+  json.dumps({"ID": "tkt_bbbb33334444", "ProjectKey": key, "Title": "ACCEPT TICKET: two", "Column": "backlog", "Revision": 1, "Outcome": "", "Disposition": ""})))
 # a foreign row that must survive untouched
 other = "C:\\other\\project"
 cur.execute("INSERT INTO projects VALUES (?,?)", (other, json.dumps({"Key": other})))
@@ -324,6 +330,8 @@ cur.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?)", ("orch_cccc55556666", othe
   json.dumps({"ID": "orch_cccc55556666", "ProjectKey": other})))
 cur.execute("INSERT INTO inbox VALUES (?,?,?,?,?,?,?,?)", ("q9", other, "orch_cccc55556666", "progress", "x", "worker progress", "pending", ""))
 cur.execute("INSERT INTO ready_sessions VALUES (?,?,?,?,?,?,?,?,?)", ("w9:p1", "sess-9", "", 0, 1, 1, "id", "sess-9", 1))
+cur.execute("INSERT INTO tickets VALUES (?,?,?,?)", ("tkt_cccc55556666", other, 1,
+  json.dumps({"ID": "tkt_cccc55556666", "ProjectKey": other, "Title": "someone else's", "Column": "backlog", "Revision": 1})))
 con.commit()
 print("seeded")
 '@
@@ -340,19 +348,32 @@ Check 'project task filter' (@($tasks).Count -eq 2) (@($tasks).Count)
 Check 'fact json decoded' ((Get-Field (Get-Field $tasks[0] 'fact') 'Branch') -match '^orch/') (Get-Json $tasks[0])
 $ready = Get-ReadySession -LaunchPaneId 'w1:p1'
 Check 'ready session read' ((Get-Field $ready 'verified') -eq 1) (Get-Json $ready)
+# --- tickets: the harness reads the tickets table the way it reads tasks -----
+Check 'dump reads the tickets table (this run two, foreign one)' (@($dump.tables.tickets).Count -eq 3) "tickets=$(@($dump.tables.tickets).Count)"
+$ticketRow = Get-TicketById -Id 'tkt_aaaa11112222'
+Check 'Get-TicketById returns the ticket row with its column and revision' `
+    (($null -ne $ticketRow) -and ((Get-Field (Get-Field $ticketRow 'fact') 'Column') -ceq 'todo') -and ([int](Get-Field $ticketRow 'revision') -eq 2) -and ((Get-Field $ticketRow 'project_key') -ceq 'C:\temp\run\repo')) `
+    (Get-Json $ticketRow)
+Check 'Get-TicketById decodes the ticket fact (title and an empty decision)' `
+    (((Get-Field (Get-Field $ticketRow 'fact') 'Title') -ceq 'ACCEPT TICKET: one') -and ([string](Get-Field (Get-Field $ticketRow 'fact') 'Outcome') -eq '')) (Get-Json $ticketRow)
+Check 'Get-TicketById returns null for an unknown ticket' ($null -eq (Get-TicketById -Id 'tkt_missing')) 'unknown id'
+Check 'Get-ProjectTickets filters to the project' (@(Get-ProjectTickets -Key 'C:\temp\run\repo').Count -eq 2) "n=$(@(Get-ProjectTickets -Key 'C:\temp\run\repo').Count)"
 
 $plan = Invoke-State -Operation 'plan-scoped' -Arguments @('C:\temp\run\repo', 'w1:p1,w2:p1')
 Check 'plan counts ours' ((Get-Field $plan 'counts').tasks -eq 2) (Get-Json $plan)
 Check 'plan sees no foreign reference' (@($plan.foreign).Count -eq 0) (Get-Json $plan.foreign)
+Check 'plan counts this run tickets' ((Get-Field $plan 'counts').tickets -eq 2) (Get-Json $plan)
 
 $del = Invoke-State -Operation 'delete-scoped' -Arguments @('C:\temp\run\repo', 'w1:p1,w2:p1')
 Check 'delete reports ok' ((Get-Flag $del 'ok')) (Get-Json $del)
 Check 'delete removed exactly our rows' (((Get-Field $del 'deleted').tasks -eq 2) -and ((Get-Field $del 'deleted').projects -eq 1) -and ((Get-Field $del 'deleted').inbox -eq 1) -and ((Get-Field $del 'deleted').ready_sessions -eq 1)) (Get-Json $del)
 Check 'delete left other rows identical' ((Get-Flag $del 'others_identical')) (Get-Json $del)
 Check 'delete left nothing of ours' ((Get-Field $del 'ours_remaining') -eq 0) (Get-Json $del)
+Check 'delete removed exactly this run tickets' ((Get-Field $del 'deleted').tickets -eq 2) (Get-Json $del)
 $after = Get-StateDump
 Check 'foreign rows survive' ((@($after.tables.projects).Count -eq 1) -and (@($after.tables.tasks).Count -eq 1) -and (@($after.tables.ready_sessions).Count -eq 1)) `
     ("p=$(@($after.tables.projects).Count) t=$(@($after.tables.tasks).Count) r=$(@($after.tables.ready_sessions).Count)")
+Check 'the foreign ticket survives the scoped delete' ((@($after.tables.tickets).Count -eq 1) -and ((Get-Field @($after.tables.tickets)[0] 'id') -ceq 'tkt_cccc55556666')) "tickets=$(@($after.tables.tickets).Count)"
 
 # a foreign row that references one of our task ids must block deletion
 $db2 = Join-Path $work 'second.sqlite'
@@ -372,6 +393,67 @@ $injected = Invoke-Native -File $script:Python -Arguments @($injectPath, $db2) -
 Check 'foreign reference injected' ($injected.Stdout -match 'injected') $injected.Stderr
 $blocked = Invoke-Native -File $script:Python -Arguments @($script:StateHelper, $db2, 'delete-scoped', 'C:\temp\run\repo', 'w1:p1,w2:p1') -TimeoutSeconds 60
 Check 'delete refuses when a foreign row references our identity' (($blocked.ExitCode -eq 3) -and ($blocked.Stdout -match 'foreign')) "exit=$($blocked.ExitCode) out=$($blocked.Stdout)"
+
+# a foreign TASK that links to one of our tickets must block deletion too
+$db3 = Join-Path $work 'third.sqlite'
+Set-Content -LiteralPath $seedPath -Value $seed -Encoding UTF8
+[void](Invoke-Native -File $script:Python -Arguments @($seedPath, $db3) -TimeoutSeconds 60)
+$injectTicketRef = @'
+import sqlite3, sys, json
+con = sqlite3.connect(sys.argv[1])
+con.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?)", ("orch_dddd77778888", "C:\\other\\project", None, "w9:p9", 1,
+  json.dumps({"ID": "orch_dddd77778888", "ProjectKey": "C:\\other\\project", "TicketID": "tkt_aaaa11112222"})))
+con.commit()
+print("injected")
+'@
+$injectTicketRefPath = Join-Path $work 'inject_ticket_ref.py'
+Set-Content -LiteralPath $injectTicketRefPath -Value $injectTicketRef -Encoding UTF8
+$injectedTicketRef = Invoke-Native -File $script:Python -Arguments @($injectTicketRefPath, $db3) -TimeoutSeconds 60
+Check 'foreign task linking to our ticket injected' ($injectedTicketRef.Stdout -match 'injected') $injectedTicketRef.Stderr
+$blockedByTicketRef = Invoke-Native -File $script:Python -Arguments @($script:StateHelper, $db3, 'delete-scoped', 'C:\temp\run\repo', 'w1:p1,w2:p1') -TimeoutSeconds 60
+Check 'delete refuses when a foreign task links to one of our tickets' (($blockedByTicketRef.ExitCode -eq 3) -and ($blockedByTicketRef.Stdout -match 'foreign')) "exit=$($blockedByTicketRef.ExitCode) out=$($blockedByTicketRef.Stdout)"
+
+# a store written before the tickets table existed is an empty table, not a failure
+$db4 = Join-Path $work 'before-tickets.sqlite'
+Set-Content -LiteralPath $seedPath -Value $seed -Encoding UTF8
+[void](Invoke-Native -File $script:Python -Arguments @($seedPath, $db4) -TimeoutSeconds 60)
+$dropTickets = @'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+con.execute("DROP TABLE tickets")
+con.commit()
+print("dropped")
+'@
+$dropTicketsPath = Join-Path $work 'drop_tickets.py'
+Set-Content -LiteralPath $dropTicketsPath -Value $dropTickets -Encoding UTF8
+[void](Invoke-Native -File $script:Python -Arguments @($dropTicketsPath, $db4) -TimeoutSeconds 60)
+$script:StateDb = $db4
+$oldDump = Get-StateDump
+Check 'a store without a tickets table dumps an empty tickets list and keeps its tasks' ((@($oldDump.tables.tickets).Count -eq 0) -and (@($oldDump.tables.tasks).Count -eq 3)) "tickets=$(@($oldDump.tables.tickets).Count) tasks=$(@($oldDump.tables.tasks).Count)"
+Check 'Get-TicketById on a store without the table is null' ($null -eq (Get-TicketById -Id 'tkt_aaaa11112222')) 'old store'
+$oldDelete = Invoke-State -Operation 'delete-scoped' -Arguments @('C:\temp\run\repo', 'w1:p1,w2:p1')
+Check 'scoped delete works on a store without the tickets table' ((Get-Flag $oldDelete 'ok') -and ((Get-Field $oldDelete 'deleted').tasks -eq 2) -and ((Get-Field $oldDelete 'deleted').tickets -eq 0)) (Get-Json $oldDelete)
+# ...but only the tickets table may be missing. A store without another table is not the
+# plugin's store (a wrong path becomes an empty SQLite file), and reading it as four
+# empty tables would let every "nothing of this run is left behind" check pass vacuously.
+$db5 = Join-Path $work 'wrong-store.sqlite'
+Set-Content -LiteralPath $seedPath -Value $seed -Encoding UTF8
+[void](Invoke-Native -File $script:Python -Arguments @($seedPath, $db5) -TimeoutSeconds 60)
+$dropProjects = @'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+con.execute("DROP TABLE projects")
+con.commit()
+print("dropped")
+'@
+$dropProjectsPath = Join-Path $work 'drop_projects.py'
+Set-Content -LiteralPath $dropProjectsPath -Value $dropProjects -Encoding UTF8
+[void](Invoke-Native -File $script:Python -Arguments @($dropProjectsPath, $db5) -TimeoutSeconds 60)
+$script:StateDb = $db5
+$wrongStoreThrew = $false
+try { [void](Get-StateDump) } catch { $wrongStoreThrew = $true }
+Check 'a store missing a table other than tickets fails the dump instead of reading as empty' $wrongStoreThrew 'projects table missing'
+$script:StateDb = $db2
 
 # --- added checks: task projection and handshake materialization -------------
 $projectionFails = 0
@@ -795,8 +877,8 @@ $reviewScreen = @'
 Earlier confirmation: Record review disposition
 Task orch_old; Accepted the reported result.
 Record review disposition
-Confirm that you reviewed the worker's final report for task orch_abc and chose this disposition:
-Accepted the reported result.
+Confirm that you reviewed the worker's final report for task orch_abc and chose this outcome: integrated
+Note: Accepted the reported result.
 Stored report (revision 7):
 Summary: "Added subtract to a.js"
 Branch: "orch/abc"
@@ -824,6 +906,66 @@ $boxedReviewScreen = ($reviewScreen -split "`r?`n" | ForEach-Object { if ($_ -ma
 $boxedReviewScreen += "`nup/down navigate  enter select  esc cancel`n$corner`n`n 10m $dot Sonnet 5.5 $dot orch-accept-x\repo $dot master $dot 1.5%/1M`n"
 Check 'review modal accepts the real boxed layout with the status bar below it' (Test-PrimaryReviewConfirmScreen -Screen $boxedReviewScreen -TaskId 'orch_abc' -Revision 7 -Disposition 'Accepted the reported result.') 'boxed layout'
 Check 'review modal refuses a newer Ask drawn below a closed boxed modal' (-not (Test-PrimaryReviewConfirmScreen -Screen ($boxedReviewScreen + "`nAsk 1 questions`n[other] What now?`nAccept`nRequest changes") -TaskId 'orch_abc' -Revision 7 -Disposition 'Accepted the reported result.')) 'boxed stale'
+# The outcome is part of the dialog's shape (recordReviewWithConsent names it first and
+# the note on its own line): the same note under another decision, an outcome that only
+# starts with the expected one, or the pre-outcome wording are different confirmations.
+$rejectedBody = 'This closes the task and frees its slot and paths, but tasks that depend on it stay queued.'
+$rejectedScreen = ($reviewScreen -replace 'chose this outcome: integrated', 'chose this outcome: rejected') -replace 'This closes the task and may start queued dependent work\.', $rejectedBody
+Check 'review modal refuses a dialog whose outcome is not the expected one' (-not (Test-PrimaryReviewConfirmScreen -Screen $rejectedScreen -TaskId 'orch_abc' -Revision 7 -Disposition 'Accepted the reported result.')) 'wrong outcome'
+Check 'review modal accepts a non-accepting outcome with its own closing sentence' (Test-PrimaryReviewConfirmScreen -Screen $rejectedScreen -TaskId 'orch_abc' -Revision 7 -Disposition 'Accepted the reported result.' -Outcome 'rejected') 'rejected outcome'
+Check 'review modal refuses a non-accepting outcome that still says it releases dependents' (-not (Test-PrimaryReviewConfirmScreen -Screen ($reviewScreen -replace 'chose this outcome: integrated', 'chose this outcome: rejected') -TaskId 'orch_abc' -Revision 7 -Disposition 'Accepted the reported result.' -Outcome 'rejected')) 'release claim'
+Check 'review modal refuses an accepting outcome that says dependents stay queued' (-not (Test-PrimaryReviewConfirmScreen -Screen ($reviewScreen -replace 'This closes the task and may start queued dependent work\.', $rejectedBody) -TaskId 'orch_abc' -Revision 7 -Disposition 'Accepted the reported result.')) 'queued claim'
+Check 'review modal refuses an outcome that merely starts with the expected one' (-not (Test-PrimaryReviewConfirmScreen -Screen ($reviewScreen -replace 'chose this outcome: integrated', 'chose this outcome: integrated-later') -TaskId 'orch_abc' -Revision 7 -Disposition 'Accepted the reported result.')) 'prefix outcome'
+Check 'review modal refuses the old wording that has no outcome' (-not (Test-PrimaryReviewConfirmScreen -Screen ($reviewScreen -replace 'chose this outcome: integrated\r?\nNote: ', 'chose this disposition: ') -TaskId 'orch_abc' -Revision 7 -Disposition 'Accepted the reported result.')) 'old wording'
+Check 'review modal refuses a note that is the outcome word in disguise' (-not (Test-PrimaryReviewConfirmScreen -Screen ($reviewScreen -replace 'Note: Accepted the reported result\.', 'Note: integrated') -TaskId 'orch_abc' -Revision 7 -Disposition 'Accepted the reported result.')) 'wrong note'
+
+# --- the ticket confirmation modals: the exact ticket, revision and decision ----
+$ticketTitle = 'ACCEPT TICKET: add search'
+$ticketMoveScreen = @'
+Earlier confirmation: Move ticket to todo
+Confirm moving ticket tkt_old to todo.
+Move ticket to todo
+Confirm moving ticket tkt_abc123 to todo.
+Title: "ACCEPT TICKET: add search"
+Now: backlog (stage backlog), revision 4
+In this version a move only records the ticket as ready for work; it starts nothing. No task, worktree or agent is created, and dispatching work for the ticket is a separate step.
+Yes
+No
+'@
+$moveArgs = @{ Kind = 'move'; TicketId = 'tkt_abc123'; TicketTitle = $ticketTitle; Revision = 4 }
+Check 'ticket move modal matches the active ticket, title and revision' (Test-PrimaryTicketConfirmScreen -Screen $ticketMoveScreen @moveArgs) 'move modal'
+Check 'ticket move modal rejects a different ticket' (-not (Test-PrimaryTicketConfirmScreen -Screen $ticketMoveScreen -Kind 'move' -TicketId 'tkt_other' -TicketTitle $ticketTitle -Revision 4)) 'wrong ticket'
+Check 'ticket move modal rejects a different revision' (-not (Test-PrimaryTicketConfirmScreen -Screen $ticketMoveScreen -Kind 'move' -TicketId 'tkt_abc123' -TicketTitle $ticketTitle -Revision 5)) 'wrong revision'
+Check 'ticket move modal rejects a different title' (-not (Test-PrimaryTicketConfirmScreen -Screen $ticketMoveScreen -Kind 'move' -TicketId 'tkt_abc123' -TicketTitle 'something else' -Revision 4)) 'wrong title'
+Check 'ticket move modal is not the ticket decision modal' (-not (Test-PrimaryTicketConfirmScreen -Screen $ticketMoveScreen -Kind 'review' -TicketId 'tkt_abc123' -TicketTitle $ticketTitle -Revision 4 -Outcome 'integrated' -Disposition 'x' -LinkedTaskIds @('orch_a'))) 'wrong kind'
+Check 'ticket move modal refuses a newer Ask below it' (-not (Test-PrimaryTicketConfirmScreen -Screen ($ticketMoveScreen + "`nAsk 1 questions`n[other] What now?`nAccept`nRequest changes") @moveArgs)) 'new Ask'
+Check 'ticket move modal refuses a later different action modal' (-not (Test-PrimaryTicketConfirmScreen -Screen ($ticketMoveScreen + "`nRemove worker checkout`nTask orch_other`nCancel") @moveArgs)) 'new action'
+Check 'ticket move modal ignores an old matching modal when another is active' (-not (Test-PrimaryTicketConfirmScreen -Screen ($ticketMoveScreen + "`nMove ticket to todo`nConfirm moving ticket tkt_other to todo.`nYes`nNo") @moveArgs)) 'stale modal'
+$ticketBoxedScreen = ($ticketMoveScreen -split "`r?`n" | ForEach-Object { if ($_ -match '^(Yes|No)$') { "$bar $_" } else { $_ } }) -join "`n"
+$ticketBoxedScreen += "`nup/down navigate  enter select  esc cancel`n$corner`n`n 10m $dot Sonnet 5.5 $dot orch-accept-x\repo $dot master $dot 1.5%/1M`n"
+Check 'ticket move modal accepts the real boxed layout with the status bar below it' (Test-PrimaryTicketConfirmScreen -Screen $ticketBoxedScreen @moveArgs) 'boxed layout'
+Check 'ticket move modal refuses a newer Ask drawn below a closed boxed modal' (-not (Test-PrimaryTicketConfirmScreen -Screen ($ticketBoxedScreen + "`nAsk 1 questions`n[other] What now?`nAccept`nRequest changes") @moveArgs)) 'boxed stale'
+Check 'ticket modal refuses an empty ticket id' (-not (Test-PrimaryTicketConfirmScreen -Screen $ticketMoveScreen -Kind 'move' -TicketId '' -TicketTitle $ticketTitle -Revision 4)) 'empty id'
+Check 'ticket modal refuses a zero revision' (-not (Test-PrimaryTicketConfirmScreen -Screen $ticketMoveScreen -Kind 'move' -TicketId 'tkt_abc123' -TicketTitle $ticketTitle -Revision 0)) 'zero revision'
+
+$ticketReviewScreen = @'
+Record ticket decision
+Confirm closing ticket tkt_abc123 with this outcome: integrated
+Title: "ACCEPT TICKET: add search"
+Note: Accepted the reported result.
+Ticket: revision 5, stage ready_for_review; linked tasks: orch_aaaa11112222
+This records your decision on the ticket only: it changes no task and merges nothing. A ticket cannot be closed while any of its linked tasks is still open.
+Yes
+No
+'@
+$ticketReviewArgs = @{ Kind = 'review'; TicketId = 'tkt_abc123'; TicketTitle = $ticketTitle; Revision = 5; Outcome = 'integrated'; Disposition = 'Accepted the reported result.'; LinkedTaskIds = @('orch_aaaa11112222') }
+Check 'ticket decision modal matches the ticket, revision, outcome, note and linked task' (Test-PrimaryTicketConfirmScreen -Screen $ticketReviewScreen @ticketReviewArgs) 'review modal'
+Check 'ticket decision modal rejects a different outcome' (-not (Test-PrimaryTicketConfirmScreen -Screen $ticketReviewScreen -Kind 'review' -TicketId 'tkt_abc123' -TicketTitle $ticketTitle -Revision 5 -Outcome 'rejected' -Disposition 'Accepted the reported result.' -LinkedTaskIds @('orch_aaaa11112222'))) 'wrong outcome'
+Check 'ticket decision modal rejects a different note' (-not (Test-PrimaryTicketConfirmScreen -Screen $ticketReviewScreen -Kind 'review' -TicketId 'tkt_abc123' -TicketTitle $ticketTitle -Revision 5 -Outcome 'integrated' -Disposition 'Rejected.' -LinkedTaskIds @('orch_aaaa11112222'))) 'wrong note'
+Check 'ticket decision modal rejects a different linked task' (-not (Test-PrimaryTicketConfirmScreen -Screen $ticketReviewScreen -Kind 'review' -TicketId 'tkt_abc123' -TicketTitle $ticketTitle -Revision 5 -Outcome 'integrated' -Disposition 'Accepted the reported result.' -LinkedTaskIds @('orch_other'))) 'wrong linked task'
+Check 'ticket decision modal rejects a different revision' (-not (Test-PrimaryTicketConfirmScreen -Screen $ticketReviewScreen -Kind 'review' -TicketId 'tkt_abc123' -TicketTitle $ticketTitle -Revision 6 -Outcome 'integrated' -Disposition 'Accepted the reported result.' -LinkedTaskIds @('orch_aaaa11112222'))) 'wrong revision'
+Check 'ticket decision modal rejects a longer note that merely contains the expected one' (-not (Test-PrimaryTicketConfirmScreen -Screen ($ticketReviewScreen -replace 'Accepted the reported result\.\r?\nTicket', "Accepted the reported result. and more`nTicket") @ticketReviewArgs)) 'substring note'
+Check 'ticket decision modal refuses an Ask drawn below it' (-not (Test-PrimaryTicketConfirmScreen -Screen ($ticketReviewScreen + "`nAsk 1 questions`n[other] What now?`nAccept`nRequest changes") @ticketReviewArgs)) 'review new Ask'
 
 $primaryAskScreen = @'
 Earlier conversation contained a completed task-A review:
@@ -1570,6 +1712,34 @@ try {
 } catch { $legacyExtraPreserved = $true }
 Check 'legacy root with anything beyond its report files is never swept as report-only' `
     ($legacyExtraPreserved -and (Test-Path -LiteralPath $legacyBlockedRoot)) 'unexpected cleanup'
+# A tickets row for the run's project blocks the report-only sweep exactly like a task row:
+# the same root is refused while the row is present and swept once it is gone, so the row
+# alone caused the refusal.
+$legacyTicketId = '3344aa55'
+$legacyTicketRoot = Join-Path $legacyReportTemp "orch-accept-$legacyTicketId"
+$legacyTicketRepo = Join-Path $legacyTicketRoot 'repo'
+New-Item -ItemType Directory -Path $legacyTicketRoot -Force | Out-Null
+@{ runId = $legacyTicketId; session = "orch-acc-$legacyTicketId"; projectKey = $legacyTicketRepo; keepResourcesRequested = $false; resourcesPreserved = $false } |
+    ConvertTo-Json | Set-Content -LiteralPath (Join-Path $legacyTicketRoot 'report.json') -Encoding UTF8
+Set-Content -LiteralPath (Join-Path $legacyTicketRoot 'report.txt') -Value 'legacy report-only run with a ticket row'
+$legacyTicketState = [pscustomobject]@{ tables = [pscustomobject]@{
+    projects = @(); tasks = @(); inbox = @(); ready_sessions = @()
+    tickets = @([pscustomobject]@{ id = 'tkt_leftover00001'; project_key = $legacyTicketRepo })
+} }
+$legacyTicketSwept = $true
+try {
+    $legacyTicketSwept = Move-LegacyAcceptanceReportRootToArchive -RunId $legacyTicketId -TempRoot $legacyReportTemp `
+        -ArchiveRoot $script:RunArchiveRoot -StateDump $legacyTicketState -Sessions @() -DefaultProjection ''
+} catch { $legacyTicketSwept = $false }
+Check 'legacy report-only sweep is refused while a tickets row still references the run project' `
+    ((-not $legacyTicketSwept) -and (Test-Path -LiteralPath (Join-Path $legacyTicketRoot 'report.json'))) 'the ticket row was ignored'
+$legacyTicketSweptAfter = $false
+try {
+    $legacyTicketSweptAfter = Move-LegacyAcceptanceReportRootToArchive -RunId $legacyTicketId -TempRoot $legacyReportTemp `
+        -ArchiveRoot $script:RunArchiveRoot -StateDump $emptyRunState -Sessions @() -DefaultProjection ''
+} catch { }
+Check 'the same legacy root is swept once no ticket row references it' `
+    ($legacyTicketSweptAfter -and -not (Test-Path -LiteralPath $legacyTicketRoot)) 'control: the refusal was not caused by the ticket row alone'
 $manifestOnlyTemp = Join-Path $script:HarnessRoot 'manifest-only-temp'
 $manifestOnlyId = '44556677'
 $manifestOnlyRoot = Join-Path $manifestOnlyTemp "orch-accept-$manifestOnlyId"
@@ -1638,6 +1808,38 @@ $pendingOnlyManifest.status = 'preserved'
     Check 'new pre-run cleanup retires a preserved pending KeepResources run with a dead owner' `
         ($pendingRecoverySucceeded -and -not (Test-Path -LiteralPath $pendingOnlyRoot) -and
          (Get-Field $pendingOnlyFinal 'status') -ceq 'complete') (Get-Json $pendingOnlyFinal)
+    # A tickets row for the run's project blocks manifest-only recovery as a task row does;
+    # with the row gone the same run recovers, so the row alone caused the refusal.
+    $ticketBlockedId = '44556679'
+    $ticketBlockedRoot = Join-Path $manifestOnlyTemp "orch-accept-$ticketBlockedId"
+    $ticketBlockedRepo = Join-Path $ticketBlockedRoot 'repo'
+    New-Item -ItemType Directory -Path $ticketBlockedRepo -Force | Out-Null
+    $ticketBlockedManifest = $manifestOnlyRecordData.PSObject.Copy()
+    $ticketBlockedManifest.runId = $ticketBlockedId
+    $ticketBlockedManifest.session = "orch-acc-$ticketBlockedId"
+    $ticketBlockedManifest.projectKey = $ticketBlockedRepo
+    $ticketBlockedManifest.workRoot = $ticketBlockedRoot
+    Write-AtomicRunManifest -Manifest $ticketBlockedManifest -Path (Join-Path (Join-Path $script:RunArchiveRoot $ticketBlockedId) 'manifest.json')
+    $ticketBlockedDump = [pscustomobject]@{ tables = [pscustomobject]@{
+        projects = @(); tasks = @(); inbox = @(); ready_sessions = @()
+        tickets = @([pscustomobject]@{ id = 'tkt_leftover00002'; project_key = $ticketBlockedRepo })
+    } }
+    $ticketBlockedError = ''
+    try {
+        [void](Recover-ManifestOnlyAcceptanceRun -RunId $ticketBlockedId -TempRoot $manifestOnlyTemp `
+            -StateDump $ticketBlockedDump -Sessions @($defaultRecordForRecovery) `
+            -SessionsRoot (Join-Path $defaultRecordForRecovery.session_dir 'sessions') -DefaultProjection '')
+    } catch { $ticketBlockedError = $_.Exception.Message }
+    Check 'manifest-only recovery refuses while a tickets row still references the run project' `
+        (($ticketBlockedError -match 'durable tickets rows still reference') -and (Test-Path -LiteralPath $ticketBlockedRoot)) $ticketBlockedError
+    $ticketFreedRecovered = $false
+    try {
+        $ticketFreedRecovered = Recover-ManifestOnlyAcceptanceRun -RunId $ticketBlockedId -TempRoot $manifestOnlyTemp `
+            -StateDump (Get-StateDump) -Sessions @($defaultRecordForRecovery) `
+            -SessionsRoot (Join-Path $defaultRecordForRecovery.session_dir 'sessions') -DefaultProjection ''
+    } catch { }
+    Check 'the same manifest-only run recovers once no ticket row references it' `
+        ($ticketFreedRecovered -and -not (Test-Path -LiteralPath $ticketBlockedRoot)) 'control: the refusal was not caused by the ticket row alone'
 $script:RunLockStateDb = $savedLockStore
 $interruptedRunId = 'eeddbb11'
 $interruptedRoot = Join-Path $script:HarnessRoot "orch-accept-$interruptedRunId"
@@ -2404,6 +2606,28 @@ Write-AtomicRunManifest -Manifest $manifestOnlyRunManifestSeed `
     } finally {
         if ($orphanHeldFile) { $orphanHeldFile.Dispose() }
     }
+    # A tickets row for the orphan's project blocks its cleanup like a task row, and its root
+    # and report survive the refusal; the exact retry below is the control that cleans it once
+    # the row is gone.
+    $orphanTicketScript = @'
+import json, sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+key, action = sys.argv[2], sys.argv[3]
+if action == "add":
+    con.execute("INSERT INTO tickets VALUES (?,?,?,?)", ("tkt_orphan0000001", key, 1, json.dumps({"ID": "tkt_orphan0000001", "ProjectKey": key})))
+else:
+    con.execute("DELETE FROM tickets WHERE id = ?", ("tkt_orphan0000001",))
+con.commit()
+'@
+    $orphanTicketScriptPath = Join-Path $script:HarnessRoot 'orphan_ticket_row.py'
+    Set-Content -LiteralPath $orphanTicketScriptPath -Value $orphanTicketScript
+    [void](Invoke-Native -File $script:Python -Arguments @($orphanTicketScriptPath, $script:StateDb, $orphanRepo, 'add') -TimeoutSeconds 60)
+    $orphanTicketError = ''
+    try { Clear-StaleAcceptanceState } catch { $orphanTicketError = $_.Exception.Message }
+    Check 'orphan cleanup is refused while a tickets row still references its project' `
+        (($orphanTicketError -match 'state rows still reference') -and (Test-Path -LiteralPath (Join-Path $orphanRoot 'report.json')) -and
+         (Test-Path -LiteralPath $siblingRoot)) $orphanTicketError
+    [void](Invoke-Native -File $script:Python -Arguments @($orphanTicketScriptPath, $script:StateDb, $orphanRepo, 'remove') -TimeoutSeconds 60)
     $orphanCleanupError = ''
     try { Clear-StaleAcceptanceState } catch { $orphanCleanupError = $_.Exception.Message }
     Check 'exact run-id recovery retries and removes only its report-verified orphan root' `
