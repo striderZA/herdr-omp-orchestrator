@@ -2495,9 +2495,9 @@ function Test-OmpApprovalToolCall {
     return $false
 }
 function Test-OmpReviewToolCall {
-    param([string]$Path, [string]$TaskId, [string]$Disposition)
+    param([string]$Path, [string]$TaskId, [string]$Disposition, [string]$Outcome = 'integrated')
     if ([string]::IsNullOrWhiteSpace($Path) -or [string]::IsNullOrWhiteSpace($TaskId) -or
-        [string]::IsNullOrWhiteSpace($Disposition) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+        [string]::IsNullOrWhiteSpace($Disposition) -or [string]::IsNullOrWhiteSpace($Outcome) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
     $stream = $null
     $reader = $null
     try {
@@ -2514,6 +2514,7 @@ function Test-OmpReviewToolCall {
                     [string](Get-Field $part 'name') -cne 'orch_review') { continue }
                 $arguments = Get-Field $part 'arguments'
                 if ([string](Get-Field $arguments 'taskId') -ceq $TaskId -and
+                    [string](Get-Field $arguments 'outcome') -ceq $Outcome -and
                     [string](Get-Field $arguments 'disposition') -ceq $Disposition) { return $true }
             }
         }
@@ -5377,7 +5378,7 @@ function Invoke-Reviews {
             $prompt = 'ACCEPT-REVIEW. Review this one worker result only: ' + $reviewTask.marker +
                 ' taskId "' + $reviewTask.id + '". Ask the user with one single-question Ask using id "' +
                 $reviewTask.askId + '" and header "' + $reviewTask.label +
-                '". Offer "Accept report", "Request changes", then "Reject report" in that order. Wait for the choice, then call orch_review for this exact taskId with disposition "Accepted the reported result." Do not ask about any other task in the same Ask and do not merge or clean up either checkout. Reply reviewed after the tool result.'
+                '". Offer "Accept report", "Request changes", then "Reject report" in that order. Wait for the choice, then call orch_review for this exact taskId with outcome "integrated" and disposition "Accepted the reported result." Do not ask about any other task in the same Ask and do not merge or clean up either checkout. Reply reviewed after the tool result.'
             $result = Invoke-PrimaryPromptNoWaitAfterDispositionAsks -PaneId $script:PrimaryPane -Text $prompt -TimeoutSeconds 300 -AssertionPrefix "V1.$($reviewTask.marker)"
             Assert-True -Id "V1.submit/$($reviewTask.marker)" -What "the primary accepted the review prompt for $($reviewTask.label)" -Condition ($result.Submitted -and ($result.ExitCode -eq 0 -or $result.Blocked)) `
                 -Command $result.CommandLine -Evidence ("code=[$($result.Code)] blocked=[$($result.Blocked)] submitted=[$($result.Submitted)] stderr=[" + (Protect-Text $result.Stderr 300) + "] screen=[" + (Protect-Text $result.Screen 500) + "]")
@@ -5912,7 +5913,7 @@ function Invoke-Restart {
                 $recordedDisposition = [string](Get-Field $beforeReview 'Disposition')
                 Assert-NonEmpty -Id 'T8.precondition' -What 'task A already has a recorded disposition before restore probe' -Value $recordedDisposition -TaskId $idA
                 $restoredDisposition = 'ACCEPT-TOOLS-RESTORED-' + $script:RunId
-            $probe = 'ACCEPT-TOOLS-RESTORED. The user already decided task "' + $idA + '". To prove your primary tools survived restore, call orch_review with taskId "' + $idA + '" and disposition "' + $restoredDisposition + '". Show the stored report and confirmation; the backend must refuse to rewrite the first decision. If the tool is unavailable, reply exactly NOTOOLHERE.'
+            $probe = 'ACCEPT-TOOLS-RESTORED. The user already decided task "' + $idA + '". To prove your primary tools survived restore, call orch_review with taskId "' + $idA + '", outcome "integrated" and disposition "' + $restoredDisposition + '". Show the stored report and confirmation; the backend must refuse to rewrite the first decision. If the tool is unavailable, reply exactly NOTOOLHERE.'
             $result = Invoke-PrimaryPromptNoWaitAfterDispositionAsks -PaneId $script:RestoredPrimaryPane -Text $probe -TimeoutSeconds 300 -AssertionPrefix 'T8'
             Assert-True -Id 'T8.1' -What 'the restored primary session accepts a prompt' -Condition ($result.Submitted -and ($result.ExitCode -eq 0 -or $result.Blocked)) -Command $result.CommandLine -Evidence ("code=[$($result.Code)] blocked=[$($result.Blocked)] stderr=[" + (Protect-Text $result.Stderr 300) + "] screen=[" + (Protect-Text $result.Screen 500) + "]")
             $confirmed = $false

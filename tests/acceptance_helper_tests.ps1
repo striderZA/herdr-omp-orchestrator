@@ -780,8 +780,10 @@ $wrongApprovalToolKeys = $true
 try { $wrongApprovalToolKeys = Test-OmpApprovalToolCall -Path $approvalTranscriptPath -TaskId 'orch_abc' -Keys @('escape') } catch { }
 Check 'primary transcript refuses a different approval key set' (-not $wrongApprovalToolKeys) 'wrong keys'
 $reviewTranscriptPath = Join-Path $script:HarnessRoot 'review-session.jsonl'
-Set-Content -LiteralPath $reviewTranscriptPath -Value '{"type":"message","message":{"role":"assistant","content":[{"type":"toolCall","name":"orch_review","arguments":{"taskId":"orch_abc","disposition":"Accepted the reported result."}}]}}' -Encoding UTF8
+Set-Content -LiteralPath $reviewTranscriptPath -Value '{"type":"message","message":{"role":"assistant","content":[{"type":"toolCall","name":"orch_review","arguments":{"taskId":"orch_abc","outcome":"integrated","disposition":"Accepted the reported result."}}]}}' -Encoding UTF8
 Check 'review transcript ties confirmation to the exact tool call' (Test-OmpReviewToolCall -Path $reviewTranscriptPath -TaskId 'orch_abc' -Disposition 'Accepted the reported result.') 'task/decision'
+Check 'review transcript refuses a different outcome' (-not (Test-OmpReviewToolCall -Path $reviewTranscriptPath -TaskId 'orch_abc' -Disposition 'Accepted the reported result.' -Outcome 'rejected')) 'wrong outcome'
+Check 'review transcript refuses a call with no outcome' (-not (Test-OmpReviewToolCall -Path $reviewTranscriptPath -TaskId 'orch_abc' -Disposition 'Accepted the reported result.' -Outcome 'kept')) 'missing outcome'
 Check 'review transcript refuses a different disposition' (-not (Test-OmpReviewToolCall -Path $reviewTranscriptPath -TaskId 'orch_abc' -Disposition 'Rejected the result.')) 'wrong decision'
 Check 'id-only restored session proves refusal from its pane' (Test-RestoredReviewRefusal -TaskId 'orch_abc' -Disposition 'RESTORED-123' -Screen 'orch_review RESTORED-123 -> already_decided') 'id-only proof'
 Check 'id-only restored session refuses a screen with only the submitted prompt' (-not (Test-RestoredReviewRefusal -TaskId 'orch_abc' -Disposition 'RESTORED-123' -Screen 'orch_review RESTORED-123')) 'no error'

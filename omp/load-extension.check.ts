@@ -380,7 +380,7 @@ const toolCalls: { name: string; params: Record<string, unknown>; bad: Record<st
     params: { taskId: "orch_abc", keys: ["1"] },
     bad: { taskId: "orch_abc", keys: [] },
   },
-  { name: "orch_review", params: { taskId: "orch_abc", disposition: "accepted" }, bad: { taskId: "orch_abc" } },
+  { name: "orch_review", params: { taskId: "orch_abc", outcome: "integrated", disposition: "accepted" }, bad: { taskId: "orch_abc", disposition: "accepted" } },
   {
     name: "orch_settle_input",
     params: { taskId: "orch_abc", decision: "not_delivered" },
@@ -460,31 +460,33 @@ async function checkReviewConsent(): Promise<void> {
   check(readReportPreview({ ...preview, evidence: null }) === null, "preview with missing evidence was trusted");
   check(readReportPreview({ ...preview, revision: 0 }) === null, "preview with no revision was trusted");
   let request = { title: "", message: "" };
-  const sent: Array<{ taskId: string; disposition: string; expectedRevision: number }> = [];
-  const send = async (confirmed: { taskId: string; disposition: string; expectedRevision: number }) => {
+  const sent: Array<{ taskId: string; outcome: string; disposition: string; expectedRevision: number }> = [];
+  const send = async (confirmed: { taskId: string; outcome: string; disposition: string; expectedRevision: number }) => {
     sent.push(confirmed);
     return { stage: "Done" };
   };
   const declined = await recordReviewWithConsent(
     { hasUI: true, confirm: async (title, message) => { request = { title, message }; return false; } },
     preview,
+    "rejected",
     params.disposition,
     send,
   );
   check(!declined.ok && sent.length === 0, "declined report review reached the bridge mutation");
-  for (const fact of [preview.taskId, "revision 7", preview.summary, preview.branch,
+  for (const fact of [preview.taskId, "revision 7", preview.summary, preview.branch, "rejected", "stay queued",
     preview.evidence[0], preview.checks[0], preview.risk, params.disposition]) {
     check(request.message.includes(fact), `review confirmation did not show ${JSON.stringify(fact)}`);
   }
   const approved = await recordReviewWithConsent(
     { hasUI: true, confirm: async () => true },
     preview,
+    "integrated",
     params.disposition,
     send,
   );
   check(approved.ok && approved.value !== null, "an approved review did not return its bridge result");
   check(
-    sent.length === 1 && sent[0]?.taskId === params.taskId &&
+    sent.length === 1 && sent[0]?.taskId === params.taskId && sent[0]?.outcome === "integrated" &&
       sent[0]?.disposition === params.disposition && sent[0]?.expectedRevision === preview.revision,
     `the approved review sent ${JSON.stringify(sent)}, want the exact preview revision and decision`,
   );

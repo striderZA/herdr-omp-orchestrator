@@ -433,25 +433,33 @@ export async function confirmThen<T>(
   return { ok: true, value: await act() };
 }
 // The review sends exactly the persisted report revision the user approved,
-// along with their disposition. A later report/task edit invalidates this token.
+// along with their decision. A later report/task edit invalidates this token.
+export const REVIEW_OUTCOMES = ["integrated", "kept", "rejected", "superseded", "abandoned"] as const;
+export type ReviewOutcome = (typeof REVIEW_OUTCOMES)[number];
+const RELEASING_OUTCOMES: readonly ReviewOutcome[] = ["integrated", "kept"];
+
 export function recordReviewWithConsent<T>(
   gate: UIGate,
   preview: ReportPreview,
+  outcome: ReviewOutcome,
   disposition: string,
-  send: (params: { taskId: string; disposition: string; expectedRevision: number }) => Promise<T>,
+  send: (params: { taskId: string; outcome: ReviewOutcome; disposition: string; expectedRevision: number }) => Promise<T>,
 ): Promise<GateOutcome<T>> {
+  const releases = RELEASING_OUTCOMES.includes(outcome);
   const request = {
     title: "Record review disposition",
     message:
-      `Confirm that you reviewed the worker's final report for task ${preview.taskId} and chose this disposition:\n` +
-      `${disposition}\nStored report (revision ${preview.revision}):\n` +
+      `Confirm that you reviewed the worker's final report for task ${preview.taskId} and chose this outcome: ${outcome}\n` +
+      `Note: ${disposition}\nStored report (revision ${preview.revision}):\n` +
       `Summary: ${JSON.stringify(preview.summary)}\nBranch: ${JSON.stringify(preview.branch)}\n` +
       `Evidence: ${JSON.stringify(preview.evidence)}\nChecks: ${JSON.stringify(preview.checks)}\n` +
       `Risk: ${JSON.stringify(preview.risk)}\n` +
-      "This closes the task and may start queued dependent work. Decline if you have not reviewed the report.",
+      (releases
+        ? "This closes the task and may start queued dependent work. Decline if you have not reviewed the report."
+        : "This closes the task and frees its slot and paths, but tasks that depend on it stay queued. Decline if you have not reviewed the report."),
   };
   return confirmThen(gate, request, () => send({
-    taskId: preview.taskId, disposition, expectedRevision: preview.revision,
+    taskId: preview.taskId, outcome, disposition, expectedRevision: preview.revision,
   }));
 }
 
@@ -938,7 +946,8 @@ export default function (pi: ExtensionAPI) {
       "Ask the user to confirm the task and proposed disposition after reviewing the worker result. A report alone never moves a task to Done.",
     parameters: z.object({
       taskId: z.string().min(1),
-      disposition: z.string().min(1).max(200),
+      outcome: z.enum(REVIEW_OUTCOMES),
+      disposition: z.string().max(200).default(""),
     }),
     async execute(_callId, params, signal, _update, ctx) {
       const gate = uiGate(ctx);
@@ -946,7 +955,7 @@ export default function (pi: ExtensionAPI) {
       const identity = sessionIdentity(ctx.sessionManager);
       const preview = readReportPreview(await callBridge("report_preview", { taskId: params.taskId }, identity, signal));
       if (!preview || preview.taskId !== params.taskId) return toolRefusal("the persisted report could not be verified for this task");
-      const gated = await recordReviewWithConsent(gate, preview, params.disposition, (confirmed) =>
+      const gated = await recordReviewWithConsent(gate, preview, params.outcome, params.disposition, (confirmed) =>
         callBridge("review", confirmed, identity, signal),
       );
       if (!gated.ok) return toolRefusal(gated.reason);
