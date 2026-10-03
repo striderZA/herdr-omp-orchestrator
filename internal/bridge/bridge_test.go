@@ -2543,7 +2543,7 @@ func (f *bridgeFixture) reviewPayload(t *testing.T, ops Ops, id, disposition str
 	var preview coord.ReportPreview
 	f.callWith("report_preview", primarySession, fmt.Sprintf(`{"taskId":%q}`, id), ops).decodeResult(t, &preview)
 	payload, err := json.Marshal(map[string]any{
-		"taskId": id, "expectedRevision": preview.Revision, "disposition": disposition,
+		"taskId": id, "expectedRevision": preview.Revision, "outcome": "integrated", "disposition": disposition,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -2609,7 +2609,7 @@ func TestReportMethodsAreRoleGated(t *testing.T) {
 			t.Fatalf("progress failed: %+v", resp.Error)
 		}
 		f.asPrimary()
-		if resp := f.callWith("review", primarySession, `{"taskId":"t1","disposition":"accepted"}`, ops); !resp.OK {
+		if resp := f.callWith("review", primarySession, `{"taskId":"t1","outcome":"integrated","disposition":"accepted"}`, ops); !resp.OK {
 			t.Fatalf("review failed: %+v", resp.Error)
 		}
 		if calls["report"] != 1 || calls["review"] != 1 {
@@ -2728,7 +2728,7 @@ func TestReportRejectsAnIncompleteReportAndReadsTheResult(t *testing.T) {
 
 	// Only the primary's own pane can record the user's decision, and that
 	// decision is what closes the task.
-	wantError(t, f.callWith("review", workerSession, `{"taskId":"t1","disposition":"accepted"}`, ops), CodeForbidden)
+	wantError(t, f.callWith("review", workerSession, `{"taskId":"t1","outcome":"integrated","disposition":"accepted"}`, ops), CodeForbidden)
 	f.asPrimary()
 	previewResp := f.callWith("report_preview", primarySession, `{"taskId":"t1"}`, ops)
 	var preview coord.ReportPreview
@@ -2738,20 +2738,20 @@ func TestReportRejectsAnIncompleteReportAndReadsTheResult(t *testing.T) {
 		len(preview.Evidence) != len(reviewed.Report.Evidence) || len(preview.Checks) != len(reviewed.Report.Checks) {
 		t.Fatalf("preview did not show the stored report and revision: %+v", preview)
 	}
-	wantError(t, f.callWith("review", primarySession, `{"taskId":"t1","disposition":"accepted: merged by hand"}`, ops), "bad_request")
-	wantError(t, f.callWith("review", primarySession, fmt.Sprintf(`{"taskId":"t1","disposition":"  ","expectedRevision":%d}`, preview.Revision), ops), "bad_request")
+	wantError(t, f.callWith("review", primarySession, `{"taskId":"t1","outcome":"integrated","disposition":"accepted: merged by hand"}`, ops), "bad_request")
+	wantError(t, f.callWith("review", primarySession, fmt.Sprintf(`{"taskId":"t1","outcome":"  ","disposition":"x","expectedRevision":%d}`, preview.Revision), ops), "bad_request")
 	if _, err := f.store.UpdateTask(context.Background(), reviewed.ID, preview.Revision, func(next *task.Task) error {
 		next.Activity = "Herdr activity changed after the report preview"
 		return nil
 	}); err != nil {
 		t.Fatalf("advance task after preview: %v", err)
 	}
-	wantError(t, f.callWith("review", primarySession, fmt.Sprintf(`{"taskId":"t1","disposition":"accepted","expectedRevision":%d}`, preview.Revision), ops), "report_changed")
+	wantError(t, f.callWith("review", primarySession, fmt.Sprintf(`{"taskId":"t1","outcome":"integrated","disposition":"accepted","expectedRevision":%d}`, preview.Revision), ops), "report_changed")
 	if st := f.task(t, "t1"); st.Disposition != "" {
 		t.Fatalf("stale preview recorded a disposition: %+v", st)
 	}
 	f.callWith("report_preview", primarySession, `{"taskId":"t1"}`, ops).decodeResult(t, &preview)
-	resp := f.callWith("review", primarySession, fmt.Sprintf(`{"taskId":"t1","disposition":"accepted: merged by hand","expectedRevision":%d}`, preview.Revision), ops)
+	resp := f.callWith("review", primarySession, fmt.Sprintf(`{"taskId":"t1","outcome":"integrated","disposition":"accepted: merged by hand","expectedRevision":%d}`, preview.Revision), ops)
 	var result coord.ReviewResult
 	resp.decodeResult(t, &result)
 	if result.Stage != task.Done {
@@ -2765,10 +2765,10 @@ func TestReportRejectsAnIncompleteReportAndReadsTheResult(t *testing.T) {
 		t.Errorf("stage after the disposition = %q, want %q", stage, task.Done)
 	}
 	f.callWith("report_preview", primarySession, `{"taskId":"t1"}`, ops).decodeResult(t, &preview)
-	if retry := f.callWith("review", primarySession, fmt.Sprintf(`{"taskId":"t1","disposition":"accepted: merged by hand","expectedRevision":%d}`, reviewed.Revision), ops); !retry.OK {
+	if retry := f.callWith("review", primarySession, fmt.Sprintf(`{"taskId":"t1","outcome":"integrated","disposition":"accepted: merged by hand","expectedRevision":%d}`, reviewed.Revision), ops); !retry.OK {
 		t.Fatalf("identical decision retry could not resume queue draining: %+v", retry.Error)
 	}
-	wantError(t, f.callWith("review", primarySession, fmt.Sprintf(`{"taskId":"t1","disposition":"rejected","expectedRevision":%d}`, preview.Revision), ops), "already_decided")
+	wantError(t, f.callWith("review", primarySession, fmt.Sprintf(`{"taskId":"t1","outcome":"rejected","disposition":"rejected","expectedRevision":%d}`, preview.Revision), ops), "already_decided")
 	if after := f.task(t, "t1"); after.Disposition != closed.Disposition || after.Revision != closed.Revision {
 		t.Fatalf("a second review rewrote the decision: %+v", after)
 	}

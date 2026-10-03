@@ -335,7 +335,7 @@ func CoordinatorOps(c *coord.Coordinator) Ops {
 			if err := decodeParams(params, &request); err != nil {
 				return nil, err
 			}
-			result, err := c.ReviewAtRevision(ctx, p.LaunchPaneID, request.TaskID, request.ExpectedRevision, request.Disposition)
+			result, err := c.ReviewAtRevision(ctx, p.LaunchPaneID, request.TaskID, request.ExpectedRevision, request.Outcome, request.Disposition)
 			return result, coordError(err)
 		},
 		CleanupPreview: func(ctx context.Context, p Principal, params json.RawMessage) (any, error) {
