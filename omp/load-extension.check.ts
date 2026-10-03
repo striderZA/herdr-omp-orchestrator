@@ -307,6 +307,14 @@ if (!dispatch) {
     "orch_dispatch invented a ticketId for a call that named none",
   );
   check(!tryParse(schema, { ...payload, ticketId: "" }).ok, "orch_dispatch accepted an empty ticketId");
+  // A repeated request is answered with the existing task and `duplicate:true`
+  // (issue #4). The bridge hands that answer to the model verbatim, so this
+  // description is the only place the model learns what the flag means and what
+  // to do about it.
+  check(
+    dispatch.description.includes("duplicate:true") && dispatch.description.includes("already holds"),
+    "orch_dispatch no longer tells the model that a repeat returns the existing task with duplicate:true",
+  );
 }
 
 // --- orch_report ------------------------------------------------------------

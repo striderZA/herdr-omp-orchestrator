@@ -943,7 +943,11 @@ export default function (pi: ExtensionAPI) {
     name: "orch_dispatch",
     label: "Delegate task",
     defaultInactive: true,
-    description: "Start a bounded, isolated coding task.",
+    description:
+      "Start a bounded, isolated coding task. If an open (not yet decided) task of this project already holds exactly this work " +
+      "(same title, brief, checks, dependencies, reserved paths, base revision and ticket), nothing new is started: the answer " +
+      "describes that existing task and carries duplicate:true. Use that task instead of repeating the call; dispatch again only " +
+      "after it is decided or with different work.",
     // Schema rule: never pass a mutable value (array or object) to `.default()`
     // — OMP's builder rejects it at construction time ("A mutable default value
     // must be specified as a factory"), which makes the whole extension fail to

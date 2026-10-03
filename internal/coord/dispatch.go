@@ -48,14 +48,22 @@ type DispatchResult struct {
 	Attention           string `json:"attention,omitempty"`
 	Blocker             string `json:"blocker,omitempty"`
 	TicketID            string `json:"ticketId,omitempty"`
+	// Duplicate is true when this request repeated work an open task of the
+	// project already holds: no task was created and nothing was touched, and
+	// every other field describes that existing task as it stands (issue #4).
+	Duplicate bool `json:"duplicate,omitempty"`
 }
 
 // DispatchFor runs one dispatch for an already authorized primary. The project
-// key comes from the verified caller, never from the request body.
+// key comes from the verified caller, never from the request body. A request
+// that repeats work an open task of the project already holds creates nothing:
+// the answer describes that task as it stands and carries Duplicate (issue #4).
 func (c *Coordinator) DispatchFor(ctx context.Context, projectKey string, params DispatchParams) (DispatchResult, error) {
-	st, err := c.dispatch(ctx, projectKey, params.TicketID, params.Title, params.Brief, params.Checks,
+	st, duplicate, err := c.dispatch(ctx, projectKey, params.TicketID, params.Title, params.Brief, params.Checks,
 		params.Dependencies, params.ReservedPaths, params.BaseRevision)
-	return resultOf(st), err
+	result := resultOf(st)
+	result.Duplicate = duplicate
+	return result, err
 }
 
 // resultOf projects the durable facts of a task onto the dispatch answer.
@@ -101,7 +109,8 @@ func (c *Coordinator) Dispatch(
 	checks, dependencies, reservedPaths []string,
 	baseRevision string,
 ) (task.Task, error) {
-	return c.dispatch(ctx, projectKey, "", title, brief, checks, dependencies, reservedPaths, baseRevision)
+	st, _, err := c.dispatch(ctx, projectKey, "", title, brief, checks, dependencies, reservedPaths, baseRevision)
+	return st, err
 }
 
 // dispatch is Dispatch with an optional ticket. An absent ticket is the empty
@@ -114,40 +123,50 @@ func (c *Coordinator) Dispatch(
 // ErrAlreadyDecided. Nothing else about the ticket is checked (its column and
 // stage are irrelevant). That read can go stale, so the store's own gate, inside
 // the transaction that creates the task, is the authority (see createTask).
+//
+// The bool reports a repeat (issue #4): the request asks for work an undecided
+// task of this project already holds, so nothing is created or touched (not even
+// the queue drain) and that task is returned as it stands. The check before the
+// drain is a read-only convenience; the store's gate inside the claim
+// transaction decides it again, which is what settles two callers racing with
+// the same work.
 func (c *Coordinator) dispatch(
 	ctx context.Context,
 	projectKey, ticketID, title, brief string,
 	checks, dependencies, reservedPaths []string,
 	baseRevision string,
-) (task.Task, error) {
+) (task.Task, bool, error) {
 	project, err := c.project(ctx, projectKey)
 	if err != nil {
-		return task.Task{}, err
+		return task.Task{}, false, err
 	}
 	request, err := newDispatchRequest(title, brief, checks, dependencies, reservedPaths)
 	if err != nil {
-		return task.Task{}, err
+		return task.Task{}, false, err
 	}
 	if ticketID != "" {
 		linked := strings.TrimSpace(ticketID)
 		if linked == "" {
-			return task.Task{}, fmt.Errorf("%w: the ticket id is blank", ErrInvalidRequest)
+			return task.Task{}, false, fmt.Errorf("%w: the ticket id is blank", ErrInvalidRequest)
 		}
 		if err := c.checkTicketForDispatch(ctx, project.Key, linked); err != nil {
-			return task.Task{}, err
+			return task.Task{}, false, err
 		}
 		request.ticketID = linked
 	}
 	base, err := c.committedSHA(ctx, project.Key, baseRevision)
 	if err != nil {
-		return task.Task{}, err
+		return task.Task{}, false, err
 	}
 	existing, err := c.projectTasks(ctx, project.Key)
 	if err != nil {
-		return task.Task{}, err
+		return task.Task{}, false, err
 	}
 	if err := checkDependencies(existing, request.dependencies); err != nil {
-		return task.Task{}, err
+		return task.Task{}, false, err
+	}
+	if holder, ok := task.OpenHolderOf(existing, request.work(project.Key, base)); ok {
+		return holder, true, nil
 	}
 
 	// Queued work goes first: a free slot belongs to the tasks that have been
@@ -157,21 +176,25 @@ func (c *Coordinator) dispatch(
 	// could not run is reported: it admitted nothing, and quietly taking
 	// resources for this request instead would hide a stalled queue.
 	if _, err := c.drainQueued(ctx, project.Key, ""); err != nil {
-		return task.Task{}, err
+		return task.Task{}, false, err
 	}
 
 	// The budget and the reserved paths are decided by the durable gate, in one
 	// transaction with the task's own creation: a second coordinator process
 	// cannot pass the same checks and provision past the limit or take paths this
-	// request holds.
+	// request holds. The same transaction answers a repeat that lost a race.
 	st, claimed, token, err := c.createTask(ctx, project.Key, request, base)
 	if err != nil {
-		return task.Task{}, err
+		var repeat *state.DuplicateError
+		if errors.As(err, &repeat) {
+			return repeat.Existing, true, nil
+		}
+		return task.Task{}, false, err
 	}
 	if !claimed {
 		// The durable gate refused the slot: the task is recorded queued and
 		// records no side effect.
-		return st, nil
+		return st, false, nil
 	}
 	// ClaimTask has committed the intent. Re-read dependencies at that point: a
 	// primary disposition may have landed after the earlier existence check but
@@ -180,20 +203,21 @@ func (c *Coordinator) dispatch(
 	current, err := c.projectTasks(ctx, project.Key)
 	if err != nil {
 		if _, releaseErr := c.releaseSlot(ctx, st, token); releaseErr != nil {
-			return st, fmt.Errorf("recheck dependencies for task %s: %w; release its slot: %w",
+			return st, false, fmt.Errorf("recheck dependencies for task %s: %w; release its slot: %w",
 				st.ID, err, releaseErr)
 		}
-		return st, fmt.Errorf("recheck dependencies for task %s: %w", st.ID, err)
+		return st, false, fmt.Errorf("recheck dependencies for task %s: %w", st.ID, err)
 	}
 	if ok, _ := c.dispatchable(current, st); !ok {
 		// A dependency is still open: give the slot this request took (its own token)
 		// back so another queued task can use it.
 		if _, err := c.releaseSlot(ctx, st, token); err != nil {
-			return st, fmt.Errorf("release provisioning slot for dependency-gated task %s: %w", st.ID, err)
+			return st, false, fmt.Errorf("release provisioning slot for dependency-gated task %s: %w", st.ID, err)
 		}
-		return st, nil
+		return st, false, nil
 	}
-	return c.provision(ctx, st, slotClaim{token: token})
+	provisioned, err := c.provision(ctx, st, slotClaim{token: token})
+	return provisioned, false, err
 }
 
 // ResumeDispatch advances a recorded task from its persisted phase. It is
@@ -259,6 +283,24 @@ type dispatchRequest struct {
 	dependencies  []string
 	reservedPaths []string
 	ticketID      string
+}
+
+// work is the task a request describes, before it has an identity: exactly the
+// fields that make up "the same work" (task.Task.Fingerprint). The repeat
+// check and the claim both build the task from here, so they cannot compare
+// different things.
+func (r dispatchRequest) work(projectKey, base string) task.Task {
+	return task.Task{
+		ProjectKey:    projectKey,
+		Title:         r.title,
+		Brief:         r.brief,
+		Checks:        r.checks,
+		Dependencies:  r.dependencies,
+		ReservedPaths: r.reservedPaths,
+		BaseRevision:  base,
+		Phase:         task.Intent,
+		TicketID:      r.ticketID,
+	}
 }
 
 // Bounds mirror the extension's own tool schema, so a request that never went
@@ -441,19 +483,8 @@ func (c *Coordinator) createTask(ctx context.Context, projectKey string, request
 		if err != nil {
 			return task.Task{}, false, 0, err
 		}
-		st := task.Task{
-			ID:            id,
-			ProjectKey:    projectKey,
-			Title:         request.title,
-			Brief:         request.brief,
-			Checks:        request.checks,
-			Dependencies:  request.dependencies,
-			ReservedPaths: request.reservedPaths,
-			BaseRevision:  base,
-			Branch:        branch,
-			Phase:         task.Intent,
-			TicketID:      request.ticketID,
-		}
+		st := request.work(projectKey, base)
+		st.ID, st.Branch = id, branch
 		claimed, created, token, err := c.store.ClaimTask(ctx, st, c.opts.Concurrency)
 		if err == nil {
 			return created, claimed, token, nil
