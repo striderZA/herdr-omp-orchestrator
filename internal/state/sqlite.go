@@ -239,7 +239,7 @@ func Open(dir string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open %q: %w", path, err)
 	}
-	if _, err := db.Exec(schema); err != nil {
+	if _, err := db.Exec(schema + historySchema); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate %q: %w", path, err)
 	}
@@ -297,6 +297,9 @@ func (s *Store) CreateTask(ctx context.Context, t task.Task) error {
 		t.ID, t.ProjectKey, nullablePane(t.LaunchPaneID), t.PublicPaneID, t.Revision, string(data),
 	); err != nil {
 		return fmt.Errorf("create task %q: %w", t.ID, err)
+	}
+	if err := recordCreated(ctx, tx, t); err != nil {
+		return err
 	}
 	return tx.commit("create task " + t.ID)
 }
@@ -436,6 +439,9 @@ func updateTask(ctx context.Context, tx *tx, id string, expectedRevision int64, 
 	if err := requireOneRow(res, ErrConflict, "update task "+id); err != nil {
 		return task.Task{}, err
 	}
+	if err := appendHistory(ctx, tx, next, diffTransitions(current, next)); err != nil {
+		return task.Task{}, err
+	}
 	return next, nil
 }
 
@@ -483,6 +489,9 @@ func (s *Store) MovePublicPane(ctx context.Context, launchPaneID, oldPublicPaneI
 		return fmt.Errorf("move public pane of task %q: %w", current.ID, err)
 	}
 	if err := requireOneRow(res, ErrConflict, "move public pane of task "+current.ID); err != nil {
+		return err
+	}
+	if err := appendHistory(ctx, tx, moved, diffTransitions(current, moved)); err != nil {
 		return err
 	}
 	return tx.commit("move public pane of task " + current.ID)
@@ -1115,6 +1124,9 @@ func (s *Store) ClaimTask(ctx context.Context, t task.Task, budget int) (bool, t
 		t.ID, t.ProjectKey, nullablePane(t.LaunchPaneID), t.PublicPaneID, t.Revision, token, token, string(data),
 	); err != nil {
 		return false, task.Task{}, 0, fmt.Errorf("claim task %q: %w", t.ID, err)
+	}
+	if err := recordCreated(ctx, tx, t); err != nil {
+		return false, task.Task{}, 0, err
 	}
 	if err := tx.commit("claim task " + t.ID); err != nil {
 		return false, task.Task{}, 0, err
