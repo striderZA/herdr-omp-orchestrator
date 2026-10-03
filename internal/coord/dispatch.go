@@ -24,6 +24,9 @@ type DispatchParams struct {
 	Dependencies  []string `json:"dependencies"`
 	ReservedPaths []string `json:"reservedPaths"`
 	BaseRevision  string   `json:"baseRevision"`
+	// TicketID optionally names the ticket this work is for. It is refused unless
+	// the ticket exists in the caller's project and is not decided.
+	TicketID string `json:"ticketId"`
 }
 
 // DispatchResult is the durable outcome of one dispatch, keyed by task id,
@@ -44,12 +47,13 @@ type DispatchResult struct {
 	AgentName           string `json:"agentName,omitempty"`
 	Attention           string `json:"attention,omitempty"`
 	Blocker             string `json:"blocker,omitempty"`
+	TicketID            string `json:"ticketId,omitempty"`
 }
 
 // DispatchFor runs one dispatch for an already authorized primary. The project
 // key comes from the verified caller, never from the request body.
 func (c *Coordinator) DispatchFor(ctx context.Context, projectKey string, params DispatchParams) (DispatchResult, error) {
-	st, err := c.Dispatch(ctx, projectKey, params.Title, params.Brief, params.Checks,
+	st, err := c.dispatch(ctx, projectKey, params.TicketID, params.Title, params.Brief, params.Checks,
 		params.Dependencies, params.ReservedPaths, params.BaseRevision)
 	return resultOf(st), err
 }
@@ -72,6 +76,7 @@ func resultOf(st task.Task) DispatchResult {
 		AgentName:           st.AgentName,
 		Attention:           st.Attention,
 		Blocker:             st.Blocker,
+		TicketID:            st.TicketID,
 	}
 }
 
@@ -96,6 +101,25 @@ func (c *Coordinator) Dispatch(
 	checks, dependencies, reservedPaths []string,
 	baseRevision string,
 ) (task.Task, error) {
+	return c.dispatch(ctx, projectKey, "", title, brief, checks, dependencies, reservedPaths, baseRevision)
+}
+
+// dispatch is Dispatch with an optional ticket. An absent ticket is the empty
+// string; an id that was supplied but is only whitespace is a link the caller
+// asked for and nothing can honor, so it is ErrInvalidRequest rather than a
+// silently unlinked task. A named ticket is checked right
+// after the request is validated and before anything is read from git or
+// written, so an ordinary refusal costs nothing: an id that is not in the
+// caller's project (or does not exist) is ErrTicketUnknown, a decided ticket is
+// ErrAlreadyDecided. Nothing else about the ticket is checked (its column and
+// stage are irrelevant). That read can go stale, so the store's own gate, inside
+// the transaction that creates the task, is the authority (see createTask).
+func (c *Coordinator) dispatch(
+	ctx context.Context,
+	projectKey, ticketID, title, brief string,
+	checks, dependencies, reservedPaths []string,
+	baseRevision string,
+) (task.Task, error) {
 	project, err := c.project(ctx, projectKey)
 	if err != nil {
 		return task.Task{}, err
@@ -103,6 +127,16 @@ func (c *Coordinator) Dispatch(
 	request, err := newDispatchRequest(title, brief, checks, dependencies, reservedPaths)
 	if err != nil {
 		return task.Task{}, err
+	}
+	if ticketID != "" {
+		linked := strings.TrimSpace(ticketID)
+		if linked == "" {
+			return task.Task{}, fmt.Errorf("%w: the ticket id is blank", ErrInvalidRequest)
+		}
+		if err := c.checkTicketForDispatch(ctx, project.Key, linked); err != nil {
+			return task.Task{}, err
+		}
+		request.ticketID = linked
 	}
 	base, err := c.committedSHA(ctx, project.Key, baseRevision)
 	if err != nil {
@@ -224,6 +258,7 @@ type dispatchRequest struct {
 	checks        []string
 	dependencies  []string
 	reservedPaths []string
+	ticketID      string
 }
 
 // Bounds mirror the extension's own tool schema, so a request that never went
@@ -417,6 +452,7 @@ func (c *Coordinator) createTask(ctx context.Context, projectKey string, request
 			BaseRevision:  base,
 			Branch:        branch,
 			Phase:         task.Intent,
+			TicketID:      request.ticketID,
 		}
 		claimed, created, token, err := c.store.ClaimTask(ctx, st, c.opts.Concurrency)
 		if err == nil {
@@ -428,6 +464,13 @@ func (c *Coordinator) createTask(ctx context.Context, projectKey string, request
 			// nothing was recorded. Report it as the coordinator's own refusal so
 			// callers classify it the same way as before.
 			return task.Task{}, false, 0, fmt.Errorf("%w: %s", ErrReservedConflict, err)
+		}
+		if errors.Is(err, state.ErrTicketUnavailable) {
+			// The ticket was decided (or went away) after the pre-check passed. The
+			// gate recorded nothing; report the refusal the pre-check would have given.
+			if refusal := c.checkTicketForDispatch(ctx, projectKey, request.ticketID); refusal != nil {
+				return task.Task{}, false, 0, refusal
+			}
 		}
 		if !errors.Is(err, state.ErrConflict) {
 			return task.Task{}, false, 0, fmt.Errorf("record task intent for %q: %w", projectKey, err)
