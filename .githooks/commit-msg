@@ -1,0 +1,19 @@
+#!/bin/sh
+
+message_file=$1
+subject=$(sed -n '/^[^#]/ { p; q; }' "$message_file")
+
+# Keep Git-generated merge and revert messages usable without weakening normal commits.
+case "$subject" in
+    "Merge "*) exit 0 ;;
+    "Revert \""*) exit 0 ;;
+esac
+
+if ! printf '%s\n' "$subject" | grep -Eq '^(feat|fix|refactor|test|docs|chore|review|build|ci|perf|style)(\([a-z0-9._/-]+\))?!?: .+'; then
+    printf '%s\n' \
+        'Commit rejected: subject must use Conventional Commit format:' \
+        '  <type>(optional-scope): <short description>' \
+        'Allowed types: feat, fix, refactor, test, docs, chore, review, build, ci, perf, style.' \
+        'Examples: feat: add task history; docs(adr): record disposition contract' >&2
+    exit 1
+fi

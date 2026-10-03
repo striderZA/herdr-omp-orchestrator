@@ -46,6 +46,16 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\acceptance_windo
 
 The full acceptance test drives real Herdr and OMP sessions in an isolated named session and temporary worktree root; it supports `-TimeoutScale`, `-KeepResources`, and `-SkipStateCleanup`. The extension load check can also be run with Bun and OMP's schema builder available: `bun run omp/load-extension.check.ts` (see `omp/load-extension.check.ts` for builder resolution options).
 
+## Git Hooks
+
+Enable the repository hooks once per clone:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+The hooks require Conventional Commit subjects (`<type>(optional-scope): <short description>`) and reject staged files under `docs/superpowers/` or `.superpowers/`.
+
 ## Code Conventions & Common Patterns
 
 - Use standard Go formatting and idioms; keep package responsibilities and existing boundaries intact. Test files use Go's `testing` package and are named beside the implementation as `*_test.go`.
