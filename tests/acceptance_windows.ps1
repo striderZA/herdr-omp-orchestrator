@@ -3861,7 +3861,7 @@ BRIEF: $brief
     $wait = Wait-ForTasks -Count 1 -TimeoutSeconds 300
     Assert-True -Id 'SW0.2' -What 'exactly one task was created for the bound project' `
         -Condition ($wait.Ok -and @($wait.Value).Count -eq 1) `
-        -Evidence ("after {0:N0}s tasks={1}" -f $wait.Elapsed, @($wait.Value).Count)
+        -Evidence ("after {0:N0}s tasks={1}" -f $wait.Elapsed, $(if ($null -eq $wait.Value) { 0 } else { @($wait.Value).Count }))
     if (-not $wait.Ok -or @($wait.Value).Count -ne 1) { throw 'the single-worker task was not created' }
 
     $script:Tasks = @($wait.Value)
