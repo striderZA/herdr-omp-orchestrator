@@ -879,23 +879,40 @@ func (s *Store) PendingInbox(ctx context.Context, projectKey string) ([]task.Inb
 	if strings.TrimSpace(projectKey) == "" {
 		return nil, fmt.Errorf("%w: project key is required", ErrInvalid)
 	}
-	rows, err := s.db.QueryContext(ctx,
+	return s.inboxRows(ctx, "the pending inbox of "+fmt.Sprintf("%q", projectKey),
 		`SELECT `+inboxSelect+` FROM inbox WHERE project_key = ? AND delivery_state = ?
 		 ORDER BY rowid`, projectKey, task.DeliveryPending)
+}
+
+// ProjectInbox reads every note of one project in the order it was recorded,
+// whatever its delivery state, with the detail each settlement left. It is a
+// read-only projection for the primary's inbox listing: it claims nothing and
+// settles nothing, so reading a note never changes whether it is delivered.
+func (s *Store) ProjectInbox(ctx context.Context, projectKey string) ([]task.Inbox, error) {
+	if strings.TrimSpace(projectKey) == "" {
+		return nil, fmt.Errorf("%w: project key is required", ErrInvalid)
+	}
+	return s.inboxRows(ctx, "the inbox of "+fmt.Sprintf("%q", projectKey),
+		`SELECT `+inboxSelect+` FROM inbox WHERE project_key = ? ORDER BY rowid`, projectKey)
+}
+
+// inboxRows runs one inbox query and scans every row it returns.
+func (s *Store) inboxRows(ctx context.Context, what, query string, args ...any) ([]task.Inbox, error) {
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("read the pending inbox of %q: %w", projectKey, err)
+		return nil, fmt.Errorf("read %s: %w", what, err)
 	}
 	defer func() { _ = rows.Close() }()
 	var out []task.Inbox
 	for rows.Next() {
-		in, err := scanInbox(rows, "pending inbox row")
+		in, err := scanInbox(rows, "inbox row")
 		if err != nil {
 			return nil, err
 		}
 		out = append(out, in)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("read the pending inbox of %q: %w", projectKey, err)
+		return nil, fmt.Errorf("read %s: %w", what, err)
 	}
 	return out, nil
 }

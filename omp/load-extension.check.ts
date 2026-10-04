@@ -155,9 +155,11 @@ const wantNames = [
   "orch_approve_dialog",
   "orch_cleanup",
   "orch_dispatch",
+  "orch_inbox_list",
   "orch_report",
   "orch_review",
   "orch_settle_input",
+  "orch_task_list",
   "orch_ticket_create",
   "orch_ticket_list",
   "orch_ticket_move",
@@ -434,6 +436,12 @@ const toolCalls: { name: string; params: Record<string, unknown>; bad: Record<st
     bad: { ticketId: "tkt_abc", outcome: "merged" },
   },
   { name: "orch_ticket_review", params: { ticketId: "tkt_abc", outcome: "kept" }, bad: { ticketId: "", outcome: "kept" } },
+  // The inspection tools take only optional filters, so the empty call is valid;
+  // the bad case is a filter value the bridge would refuse.
+  { name: "orch_task_list", params: {}, bad: { stage: "archived" } },
+  { name: "orch_task_list", params: { stage: "needs_input", limit: 20 }, bad: { limit: 0 } },
+  { name: "orch_inbox_list", params: {}, bad: { state: "lost" } },
+  { name: "orch_inbox_list", params: { state: "uncertain", limit: 20 }, bad: { limit: 0 } },
 ];
 
 for (const call of toolCalls) {
@@ -475,6 +483,17 @@ if (ticketReview) {
     "orch_ticket_review disposition does not default to an empty string",
   );
   check(!tryParse(schema, { ticketId: "tkt_abc", outcome: "kept", disposition: "n".repeat(201) }).ok, "orch_ticket_review accepted a note over 200 characters");
+}
+// Bounds the inspection schemas promise: an optional filter, and a row limit that
+// is a whole number between 1 and the 200 the coordinator accepts.
+for (const name of ["orch_task_list", "orch_inbox_list"]) {
+  const inspect = tools.find((tool) => tool.name === name);
+  if (!inspect) continue;
+  const schema = requireSchema(inspect);
+  check(tryParse(schema, { limit: 1 }).ok && tryParse(schema, { limit: 200 }).ok, `${name} refused a limit inside 1..200`);
+  check(!tryParse(schema, { limit: 201 }).ok, `${name} accepted a limit over 200`);
+  check(!tryParse(schema, { limit: -1 }).ok, `${name} accepted a negative limit`);
+  check(!tryParse(schema, { limit: 2.5 }).ok, `${name} accepted a fractional limit`);
 }
 // A review is a user decision, not a model decision. Refusing the UI or
 // declining the exact task/disposition must stop before the bridge is spawned.
