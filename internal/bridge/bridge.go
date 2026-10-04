@@ -105,6 +105,15 @@ const (
 	MethodTicketReview      = "ticket_review"
 )
 
+// The primary's read-only views of its own project. Both are primary-only and
+// go through the same authorization as every other primary method; neither
+// writes anything, and the project comes from the verified principal. They are
+// additive, so the protocol version is unchanged.
+const (
+	MethodTaskList  = "task_list"
+	MethodInboxList = "inbox_list"
+)
+
 // The kinds one worker report carries, matching the extension's tool schema.
 // Each selects the coordinator operation that already existed for it, so the
 // merge is a wire surface change and not a behavior change.
@@ -227,6 +236,9 @@ type Ops struct {
 	TicketMovePreview func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
 	TicketMove        func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
 	TicketReview      func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
+	// Read-only views (primary role). The project comes from the verified principal.
+	TaskList  func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
+	InboxList func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
 }
 
 // Options carries what the caller observed before reading the request.
@@ -421,6 +433,22 @@ func CoordinatorOps(c *coord.Coordinator) Ops {
 			result, err := c.ReviewTicketFor(ctx, p.ProjectKey, request)
 			return result, coordError(err)
 		},
+		TaskList: func(ctx context.Context, p Principal, params json.RawMessage) (any, error) {
+			var request coord.TaskListParams
+			if err := decodeParams(params, &request); err != nil {
+				return nil, err
+			}
+			result, err := c.ListTasksFor(ctx, p.ProjectKey, request)
+			return result, coordError(err)
+		},
+		InboxList: func(ctx context.Context, p Principal, params json.RawMessage) (any, error) {
+			var request coord.InboxListParams
+			if err := decodeParams(params, &request); err != nil {
+				return nil, err
+			}
+			result, err := c.ListInboxFor(ctx, p.ProjectKey, request)
+			return result, coordError(err)
+		},
 	}
 }
 
@@ -452,6 +480,8 @@ func UnavailableOps(cause error) Ops {
 		TicketMovePreview: unavailable,
 		TicketMove:        unavailable,
 		TicketReview:      unavailable,
+		TaskList:          unavailable,
+		InboxList:         unavailable,
 	}
 }
 
@@ -668,6 +698,10 @@ func run(ctx context.Context, env map[string]string, input io.Reader, opts Optio
 		return h.mutate(req, state.RolePrimary, announced, h.ops.TicketMove)
 	case MethodTicketReview:
 		return h.mutate(req, state.RolePrimary, announced, h.ops.TicketReview)
+	case MethodTaskList:
+		return h.mutate(req, state.RolePrimary, announced, h.ops.TaskList)
+	case MethodInboxList:
+		return h.mutate(req, state.RolePrimary, announced, h.ops.InboxList)
 	default:
 		return nil, fail(CodeUnsupportedMethod, "unknown bridge method %q", req.Method)
 	}
@@ -1219,9 +1253,10 @@ func (h *handler) ready(announced task.Announcement) (any, error) {
 // Authorization is repeated for every call, so a call is never legal because an
 // earlier one was.
 //
-// The two read-only previews are authorized by the same function: a preview needs
-// the same proof of role and identity as a mutation, and the coordinator
-// operation behind it performs no write.
+// The read-only methods (the previews and the task and inbox listings) are
+// authorized by the same function: a read needs the same proof of role and
+// identity as a mutation, and the coordinator operation behind it performs no
+// write.
 func (h *handler) mutate(req request, want state.Role, announced task.Announcement, op func(context.Context, Principal, json.RawMessage) (any, error)) (any, error) {
 	binding, err := h.authorize(announced)
 	if err != nil {
