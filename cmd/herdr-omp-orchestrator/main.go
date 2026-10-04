@@ -414,7 +414,8 @@ func openCoordinator(env map[string]string) (*coord.Coordinator, func(), error) 
 	if stateDir == "" {
 		return nil, func() {}, fmt.Errorf("%w: %s is not set", coord.ErrInvalidRequest, envStateDir)
 	}
-	client, err := herdr.NewClient(herdrBinary(env))
+	herdrPath := herdrBinary(env)
+	client, err := herdr.NewClient(herdrPath)
 	if err != nil {
 		return nil, func() {}, err
 	}
@@ -422,7 +423,12 @@ func openCoordinator(env map[string]string) (*coord.Coordinator, func(), error) 
 	if err != nil {
 		return nil, func() {}, fmt.Errorf("open the orchestrator state: %w", err)
 	}
-	coordinator, err := coord.New(store, client, coord.Options{})
+	coordinator, err := coord.New(store, client, coord.Options{
+		// Only Bind consults the gate: it refuses, before it records or starts
+		// anything, when Herdr's OMP integration or this plugin's extension is
+		// missing from the profile the action runs in. The check is read-only.
+		Preflight: func(ctx context.Context) error { return setup.Verify(ctx, env, herdrPath) },
+	})
 	if err != nil {
 		_ = store.Close()
 		return nil, func() {}, err
@@ -459,6 +465,15 @@ func coordCode(err error) string {
 		// (a readiness timeout, a refused notice), and the caller must hear that
 		// the replacement is recorded but unconfirmed, not only why.
 		return "reattach_pending"
+	case errors.Is(err, coord.ErrNotReady):
+		// The cause is the setup package's own proof, so the code is the one the
+		// setup action reports for the same failure: a caller sees
+		// integration_missing or extension_missing, not a generic refusal.
+		var coded *setup.Error
+		if errors.As(err, &coded) {
+			return coded.Code()
+		}
+		return "not_ready"
 	case errors.Is(err, coord.ErrPrimaryLive):
 		return "primary_live"
 	case errors.Is(err, coord.ErrAlreadyBound):

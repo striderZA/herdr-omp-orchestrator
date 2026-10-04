@@ -93,6 +93,11 @@ var (
 	ErrAmbiguousStep = errors.New("coord: the step's outcome could not be identified")
 	// ErrHerdrUnavailable reports that the Herdr CLI could not be used at all.
 	ErrHerdrUnavailable = errors.New("coord: Herdr is unavailable")
+	// ErrNotReady reports that a prerequisite Bind verifies before it records or
+	// starts anything is not met (Herdr's OMP integration or the plugin's
+	// extension). Nothing was written or started; the wrapped cause names the
+	// remedy.
+	ErrNotReady = errors.New("coord: the bind prerequisites are not met")
 )
 
 // Defaults for one coordinator.
@@ -157,6 +162,14 @@ type Options struct {
 	// StepLease bounds how long one provisioning step holds its durable step
 	// claim. It defaults to two minutes.
 	StepLease time.Duration
+	// Preflight is the read-only readiness proof Bind runs before it records a
+	// project, creates a workspace, looks up a pane or starts an agent. A failure
+	// refuses the bind as ErrNotReady and leaves nothing behind. It must not
+	// install or change anything. Bind requires it: a coordinator built without
+	// one refuses to bind (ErrNotReady) instead of skipping the check, so no
+	// caller can launch a primary unverified by omission. No other operation
+	// consults it. The executable wires it to the setup package's check.
+	Preflight func(ctx context.Context) error
 }
 
 // Coordinator is the only writer of dispatch facts. It owns no private state:
@@ -227,9 +240,18 @@ func New(store *state.Store, client *herdr.Client, opts Options) (*Coordinator, 
 // its launch-time and public identity before `agent start`, so the extension's
 // handshake can be matched against `agent get`. Binding never steals focus and
 // never substitutes a new primary for a recorded one that is gone.
+//
+// The prerequisites (Options.Preflight) are verified before any of that, for a
+// first bind and for a re-bind of a recorded project alike: a re-bind can start
+// the recorded primary's agent, so it is gated by the same proof. A bind that
+// cannot work is refused before it records a project or starts an agent. The
+// extension's runtime handshake below stays the second check.
 func (c *Coordinator) Bind(ctx context.Context, repo, workspaceID, rootPaneID string) (task.Project, error) {
 	root, err := c.canonicalRoot(ctx, repo)
 	if err != nil {
+		return task.Project{}, err
+	}
+	if err := c.preflight(ctx); err != nil {
 		return task.Project{}, err
 	}
 	switch existing, err := c.store.Project(ctx, root); {
@@ -322,6 +344,19 @@ func (c *Coordinator) Bind(ctx context.Context, repo, workspaceID, rootPaneID st
 	project.TerminalID = view.Agent.TerminalID
 	project.CurrentWorkspaceID = view.Agent.WorkspaceID
 	return project, nil
+}
+
+// preflight runs the configured readiness proof and refuses when none is
+// configured. It is read-only, so a refusal needs no settling: no project exists
+// to carry a note, and the caller hears the cause at once.
+func (c *Coordinator) preflight(ctx context.Context) error {
+	if c.opts.Preflight == nil {
+		return fmt.Errorf("%w: no readiness check is configured, so Herdr's OMP integration and the plugin's extension cannot be verified", ErrNotReady)
+	}
+	if err := c.opts.Preflight(ctx); err != nil {
+		return fmt.Errorf("%w: %w", ErrNotReady, err)
+	}
+	return nil
 }
 
 // reopenPrimary re-verifies a recorded primary binding. It never starts a new
