@@ -1,6 +1,7 @@
 package setup
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
@@ -433,6 +434,273 @@ func TestInstallFailsWithoutIntegrationBeforeWriting(t *testing.T) {
 		}
 		assertAbsent(t, f.extensionPath(""))
 	})
+}
+
+// ---------------------------------------------------------------------------
+// verify (read-only)
+// ---------------------------------------------------------------------------
+
+// verify runs the read-only check the bind action runs, with the fixture's own
+// stand-in Herdr CLI as the binary.
+func (f *fixture) verify() error {
+	return Verify(context.Background(), f.env, f.env["HERDR_BIN_PATH"])
+}
+
+// profile is the OMP configuration tree of the fixture's home. The stand-in
+// Herdr writes its argv log beside it, so the read-only proofs snapshot this
+// tree and not the whole home.
+func (f *fixture) profile() string { return filepath.Join(f.home, ".omp") }
+
+// installed leaves the profile the way a successful setup does: Herdr's
+// integration plus the plugin's extension, written by the real Install.
+func (f *fixture) installed(t *testing.T) {
+	t.Helper()
+	f.installIntegration(t, "")
+	if err := f.install(); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+}
+
+func TestVerifyAcceptsWhatSetupInstalls(t *testing.T) {
+	f := newFixture(t)
+	f.installed(t)
+
+	if err := f.verify(); err != nil {
+		t.Fatalf("Verify after a successful setup = %v, want nil", err)
+	}
+	argv, err := os.ReadFile(f.env[fixtureArgvFile])
+	if err != nil {
+		t.Fatalf("read the status stand-in's argv: %v", err)
+	}
+	if got := strings.TrimSpace(string(argv)); got != "integration status" {
+		t.Errorf("herdr was called with %q, want %q", got, "integration status")
+	}
+}
+
+func TestVerifyRefusesWithoutHerdrsIntegration(t *testing.T) {
+	t.Run("status reports not installed", func(t *testing.T) {
+		f := newFixture(t)
+		f.installed(t)
+		f.setStatus(integrationReportMissing)
+
+		err := f.verify()
+		if !errors.Is(err, ErrIntegrationMissing) {
+			t.Fatalf("Verify = %v, want ErrIntegrationMissing", err)
+		}
+		if !strings.Contains(err.Error(), "herdr integration install omp") {
+			t.Errorf("error %q does not name the remedy", err)
+		}
+	})
+
+	t.Run("integration file absent from the effective directory", func(t *testing.T) {
+		f := newFixture(t)
+		f.installed(t)
+		if err := os.Remove(filepath.Join(f.extensionsDir(""), HerdrIntegrationFile)); err != nil {
+			t.Fatalf("remove the integration file: %v", err)
+		}
+
+		if err := f.verify(); !errors.Is(err, ErrIntegrationMissing) {
+			t.Fatalf("Verify = %v, want ErrIntegrationMissing", err)
+		}
+	})
+
+	t.Run("status command fails", func(t *testing.T) {
+		f := newFixture(t)
+		f.installed(t)
+		f.setStatus("error: command not found: herdr\n")
+		f.useStatusExit(127)
+
+		if err := f.verify(); !errors.Is(err, ErrIntegrationMissing) {
+			t.Fatalf("Verify = %v, want ErrIntegrationMissing", err)
+		}
+	})
+
+	t.Run("a canceled context stops the status call", func(t *testing.T) {
+		f := newFixture(t)
+		f.installed(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		if err := Verify(ctx, f.env, f.env["HERDR_BIN_PATH"]); !errors.Is(err, ErrIntegrationMissing) {
+			t.Fatalf("Verify with a canceled context = %v, want ErrIntegrationMissing", err)
+		}
+	})
+}
+
+func TestVerifyRefusesWithoutThePluginsExtension(t *testing.T) {
+	t.Run("absent from the effective directory", func(t *testing.T) {
+		f := newFixture(t)
+		f.installIntegration(t, "")
+
+		err := f.verify()
+		if !errors.Is(err, ErrExtensionMissing) {
+			t.Fatalf("Verify = %v, want ErrExtensionMissing", err)
+		}
+		if !strings.Contains(err.Error(), "setup action") || !strings.Contains(err.Error(), f.extensionsDir("")) {
+			t.Errorf("error %q does not name the remedy and the directory it checked", err)
+		}
+	})
+
+	t.Run("a directory is not the extension", func(t *testing.T) {
+		f := newFixture(t)
+		f.installIntegration(t, "")
+		if err := os.MkdirAll(f.extensionPath(""), 0o755); err != nil {
+			t.Fatalf("create a directory in the extension's place: %v", err)
+		}
+
+		if err := f.verify(); !errors.Is(err, ErrExtensionMissing) {
+			t.Fatalf("Verify = %v, want ErrExtensionMissing", err)
+		}
+	})
+
+	for name, content := range map[string]string{
+		"a file this plugin did not write": "// an extension this plugin did not generate\nexport default () => {};\n",
+		"an empty file":                    "",
+		"a file cut off inside the marker": ManagedMarker[:20],
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t)
+			f.installIntegration(t, "")
+			writeFile(t, f.extensionPath(""), content)
+
+			if err := f.verify(); !errors.Is(err, ErrExtensionConflict) {
+				t.Fatalf("Verify = %v, want ErrExtensionConflict", err)
+			}
+			after, err := os.ReadFile(f.extensionPath(""))
+			if err != nil {
+				t.Fatalf("read the file: %v", err)
+			}
+			if string(after) != content {
+				t.Errorf("Verify modified the file:\n%q", after)
+			}
+		})
+	}
+}
+
+// TestVerifyNeverWrites pins the check's read-only contract: refusing leaves the
+// profile byte for byte as it was, and a passing check neither refreshes a stale
+// extension nor touches Herdr's own integration file.
+func TestVerifyNeverWrites(t *testing.T) {
+	t.Run("a refusal creates nothing", func(t *testing.T) {
+		f := newFixture(t)
+		f.installIntegration(t, "")
+		before := snapshotTree(t, f.profile())
+
+		if err := f.verify(); !errors.Is(err, ErrExtensionMissing) {
+			t.Fatalf("Verify = %v, want ErrExtensionMissing", err)
+		}
+		assertAbsent(t, f.extensionPath(""))
+		assertSameTree(t, before, snapshotTree(t, f.profile()))
+	})
+
+	t.Run("a refusal for a missing integration creates nothing", func(t *testing.T) {
+		f := newFixture(t)
+		f.setStatus(integrationReportMissing)
+		if err := os.MkdirAll(f.extensionsDir(""), 0o755); err != nil {
+			t.Fatalf("create extensions dir: %v", err)
+		}
+		before := snapshotTree(t, f.profile())
+
+		if err := f.verify(); !errors.Is(err, ErrIntegrationMissing) {
+			t.Fatalf("Verify = %v, want ErrIntegrationMissing", err)
+		}
+		assertSameTree(t, before, snapshotTree(t, f.profile()))
+	})
+
+	t.Run("a stale extension is accepted and left alone", func(t *testing.T) {
+		f := newFixture(t)
+		f.installed(t)
+		stale := ManagedMarker + "\nconst PLUGIN_EXECUTABLE = \"C:\\\\moved\\\\herdr-omp-orchestrator.exe\";\n"
+		writeFile(t, f.extensionPath(""), stale)
+		before := snapshotTree(t, f.profile())
+
+		if err := f.verify(); err != nil {
+			t.Fatalf("Verify with a stale but managed extension = %v, want nil", err)
+		}
+		assertSameTree(t, before, snapshotTree(t, f.profile()))
+	})
+}
+
+func TestVerifyChecksTheEffectiveProfileOnly(t *testing.T) {
+	f := newFixture(t)
+	f.installed(t) // only the default profile is integrated and has the extension
+
+	f.env["OMP_PROFILE"] = "qa"
+	if err := f.verify(); !errors.Is(err, ErrIntegrationMissing) {
+		t.Fatalf("Verify under OMP_PROFILE=qa without its own integration = %v, want ErrIntegrationMissing", err)
+	}
+
+	f.installIntegration(t, "qa")
+	if err := f.verify(); !errors.Is(err, ErrExtensionMissing) {
+		t.Fatalf("Verify under OMP_PROFILE=qa without its own extension = %v, want ErrExtensionMissing", err)
+	}
+
+	if err := f.install(); err != nil {
+		t.Fatalf("Install under OMP_PROFILE=qa: %v", err)
+	}
+	if err := f.verify(); err != nil {
+		t.Fatalf("Verify under OMP_PROFILE=qa after setup = %v, want nil", err)
+	}
+}
+
+func TestVerifyRequiresAUsableHerdrBinary(t *testing.T) {
+	f := newFixture(t)
+	f.installed(t)
+
+	for name, binary := range map[string]string{
+		"empty":   "",
+		"missing": filepath.Join(t.TempDir(), "no-such-herdr.exe"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := Verify(context.Background(), f.env, binary); !errors.Is(err, ErrHerdrBinaryUnavailable) {
+				t.Fatalf("Verify with %s Herdr binary = %v, want ErrHerdrBinaryUnavailable", name, err)
+			}
+		})
+	}
+}
+
+// snapshotTree records every file under root with its content, so a test can
+// prove a check wrote nothing: no new file, no removed file, no changed byte.
+func snapshotTree(t *testing.T, root string) map[string]string {
+	t.Helper()
+	out := map[string]string{}
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			out[path] = "<dir>"
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		out[path] = string(data)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("snapshot %s: %v", root, err)
+	}
+	return out
+}
+
+func assertSameTree(t *testing.T, before, after map[string]string) {
+	t.Helper()
+	for path, content := range before {
+		got, ok := after[path]
+		switch {
+		case !ok:
+			t.Errorf("%s was removed", path)
+		case got != content:
+			t.Errorf("%s changed:\nbefore: %q\nafter:  %q", path, content, got)
+		}
+	}
+	for path := range after {
+		if _, ok := before[path]; !ok {
+			t.Errorf("%s was created", path)
+		}
+	}
 }
 
 func TestInstallRequiresHerdrBinaryAndStateDir(t *testing.T) {

@@ -6,6 +6,10 @@
 // beside it, after proving that Herdr's OMP integration is installed in that
 // same effective directory and that it has a usable Herdr CLI and plugin state
 // directory to embed. A failed proof changes nothing on disk.
+//
+// Verify is the read-only counterpart: it runs the same integration proof and
+// additionally requires the extension to be installed, so a caller that is about
+// to start an OMP session can refuse first. It never writes.
 package setup
 
 import (
@@ -14,6 +18,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -98,6 +103,7 @@ var (
 	ErrStateDirUnavailable    = &Error{code: "state_dir_unavailable"}
 	ErrHerdrBinaryUnavailable = &Error{code: "herdr_binary_unavailable"}
 	ErrIntegrationMissing     = &Error{code: "integration_missing"}
+	ErrExtensionMissing       = &Error{code: "extension_missing"}
 	ErrSourceUnavailable      = &Error{code: "source_unavailable"}
 	ErrExtensionConflict      = &Error{code: "extension_conflict"}
 	ErrWriteFailed            = &Error{code: "write_failed"}
@@ -199,7 +205,7 @@ func Install(env map[string]string, executable string) error {
 	if err != nil {
 		return err
 	}
-	if err := checkIntegration(env, dir, herdrBinary); err != nil {
+	if err := checkIntegration(context.Background(), env, dir, herdrBinary); err != nil {
 		return err
 	}
 
@@ -217,6 +223,33 @@ func Install(env map[string]string, executable string) error {
 		return err
 	}
 	return nil
+}
+
+// Verify proves, without writing anything, that an OMP session started now would
+// load this plugin's extension next to Herdr's own integration. It is the check
+// the bind action runs before it records or starts anything.
+//
+// It reuses Install's proof (checkIntegration) against the same effective
+// profile directory, then requires the plugin's own extension to be installed
+// there and to be ours. It never installs or refreshes anything, never touches
+// Herdr's integration file, and does not judge whether the installed copy is
+// current: the runtime handshake remains the check that the extension actually
+// loaded and speaks the bridge protocol. herdrBinary is the Herdr CLI the caller
+// uses; env is the environment the plugin action received, from which the
+// profile is resolved exactly as setup resolves it.
+func Verify(ctx context.Context, env map[string]string, herdrBinary string) error {
+	herdrBinary, err := checkExecutable(ErrHerdrBinaryUnavailable, "Herdr binary", herdrBinary)
+	if err != nil {
+		return err
+	}
+	dir, err := ExtensionDir(env)
+	if err != nil {
+		return err
+	}
+	if err := checkIntegration(ctx, env, dir, herdrBinary); err != nil {
+		return err
+	}
+	return checkExtension(dir)
 }
 
 // checkExecutable resolves path to an absolute path and requires it to be an
@@ -254,10 +287,10 @@ func checkExecutable(sentinel *Error, what, path string) (string, error) {
 //     does not scope that path by OMP profile, so this second check is what
 //     makes a named profile fail explicitly instead of silently installing an
 //     extension for an integration that is not there.
-func checkIntegration(env map[string]string, dir, herdrBinary string) error {
+func checkIntegration(ctx context.Context, env map[string]string, dir, herdrBinary string) error {
 	const remedy = "install it with `herdr integration install omp` (for the profile in the environment the plugin runs in) and re-run setup"
 
-	report, err := herdrStatus(env, herdrBinary)
+	report, err := herdrStatus(ctx, env, herdrBinary)
 	if err != nil {
 		return wrap(ErrIntegrationMissing, err, "Herdr's OMP integration status could not be read; %s", remedy)
 	}
@@ -268,6 +301,41 @@ func checkIntegration(env map[string]string, dir, herdrBinary string) error {
 	if info, err := os.Stat(integrationFile); err != nil || !info.Mode().IsRegular() {
 		return fail(ErrIntegrationMissing, "Herdr's own %s is not installed in %s (the extension directory for this profile); %s",
 			HerdrIntegrationFile, dir, remedy)
+	}
+	return nil
+}
+
+// checkExtension requires the plugin's own extension in dir, the effective
+// extension directory, and requires it to carry the managed marker: a file of
+// that name that this plugin did not write is not our extension, and setup
+// refuses to replace it for the same reason.
+func checkExtension(dir string) error {
+	const remedy = "run the plugin's setup action"
+
+	target := filepath.Join(dir, ExtensionName)
+	file, err := os.Open(target)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fail(ErrExtensionMissing, "the plugin's OMP extension %s is not installed in %s (the extension directory for this profile); %s",
+				ExtensionName, dir, remedy)
+		}
+		return wrap(ErrExtensionMissing, err, "the plugin's OMP extension %s cannot be read; %s", target, remedy)
+	}
+	defer func() { _ = file.Close() }()
+	info, err := file.Stat()
+	if err != nil {
+		return wrap(ErrExtensionMissing, err, "the plugin's OMP extension %s cannot be read; %s", target, remedy)
+	}
+	if !info.Mode().IsRegular() {
+		return fail(ErrExtensionMissing, "the plugin's OMP extension %s is not a regular file; %s", target, remedy)
+	}
+	head := make([]byte, len(ManagedMarker)+1)
+	n, err := io.ReadFull(file, head)
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		return wrap(ErrExtensionMissing, err, "the plugin's OMP extension %s cannot be read; %s", target, remedy)
+	}
+	if string(head[:n]) != ManagedMarker+"\n" {
+		return fail(ErrExtensionConflict, "%q exists but was not written by this plugin, so it is not the plugin's extension; move it away or rename it and %s", target, remedy)
 	}
 	return nil
 }
@@ -294,8 +362,8 @@ func statusReportsInstalled(report string) bool {
 
 // herdrStatus runs `herdr integration status` with a bounded report and an
 // explicit timeout, argv only, never a shell.
-func herdrStatus(env map[string]string, herdrBinary string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), statusTimeout)
+func herdrStatus(ctx context.Context, env map[string]string, herdrBinary string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, statusTimeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, herdrBinary, "integration", "status")
