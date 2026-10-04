@@ -65,3 +65,23 @@ id = "board"
 title = "Open the task board"
 contexts = ["pane", "workspace"]
 command = ["./herdr-omp-orchestrator.exe", "open-board"]
+
+# Re-establishing a lost primary is explicit and confirmed, never automatic. Bind
+# refuses to substitute a new primary for a recorded one that is gone and the
+# startup pass only records its absence; this is the one action that moves a
+# project to a replacement pane. Run it from the pane that runs the replacement
+# OMP at the repository root. Herdr runs action commands without a terminal, so
+# the action only opens the pane below, which shows what would be recorded and
+# asks for a yes before anything is written. The action passes it the pane the
+# user invoked it from, because the pane's own focus is the overlay.
+[[panes]]
+id = "reattach"
+title = "Reattach the primary"
+placement = "overlay"
+command = ["./herdr-omp-orchestrator.exe", "reattach"]
+
+[[actions]]
+id = "reattach"
+title = "Reattach the primary OMP session"
+contexts = ["pane"]
+command = ["./herdr-omp-orchestrator.exe", "open-reattach"]

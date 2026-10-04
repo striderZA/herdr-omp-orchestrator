@@ -77,7 +77,7 @@ const (
 	envPluginEventJSON = "HERDR_PLUGIN_EVENT_JSON"
 )
 
-const usage = "usage: herdr-omp-orchestrator <setup|bind|startup|event|board|open-board|bridge <method>>"
+const usage = "usage: herdr-omp-orchestrator <setup|bind|startup|event|board|open-board|reattach|open-reattach|bridge <method>>"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -98,6 +98,10 @@ func main() {
 		os.Exit(runBoard(env, os.Stdout, os.Stderr))
 	case "open-board":
 		os.Exit(runOpenBoard(env, os.Stdout, os.Stderr))
+	case "reattach":
+		os.Exit(runReattach(env, os.Stdin, os.Stdout, os.Stderr))
+	case "open-reattach":
+		os.Exit(runOpenReattach(env, os.Stdout, os.Stderr))
 	case "bridge":
 		os.Exit(runBridge(env, os.Stdin, os.Stdout, os.Stderr, os.Args[2:]))
 	default:
@@ -450,6 +454,19 @@ func herdrBinary(env map[string]string) string {
 // plugin log can classify.
 func coordCode(err error) string {
 	switch {
+	case errors.Is(err, coord.ErrReattachPending):
+		// Checked first: a pending reattach wraps the cause that left it pending
+		// (a readiness timeout, a refused notice), and the caller must hear that
+		// the replacement is recorded but unconfirmed, not only why.
+		return "reattach_pending"
+	case errors.Is(err, coord.ErrPrimaryLive):
+		return "primary_live"
+	case errors.Is(err, coord.ErrAlreadyBound):
+		return "already_bound"
+	case errors.Is(err, coord.ErrReplacementBusy):
+		return "replacement_busy"
+	case errors.Is(err, coord.ErrEvidenceChanged):
+		return "evidence_changed"
 	case errors.Is(err, coord.ErrInvalidRequest):
 		return "bad_request"
 	case errors.Is(err, coord.ErrNotGitRepository):
