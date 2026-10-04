@@ -101,12 +101,14 @@
       powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\acceptance_windows.ps1 -Scenario SingleWorker
       powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\acceptance_windows.ps1 -Scenario SingleWorker -ScenarioTimeoutSeconds 600
       powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\acceptance_windows.ps1 -KeepResources
+      powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\acceptance_windows.ps1 -Model openai-codex/gpt-6-luna
+      powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\acceptance_windows.ps1 -Model ''
       powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\acceptance_windows.ps1 -RetireStaleAcceptanceRunId 1ad8af22
 #>
 [CmdletBinding()]
 param(
     # Multiplies every bounded wait. Raise it on a slow machine or when the
-    # configured OMP model is under load.
+    # OMP model (pinned with -Model, or OMP's default) is under load.
     [double]$TimeoutScale = 1.0,
     # The focused path exercises one task from dispatch through report and review.
     [ValidateSet('Full', 'SingleWorker')]
@@ -122,6 +124,12 @@ param(
     # Do everything else, but keep the plugin's state rows (the store keeps the
     # task facts that explain what the run observed).
     [switch]$SkipStateCleanup,
+    # The OMP model every session of this run uses, spelled as `omp --model`
+    # spells it (provider/id, optionally :thinking). Herdr starts the primary and
+    # every worker from the isolated server, so the model is pinned in that
+    # server's environment only; the user's own OMP settings are never touched.
+    # Empty leaves each session on whatever model OMP is configured to default to.
+    [string]$Model = 'openai-codex/gpt-6-luna',
     # Explicitly authorize cleanup of only this verified acceptance run ID;
     # this may close its workspace group and stop its session, never the default.
     [string]$RetireStaleAcceptanceRunId = ''
@@ -133,6 +141,11 @@ $ProgressPreference = 'SilentlyContinue'
 if ($RetireStaleAcceptanceRunId -and $RetireStaleAcceptanceRunId -notmatch '^[0-9a-fA-F]{8}$') {
     throw 'RetireStaleAcceptanceRunId must be one exact eight-character acceptance run ID'
 }
+$script:OmpModelPattern = '^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._/-]*(:(off|minimal|low|medium|high|xhigh|max|auto))?\z'
+if ($Model -and $Model -notmatch $script:OmpModelPattern) {
+    throw "Model must be spelled provider/model[:thinking] (for example openai-codex/gpt-6-luna), got '$Model'"
+}
+$script:OmpModel = $Model
 
 # ---------------------------------------------------------------------------
 # run identity and paths
@@ -171,6 +184,7 @@ $script:RunLockPath = ''
 $script:ServerLog = Join-Path $script:WorkRoot 'herdr-server.log'
 $script:ServerErr = Join-Path $script:WorkRoot 'herdr-server.err'
 $script:ConfigPath = Join-Path $script:WorkRoot 'herdr-config.toml'
+$script:OmpModelOverlayPath = Join-Path $script:WorkRoot 'omp-model-overlay.yml'
 $script:RepoPath = Join-Path $script:WorkRoot 'repo'
 $script:WorktreesRoot = Join-Path $script:WorkRoot 'worktrees'
 $script:StateHelper = Join-Path $script:ReportDir 'state_query.py'
@@ -2216,6 +2230,135 @@ function Test-SessionIdentity {
     return ($leftSeen -and $rightSeen)
 }
 
+# ---------------------------------------------------------------------------
+# OMP model pinning
+# ---------------------------------------------------------------------------
+# Herdr starts every OMP agent (the primary and each worker) from the isolated
+# server this script launches, and those agents inherit the server's environment.
+# -Model is therefore pinned there, as a one-file OMP config overlay named by
+# PI_CONFIG_FILES. The overlay outranks the user's global and project settings for
+# these processes only; nothing under the user's OMP profile is written.
+
+function Get-OmpModelOverlayText {
+    param([Parameter(Mandatory)][string]$Model)
+    # Checked again here because the value is written into a YAML file.
+    if ($Model -notmatch $script:OmpModelPattern) {
+        throw "'$Model' is not an OMP model spelled provider/model[:thinking]"
+    }
+    return "modelRoles:`n  default: `"$Model`"`n"
+}
+
+function Join-OmpConfigFiles {
+    <#
+        PI_CONFIG_FILES is a platform path list: OMP loads its files in order and a
+        later file wins. The overlay goes last so it outranks anything the invoking
+        user already lists there, and it appears once even if they listed it.
+    #>
+    param([string]$Existing, [Parameter(Mandatory)][string]$Overlay)
+    $separator = [string][System.IO.Path]::PathSeparator
+    $files = New-Object System.Collections.ArrayList
+    foreach ($entry in @($Existing -split [regex]::Escape($separator))) {
+        if ([string]::IsNullOrWhiteSpace($entry) -or $entry -ieq $Overlay) { continue }
+        if ($files -notcontains $entry) { [void]$files.Add($entry) }
+    }
+    [void]$files.Add($Overlay)
+    return ($files -join $separator)
+}
+
+function Get-OmpConfigFilesValue {
+    return (Join-OmpConfigFiles -Existing ([string]$env:PI_CONFIG_FILES) -Overlay $script:OmpModelOverlayPath)
+}
+
+function Get-OmpTranscriptModels {
+    <#
+        The distinct provider/model pairs that produced the assistant turns of one
+        OMP transcript, in first-seen order. Every assistant message records the
+        provider and model that generated it, so the transcript is the record of
+        what a session ran on (the config overlay is only a request). Unreadable or
+        half-written lines are skipped; a missing file has no models.
+    #>
+    param([string]$Path)
+    $models = New-Object System.Collections.ArrayList
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return @() }
+    $stream = $null
+    $reader = $null
+    try {
+        $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        $reader = New-Object System.IO.StreamReader($stream)
+        while ($null -ne ($line = $reader.ReadLine())) {
+            try { $entry = ConvertFrom-Json -InputObject $line -ErrorAction Stop } catch { continue }
+            if ([string](Get-Field $entry 'type') -cne 'message') { continue }
+            $message = Get-Field $entry 'message'
+            if ([string](Get-Field $message 'role') -cne 'assistant') { continue }
+            $provider = [string](Get-Field $message 'provider')
+            $model = [string](Get-Field $message 'model')
+            if ($provider -eq '' -or $model -eq '') { continue }
+            $pair = "$provider/$model"
+            if ($models -notcontains $pair) { [void]$models.Add($pair) }
+        }
+    } catch {
+        # A transcript that cannot be read proves nothing beyond what was seen.
+    } finally {
+        if ($reader) { $reader.Dispose() }
+        elseif ($stream) { $stream.Dispose() }
+    }
+    return @($models)
+}
+
+function Test-OmpTranscriptModels {
+    <#
+        True when the transcript holds at least one assistant turn and every turn
+        was produced by the pinned model. The :thinking suffix is a request setting,
+        not part of the model id a turn records.
+    #>
+    param([string]$Path, [Parameter(Mandatory)][string]$Model)
+    $expected = $Model -replace ':(off|minimal|low|medium|high|xhigh|max|auto)\z', ''
+    $seen = @(Get-OmpTranscriptModels -Path $Path)
+    if ($seen.Count -eq 0) { return $false }
+    return (@($seen | Where-Object { $_ -ne $expected }).Count -eq 0)
+}
+
+function Assert-OmpSessionModel {
+    <#
+        Evidence that one session really ran on the pinned model, read from the
+        transcript its readiness handshake announced. With a model pinned this fails
+        closed: no handshake, an id-only reference whose transcript cannot be read
+        from here, an unreadable transcript, or any turn on another model is a FAIL,
+        never a pass on faith. With no model pinned, the model OMP chose is recorded
+        as INFO.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Id,
+        [Parameter(Mandatory)][string]$What,
+        [Parameter(Mandatory)][string]$LaunchPaneId,
+        [string]$TaskId = ''
+    )
+    $handshake = Get-ReadySession -LaunchPaneId $LaunchPaneId
+    $path = [string](Get-Field $handshake 'omp_session_file')
+    if ($path -notmatch '\.jsonl$' -and $path -notmatch '[\\/]') {
+        $evidence = "launch pane=[$LaunchPaneId] handshake=[$(if ($null -eq $handshake) { 'none' } else { 'present' })] announced file=[$path]"
+        if ($script:OmpModel) {
+            [void](Assert-True -Id $Id -What $What -Condition $false -TaskId $TaskId -Evidence "$evidence (no readable transcript path, so the requested model cannot be proven)")
+        } else {
+            [void](Add-Assertion -Id $Id -What "$What (no model pinned; the session reference has no readable transcript path)" -Status 'INFO' -TaskId $TaskId -Evidence $evidence)
+        }
+        return
+    }
+    # The transcript is flushed as turns finish, so give the last one a moment.
+    [void](Wait-Until -TimeoutSeconds 30 -IntervalSeconds 3 -What "an assistant turn in $path" -Probe {
+        $now = @(Get-OmpTranscriptModels -Path $path)
+        if ($now.Count -gt 0) { return ($now -join ', ') }
+        return $null
+    })
+    $seen = @(Get-OmpTranscriptModels -Path $path)
+    $evidence = "pinned=[$($script:OmpModel)] seen=[$($seen -join ', ')] file=[$path]"
+    if (-not $script:OmpModel) {
+        [void](Add-Assertion -Id $Id -What "$What (no model pinned; recording the model OMP chose)" -Status 'INFO' -TaskId $TaskId -Evidence $evidence)
+        return
+    }
+    [void](Assert-True -Id $Id -What $What -Condition (Test-OmpTranscriptModels -Path $path -Model $script:OmpModel) -TaskId $TaskId -Evidence $evidence)
+}
+
 function Test-OmpSessionMaterialized {
     # A path-shaped session reference is materialized only when the file exists;
     # an id-shaped reference cannot be proven from here (the store records the
@@ -3204,6 +3347,11 @@ function New-RunServerStartInfo {
     # The isolated server must not inherit the invoking pane's caller identity or
     # configuration. Reapply only this run's dedicated config path.
     $psi.EnvironmentVariables['HERDR_CONFIG_PATH'] = $script:ConfigPath
+    # Every OMP agent this server starts, primary and workers alike, inherits this;
+    # it is how -Model reaches them. Left alone when no model is pinned.
+    if ($script:OmpModel) {
+        $psi.EnvironmentVariables['PI_CONFIG_FILES'] = Get-OmpConfigFilesValue
+    }
     return $psi
 }
 
@@ -3246,6 +3394,23 @@ directory = "$($script:WorktreesRoot.Replace('\', '/'))"
 "@
     Set-Content -LiteralPath $script:ConfigPath -Value $config -Encoding UTF8
     Assert-True -Id 'S1.2' -What 'the run config points Herdr worktrees at the run temp root' -Condition (Test-Path -LiteralPath $script:ConfigPath) -Evidence $script:ConfigPath
+
+    if ($script:OmpModel) {
+        [System.IO.File]::WriteAllText($script:OmpModelOverlayPath, (Get-OmpModelOverlayText -Model $script:OmpModel), (New-Object System.Text.UTF8Encoding($false)))
+        # Prove OMP honors the overlay before anything runs on it: a silently ignored
+        # overlay would run the whole suite on a model nobody asked for.
+        $omp = Get-Command omp -ErrorAction SilentlyContinue
+        if (-not $omp) { throw 'omp is not on PATH; the model overlay cannot be verified and the agents cannot start' }
+        $overlayProbe = Invoke-Native -File $omp.Source -Arguments @('config', 'get', 'modelRoles', '--json') `
+            -Environment @{ 'PI_CONFIG_FILES' = (Get-OmpConfigFilesValue) } -TimeoutSeconds 60
+        $resolvedModel = ''
+        try { $resolvedModel = [string](Get-Field (Get-Field ($overlayProbe.Stdout | ConvertFrom-Json) 'value') 'default') } catch { }
+        Assert-Equal -Id 'S1.2b' -What 'OMP resolves the run overlay as its default model role' -Expected $script:OmpModel -Actual $resolvedModel `
+            -Command $overlayProbe.CommandLine -Evidence ("overlay=$($script:OmpModelOverlayPath) stderr=[" + (Protect-Text $overlayProbe.Stderr 300) + "]")
+        if ($resolvedModel -cne $script:OmpModel) { throw "OMP did not apply the model overlay (resolved '$resolvedModel'); refusing to run on a model that was not requested" }
+    } else {
+        Add-Assertion -Id 'S1.2b' -What 'no model is pinned; every session uses the default of the OMP profile' -Status 'INFO'
+    }
 
     [void](Start-RunServer)
     $ready = Wait-Until -TimeoutSeconds 60 -IntervalSeconds 2 -What 'our session server' -Probe {
@@ -3651,6 +3816,7 @@ function Invoke-PrimaryTurn {
     } else {
         Assert-True -Id 'N7.3' -What 'the OMP session is now materialized on disk' -Condition $true -Evidence ("session=$($script:MaterializedSession) after=$($materialized.Elapsed)s")
     }
+    Assert-OmpSessionModel -Id 'N7.4' -What 'the primary session ran on the requested model' -LaunchPaneId $script:PrimaryPane
 
     $context = @{
         'HERDR_ENV'          = '1'
@@ -3857,6 +4023,7 @@ BRIEF: $brief
         -Condition ($result.ExitCode -eq 0) -Command $result.CommandLine `
         -Evidence ("code=[$($result.Code)] blocked=[$($result.Blocked)] stderr=[" + (Protect-Text $result.Stderr 300) + "]")
     if ($result.ExitCode -ne 0) { throw 'single-worker dispatch prompt was not accepted' }
+    Assert-OmpSessionModel -Id 'SW0.1b' -What 'the primary session ran on the requested model' -LaunchPaneId $script:PrimaryPane
 
     $wait = Wait-ForTasks -Count 1 -TimeoutSeconds 300
     Assert-True -Id 'SW0.2' -What 'exactly one task was created for the bound project' `
@@ -5296,6 +5463,8 @@ function Invoke-WorkerReports {
         $dump = Get-StateDump
         $note = @($dump.tables.inbox | Where-Object { (Get-Field $_ 'task_id') -eq $id -and (Get-Field $_ 'kind') -eq 'result' })
         Assert-Equal -Id "W3.$($pair.Name)-note" -What 'exactly one result note was recorded for the primary' -Expected 1 -Actual $note.Count -TaskId $id
+        Assert-OmpSessionModel -Id "W2.$($pair.Name)-model" -What "worker $($pair.Name) ran on the requested model" `
+            -LaunchPaneId ([string](Get-Field $reported 'LaunchPaneID')) -TaskId $id
     }
 
     # The reported evidence must be true of the real checkout.
