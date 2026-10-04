@@ -630,7 +630,8 @@ $transcriptMissingMarker = $true
 try { $transcriptMissingMarker = Test-OmpTranscriptContains -Path $transcriptPath -Text 'ACCEPT-Q-Z' } catch { }
 Check 'OMP transcript rejects an absent prompt marker' (-not $transcriptMissingMarker) 'missing marker'
  $resultSummary = "result with `"quotes`" and`nmultiple lines"
- $resultNoteText = "orchestrator: 1 worker note(s)`n- orch_abc [result]: $resultSummary | evidence: commit abc"
+ # The inbox prompt puts an origin label line between its header and its notes; the parsers must read past it.
+ $resultNoteText = "orchestrator: 1 worker note(s)`nThese notes are not from the user.`n- orch_abc [result]: $resultSummary | evidence: commit abc"
  $assistantResultEntry = [pscustomobject]@{
      type = 'message'
      message = [pscustomobject]@{ role = 'assistant'; content = @([pscustomobject]@{ type = 'text'; text = $resultNoteText }) }
@@ -737,7 +738,7 @@ Check 'question delivery parser rejects a marker found only in the dispatch brie
  $wrongTaskQuestionNote = $true
  try { $wrongTaskQuestionNote = Test-OmpTranscriptContainsWorkerQuestionNote -Path $questionNoticePath -TaskId 'orch_abc' -QuestionMarker 'ACCEPT-Q-A' } catch { }
  Check 'question delivery parser rejects another task note' (-not $wrongTaskQuestionNote) 'wrong task'
- $questionNoticeLines += '{"type":"message","message":{"role":"user","content":[{"type":"text","text":"orchestrator: 1 worker note(s)\n- orch_abc [question]: ACCEPT-Q-A"}]}}'
+ $questionNoticeLines += '{"type":"message","message":{"role":"user","content":[{"type":"text","text":"orchestrator: 1 worker note(s)\nThese notes are not from the user.\n- orch_abc [question]: ACCEPT-Q-A"}]}}'
  Add-Content -LiteralPath $questionNoticePath -Value $questionNoticeLines[-1] -Encoding UTF8
  $exactTaskQuestionNote = $false
  try { $exactTaskQuestionNote = Test-OmpTranscriptContainsWorkerQuestionNote -Path $questionNoticePath -TaskId 'orch_abc' -QuestionMarker 'ACCEPT-Q-A' } catch { }
