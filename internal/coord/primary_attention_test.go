@@ -107,7 +107,7 @@ func TestReconcileRecordsAnAbsentPrimaryAndLeavesWorkersAndInboxAlone(t *testing
 
 			// A repeated pass over the same Herdr state records the same fact.
 			f.mustReconcile(t)
-			if again := f.boundProject(t); again != project {
+			if again := f.boundProject(t); !reflect.DeepEqual(again, project) {
 				t.Fatalf("a repeated pass rewrote the project:\n got %+v\nwant %+v", again, project)
 			}
 			if got := f.inboxRows(t); !reflect.DeepEqual(got, inboxBefore) {
@@ -301,7 +301,7 @@ func TestPrimaryMoveRetiresButNeverRecordsThePrimaryAttention(t *testing.T) {
 			t.Fatalf("err = %v, want ErrPrimaryNotLive", err)
 		}
 		after := f.boundProject(t)
-		if after != project {
+		if !reflect.DeepEqual(after, project) {
 			t.Fatalf("a refused move changed the project:\n got %+v\nwant %+v", after, project)
 		}
 		if notes := f.notesOfKind(t, noteKindAttention); len(notes) != notesBefore+1 {
@@ -446,7 +446,7 @@ func TestApplyPrimaryPaneDecidesAgainstTheStoredRow(t *testing.T) {
 		if err := f.coord.applyPrimaryPane(context.Background(), snapshot, probe); err != nil {
 			t.Fatalf("applyPrimaryPane: %v", err)
 		}
-		if after := f.boundProject(t); after != recorded {
+		if after := f.boundProject(t); !reflect.DeepEqual(after, recorded) {
 			t.Fatalf("a stale reconcile overwrote a newer move:\n got %+v\nwant %+v", after, recorded)
 		}
 	})

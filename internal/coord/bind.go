@@ -339,25 +339,26 @@ func (c *Coordinator) reopenPrimary(ctx context.Context, existing task.Project) 
 	}
 	if strings.TrimSpace(paneID) == "" {
 		return existing, c.refuseReopen(ctx, existing, "the project records no primary pane",
-			fmt.Errorf("%w: project %s records no pane", ErrPrimaryNotLive, existing.Key))
+			fmt.Errorf("%w: project %s records no pane; %s", ErrPrimaryNotLive, existing.Key, reattachHint))
 	}
 	pane, err := c.paneGet(ctx, paneID)
 	switch {
 	case isMissingTarget(err):
 		return existing, c.refuseReopen(ctx, existing,
 			fmt.Sprintf("the recorded primary pane %s no longer exists", paneID),
-			fmt.Errorf("%w: the recorded primary pane %s no longer exists; relaunch the primary explicitly", ErrPrimaryNotLive, paneID))
+			fmt.Errorf("%w: the recorded primary pane %s no longer exists; bind never substitutes a new primary, so %s",
+				ErrPrimaryNotLive, paneID, reattachHint))
 	case err != nil:
 		return existing, err
 	case !samePath(pane.Cwd, existing.Key):
 		return existing, c.refuseReopen(ctx, existing,
 			fmt.Sprintf("the recorded primary pane %s works in %s, not the bound repository %s", paneID, pane.Cwd, existing.Key),
-			fmt.Errorf("%w: the recorded primary pane %s works in %s, not the bound repository %s",
-				ErrPrimaryNotLive, paneID, pane.Cwd, existing.Key))
+			fmt.Errorf("%w: the recorded primary pane %s works in %s, not the bound repository %s; %s",
+				ErrPrimaryNotLive, paneID, pane.Cwd, existing.Key, reattachHint))
 	case paneHostsAgent(pane) && !strings.EqualFold(pane.Agent, c.opts.AgentKind):
 		return existing, c.refuseReopen(ctx, existing,
 			fmt.Sprintf("the recorded primary pane %s now runs %q", paneID, pane.Agent),
-			fmt.Errorf("%w: the recorded primary pane %s now runs %q", ErrPrimaryNotLive, paneID, pane.Agent))
+			fmt.Errorf("%w: the recorded primary pane %s now runs %q; %s", ErrPrimaryNotLive, paneID, pane.Agent, reattachHint))
 	}
 	if pane.PaneID != existing.PublicPaneID || pane.WorkspaceID != existing.CurrentWorkspaceID {
 		// Herdr resolved a moved pane to its current public identity. The

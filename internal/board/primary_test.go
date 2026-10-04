@@ -235,7 +235,7 @@ func TestBoardModelShowsAndRetiresThePrimaryMarkerFromTheStore(t *testing.T) {
 	if after := f.snapshot(); !reflect.DeepEqual(after, before) {
 		t.Fatalf("showing the marker wrote to a task:\n got %+v\nwant %+v", after, before)
 	}
-	if now, err := f.store.Project(context.Background(), f.project); err != nil || now != project {
+	if now, err := f.store.Project(context.Background(), f.project); err != nil || !reflect.DeepEqual(now, project) {
 		t.Fatalf("the project after the marker came and went = (%+v, %v), want %+v", now, err, project)
 	}
 	if calls := f.calls(); len(calls) != 0 {
