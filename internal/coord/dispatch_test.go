@@ -1314,7 +1314,7 @@ func (f *coordFixture) satisfyReview(st task.Task) task.Task {
 			Summary:  "done",
 			Branch:   next.Branch,
 			Evidence: []string{"commit " + f.base},
-			Checks:   []string{"go test ./... ok"},
+			Checks:   []task.Check{{Name: "go test ./...", Outcome: task.CheckPassed}},
 			Risk:     "none",
 		}
 		return nil

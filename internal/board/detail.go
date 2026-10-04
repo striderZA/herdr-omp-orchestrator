@@ -58,7 +58,7 @@ func pageLines(card Card, width int, th Theme) []string {
 			out = append(out, wrap("Evidence: "+singleLine(item), width)...)
 		}
 		for _, item := range report.Checks {
-			out = append(out, wrap("Check: "+singleLine(item), width)...)
+			out = append(out, wrap("Check: "+singleLine(item.Label()), width)...)
 		}
 		if risk := singleLine(report.Risk); risk != "" {
 			add("Risk", risk)

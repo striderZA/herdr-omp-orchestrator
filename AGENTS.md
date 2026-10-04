@@ -64,6 +64,7 @@ The hooks require Conventional Commit subjects (`<type>(optional-scope): <short 
 - Pass `context.Context` through external operations and bound subprocess/protocol calls. Herdr commands use `exec` with argv, not shell strings; enforce input/output limits where the protocol defines them.
 - Compare stable errors by code or with `errors.Is`/`errors.As`, not by matching prose. Preserve the bridge's JSON envelope and protocol version when changing either side of the Go/TypeScript seam.
 - Treat durable records as facts and derived views as projections. Do not infer task completion from Herdr's idle/done activity; a final report and explicit disposition drive the task lifecycle. Event hooks apply one observation; reconciliation handles missed events/restarts.
+- A final report's checks are `task.Check` values that each state an outcome (`passed`, `failed` or `skipped`); `coord.validateReport` is the one place that requires it (ADR 0003). A report stored with free-text checks decodes to checks with no outcome and is rendered as recorded: never invent an outcome for one. Change the extension schema, the worker instructions and the Go validation together.
 - Keep `internal/state` as the persistence writer. Inject narrow client interfaces where a package needs Herdr behavior, and maintain fail-closed identity checks and explicit user confirmation for input injection or destructive cleanup.
 - TypeScript schemas must use factory defaults for mutable values (for example, `.default(() => [])`), not shared mutable defaults.
 

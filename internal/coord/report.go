@@ -274,8 +274,11 @@ type ReportParams struct {
 	Summary  string   `json:"summary"`
 	Branch   string   `json:"branch"`
 	Evidence []string `json:"evidence"`
-	Checks   []string `json:"checks"`
-	Risk     string   `json:"risk"`
+	// Checks are the checks the worker ran, each with the outcome it states. A
+	// bare string decodes as a check that states none, which validateReport
+	// refuses as an incomplete report rather than as a malformed body.
+	Checks []task.Check `json:"checks"`
+	Risk   string       `json:"risk"`
 }
 
 // Report projects the wire body onto the durable report.
@@ -406,8 +409,13 @@ type ReportPreview struct {
 	Summary  string     `json:"summary"`
 	Branch   string     `json:"branch"`
 	Evidence []string   `json:"evidence"`
-	Checks   []string   `json:"checks"`
-	Risk     string     `json:"risk"`
+	// Checks is one line per recorded check, as task.Check.Label renders it: the
+	// check's own text for a report from before outcomes were required, and
+	// "name: outcome (detail)" for one that states them. It stays a list of strings
+	// so the review confirmation, and an extension that predates outcomes, read
+	// it as they always have.
+	Checks []string `json:"checks"`
+	Risk   string   `json:"risk"`
 }
 
 // ReviewResult is the answer to one recorded disposition.
@@ -646,7 +654,7 @@ func validateReport(report task.Report, st task.Task) (task.Report, error) {
 	if err != nil {
 		return invalid("%v", err)
 	}
-	checks, err := boundedList(report.Checks, reportChecksLimit, reportTextLimit, "the checks and their outcomes")
+	checks, err := validateChecks(report.Checks)
 	if err != nil {
 		return invalid("%v", err)
 	}
@@ -670,7 +678,7 @@ func reportNote(report task.Report) string {
 	return truncateRunes(strings.Join(nonEmpty(
 		report.Summary,
 		"evidence: "+strings.Join(report.Evidence, "; "),
-		"checks: "+strings.Join(report.Checks, "; "),
+		"checks: "+strings.Join(task.CheckLabels(report.Checks), "; "),
 		"risk: "+report.Risk,
 	), " | "), inboxSummaryLimit)
 }
@@ -986,7 +994,7 @@ func (c *Coordinator) ReportPreview(ctx context.Context, primaryLaunchPaneID, ta
 	return ReportPreview{
 		TaskID: st.ID, Revision: st.Revision, Stage: task.StageOf(st),
 		Summary: report.Summary, Branch: report.Branch, Evidence: report.Evidence,
-		Checks: report.Checks, Risk: report.Risk,
+		Checks: task.CheckLabels(report.Checks), Risk: report.Risk,
 	}, nil
 }
 
@@ -1991,8 +1999,54 @@ func boundedText(value string, limit int, what string) (string, error) {
 	return text, nil
 }
 
+// validateChecks bounds the checks a result reports and requires each one to say
+// how it ended. This is the single place that decides a check is complete: the
+// extension's schema and the worker's instructions ask for the same thing, but a
+// call that never went through them is refused here all the same.
+//
+// A worker reads a refusal to correct its next call, so each one names the check
+// by its position and name and lists the outcomes it may state.
+func validateChecks(checks []task.Check) ([]task.Check, error) {
+	const what = "the checks and their outcomes"
+	if len(checks) > reportChecksLimit {
+		return nil, fmt.Errorf("%s names %d entries, at most %d are accepted", what, len(checks), reportChecksLimit)
+	}
+	outcomes := task.CheckOutcomes()
+	vocabulary := strings.Join(outcomes[:len(outcomes)-1], ", ") + " or " + outcomes[len(outcomes)-1]
+	out := make([]task.Check, 0, len(checks))
+	for i, check := range checks {
+		position := i + 1
+		name, err := textField(check.Name, reportTextLimit, fmt.Sprintf("the name of check %d", position))
+		if err != nil {
+			return nil, err
+		}
+		outcome := strings.TrimSpace(check.Outcome)
+		switch {
+		case outcome == "":
+			return nil, fmt.Errorf("check %d (%q) states no outcome; state %s", position, name, vocabulary)
+		case !task.ValidCheckOutcome(outcome):
+			return nil, fmt.Errorf("check %d (%q) has outcome %q, which is not one of %s",
+				position, name, truncateRunes(outcome, 40), vocabulary)
+		}
+		clean := task.Check{Name: name, Outcome: outcome}
+		// A detail is optional, so a blank one is no detail rather than an error.
+		if strings.TrimSpace(check.Detail) != "" {
+			detail, err := textField(check.Detail, reportTextLimit, fmt.Sprintf("the detail of check %d", position))
+			if err != nil {
+				return nil, err
+			}
+			clean.Detail = detail
+		}
+		out = append(out, clean)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("%s is empty", what)
+	}
+	return out, nil
+}
+
 // boundedList bounds one required list of human-supplied strings. It refuses an
-// empty list: a report with no evidence and no checks is not a report.
+// empty list: a report with no evidence is not a report.
 func boundedList(values []string, maxItems, maxLength int, what string) ([]string, error) {
 	if len(values) > maxItems {
 		return nil, fmt.Errorf("%s names %d entries, at most %d are accepted", what, len(values), maxItems)

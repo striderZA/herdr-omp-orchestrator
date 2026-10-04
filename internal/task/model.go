@@ -34,10 +34,14 @@ const (
 	PromptSubmitted Phase = "prompt_submitted"
 )
 
-// Report is a worker's self-reported outcome. Only Kind "result" is final.
+// Report is a worker's self-reported outcome. Only Kind "result" is final. A
+// final report's Checks each state how they ended; a report stored before that
+// was required holds free-text checks, which read as checks without an outcome
+// (see Check).
 type Report struct {
 	Kind, Summary, Branch string
-	Evidence, Checks      []string
+	Evidence              []string
+	Checks                []Check
 	Risk                  string
 }
 

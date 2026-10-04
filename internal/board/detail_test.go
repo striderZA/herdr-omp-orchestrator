@@ -158,3 +158,59 @@ func mustCard(t *testing.T, m *Model) Card {
 	}
 	return card
 }
+
+// A report stored with free-text checks shows them exactly as it always did; a
+// report that states outcomes shows each outcome (and its detail) next to the
+// check, on the detail page and in the expanded card. Both come from one stored
+// task, so this is also the "legacy rows render unchanged" guarantee.
+func TestCheckOutcomesAreShownAndLegacyChecksAreNot(t *testing.T) {
+	report := func(checks ...task.Check) func(*task.Task) {
+		return func(x *task.Task) {
+			x.Report = &task.Report{
+				Kind: "result", Summary: "done", Branch: x.Branch,
+				Evidence: []string{"commit 4a5b6c7"}, Checks: checks, Risk: "none",
+			}
+		}
+	}
+	legacy := Card{Task: sampleTask("orch_lg", report(
+		task.Check{Name: "go test ./internal/parser ok"},
+		task.Check{Name: "gofmt -l . (no output)"},
+	))}
+	stated := Card{Task: sampleTask("orch_st", report(
+		task.Check{Name: "go test ./...", Outcome: task.CheckPassed},
+		task.Check{Name: "go vet ./...", Outcome: task.CheckFailed, Detail: "2 findings"},
+		task.Check{Name: "golangci-lint run", Outcome: task.CheckSkipped, Detail: "not installed"},
+	))}
+
+	page := func(card Card) string {
+		return strings.Join(pageLines(card, 200, Theme{}), "\n")
+	}
+	for _, want := range []string{"Check: go test ./internal/parser ok", "Check: gofmt -l . (no output)"} {
+		if got := page(legacy); !strings.Contains(got, want) {
+			t.Errorf("a legacy report's page changed; it no longer shows %q:\n%s", want, got)
+		}
+	}
+	for _, want := range []string{
+		"Check: go test ./...: passed",
+		"Check: go vet ./...: failed (2 findings)",
+		"Check: golangci-lint run: skipped (not installed)",
+	} {
+		if got := page(stated); !strings.Contains(got, want) {
+			t.Errorf("the page does not show %q:\n%s", want, got)
+		}
+	}
+	if got := page(legacy); strings.Contains(got, "passed") || strings.Contains(got, "failed") || strings.Contains(got, "skipped") {
+		t.Errorf("a legacy report's page claims an outcome nobody recorded:\n%s", got)
+	}
+
+	card := func(c Card) string {
+		return Render(NewBoard([]Card{c}), Detail{SelectedID: c.ID(), Expanded: true}, 200, Theme{})
+	}
+	if got := card(legacy); !strings.Contains(got, "Checks: go test ./internal/parser ok, gofmt -l . (no output)") {
+		t.Errorf("a legacy report's expanded card changed:\n%s", got)
+	}
+	if got := card(stated); !strings.Contains(got,
+		"Checks: go test ./...: passed, go vet ./...: failed (2 findings), golangci-lint run: skipped (not installed)") {
+		t.Errorf("the expanded card does not show the outcomes:\n%s", got)
+	}
+}

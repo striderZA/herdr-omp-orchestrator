@@ -39,7 +39,7 @@ func TestProjectionKeepsFiveColumnsAndNeverDerivesStageFromActivity(t *testing.T
 			Summary:  "the parser and its tests are done",
 			Branch:   "orch/orch_v4",
 			Evidence: []string{"commit 4a5b6c7 on orch/orch_v4", "file internal/parser/parse.go"},
-			Checks:   []string{"go test ./internal/parser ok"},
+			Checks:   []task.Check{{Name: "go test ./internal/parser ok"}}, // a legacy check: free text, no outcome
 			Risk:     "no coverage for malformed input",
 		}
 	})
@@ -301,7 +301,7 @@ func TestBoardSelectionShowsTheTaskFacts(t *testing.T) {
 			Summary:  "the parser and its tests are done",
 			Branch:   "orch/orch_r2",
 			Evidence: []string{"commit 4a5b6c7 on orch/orch_r2", "file internal/parser/parse.go"},
-			Checks:   []string{"go test ./internal/parser ok"},
+			Checks:   []task.Check{{Name: "go test ./internal/parser ok"}}, // a legacy check: free text, no outcome
 			Risk:     "no coverage for malformed input",
 		}
 		x.Activity = "working"

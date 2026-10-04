@@ -532,7 +532,7 @@ func detailLines(b *Board, d Detail, width int, th Theme) []string {
 				out = append(out, wrap("Evidence: "+singleLine(strings.Join(report.Evidence, ", ")), width)...)
 			}
 			if len(report.Checks) > 0 {
-				out = append(out, wrap("Checks: "+singleLine(strings.Join(report.Checks, ", ")), width)...)
+				out = append(out, wrap("Checks: "+singleLine(strings.Join(task.CheckLabels(report.Checks), ", ")), width)...)
 			}
 			if risk := singleLine(report.Risk); risk != "" {
 				out = append(out, wrap("Risk: "+risk, width)...)

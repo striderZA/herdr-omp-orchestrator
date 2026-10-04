@@ -331,7 +331,7 @@ if (!report) {
     summary: "done",
     branch: "orch/abc",
     evidence: ["commit abc"],
-    checks: ["go test ./..."],
+    checks: [{ name: "go test ./...", outcome: "passed" }],
     risk: "none: no new path is reachable",
   };
   const parsed = tryParse(schema, valid);
@@ -344,11 +344,45 @@ if (!report) {
         : undefined;
     check(kind === "result", `orch_report accepted kind ${JSON.stringify(kind)}`);
     const checks = arrayField(parsed.value, "checks");
+    const first = checks !== null && checks.length === 1 ? checks[0] : null;
     check(
-      checks !== null && checks.length === 1,
-      `orch_report checks round trip = ${JSON.stringify(checks)}, want the submitted checks`,
+      typeof first === "object" && first !== null && "name" in first && first.name === "go test ./..." &&
+        "outcome" in first && first.outcome === "passed",
+      `orch_report checks round trip = ${JSON.stringify(checks)}, want the submitted checks with their outcomes`,
     );
   }
+  // Every check says how it ended (issue #20, ADR 0003). The executable refuses a
+  // check without an outcome as invalid_report; the schema asks for it up front.
+  for (const outcome of ["passed", "failed", "skipped"]) {
+    check(
+      tryParse(schema, { ...valid, checks: [{ name: "go vet ./...", outcome, detail: "2 findings" }] }).ok,
+      `orch_report rejected a check whose outcome is ${outcome}`,
+    );
+  }
+  check(
+    tryParse(schema, { ...valid, checks: [{ name: "go vet ./...", outcome: "passed", detail: "" }] }).ok,
+    "orch_report rejected a check with a blank detail; the executable reads that as no detail",
+  );
+  for (const [what, checks] of [
+    ["a bare string, as before outcomes existed", ["go test ./..."]],
+    ["a check with no outcome", [{ name: "go test ./..." }]],
+    ["a check with a blank outcome", [{ name: "go test ./...", outcome: "" }]],
+    ["an unknown outcome", [{ name: "go test ./...", outcome: "ok" }]],
+    ["an outcome in another case", [{ name: "go test ./...", outcome: "Passed" }]],
+    ["a nameless check", [{ name: "", outcome: "passed" }]],
+    ["one check without an outcome among valid ones", [{ name: "a", outcome: "passed" }, { name: "b" }]],
+  ] as const) {
+    check(!tryParse(schema, { ...valid, checks }).ok, `orch_report accepted ${what}`);
+  }
+  check(
+    report.description.includes("outcome"),
+    "orch_report no longer tells the worker that every check states its outcome",
+  );
+  // The most checks one report may carry mirrors coord.reportChecksLimit (32).
+  const manyChecks = (count: number) =>
+    Array.from({ length: count }, (_, index) => ({ name: `check ${index}`, outcome: "passed" }));
+  check(tryParse(schema, { ...valid, checks: manyChecks(32) }).ok, "orch_report rejected 32 checks, which the executable accepts");
+  check(!tryParse(schema, { ...valid, checks: manyChecks(33) }).ok, "orch_report accepted 33 checks, which the executable refuses");
   check(
     !tryParse(schema, { kind: "result", summary: "done", branch: "orch/abc", evidence: ["commit abc"], risk: "none" }).ok,
     "orch_report accepted a final report without checks",
@@ -542,6 +576,33 @@ async function checkReviewConsent(): Promise<void> {
     risk: "No known risk",
   };
   check(readReportPreview(preview)?.revision === 7, "valid stored report preview was refused");
+  // A report stored before checks carried outcomes previews as bare strings, and
+  // the reader hands them back as recorded: no outcome is claimed for them.
+  check(
+    JSON.stringify(readReportPreview(preview)?.checks) === JSON.stringify(preview.checks),
+    "a legacy free-text check was altered by the preview reader",
+  );
+  // A report that states outcomes previews one line per check, in the same list
+  // of strings, so the reader needs no second shape.
+  const stated = {
+    ...preview,
+    checks: ["go test ./internal/coord: passed", "go vet ./...: failed (2 findings)"],
+  };
+  const readStated = readReportPreview(stated);
+  check(
+    readStated !== null && JSON.stringify(readStated.checks) === JSON.stringify(stated.checks),
+    `a preview whose checks state outcomes was read as ${JSON.stringify(readStated?.checks)}`,
+  );
+  // The reader still trusts only a list of strings.
+  for (const [what, checks] of [
+    ["an object", [{ name: "x", outcome: "passed" }]],
+    ["a number", [7]],
+    ["null", [null]],
+    ["a nested array", [["x", "passed"]]],
+    ["no checks", []],
+  ] as const) {
+    check(readReportPreview({ ...preview, checks }) === null, `a preview with ${what} as a check was trusted`);
+  }
   check(readReportPreview({ ...preview, evidence: null }) === null, "preview with missing evidence was trusted");
   check(readReportPreview({ ...preview, revision: 0 }) === null, "preview with no revision was trusted");
   let request = { title: "", message: "" };
@@ -581,6 +642,29 @@ async function checkReviewConsent(): Promise<void> {
       "This closes the task and frees its slot and paths, but tasks that depend on it stay queued. Decline if you have not reviewed the report.",
     ].join("\n"),
     `the non-accepting review dialog changed shape:\n${request.message}`,
+  );
+  // The legacy preview's Checks line is pinned literally, not computed from the
+  // same value the dialog prints: a report stored before outcomes were required
+  // must confirm with exactly the line it always had.
+  check(
+    request.message.includes(`\nChecks: ["go test ./internal/coord ok"]\n`),
+    `the review dialog changed how a legacy report's checks are printed:\n${request.message}`,
+  );
+  // A report that states outcomes previews one line per check, so the same dialog
+  // code prints each name with its outcome and a detail where there is one.
+  let statedRequest = { title: "", message: "" };
+  await recordReviewWithConsent(
+    { hasUI: true, confirm: async (title, message) => { statedRequest = { title, message }; return false; } },
+    readStated ?? preview,
+    "rejected",
+    params.disposition,
+    send,
+  );
+  check(
+    statedRequest.message.includes(
+      `\nChecks: ["go test ./internal/coord: passed","go vet ./...: failed (2 findings)"]\n`,
+    ),
+    `the review dialog did not show the checks with their outcomes:\n${statedRequest.message}`,
   );
   let approvedRequest = { title: "", message: "" };
   const approved = await recordReviewWithConsent(
