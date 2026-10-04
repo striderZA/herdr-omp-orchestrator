@@ -3,7 +3,9 @@ package coord
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -153,8 +155,11 @@ func (f *reportFixture) completeReport(worker task.Task) task.Report {
 			"commit 773efbc4c9a0d7f0f6f2b3f2d5f1c0b8f0a1d2e3 internal/coord/report.go",
 			"internal/coord/report.go +214/-3",
 		},
-		Checks: []string{"go test ./internal/coord ok", "gofmt -l internal/coord (no output)"},
-		Risk:   "none: the new path is only reachable from the worker role",
+		Checks: []task.Check{
+			{Name: "go test ./internal/coord", Outcome: task.CheckPassed},
+			{Name: "gofmt -l internal/coord", Outcome: task.CheckPassed, Detail: "no output"},
+		},
+		Risk: "none: the new path is only reachable from the worker role",
 	}
 }
 
@@ -521,7 +526,24 @@ func TestReportRejectsEveryIncompleteReport(t *testing.T) {
 		{"no evidence", func(r *task.Report) { r.Evidence = nil }},
 		{"blank evidence", func(r *task.Report) { r.Evidence = []string{"  ", ""} }},
 		{"no checks", func(r *task.Report) { r.Checks = nil }},
-		{"blank checks", func(r *task.Report) { r.Checks = []string{" "} }},
+		{"blank checks", func(r *task.Report) {
+			r.Checks = []task.Check{{Outcome: task.CheckPassed}, {Name: " ", Outcome: task.CheckPassed}}
+		}},
+		{"a check with no outcome", func(r *task.Report) { r.Checks = []task.Check{{Name: "go test ./..."}} }},
+		{"one check of several with no outcome", func(r *task.Report) {
+			r.Checks = append(r.Checks, task.Check{Name: "go vet ./..."})
+		}},
+		{"a blank outcome", func(r *task.Report) { r.Checks[0].Outcome = "  " }},
+		{"an unknown outcome", func(r *task.Report) { r.Checks[0].Outcome = "ok" }},
+		{"an outcome in the wrong case", func(r *task.Report) { r.Checks[0].Outcome = "PASSED" }},
+		{"an oversized check name", func(r *task.Report) { r.Checks[0].Name = strings.Repeat("x", reportTextLimit+1) }},
+		{"an oversized check detail", func(r *task.Report) { r.Checks[0].Detail = strings.Repeat("x", reportTextLimit+1) }},
+		{"too many checks", func(r *task.Report) {
+			r.Checks = nil
+			for i := 0; i <= reportChecksLimit; i++ {
+				r.Checks = append(r.Checks, task.Check{Name: fmt.Sprintf("check %d", i), Outcome: task.CheckPassed})
+			}
+		}},
 		{"no risk", func(r *task.Report) { r.Risk = " " }},
 		{"oversized summary", func(r *task.Report) { r.Summary = strings.Repeat("x", reportSummaryLimit+1) }},
 	}
@@ -609,6 +631,193 @@ func TestReportMovesToReadyForReviewAndNotesOnce(t *testing.T) {
 	}
 	if got := len(f.notes("result")); got != 1 {
 		t.Errorf("result notes after a repeated report = %d, want 1", got)
+	}
+}
+
+// Every outcome a check can state is a recordable fact. A failed or skipped
+// check does not block the report: the worker says what happened, and the
+// primary and the user decide. The inbox note names each outcome, so a failure is
+// visible without opening the report.
+func TestReportRecordsEachCheckOutcomeAndTheNoteStatesThem(t *testing.T) {
+	f := newReportFixture(t)
+	_, worker := f.seed()
+	ctx := context.Background()
+
+	report := f.completeReport(worker)
+	report.Checks = []task.Check{
+		{Name: "go test ./internal/coord", Outcome: task.CheckPassed},
+		{Name: "go vet ./...", Outcome: task.CheckFailed, Detail: "2 findings in report.go"},
+		{Name: "golangci-lint run", Outcome: task.CheckSkipped, Detail: "not installed on this machine"},
+	}
+	if _, err := f.coord.FinalReport(ctx, worker.LaunchPaneID, report); err != nil {
+		t.Fatalf("FinalReport with a passed, a failed and a skipped check: %v", err)
+	}
+
+	after := f.reload(worker.ID)
+	if after.Report == nil || !slices.Equal(after.Report.Checks, report.Checks) {
+		t.Fatalf("recorded checks = %+v, want %+v", after.Report, report.Checks)
+	}
+	if stage := task.StageOf(after); stage != task.ReadyForReview {
+		t.Errorf("stage after a report with a failed check = %q, want %q: the checks do not decide the stage", stage, task.ReadyForReview)
+	}
+	notes := f.notes("result")
+	if len(notes) != 1 {
+		t.Fatalf("result notes = %d, want 1", len(notes))
+	}
+	for _, want := range []string{
+		"go test ./internal/coord: passed",
+		"go vet ./...: failed (2 findings in report.go)",
+		"golangci-lint run: skipped (not installed on this machine)",
+	} {
+		if !strings.Contains(notes[0].Summary, want) {
+			t.Errorf("result note %q does not state %q", notes[0].Summary, want)
+		}
+	}
+}
+
+// The checks are recorded in the canonical form the rest of the system compares
+// and shows: trimmed, with a blank detail meaning no detail.
+func TestReportTrimsCheckFieldsBeforeRecordingThem(t *testing.T) {
+	f := newReportFixture(t)
+	_, worker := f.seed()
+	ctx := context.Background()
+
+	report := f.completeReport(worker)
+	report.Checks = []task.Check{
+		{Name: "  go test ./...  ", Outcome: " passed ", Detail: "   "},
+		{Name: "go vet ./...", Outcome: "failed\n", Detail: "  2 findings  "},
+	}
+	if _, err := f.coord.FinalReport(ctx, worker.LaunchPaneID, report); err != nil {
+		t.Fatalf("FinalReport: %v", err)
+	}
+	want := []task.Check{
+		{Name: "go test ./...", Outcome: task.CheckPassed},
+		{Name: "go vet ./...", Outcome: task.CheckFailed, Detail: "2 findings"},
+	}
+	if got := f.reload(worker.ID).Report.Checks; !slices.Equal(got, want) {
+		t.Errorf("recorded checks = %+v, want %+v", got, want)
+	}
+}
+
+// The refusal has to tell the worker what to fix, because the worker is a model
+// reading this message to correct its next call.
+func TestReportRefusalNamesTheCheckThatStatesNoOutcome(t *testing.T) {
+	f := newReportFixture(t)
+	_, worker := f.seed()
+	ctx := context.Background()
+
+	for _, tc := range []struct {
+		name   string
+		checks []task.Check
+		want   []string
+	}{
+		{
+			"none stated",
+			[]task.Check{{Name: "go test ./..."}},
+			[]string{"check 1", "go test ./...", "outcome", "passed, failed or skipped"},
+		},
+		{
+			"the second of two",
+			[]task.Check{{Name: "go test ./...", Outcome: task.CheckPassed}, {Name: "go vet ./..."}},
+			[]string{"check 2", "go vet ./...", "outcome"},
+		},
+		{
+			"unknown",
+			[]task.Check{{Name: "go test ./...", Outcome: "ok"}},
+			[]string{"check 1", `"ok"`, "passed, failed or skipped"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			report := f.completeReport(worker)
+			report.Checks = tc.checks
+			_, err := f.coord.FinalReport(ctx, worker.LaunchPaneID, report)
+			if !errors.Is(err, ErrReportInvalid) {
+				t.Fatalf("FinalReport err = %v, want ErrReportInvalid", err)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("refusal %q does not say %q", err.Error(), want)
+				}
+			}
+		})
+	}
+}
+
+// A report stored before checks carried outcomes holds bare strings. It must
+// still preview as exactly those strings on the wire (so the review dialog shows
+// what it always showed), its checks must still read as stating no outcome, and a
+// later write of the same task must keep them as strings: nobody recorded how
+// those checks ended.
+func TestLegacyStoredReportPreviewsUnchangedAndSurvivesARewrite(t *testing.T) {
+	f := newReportFixture(t)
+	project, worker := f.seed()
+	ctx := context.Background()
+
+	stored := `{"Kind":"result","Summary":"Ported the parser.","Branch":"` + worker.Branch + `","Evidence":["commit 773efbc"],` +
+		`"Checks":["go test ./internal/coord ok","gofmt -l internal/coord (no output)"],"Risk":"none"}`
+	if _, err := f.stateDB(t).ExecContext(ctx,
+		`UPDATE tasks SET data = json_set(data, '$.Report', json(?)) WHERE id = ?`, stored, worker.ID); err != nil {
+		t.Fatalf("store a legacy report: %v", err)
+	}
+
+	preview, err := f.coord.ReportPreview(ctx, project.LaunchPaneID, worker.ID)
+	if err != nil {
+		t.Fatalf("preview of a legacy report: %v", err)
+	}
+	wire, err := json.Marshal(preview)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `"checks":["go test ./internal/coord ok","gofmt -l internal/coord (no output)"]`; !strings.Contains(string(wire), want) {
+		t.Errorf("legacy preview on the wire = %s, want it to carry %s", wire, want)
+	}
+	for i, check := range f.reload(worker.ID).Report.Checks {
+		if check.HasOutcome() {
+			t.Errorf("legacy check %d reads as having outcome %q", i, check.Outcome)
+		}
+	}
+
+	// Decide the task: this rewrites the task row for a reason unrelated to the checks.
+	if _, err := f.coord.ReviewAtRevision(ctx, project.LaunchPaneID, worker.ID, preview.Revision, "integrated", "accepted"); err != nil {
+		t.Fatalf("review of a legacy report: %v", err)
+	}
+	var checks string
+	if err := f.stateDB(t).QueryRowContext(ctx,
+		`SELECT json_extract(data, '$.Report.Checks') FROM tasks WHERE id = ?`, worker.ID).Scan(&checks); err != nil {
+		t.Fatalf("read the stored checks: %v", err)
+	}
+	if want := `["go test ./internal/coord ok","gofmt -l internal/coord (no output)"]`; checks != want {
+		t.Errorf("stored checks after a rewrite = %s, want %s", checks, want)
+	}
+}
+
+// A report with outcomes previews each check as one line, "name: outcome
+// (detail)", in the list of strings the review confirmation has always printed.
+// The wire form is pinned as bytes: an extension that predates outcomes reads it.
+func TestPreviewCarriesEachCheckWithItsOutcomeAsOneLine(t *testing.T) {
+	f := newReportFixture(t)
+	project, worker := f.seed()
+	ctx := context.Background()
+
+	report := f.completeReport(worker)
+	report.Checks = []task.Check{
+		{Name: "go test ./...", Outcome: task.CheckPassed},
+		{Name: "lint", Outcome: task.CheckSkipped, Detail: "not installed"},
+	}
+	if _, err := f.coord.FinalReport(ctx, worker.LaunchPaneID, report); err != nil {
+		t.Fatal(err)
+	}
+	preview, err := f.coord.ReportPreview(ctx, project.LaunchPaneID, worker.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire, err := json.Marshal(preview)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = `"checks":["go test ./...: passed","lint: skipped (not installed)"]`
+	if !strings.Contains(string(wire), want) {
+		t.Errorf("preview on the wire = %s, want it to carry %s", wire, want)
 	}
 }
 
@@ -717,7 +926,7 @@ func TestReviewPreviewShowsDurableReportAndRefusesStaleDecision(t *testing.T) {
 	if preview.TaskID != worker.ID || preview.Revision != f.reload(worker.ID).Revision ||
 		preview.Summary != report.Summary || preview.Branch != report.Branch ||
 		preview.Risk != report.Risk || !slices.Equal(preview.Evidence, report.Evidence) ||
-		!slices.Equal(preview.Checks, report.Checks) {
+		!slices.Equal(preview.Checks, task.CheckLabels(report.Checks)) {
 		t.Fatalf("preview did not return the persisted report: %+v", preview)
 	}
 	changed := report

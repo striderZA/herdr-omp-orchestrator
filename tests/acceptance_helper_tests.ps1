@@ -891,6 +891,11 @@ Yes
 No
 '@
 Check 'review modal matches the active task, revision and disposition' (Test-PrimaryReviewConfirmScreen -Screen $reviewScreen -TaskId 'orch_abc' -Revision 7 -Disposition 'Accepted the reported result.') 'review modal'
+# A report that states outcomes previews one line per check ("name: outcome (detail)"), which the
+# dialog prints in the same Checks list; the matcher stops at the "Stored report" line, so that
+# line's content is data.
+$statedChecksScreen = $reviewScreen -replace 'Checks: \["go test \./internal/coord ok"\]', 'Checks: ["go test ./internal/coord: passed","go vet ./...: failed (2 findings)"]'
+Check 'review modal accepts a stored report whose checks state outcomes' ($statedChecksScreen -ne $reviewScreen -and (Test-PrimaryReviewConfirmScreen -Screen $statedChecksScreen -TaskId 'orch_abc' -Revision 7 -Disposition 'Accepted the reported result.')) 'stated checks'
 Check 'review modal rejects a different task' (-not (Test-PrimaryReviewConfirmScreen -Screen $reviewScreen -TaskId 'orch_other' -Revision 7 -Disposition 'Accepted the reported result.')) 'wrong task'
 Check 'review modal rejects a different report revision' (-not (Test-PrimaryReviewConfirmScreen -Screen $reviewScreen -TaskId 'orch_abc' -Revision 8 -Disposition 'Accepted the reported result.')) 'wrong revision'
 Check 'review modal rejects a different decision' (-not (Test-PrimaryReviewConfirmScreen -Screen $reviewScreen -TaskId 'orch_abc' -Revision 7 -Disposition 'Rejected the result.')) 'wrong disposition'

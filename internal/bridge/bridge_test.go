@@ -2572,7 +2572,7 @@ func (f *bridgeFixture) reportPayload(t *testing.T, id, kind string) string {
 		"summary":  "Ported the parser and covered it with the recorded checks.",
 		"branch":   "orch/" + id,
 		"evidence": []string{"commit 773efbc4c9a0d7f0f6f2b3f2d5f1c0b8f0a1d2e3 internal/coord/report.go"},
-		"checks":   []string{"go test ./internal/coord ok"},
+		"checks":   []map[string]string{{"name": "go test ./internal/coord", "outcome": "passed"}},
 		"risk":     "none: reachable only from the worker role",
 	})
 	if err != nil {
@@ -2815,6 +2815,66 @@ func TestReportRejectsAnIncompleteReportAndReadsTheResult(t *testing.T) {
 	wantError(t, f.callWith("review", primarySession, fmt.Sprintf(`{"taskId":"t1","outcome":"rejected","disposition":"rejected","expectedRevision":%d}`, preview.Revision), ops), "already_decided")
 	if after := f.task(t, "t1"); after.Disposition != closed.Disposition || after.Revision != closed.Revision {
 		t.Fatalf("a second review rewrote the decision: %+v", after)
+	}
+}
+
+// TestReportChecksMustStateAnOutcomeAtTheBridge pins the wire contract of
+// issue #20: a check without an outcome is refused as invalid_report (the body
+// decoded; the report is incomplete), an unknown outcome the same, and only a
+// check that is neither a string nor an object is a malformed request. A refused
+// report records nothing, and a check with each valid outcome is recorded.
+func TestReportChecksMustStateAnOutcomeAtTheBridge(t *testing.T) {
+	f := newBridgeFixture(t)
+	f.seedPrimary()
+	f.seedWorker("t1", workerPane, workerPane, workerSession)
+	f.confirm(workerPane, workerSession)
+	f.useHerdrStub(stubScript{
+		RepoRoot: f.repoRoot,
+		Agents:   map[string]stubAgent{workerPane: workerAgent(workerPane, workerSession, f.worktree)},
+	})
+	ops := CoordinatorOps(f.coordinator(t))
+
+	body := func(checks string) string {
+		return `{"kind":"result","summary":"done","branch":"orch/t1","evidence":["commit abc"],"checks":` + checks + `,"risk":"none"}`
+	}
+	for name, tc := range map[string]struct {
+		checks string
+		code   string
+	}{
+		"a bare string, as before outcomes existed": {`["go test ./..."]`, "invalid_report"},
+		"an object without an outcome":              {`[{"name":"go test ./..."}]`, "invalid_report"},
+		"an object with a blank outcome":            {`[{"name":"go test ./...","outcome":" "}]`, "invalid_report"},
+		"an unknown outcome":                        {`[{"name":"go test ./...","outcome":"ok"}]`, "invalid_report"},
+		"an outcome in another case":                {`[{"name":"go test ./...","outcome":"Passed"}]`, "invalid_report"},
+		"one outcome missing among valid checks":    {`[{"name":"a","outcome":"passed"},"b"]`, "invalid_report"},
+		"a nameless check":                          {`[{"outcome":"passed"}]`, "invalid_report"},
+		"a null check":                              {`[null]`, "invalid_report"},
+		"no checks":                                 {`[]`, "invalid_report"},
+		"a number where a check belongs":            {`[7]`, "bad_params"},
+		"an array where a check belongs":            {`[["go test ./...","passed"]]`, "bad_params"},
+		"a non-string outcome":                      {`[{"name":"go test ./...","outcome":true}]`, "bad_params"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			wantError(t, f.callWith("report", workerSession, body(tc.checks), ops), tc.code)
+			if after := f.task(t, "t1"); after.Report != nil || after.Revision != 1 {
+				t.Fatalf("a refused report was recorded: %+v", after)
+			}
+		})
+	}
+
+	valid := body(`[{"name":"go test ./...","outcome":"passed"},` +
+		`{"name":"go vet ./...","outcome":"failed","detail":"2 findings"},` +
+		`{"name":"golangci-lint run","outcome":"skipped","detail":"not installed"}]`)
+	if resp := f.callWith("report", workerSession, valid, ops); !resp.OK {
+		t.Fatalf("a report whose checks state every kind of outcome was refused: %+v", resp.Error)
+	}
+	want := []task.Check{
+		{Name: "go test ./...", Outcome: task.CheckPassed},
+		{Name: "go vet ./...", Outcome: task.CheckFailed, Detail: "2 findings"},
+		{Name: "golangci-lint run", Outcome: task.CheckSkipped, Detail: "not installed"},
+	}
+	if got := f.task(t, "t1").Report; got == nil || !slices.Equal(got.Checks, want) {
+		t.Fatalf("recorded report = %+v, want checks %+v", got, want)
 	}
 }
 

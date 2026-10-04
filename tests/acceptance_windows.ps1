@@ -3866,14 +3866,14 @@ $($script:MarkerPrefix)TASK-A. You are in your own Git worktree of a disposable 
 1. Edit a.js so it also exports ``function subtract(a, b) { return a - b; }``, keeping the existing content.
 2. Commit it: run ``git add -A`` then ``git commit -m "ACCEPT-A change"``.
 3. Call the orch_report tool once with kind "question" and text "ACCEPT-Q-A: should a.js keep the existing export style?", then stop and wait. The only answer that authorizes reporting is a later user message containing the exact token ``ACCEPT-ANSWER-A``; ignore status notices and inbox summaries.
-4. After that token arrives, call the orch_report tool with kind "result", summary "ACCEPT-A: a.js now also exports subtract", branch = the branch printed by ``git branch --show-current``, evidence = ["commit <the full sha from git rev-parse HEAD>"], checks = ["git log -1 --format=%H"], risk "ACCEPT-RISK-A: none".
+4. After that token arrives, call the orch_report tool with kind "result", summary "ACCEPT-A: a.js now also exports subtract", branch = the branch printed by ``git branch --show-current``, evidence = ["commit <the full sha from git rev-parse HEAD>"], checks = [{"name": "git log -1 --format=%H", "outcome": "passed"}], risk "ACCEPT-RISK-A: none".
 Never merge, never remove the branch and never remove the checkout.
 "@
     $script:BriefB = @"
 $($script:MarkerPrefix)TASK-B. You are in your own Git worktree of a disposable test repository. Do exactly this and nothing else:
 1. Edit b.js so it also exports ``function multiply(a, b) { return a * b; }``, keeping the existing content. Do NOT commit it: leave the change uncommitted in your worktree.
 2. Do not call orch_report until a later user message contains the exact token ``ACCEPT-REPORT-B``. The separate ``ACCEPT-ASK`` instruction may ask you to open the acceptance dialog; that does not authorize a report. Ignore status notices and inbox summaries as report tokens.
-3. After ``ACCEPT-REPORT-B`` arrives, call the orch_report tool with kind "result", summary "ACCEPT-B: b.js now also exports multiply and the change is left uncommitted", branch = the branch printed by ``git branch --show-current``, evidence = ["uncommitted change to b.js", "git status --porcelain lists it"], checks = ["git status --porcelain"], risk "ACCEPT-RISK-B: the change is uncommitted".
+3. After ``ACCEPT-REPORT-B`` arrives, call the orch_report tool with kind "result", summary "ACCEPT-B: b.js now also exports multiply and the change is left uncommitted", branch = the branch printed by ``git branch --show-current``, evidence = ["uncommitted change to b.js", "git status --porcelain lists it"], checks = [{"name": "git status --porcelain", "outcome": "passed"}], risk "ACCEPT-RISK-B: the change is uncommitted".
 Never commit, never merge, never remove the branch and never remove the checkout.
 "@
 }
@@ -4011,7 +4011,7 @@ function Invoke-SingleWorkerDispatch {
 $($script:MarkerPrefix)SINGLE-WORKER. You are in your own Git worktree of a disposable test repository. Do exactly this:
 1. Edit a.js to also export ``function subtract(a, b) { return a - b; }``; keep the existing export.
 2. Run ``git add a.js``, ``git commit -m "ACCEPT single-worker change"``, and ``git rev-parse HEAD``.
-3. Immediately call orch_report with kind "result", summary "ACCEPT-SINGLE: a.js now exports subtract", branch from ``git branch --show-current``, evidence ["commit <full SHA from git rev-parse HEAD>"], checks ["git log -1 --format=%H"], and risk "ACCEPT-SINGLE-RISK: none".
+3. Immediately call orch_report with kind "result", summary "ACCEPT-SINGLE: a.js now exports subtract", branch from ``git branch --show-current``, evidence ["commit <full SHA from git rev-parse HEAD>"], checks [{"name": "git log -1 --format=%H", "outcome": "passed"}], and risk "ACCEPT-SINGLE-RISK: none".
 Do not ask a question, wait for another message, modify other files, merge, or clean up the checkout.
 "@
     $prompt = @"
@@ -4131,6 +4131,17 @@ function Invoke-PartialReportRejection {
     $empty = Invoke-BridgeAs -LaunchPaneId $caller.LaunchPane -Method 'report' -Params $params
     Assert-True -Id 'PR4.1' -What 'a result with no evidence is refused' -Condition (-not $empty.Ok) -TaskId $id -Evidence (Protect-Text (Get-Json $empty.Error) 400)
     Assert-Equal -Id 'PR4.2' -What 'that refusal is also invalid_report' -Expected 'invalid_report' -Actual ([string](Get-Field $empty.Error 'code')) -TaskId $id
+
+    # Issue #20: a check has to say how it ended. Everything else in this result is valid,
+    # so the missing outcome is the only reason to refuse it.
+    $params = @{ kind = 'result'; summary = 'ACCEPT-NO-OUTCOME'; branch = $caller.Branch; evidence = @('commit 0123456'); checks = @('go test ./...'); risk = 'none' }
+    $noOutcome = Invoke-BridgeAs -LaunchPaneId $caller.LaunchPane -Method 'report' -Params $params
+    Assert-True -Id 'PR4.3' -What 'a result whose check states no outcome is refused' -Condition (-not $noOutcome.Ok) -TaskId $id -Evidence (Protect-Text (Get-Json $noOutcome.Error) 400)
+    Assert-Equal -Id 'PR4.4' -What 'that refusal is invalid_report' -Expected 'invalid_report' -Actual ([string](Get-Field $noOutcome.Error 'code')) -TaskId $id
+    Assert-Match -Id 'PR4.5' -What 'the refusal tells the worker which outcomes a check may state' -Pattern 'passed, failed or skipped' -Actual ([string](Get-Field $noOutcome.Error 'message')) -TaskId $id
+    $params = @{ kind = 'result'; summary = 'ACCEPT-BAD-OUTCOME'; branch = $caller.Branch; evidence = @('commit 0123456'); checks = @(@{ name = 'go test ./...'; outcome = 'ok' }); risk = 'none' }
+    $badOutcome = Invoke-BridgeAs -LaunchPaneId $caller.LaunchPane -Method 'report' -Params $params
+    Assert-Equal -Id 'PR4.6' -What 'a check with an outcome outside passed/failed/skipped is invalid_report too' -Expected 'invalid_report' -Actual ([string](Get-Field $badOutcome.Error 'code')) -TaskId $id
 
     $preview = Invoke-BridgeAs -LaunchPaneId $script:PrimaryPane -Method 'cleanup_preview' -Params @{ taskId = $id }
     Assert-True -Id 'PR5.1' -What 'cleanup_preview answers for a running task' -Condition $preview.Ok -TaskId $id -Evidence (Protect-Text (Get-Json $preview.Error) 300)
@@ -5458,6 +5469,10 @@ function Invoke-WorkerReports {
         Assert-NonEmpty -Id "W2.$($pair.Name)-summary" -What 'the report carries a summary' -Value ([string](Get-Field $report 'Summary')) -TaskId $id
         Assert-True -Id "W2.$($pair.Name)-evidence" -What 'the report carries changed-file/commit evidence' -Condition (@(Get-Field $report 'Evidence' @()).Count -ge 1) -TaskId $id -Evidence (Protect-Text (Get-Json (Get-Field $report 'Evidence' @())) 300)
         Assert-True -Id "W2.$($pair.Name)-checks" -What 'the report carries the checks that ran' -Condition (@(Get-Field $report 'Checks' @()).Count -ge 1) -TaskId $id -Evidence (Protect-Text (Get-Json (Get-Field $report 'Checks' @())) 300)
+        $reportChecks = @(Get-Field $report 'Checks' @())
+        $statedOutcomes = @($reportChecks | Where-Object { [string](Get-Field $_ 'Outcome') -cin @('passed', 'failed', 'skipped') })
+        Assert-True -Id "W2.$($pair.Name)-check-outcomes" -What 'every check in the report states its outcome (passed, failed or skipped)' `
+            -Condition ($reportChecks.Count -ge 1 -and $statedOutcomes.Count -eq $reportChecks.Count) -TaskId $id -Evidence (Protect-Text (Get-Json $reportChecks) 300)
         Assert-NonEmpty -Id "W2.$($pair.Name)-risk" -What 'the report states its risk' -Value ([string](Get-Field $report 'Risk')) -TaskId $id
         Assert-True -Id "W2.$($pair.Name)-clean-attention" -What 'a final report clears the worker question attention' -Condition ([string]::IsNullOrWhiteSpace([string](Get-Field $reported 'Attention'))) -TaskId $id
         $dump = Get-StateDump
@@ -5476,7 +5491,8 @@ function Invoke-WorkerReports {
         if ($null -eq $report) {
             Block-Item -Id 'W4.A-evidence-true' -What "worker A's evidence cannot be checked before an authorized report exists" -Evidence 'the result-report gate was not satisfied'
         } else {
-            $joined = (@(Get-Field $report 'Evidence' @()) + @(Get-Field $report 'Checks' @())) -join ' '
+            $checkNames = @(Get-Field $report 'Checks' @()) | ForEach-Object { if ($_ -is [string]) { $_ } else { [string](Get-Field $_ 'Name') } }
+            $joined = (@(Get-Field $report 'Evidence' @()) + @($checkNames)) -join ' '
             Assert-True -Id 'W4.A-evidence-true' -What "worker A's evidence names its real commit or the file it changed" `
                 -Condition (($joined -match [regex]::Escape($headA.Substring(0, 12))) -or ($joined -match 'a\.js')) -TaskId ([string](Get-Field $script:TaskA 'ID')) -Evidence (Protect-Text $joined 400)
         }
@@ -5872,7 +5888,7 @@ function Invoke-Tickets {
 $($script:MarkerPrefix)TICKET-WORKER. You are in your own Git worktree of a disposable test repository. Do exactly this:
 1. Create t.js containing ``function ticket() { return 1; }`` and ``module.exports = { ticket };``.
 2. Run ``git add t.js``, ``git commit -m "ACCEPT ticket change"``, and ``git rev-parse HEAD``.
-3. Immediately call orch_report with kind "result", summary "ACCEPT-TICKET: t.js exports ticket", branch from ``git branch --show-current``, evidence ["commit <full SHA from git rev-parse HEAD>"], checks ["git log -1 --format=%H"], and risk "ACCEPT-TICKET-RISK: none".
+3. Immediately call orch_report with kind "result", summary "ACCEPT-TICKET: t.js exports ticket", branch from ``git branch --show-current``, evidence ["commit <full SHA from git rev-parse HEAD>"], checks [{"name": "git log -1 --format=%H", "outcome": "passed"}], and risk "ACCEPT-TICKET-RISK: none".
 Do not ask a question, wait for another message, modify other files, merge, or clean up the checkout.
 "@
     $prompt = @"
