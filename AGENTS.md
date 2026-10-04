@@ -45,7 +45,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\acceptance_helpe
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\acceptance_windows.ps1
 ```
 
-The full acceptance test drives real Herdr and OMP sessions in an isolated named session and temporary worktree root; it supports `-TimeoutScale`, `-KeepResources`, and `-SkipStateCleanup`. The extension load check can also be run with Bun and OMP's schema builder available: `bun run omp/load-extension.check.ts` (see `omp/load-extension.check.ts` for builder resolution options).
+The full acceptance test drives real Herdr and OMP sessions in an isolated named session and temporary worktree root; it supports `-TimeoutScale`, `-KeepResources`, `-SkipStateCleanup`, and `-Model`. `-Model` (default `openai-codex/gpt-6-luna`, spelled as `omp --model` spells it; `-Model ''` keeps OMP's own default) pins the primary and every worker to one model without touching the user's OMP settings: the run writes a one-file OMP config overlay into its temp root and names it in `PI_CONFIG_FILES` on the isolated Herdr server, whose agents inherit it. The run first checks that OMP resolves the overlay (`S1.2b`, fail-closed), then reads each session's transcript to assert every assistant turn used that model (`N7.4`, `SW0.1b`, `W2.<A|B>-model`). With a model pinned those checks fail closed: a session whose transcript cannot be read, or that ran any turn on another model, is a FAIL, not an INFO. With no model pinned they only record the model OMP chose. The extension load check can also be run with Bun and OMP's schema builder available: `bun run omp/load-extension.check.ts` (see `omp/load-extension.check.ts` for builder resolution options).
 
 ## Git Hooks
 
