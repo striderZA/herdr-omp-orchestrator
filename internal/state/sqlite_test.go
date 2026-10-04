@@ -323,6 +323,65 @@ func TestStoreInboxDeduplicates(t *testing.T) {
 	}
 }
 
+// TestProjectInboxReadsEveryStateOfOneProject pins the read behind the primary's
+// inbox listing: every delivery state with its detail, in the order the notes
+// were recorded, for the one project asked for, and without moving any state.
+func TestProjectInboxReadsEveryStateOfOneProject(t *testing.T) {
+	ctx := context.Background()
+	s := open(t, t.TempDir())
+	for _, note := range []task.Inbox{
+		{ID: "pending", ProjectKey: "repo-a", TaskID: "t1", Kind: "progress", Summary: "one"},
+		{ID: "sending", ProjectKey: "repo-a", TaskID: "t1", Kind: "question", Summary: "two"},
+		{ID: "uncertain", ProjectKey: "repo-a", TaskID: "t2", Kind: "result", Summary: "three"},
+		{ID: "delivered", ProjectKey: "repo-a", Kind: "attention", Summary: "four"},
+		{ID: "other", ProjectKey: "repo-b", TaskID: "t9", Kind: "progress", Summary: "five"},
+	} {
+		if _, err := s.AddInbox(ctx, note); err != nil {
+			t.Fatalf("AddInbox(%s): %v", note.ID, err)
+		}
+	}
+	if claimed, err := s.ClaimInbox(ctx, []string{"sending", "uncertain", "delivered"}); err != nil || len(claimed) != 3 {
+		t.Fatalf("ClaimInbox = %d notes, %v", len(claimed), err)
+	}
+	if _, err := s.SettleInbox(ctx, []string{"uncertain"}, task.DeliveryUncertain, "inspect the pane"); err != nil {
+		t.Fatalf("SettleInbox uncertain: %v", err)
+	}
+	if _, err := s.SettleInbox(ctx, []string{"delivered"}, task.DeliveryDelivered, "prompted to w1:p1"); err != nil {
+		t.Fatalf("SettleInbox delivered: %v", err)
+	}
+
+	got, err := s.ProjectInbox(ctx, "repo-a")
+	if err != nil {
+		t.Fatalf("ProjectInbox: %v", err)
+	}
+	type row struct{ ID, State, Detail string }
+	var rows []row
+	for _, note := range got {
+		rows = append(rows, row{note.ID, note.State(), note.DeliveryDetail})
+	}
+	want := []row{
+		{"pending", task.DeliveryPending, ""},
+		{"sending", task.DeliverySending, ""},
+		{"uncertain", task.DeliveryUncertain, "inspect the pane"},
+		{"delivered", task.DeliveryDelivered, "prompted to w1:p1"},
+	}
+	if !reflect.DeepEqual(rows, want) {
+		t.Fatalf("ProjectInbox = %+v, want %+v", rows, want)
+	}
+	if again, err := s.ProjectInbox(ctx, "repo-a"); err != nil || !reflect.DeepEqual(again, got) {
+		t.Fatalf("a second read changed the answer: %+v, %v", again, err)
+	}
+	if pending, err := s.PendingInbox(ctx, "repo-a"); err != nil || len(pending) != 1 || pending[0].ID != "pending" {
+		t.Fatalf("reading must not claim the pending note: %+v, %v", pending, err)
+	}
+	if none, err := s.ProjectInbox(ctx, "repo-c"); err != nil || len(none) != 0 {
+		t.Fatalf("a project with no notes = %+v, %v", none, err)
+	}
+	if _, err := s.ProjectInbox(ctx, "  "); !errors.Is(err, state.ErrInvalid) {
+		t.Fatalf("a blank project key = %v, want ErrInvalid", err)
+	}
+}
+
 // TestAddInboxForTaskGuardsInsideTheNotesTransaction pins the store half of the
 // worker-write guard: the read that decides whether a note may land and the insert
 // are one transaction, the caller's own refusal survives it, and neither the task nor
