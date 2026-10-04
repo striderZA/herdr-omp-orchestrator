@@ -1230,7 +1230,14 @@ func TestBridgeResolveRebindsVerifiedRestore(t *testing.T) {
 // primary is told — never an internal failure that hides the reason.
 func TestBridgeResolveKeepsARebindConflictRecoverable(t *testing.T) {
 	f := newBridgeFixture(t)
-	f.seedPrimary()
+	seeded := f.seedPrimary()
+	const reason = "the recorded primary cannot be verified: left by an earlier pass"
+	if err := f.store.UpdateProject(context.Background(), seeded.Key, func(next *task.Project) error {
+		next.PrimaryAttention = reason
+		return nil
+	}); err != nil {
+		t.Fatalf("record primary attention: %v", err)
+	}
 
 	// Herdr restarted the primary in a new pane of the recorded workspace and
 	// checkout, and while that pane is verified another bridge call records a move
@@ -1276,6 +1283,9 @@ func TestBridgeResolveKeepsARebindConflictRecoverable(t *testing.T) {
 	}
 	if project.LaunchPaneID != primaryPane {
 		t.Errorf("launch pane = %q, want the recorded %q untouched", project.LaunchPaneID, primaryPane)
+	}
+	if project.PrimaryAttention != reason {
+		t.Errorf("PrimaryAttention = %q, want %q kept: a rebind that lost its compare-and-swap verified nothing", project.PrimaryAttention, reason)
 	}
 	if got := len(notesOf(t, f, "attention")); got != 1 {
 		t.Errorf("attention notes = %d, want the conflict reported exactly once", got)
