@@ -355,13 +355,15 @@ func ticketPageLines(card TicketCard, width int, th Theme) []string {
 
 // pageLinesOf is the dedicated page of the selected task or ticket, and whether
 // the selection is on the board at all. The detail page and its scrolling both
-// measure the same lines.
+// measure the same lines, so the primary marker that leads the page is counted
+// here as well as drawn by RenderPage.
 func pageLinesOf(b *Board, id string, width int, th Theme) ([]string, bool) {
+	marker := primaryMarkerBlock(b, width, th)
 	if ticket, ok := b.FindTicket(id); ok {
-		return ticketPageLines(ticket, width, th), true
+		return append(marker, ticketPageLines(ticket, width, th)...), true
 	}
 	if card, ok := b.Find(id); ok {
-		return pageLines(card, width, th), true
+		return append(marker, pageLines(card, width, th)...), true
 	}
 	return nil, false
 }

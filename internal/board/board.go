@@ -322,8 +322,13 @@ func (m *Model) refresh() {
 		m.loadErr = err
 		return
 	}
+	attention, err := ProjectPrimaryAttention(m.ctx, m.store, m.project)
+	if err != nil {
+		m.loadErr = err
+		return
+	}
 	m.loadErr = nil
-	m.board = NewBoardWithTickets(cards, tickets)
+	m.board = NewBoardWithTickets(cards, tickets).WithPrimaryAttention(attention)
 	before := m.selected
 	m.reselect()
 	if m.selected != before {

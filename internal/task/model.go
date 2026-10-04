@@ -102,6 +102,15 @@ func (x Task) Accepted() bool {
 type Project struct {
 	Key, RepoWorkspaceID, CurrentWorkspaceID, TerminalID string
 	LaunchPaneID, PublicPaneID, AgentName, OMPSessionID  string
+	// PrimaryAttention is why the plugin cannot currently vouch for the project's
+	// primary, or empty while it can. It is a recorded observation, not a lifecycle
+	// state: reconciliation and the paths that probe the primary write it when the
+	// primary is absent or unproven and clear it once the primary is verified live
+	// again, and the board only reads it. Writing it changes no task and moves none
+	// between stages; it is separate from Task.Attention and from the inbox notes
+	// that some of those paths queue for the primary. A project row written before
+	// this field existed decodes to the empty string, which reads as "no attention".
+	PrimaryAttention string
 }
 
 // Inbox is one durable note addressed to a project or task.

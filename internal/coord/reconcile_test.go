@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -1469,7 +1470,9 @@ func TestPrimaryLossKeepsWorkersAndInboxWithoutRespawning(t *testing.T) {
 	noteID := f.queueNote(t, worker, "progress", "halfway", "worker progress").ID
 
 	// The primary's OMP process is gone; its workspace (and pane) remain.
+	var gone fixtureAgent
 	f.rewriteState(func(current *fixtureState) {
+		gone = *current.Agents[before.PublicPaneID]
 		delete(current.Agents, before.PublicPaneID)
 	})
 
@@ -1494,6 +1497,26 @@ func TestPrimaryLossKeepsWorkersAndInboxWithoutRespawning(t *testing.T) {
 	}
 	if kept := f.taskByID(t, worker.ID); kept.Phase != worker.Phase || kept.WorktreePath != worker.WorktreePath {
 		t.Fatalf("a primary loss discarded an unfinished worker: phase %q path %q", kept.Phase, kept.WorktreePath)
+	}
+	if after.PrimaryAttention == "" {
+		t.Fatal("a lost primary left no durable marker for the board")
+	}
+
+	// Verified live again: the marker clears and nothing else about the worker or
+	// its queued note was touched to get there.
+	workerBefore := f.taskByID(t, worker.ID)
+	f.rewriteState(func(current *fixtureState) {
+		restored := gone
+		current.Agents[before.PublicPaneID] = &restored
+	})
+	if err := f.coord.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile after the primary returned: %v", err)
+	}
+	if recovered := f.boundProject(t); recovered.PrimaryAttention != "" || recovered.LaunchPaneID != before.LaunchPaneID || recovered.OMPSessionID != before.OMPSessionID {
+		t.Fatalf("project after the primary returned = %+v, want the marker cleared and the binding unchanged", recovered)
+	}
+	if got := f.taskByID(t, worker.ID); !reflect.DeepEqual(got, workerBefore) {
+		t.Fatalf("recovering the primary changed the worker:\n got %+v\nwant %+v", got, workerBefore)
 	}
 }
 

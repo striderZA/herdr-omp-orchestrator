@@ -1109,6 +1109,8 @@ func (h *handler) rebind(binding state.Binding, pane *herdr.PaneInfo) (state.Bin
 			next.PublicPaneID = pane.PaneID
 			next.TerminalID = pane.TerminalID
 			next.CurrentWorkspaceID = pane.WorkspaceID
+			// The verified rebind proves the primary is live again.
+			next.PrimaryAttention = ""
 			return nil
 		})
 		if err != nil {
@@ -1118,6 +1120,7 @@ func (h *handler) rebind(binding state.Binding, pane *herdr.PaneInfo) (state.Bin
 		project.PublicPaneID = pane.PaneID
 		project.TerminalID = pane.TerminalID
 		project.CurrentWorkspaceID = pane.WorkspaceID
+		project.PrimaryAttention = ""
 		return state.Binding{Role: state.RolePrimary, Project: project}, nil
 	}
 

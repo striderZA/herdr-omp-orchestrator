@@ -328,28 +328,35 @@ func (c *Coordinator) Bind(ctx context.Context, repo, workspaceID, rootPaneID st
 // primary in place of one that is missing: that would silently substitute a
 // different session for the one the user was talking to. It does complete a bind
 // that was interrupted before its agent started, in the pane that bind recorded.
+//
+// A recorded primary that is definitely not live is also recorded on the project,
+// where the board reads it, and a primary this bind verified live retires that
+// record.
 func (c *Coordinator) reopenPrimary(ctx context.Context, existing task.Project) (task.Project, error) {
 	paneID := existing.LaunchPaneID
 	if strings.TrimSpace(paneID) == "" {
 		paneID = existing.PublicPaneID
 	}
 	if strings.TrimSpace(paneID) == "" {
-		return existing, c.settleProject(ctx, existing.Key, true,
+		return existing, c.refuseReopen(ctx, existing, "the project records no primary pane",
 			fmt.Errorf("%w: project %s records no pane", ErrPrimaryNotLive, existing.Key))
 	}
 	pane, err := c.paneGet(ctx, paneID)
 	switch {
 	case isMissingTarget(err):
-		return existing, c.settleProject(ctx, existing.Key, true,
+		return existing, c.refuseReopen(ctx, existing,
+			fmt.Sprintf("the recorded primary pane %s no longer exists", paneID),
 			fmt.Errorf("%w: the recorded primary pane %s no longer exists; relaunch the primary explicitly", ErrPrimaryNotLive, paneID))
 	case err != nil:
 		return existing, err
 	case !samePath(pane.Cwd, existing.Key):
-		return existing, c.settleProject(ctx, existing.Key, true,
+		return existing, c.refuseReopen(ctx, existing,
+			fmt.Sprintf("the recorded primary pane %s works in %s, not the bound repository %s", paneID, pane.Cwd, existing.Key),
 			fmt.Errorf("%w: the recorded primary pane %s works in %s, not the bound repository %s",
 				ErrPrimaryNotLive, paneID, pane.Cwd, existing.Key))
 	case paneHostsAgent(pane) && !strings.EqualFold(pane.Agent, c.opts.AgentKind):
-		return existing, c.settleProject(ctx, existing.Key, true,
+		return existing, c.refuseReopen(ctx, existing,
+			fmt.Sprintf("the recorded primary pane %s now runs %q", paneID, pane.Agent),
 			fmt.Errorf("%w: the recorded primary pane %s now runs %q", ErrPrimaryNotLive, paneID, pane.Agent))
 	}
 	if pane.PaneID != existing.PublicPaneID || pane.WorkspaceID != existing.CurrentWorkspaceID {
@@ -401,6 +408,12 @@ func (c *Coordinator) reopenPrimary(ctx context.Context, existing task.Project) 
 	}
 	existing.TerminalID = view.Agent.TerminalID
 	existing.CurrentWorkspaceID = view.Agent.WorkspaceID
+	// The agent answered its readiness handshake in the recorded pane: the primary
+	// is verified live, so a recorded absence of it ends here.
+	if err := c.clearPrimaryAttention(ctx, existing); err != nil {
+		return existing, err
+	}
+	existing.PrimaryAttention = ""
 	return existing, nil
 }
 
