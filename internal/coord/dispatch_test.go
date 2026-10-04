@@ -64,6 +64,10 @@ type fixturePlan struct {
 	BindPaneAgent     string `json:"bind_pane_agent"`
 	// SuppressReady makes the extension stand-in never record the handshake.
 	SuppressReady bool `json:"suppress_ready"`
+	// AnnounceOnPrompt makes the extension stand-in announce only in the turn an
+	// `agent prompt` starts instead of as soon as the store binds the pane: an
+	// OMP that is already running resolves its binding at its next turn.
+	AnnounceOnPrompt bool `json:"announce_on_prompt"`
 	// SuppressSession makes `agent get` report no native session reference.
 	SuppressSession bool `json:"suppress_session"`
 	// SuppressSessionFor makes `agent get` report no native session reference for
@@ -151,6 +155,16 @@ type fixtureAgent struct {
 	Status   string `json:"status"`
 	Prompted int    `json:"prompted"`
 	Gets     int    `json:"gets"`
+	// Kind is the agent Herdr reports for the pane; empty means omp.
+	Kind string `json:"kind"`
+}
+
+// agentKindOf is the agent kind a stand-in agent reports.
+func agentKindOf(agent *fixtureAgent) string {
+	if agent != nil && agent.Kind != "" {
+		return agent.Kind
+	}
+	return "omp"
 }
 
 // fixtureWorktree is one checkout the stand-in CLI created.
@@ -288,7 +302,7 @@ func fixturePaneGet(plan fixturePlan, state fixtureState, argv []string) int {
 	if ws := workspaceOfPane(pane); state.Workspaces[ws] != "" {
 		agent := ""
 		if state.Agents[pane] != nil {
-			agent = "omp"
+			agent = agentKindOf(state.Agents[pane])
 		}
 		return fixtureResult(map[string]any{
 			"type": "pane_info",
@@ -377,7 +391,7 @@ func fixtureAgentGet(dir string, plan fixturePlan, state *fixtureState, argv []s
 		restarted := announced
 		restarted.ID += "-restarted"
 		reported = &task.SessionRef{Kind: task.SessionKindID, Value: restarted.ID}
-	} else if !plan.SuppressReady && fixtureBound(stateDirOf(), pane, announced) {
+	} else if !plan.SuppressReady && !plan.AnnounceOnPrompt && fixtureBound(stateDirOf(), pane, announced) {
 		// The OMP extension can only announce readiness for a session the bridge
 		// already resolves to its own launch pane.
 		recordFixtureReady(pane, announced)
@@ -516,6 +530,13 @@ func fixtureAgentPrompt(dir string, plan fixturePlan, state *fixtureState, argv 
 	agent.Prompted++
 	agent.Status = "working"
 	state.save(dir)
+	if plan.AnnounceOnPrompt && !plan.SuppressReady {
+		// The extension resolves and announces in the turn this prompt starts
+		// (before_agent_start), once the store binds the pane's session.
+		if announced := fixtureAnnouncement(plan, agent.Session); fixtureBound(stateDirOf(), pane, announced) {
+			recordFixtureReady(pane, announced)
+		}
+	}
 	if plan.PromptAmbiguous {
 		return fixtureError("timeout", "the prompt may already have been submitted")
 	}
@@ -880,8 +901,8 @@ func agentInfo(state fixtureState, pane, cwd string, agent *fixtureAgent, report
 	ws := workspaceOfPane(pane)
 	info := map[string]any{
 		"name":                    agent.Name,
-		"agent":                   "omp",
-		"display_agent":           "omp",
+		"agent":                   agentKindOf(agent),
+		"display_agent":           agentKindOf(agent),
 		"agent_status":            agent.Status,
 		"pane_id":                 pane,
 		"terminal_id":             fixtureTerminal(state, pane),
