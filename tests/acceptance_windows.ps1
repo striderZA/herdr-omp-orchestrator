@@ -3883,7 +3883,7 @@ function Get-DispatchPrompt {
 $($script:MarkerPrefix)DISPATCH. Call the orch_dispatch tool exactly twice (once per task) with these exact parameter values, unchanged:
 Call 1: title = "ACCEPT A: helper in a.js", brief = <<<BRIEF-A>>>, checks = ["git log -1 --format=%H"], dependencies = [], reservedPaths = ["a.js"], baseRevision = "$($script:BaseRevision)".
 Call 2: title = "ACCEPT B: helper in b.js", brief = <<<BRIEF-B>>>, checks = ["git status --porcelain"], dependencies = [], reservedPaths = ["b.js"], baseRevision = "$($script:BaseRevision)".
-Do not edit any file yourself and do not do the work of the tasks. There is no ticket: pass ticketId as null and pass no other parameters. After both tool calls, reply with the two task ids from the tool results and nothing else.
+Do not edit any file yourself and do not do the work of the tasks. There is no ticket: set ticketId to null in each call, send every parameter listed above, and send no other parameter. After both tool calls, reply with the two task ids from the tool results and nothing else.
 BRIEF-A: $($script:BriefA)
 BRIEF-B: $($script:BriefB)
 "@
@@ -4015,7 +4015,7 @@ $($script:MarkerPrefix)SINGLE-WORKER. You are in your own Git worktree of a disp
 Do not ask a question, wait for another message, modify other files, merge, or clean up the checkout.
 "@
     $prompt = @"
-$($script:MarkerPrefix)SINGLE-DISPATCH. Call orch_dispatch exactly once with title "ACCEPT SINGLE: helper in a.js", the following brief unchanged, checks ["git log -1 --format=%H"], dependencies [], reservedPaths ["a.js"], and baseRevision "$($script:BaseRevision)". There is no ticket: pass ticketId as null and pass no other parameters. Do no implementation work yourself. Reply with the new task id only.
+$($script:MarkerPrefix)SINGLE-DISPATCH. Call orch_dispatch exactly once with title "ACCEPT SINGLE: helper in a.js", the following brief unchanged, checks ["git log -1 --format=%H"], dependencies [], reservedPaths ["a.js"], and baseRevision "$($script:BaseRevision)". There is no ticket: set ticketId to null, send every parameter listed above, and send no other parameter. Do no implementation work yourself. Reply with the new task id only.
 BRIEF: $brief
 "@
     $result = Invoke-PrimaryPrompt -PaneId $script:PrimaryPane -Text $prompt -TimeoutSeconds 300
