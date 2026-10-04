@@ -720,6 +720,8 @@ func TestCanonicalExtensionSourceIsTheSubstitutionTemplate(t *testing.T) {
 		`spawn(PLUGIN_EXECUTABLE, ["bridge", method]`,
 		`name: "orch_dispatch"`,
 		`name: "orch_report"`,
+		`name: "orch_task_list"`,
+		`name: "orch_inbox_list"`,
 		`name: "orch_ticket_create"`,
 		`name: "orch_ticket_list"`,
 		`name: "orch_ticket_move"`,
