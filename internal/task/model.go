@@ -111,6 +111,66 @@ type Project struct {
 	// that some of those paths queue for the primary. A project row written before
 	// this field existed decodes to the empty string, which reads as "no attention".
 	PrimaryAttention string
+	// Replaced is the primaries an explicit reattach replaced, oldest first and
+	// bounded to the most recent MaxReplacedPrimaries. The project row only ever
+	// holds the primary it currently records, so without this list the session a
+	// reattach displaced would vanish silently; with it, which session held the
+	// project, in which pane and why the plugin could not vouch for it any more is
+	// a durable fact. A project row written before this field existed decodes to
+	// none.
+	Replaced []ReplacedPrimary
+	// ReattachNotice is the notice attempt of the latest reattach, kept until the
+	// replacement is confirmed. It is what stops a later reattach from sending a
+	// second notice into a session that may already have received one. A project
+	// row written before this field existed decodes to none.
+	ReattachNotice NoticeAttempt
+}
+
+// MaxReplacedPrimaries bounds Project.Replaced.
+const MaxReplacedPrimaries = 8
+
+// ReplacedPrimary is one primary binding that an explicit reattach displaced:
+// the identities the project recorded for it at that moment, why the plugin could
+// not vouch for it, and when the replacement was recorded.
+type ReplacedPrimary struct {
+	LaunchPaneID, PublicPaneID, TerminalID, WorkspaceID string
+	// OMPSessionID is the session identity the displaced binding recorded. It is
+	// kept as recorded, in whatever form the binding held it.
+	OMPSessionID string
+	// Reason is what the plugin observed about the displaced primary when it was
+	// replaced (its pane gone, a different agent in it, a session it could not
+	// prove).
+	Reason string
+	// At is when the replacement was recorded, in Unix milliseconds.
+	At int64
+}
+
+// ReattachNotice states. A notice is the one prompt a reattach sends the
+// replacement session so its extension can announce itself.
+const (
+	// NoticeUncertain is an attempt whose outcome is unknown: it is recorded
+	// before the prompt is sent, and stays so when the prompt's answer was
+	// ambiguous, failed without proof that nothing was written, or the process
+	// stopped mid-call. Like an uncertain inbox note it is inspected by a human and
+	// never resent.
+	NoticeUncertain = "uncertain"
+	// NoticeSent is a notice Herdr acknowledged. The replacement took its turn, so
+	// sending another one cannot make its extension announce.
+	NoticeSent = "sent"
+)
+
+// NoticeAttempt records the notice a reattach sent (or may have sent) to one
+// replacement session. It is keyed by the pane and session it went to, so a
+// different replacement starts with no attempt. The zero value is "none".
+type NoticeAttempt struct {
+	PaneID  string
+	Session string
+	// Kind is the form Session is held in (SessionKindID or SessionKindPath), as
+	// Herdr reported it, so a later comparison never has to guess it.
+	Kind  string
+	State string
+	// At is when the attempt was recorded, in Unix milliseconds.
+	At int64
 }
 
 // Inbox is one durable note addressed to a project or task.
