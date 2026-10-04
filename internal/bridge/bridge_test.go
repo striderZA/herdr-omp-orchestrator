@@ -1123,6 +1123,40 @@ func TestBridgeResolveDirectBindingNeedsNoHerdr(t *testing.T) {
 	}
 }
 
+func TestBridgeResolveClearsPrimaryAttentionAfterVerifiedRestore(t *testing.T) {
+	f := newBridgeFixture(t)
+	project := f.seedPrimary()
+	const reason = "the recorded primary pane w3:p1 is absent from Herdr's snapshot"
+	if err := f.store.UpdateProject(context.Background(), project.Key, func(next *task.Project) error {
+		next.PrimaryAttention = reason
+		return nil
+	}); err != nil {
+		t.Fatalf("record primary attention: %v", err)
+	}
+
+	const newPane = "w7:p3"
+	f.useHerdrFixture(paneEnvelope(t, newPane, "term-restored", "ws-repo-1", f.repoRoot, "omp"))
+	f.env["HERDR_PANE_ID"] = newPane
+
+	resp := f.call("resolve", primarySession, "{}")
+	var result ResolveResult
+	resp.decodeResult(t, &result)
+	if !result.Bound || !result.Rebound || result.Role != string(state.RolePrimary) {
+		t.Fatalf("resolve after verified primary restore = %+v, want a rebound primary", result)
+	}
+
+	after, err := f.store.Project(context.Background(), project.Key)
+	if err != nil {
+		t.Fatalf("read primary after restore: %v", err)
+	}
+	if after.PrimaryAttention != "" {
+		t.Errorf("PrimaryAttention = %q after verified restore, want it cleared", after.PrimaryAttention)
+	}
+	if after.LaunchPaneID != newPane || after.PublicPaneID != newPane || after.TerminalID != "term-restored" {
+		t.Errorf("verified restore did not rebind the primary: %+v", after)
+	}
+}
+
 func TestBridgeResolveRebindsVerifiedRestore(t *testing.T) {
 	f := newBridgeFixture(t)
 	before := f.seedWorker("t1", workerPane, workerPane, workerSession)
