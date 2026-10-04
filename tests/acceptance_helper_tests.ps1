@@ -2641,6 +2641,106 @@ con.commit()
     $script:StateDb = $savedDb
 }
 
+# --- OMP model pinning (-Model) ----------------------------------------------
+foreach ($accepted in @('openai-codex/gpt-6-luna', 'openai-codex/gpt-6-luna:high', 'nanogpt/openai/gpt-6-luna', 'anthropic/claude-sonnet-5-5:xhigh')) {
+    Check "model spec accepted: $accepted" ($accepted -match $script:OmpModelPattern) $accepted
+}
+foreach ($rejected in @('', 'gpt-6-luna', 'openai-codex/', '/gpt-6-luna', 'openai-codex/gpt-6-luna:turbo', 'openai-codex/gpt 6', 'openai-codex/gpt-6-luna"', "openai-codex/gpt-6-luna`nmodelRoles:", "openai-codex/gpt-6-luna`n")) {
+    Check "model spec rejected: [$($rejected -replace "`n", '\n')]" (-not ($rejected -match $script:OmpModelPattern)) $rejected
+}
+Check 'overlay pins only the default model role, quoted' `
+    ((Get-OmpModelOverlayText -Model 'openai-codex/gpt-6-luna') -ceq "modelRoles:`n  default: `"openai-codex/gpt-6-luna`"`n") 'overlay text'
+$overlayRefused = $false
+try { [void](Get-OmpModelOverlayText -Model "x/y`nmodelRoles: {}") } catch { $overlayRefused = $true }
+Check 'overlay refuses a spec that could inject YAML' $overlayRefused 'injection'
+
+$pathSeparator = [string][System.IO.Path]::PathSeparator
+$overlayFile = 'C:\run\omp-model-overlay.yml'
+Check 'config files: with nothing listed the value is just the overlay' `
+    ((Join-OmpConfigFiles -Existing '' -Overlay $overlayFile) -ceq $overlayFile) 'empty list'
+Check 'config files: the invoking user list is kept and the overlay goes last so it wins' `
+    ((Join-OmpConfigFiles -Existing 'C:\u\one.yml' -Overlay $overlayFile) -ceq ('C:\u\one.yml' + $pathSeparator + $overlayFile)) 'order'
+Check 'config files: blanks, repeats and an earlier copy of the overlay collapse to one trailing overlay' `
+    ((Join-OmpConfigFiles -Existing ($pathSeparator + $overlayFile + $pathSeparator + 'C:\u\one.yml' + $pathSeparator + 'C:\u\one.yml') -Overlay $overlayFile) -ceq ('C:\u\one.yml' + $pathSeparator + $overlayFile)) 'dedupe'
+
+$modelTranscript = Join-Path $script:HarnessRoot 'model-session.jsonl'
+Set-Content -LiteralPath $modelTranscript -Encoding UTF8 -Value @(
+    '{"type":"title","v":1,"title":"x"}'
+    '{"type":"message","message":{"role":"user","content":[{"type":"text","text":"hi"}],"provider":"anthropic","model":"claude-sonnet-5-5"}}'
+    '{"type":"message","message":{"role":"assistant","provider":"openai-codex","model":"gpt-6-luna","content":[]}}'
+    '{"type":"message","message":{"role":"assistant","provider":"openai-codex","model":"gpt-6-luna","content":[]}}'
+    '{"type":"message","message":{"role":"assistant","provid'
+)
+$modelsSeen = @(Get-OmpTranscriptModels -Path $modelTranscript)
+Check 'transcript models: only distinct assistant provider/model pairs (a user line and a half-written line add nothing)' `
+    ($modelsSeen.Count -eq 1 -and $modelsSeen[0] -ceq 'openai-codex/gpt-6-luna') ($modelsSeen -join ',')
+Check 'transcript models: a session that ran only on the pinned model passes' `
+    (Test-OmpTranscriptModels -Path $modelTranscript -Model 'openai-codex/gpt-6-luna') 'pinned model'
+Check 'transcript models: the :thinking suffix is a request, not part of the recorded model id' `
+    (Test-OmpTranscriptModels -Path $modelTranscript -Model 'openai-codex/gpt-6-luna:high') 'suffix'
+Check 'transcript models: a different pinned model fails' `
+    (-not (Test-OmpTranscriptModels -Path $modelTranscript -Model 'anthropic/claude-sonnet-5-5')) 'other model'
+
+$mixedTranscript = Join-Path $script:HarnessRoot 'model-mixed-session.jsonl'
+Set-Content -LiteralPath $mixedTranscript -Encoding UTF8 -Value @(
+    '{"type":"message","message":{"role":"assistant","provider":"openai-codex","model":"gpt-6-luna","content":[]}}'
+    '{"type":"message","message":{"role":"assistant","provider":"anthropic","model":"claude-sonnet-5-5","content":[]}}'
+)
+Check 'transcript models: one turn on another model (a fallback) fails the whole session' `
+    (-not (Test-OmpTranscriptModels -Path $mixedTranscript -Model 'openai-codex/gpt-6-luna')) 'mixed models'
+
+$userOnlyTranscript = Join-Path $script:HarnessRoot 'model-user-only-session.jsonl'
+Set-Content -LiteralPath $userOnlyTranscript -Encoding UTF8 -Value '{"type":"message","message":{"role":"user","content":[],"provider":"openai-codex","model":"gpt-6-luna"}}'
+Check 'transcript models: a user message naming the model is not an assistant turn' `
+    (-not (Test-OmpTranscriptModels -Path $userOnlyTranscript -Model 'openai-codex/gpt-6-luna')) 'user only'
+Check 'transcript models: a missing transcript proves nothing' `
+    (-not (Test-OmpTranscriptModels -Path (Join-Path $script:HarnessRoot 'no-such-session.jsonl') -Model 'openai-codex/gpt-6-luna')) 'missing file'
+
+$nestedTranscript = Join-Path $script:HarnessRoot 'model-nested-session.jsonl'
+Set-Content -LiteralPath $nestedTranscript -Encoding UTF8 -Value '{"type":"message","message":{"role":"assistant","provider":"nanogpt","model":"openai/gpt-6-luna","content":[]}}'
+Check 'transcript models: a model id that itself contains a slash matches its provider/model spelling' `
+    (Test-OmpTranscriptModels -Path $nestedTranscript -Model 'nanogpt/openai/gpt-6-luna') 'nested id'
+
+# Assert-OmpSessionModel is the runtime gate that stops a pinned run passing without
+# proof. Stub only the handshake lookup, record what the gate asserts, then restore
+# the real function and the run counters so nothing leaks into other checks.
+$realGetReadySession = ${function:Get-ReadySession}
+$savedModel = $script:OmpModel
+$savedAssertions = $script:Assertions
+$savedCounts = @($script:Passed, $script:Failures, $script:Blocked)
+$script:Assertions = New-Object System.Collections.ArrayList
+$script:StubHandshake = $null
+function Get-ReadySession { param([string]$LaunchPaneId) return $script:StubHandshake }
+function Get-ModelGateStatus {
+    param([string]$Model, $Handshake)
+    $script:OmpModel = $Model
+    $script:StubHandshake = $Handshake
+    $before = $script:Assertions.Count
+    Assert-OmpSessionModel -Id 'T.model' -What 'probe' -LaunchPaneId 'w1:p1' *> $null
+    return [string]$script:Assertions[$before].status
+}
+try {
+    $pinned = 'openai-codex/gpt-6-luna'
+    $idOnly = [pscustomobject]@{ omp_session_id = '01a0-abc'; omp_session_file = '' }
+    Check 'model gate: pinned with no readiness handshake fails' ((Get-ModelGateStatus -Model $pinned -Handshake $null) -ceq 'FAIL') 'no handshake'
+    Check 'model gate: pinned with an id-only session (no transcript path) fails instead of passing on faith' ((Get-ModelGateStatus -Model $pinned -Handshake $idOnly) -ceq 'FAIL') 'id only'
+    Check 'model gate: pinned and every turn on the pinned model passes' `
+        ((Get-ModelGateStatus -Model $pinned -Handshake ([pscustomobject]@{ omp_session_file = $modelTranscript })) -ceq 'PASS') 'right model'
+    Check 'model gate: pinned but one turn on another model fails' `
+        ((Get-ModelGateStatus -Model $pinned -Handshake ([pscustomobject]@{ omp_session_file = $mixedTranscript })) -ceq 'FAIL') 'mixed models'
+    Check 'model gate: nothing pinned only records what OMP chose (INFO), even without a transcript path' `
+        ((Get-ModelGateStatus -Model '' -Handshake $idOnly) -ceq 'INFO') 'unpinned id only'
+    Check 'model gate: nothing pinned records a readable transcript as INFO, not a verdict' `
+        ((Get-ModelGateStatus -Model '' -Handshake ([pscustomobject]@{ omp_session_file = $modelTranscript })) -ceq 'INFO') 'unpinned file'
+} finally {
+    ${function:Get-ReadySession} = $realGetReadySession
+    Remove-Item -LiteralPath Function:\Get-ModelGateStatus -ErrorAction SilentlyContinue
+    Remove-Variable -Name StubHandshake -Scope Script -ErrorAction SilentlyContinue
+    $script:OmpModel = $savedModel
+    $script:Assertions = $savedAssertions
+    $script:Passed, $script:Failures, $script:Blocked = $savedCounts
+}
+
 } finally {
     # One owned directory holds every path this run created, so cleanup is a single
     # removal that cannot touch anything the harness did not create.
