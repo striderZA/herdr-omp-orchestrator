@@ -1260,6 +1260,26 @@ $script:PrimaryPromptCallsForTest = 0
 $blockedAsyncPrimary = $null
 try { $blockedAsyncPrimary = Invoke-PrimaryPromptNoWaitAfterDispositionAsks -PaneId 'w1:p1' -Text 'must not type into active UI' -TimeoutSeconds 30 } catch { }
 Check 'no-wait primary prompt refuses an already blocked session without submitting' ($null -ne $blockedAsyncPrimary -and $blockedAsyncPrimary.Blocked -and -not $blockedAsyncPrimary.Submitted -and $script:PrimaryPromptCallsForTest -eq 0) 'blocked refusal'
+# A primary that Herdr reports blocked only briefly (no dialog was open) is tried
+# once more after its pending disposition Asks are resolved, as the --wait variant
+# does; the first attempt still types nothing.
+$script:ResolvePendingCallsForTest = 0
+function Resolve-PendingPrimaryDispositionAsks {
+    param([string]$AssertionPrefix, [double]$TimeoutSeconds = 60)
+    $script:ResolvePendingCallsForTest++
+    if ($script:ResolvePendingCallsForTest -ge 2) { $script:PrimaryAgentStatusForTest = 'idle' }
+    return [pscustomobject]@{ Resolved = $true; Observed = $false; Screen = '' }
+}
+$script:PrimaryAgentStatusForTest = 'blocked'
+$script:PrimaryPromptCallsForTest = 0
+$transientAsyncPrimary = $null
+try { $transientAsyncPrimary = Invoke-PrimaryPromptNoWaitAfterDispositionAsks -PaneId 'w1:p1' -Text 'answer after a transient block' -TimeoutSeconds 30 } catch { }
+Check 'no-wait primary prompt retries once after a transient blocked state and submits exactly once' ($null -ne $transientAsyncPrimary -and $transientAsyncPrimary.Submitted -and $script:PrimaryPromptCallsForTest -eq 1 -and $script:PrimaryPromptTextForTest -eq 'answer after a transient block') ("calls=$($script:PrimaryPromptCallsForTest) resolves=$($script:ResolvePendingCallsForTest)")
+function Resolve-PendingPrimaryDispositionAsks {
+    param([string]$AssertionPrefix, [double]$TimeoutSeconds = 60)
+    return [pscustomobject]@{ Resolved = $true; Observed = $false; Screen = '' }
+}
+$script:PrimaryAgentStatusForTest = 'blocked'
 $savedKeepResources = [bool]$script:KeepResources
 $script:KeepResources = $false
 if (Get-Command Preserve-ResourcesForPendingTool -ErrorAction SilentlyContinue) {

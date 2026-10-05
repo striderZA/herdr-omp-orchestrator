@@ -5158,6 +5158,30 @@ function Invoke-PrimaryPromptAfterDispositionAsks {
 }
 
 function Invoke-PrimaryPromptNoWaitAfterDispositionAsks {
+    <#
+        The no-wait twin of Invoke-PrimaryPromptAfterDispositionAsks, with the same
+        single retry: a primary seen blocked before anything was submitted gets its
+        pending disposition Asks resolved once and the prompt is tried once more.
+        Nothing is typed while the primary is blocked, so the retry cannot answer an
+        unrelated dialog.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$PaneId,
+        [Parameter(Mandatory)][string]$Text,
+        [double]$TimeoutSeconds = 300,
+        [string]$AssertionPrefix = 'prompt'
+    )
+    $result = Invoke-PrimaryPromptNoWaitOnce -PaneId $PaneId -Text $Text -TimeoutSeconds $TimeoutSeconds -AssertionPrefix $AssertionPrefix
+    if ($result.Blocked -and $result.Code -eq 'agent_blocked' -and -not $result.Submitted) {
+        $pending = Resolve-PendingPrimaryDispositionAsks -AssertionPrefix $AssertionPrefix -TimeoutSeconds 60
+        if ($pending.Resolved) {
+            $result = Invoke-PrimaryPromptNoWaitOnce -PaneId $PaneId -Text $Text -TimeoutSeconds $TimeoutSeconds -AssertionPrefix $AssertionPrefix
+        }
+    }
+    return $result
+}
+
+function Invoke-PrimaryPromptNoWaitOnce {
     param(
         [Parameter(Mandatory)][string]$PaneId,
         [Parameter(Mandatory)][string]$Text,
