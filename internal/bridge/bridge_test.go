@@ -1568,6 +1568,50 @@ func TestBridgeResolveRefusesAmbiguousSession(t *testing.T) {
 	}
 }
 
+// A database written before the store refused a shared pane can hold two fresh
+// primaries on one launch pane. A process on that pane announces a session
+// neither records: adopting it into either would attribute it to a guess, so
+// resolve refuses as ambiguous and writes the session into neither project.
+func TestBridgeResolveRefusesALaunchPaneTwoProjectsRecord(t *testing.T) {
+	ctx := context.Background()
+	f := newBridgeFixture(t)
+	project := f.seedPrimary()
+	if err := f.store.UpdateProject(ctx, project.Key, func(next *task.Project) error {
+		next.OMPSessionID = ""
+		return nil
+	}); err != nil {
+		t.Fatalf("make the primary fresh: %v", err)
+	}
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(f.stateDir, "orchestrator.sqlite")))
+	if err != nil {
+		t.Fatalf("open state: %v", err)
+	}
+	defer db.Close()
+	legacyKey := filepath.Join(t.TempDir(), "repo-legacy")
+	legacy, err := json.Marshal(task.Project{Key: legacyKey, LaunchPaneID: primaryPane, PublicPaneID: primaryPane})
+	if err != nil {
+		t.Fatalf("encode the legacy duplicate: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO projects (key, data) VALUES (?, ?)`, legacyKey, string(legacy)); err != nil {
+		t.Fatalf("insert the legacy duplicate: %v", err)
+	}
+	f.env["HERDR_PANE_ID"] = primaryPane
+
+	var result ResolveResult
+	f.call("resolve", "omp-fresh-primary", "{}").decodeResult(t, &result)
+	if result.Bound {
+		t.Fatalf("resolve picked one of two projects on the pane: %+v", result)
+	}
+	if result.Reason != ReasonAmbiguousSession || !strings.Contains(result.Attention, primaryPane) {
+		t.Errorf("resolve = %+v, want %q naming the pane", result, ReasonAmbiguousSession)
+	}
+	for _, key := range []string{project.Key, legacyKey} {
+		if stored, err := f.store.Project(ctx, key); err != nil || stored.OMPSessionID != "" {
+			t.Errorf("project %s = (%q, %v), want no adopted session", key, stored.OMPSessionID, err)
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // ready
 // ---------------------------------------------------------------------------

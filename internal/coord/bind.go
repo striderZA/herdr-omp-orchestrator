@@ -235,9 +235,12 @@ func New(store *state.Store, client *herdr.Client, opts Options) (*Coordinator, 
 // compares against a pane's working directory.
 //
 // workspaceID and rootPaneID describe where the action was invoked from. A pane
-// that already represents the canonical root is used as the primary's pane;
-// otherwise a workspace is created for the root. The pane is recorded as both
-// its launch-time and public identity before `agent start`, so the extension's
+// that already represents the canonical root, runs no agent and is recorded by
+// no other project or task is used as the primary's pane; otherwise a workspace
+// is created for the root. The store refuses a pane another binding records
+// (ErrAlreadyBound here), so one pane never attributes to two primaries. The
+// pane is recorded as both its launch-time and public identity before
+// `agent start`, so the extension's
 // handshake can be matched against `agent get`. Binding never steals focus and
 // never substitutes a new primary for a recorded one that is gone.
 //
@@ -275,7 +278,17 @@ func (c *Coordinator) Bind(ctx context.Context, repo, workspaceID, rootPaneID st
 			// one, and never adopts a session whose readiness cannot be observed
 			// before the next human turn.
 		case err == nil:
-			workspace, paneID = pane.WorkspaceID, pane.PaneID
+			claimed, claimErr := c.paneClaimed(ctx, pane.PaneID)
+			if claimErr != nil {
+				return task.Project{}, claimErr
+			}
+			if !claimed {
+				workspace, paneID = pane.WorkspaceID, pane.PaneID
+			}
+			// A pane another record still owns (an exited primary of another
+			// repository whose shell moved here, or a worker) is never adopted:
+			// a second record on it would make every lookup by that pane
+			// ambiguous. The primary gets its own workspace instead.
 		case isMissingTarget(err):
 			// The named pane is gone: fall through and create a workspace for the
 			// root rather than binding a pane that no longer exists.
@@ -304,6 +317,9 @@ func (c *Coordinator) Bind(ctx context.Context, repo, workspaceID, rootPaneID st
 		AgentName:          PrimaryAgentName(root),
 	}
 	if err := c.store.CreateProject(ctx, project); err != nil {
+		if errors.Is(err, state.ErrPaneTaken) {
+			return task.Project{}, fmt.Errorf("%w: record the primary for %s: %w", ErrAlreadyBound, root, err)
+		}
 		return task.Project{}, fmt.Errorf("record the primary for %s: %w", root, err)
 	}
 	name, err := c.ensureAgent(ctx, paneID, PrimaryAgentName(root))
@@ -359,6 +375,20 @@ func (c *Coordinator) preflight(ctx context.Context) error {
 	return nil
 }
 
+// paneClaimed reports whether any project or task records paneID as its launch
+// or public pane. A pane claimed by more than one record is claimed too.
+func (c *Coordinator) paneClaimed(ctx context.Context, paneID string) (bool, error) {
+	_, err := c.store.ByPane(ctx, paneID)
+	switch {
+	case err == nil, errors.Is(err, state.ErrAmbiguous):
+		return true, nil
+	case errors.Is(err, state.ErrNotFound):
+		return false, nil
+	default:
+		return false, fmt.Errorf("read the records of pane %q: %w", paneID, err)
+	}
+}
+
 // reopenPrimary re-verifies a recorded primary binding. It never starts a new
 // primary in place of one that is missing: that would silently substitute a
 // different session for the one the user was talking to. It does complete a bind
@@ -403,6 +433,9 @@ func (c *Coordinator) reopenPrimary(ctx context.Context, existing task.Project) 
 			next.CurrentWorkspaceID = pane.WorkspaceID
 			return nil
 		})
+		if errors.Is(err, state.ErrPaneTaken) {
+			return existing, fmt.Errorf("%w: record the moved primary pane %s of %s: %w", ErrAlreadyBound, pane.PaneID, existing.Key, err)
+		}
 		if err != nil {
 			return existing, err
 		}

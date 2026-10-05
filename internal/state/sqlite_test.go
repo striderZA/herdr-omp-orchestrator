@@ -958,6 +958,125 @@ func TestStoreProjectByLaunchPane(t *testing.T) {
 	}
 }
 
+// A pane names one binding. A second project on a pane another project records
+// (as its launch or public pane), or on a task's pane, is refused in the same
+// transaction as the insert, with a stable error that is not a retryable
+// compare-and-swap conflict, and nothing is written.
+func TestStoreCreateProjectRefusesARecordedPane(t *testing.T) {
+	ctx := context.Background()
+	s := open(t, t.TempDir())
+	first := task.Project{Key: "E:/repo-a", LaunchPaneID: "w3:p1", PublicPaneID: "w4:p2"}
+	if err := s.CreateProject(ctx, first); err != nil {
+		t.Fatalf("CreateProject(first): %v", err)
+	}
+	if err := s.CreateTask(ctx, seedTask("t1")); err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+
+	for name, p := range map[string]task.Project{
+		"another project's launch pane":      {Key: "E:/repo-b", LaunchPaneID: "w3:p1", PublicPaneID: "w3:p1"},
+		"another project's public pane":      {Key: "E:/repo-b", LaunchPaneID: "w4:p2", PublicPaneID: "w4:p2"},
+		"a public pane another project owns": {Key: "E:/repo-b", LaunchPaneID: "w5:p1", PublicPaneID: "w3:p1"},
+		"a task's launch pane":               {Key: "E:/repo-b", LaunchPaneID: launchPane, PublicPaneID: launchPane},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := s.CreateProject(ctx, p)
+			if !errors.Is(err, state.ErrPaneTaken) {
+				t.Fatalf("CreateProject = %v, want ErrPaneTaken", err)
+			}
+			if errors.Is(err, state.ErrConflict) {
+				t.Errorf("CreateProject = %v: a taken pane must not read as a retryable conflict", err)
+			}
+			if _, err := s.Project(ctx, p.Key); !errors.Is(err, state.ErrNotFound) {
+				t.Errorf("the refused project was recorded: %v", err)
+			}
+		})
+	}
+	if got, err := s.ProjectByLaunchPane(ctx, "w3:p1"); err != nil || got.Key != first.Key {
+		t.Errorf("ProjectByLaunchPane(w3:p1) = (%q, %v), want the first project unchanged", got.Key, err)
+	}
+	// A free pane is still accepted.
+	if err := s.CreateProject(ctx, task.Project{Key: "E:/repo-b", LaunchPaneID: "w5:p1", PublicPaneID: "w5:p1"}); err != nil {
+		t.Fatalf("CreateProject(free pane): %v", err)
+	}
+}
+
+// Moving a project onto a pane another binding records is refused like
+// creating one there; a write that keeps the panes is never refused for it.
+func TestStoreUpdateProjectRefusesMovingOntoARecordedPane(t *testing.T) {
+	ctx := context.Background()
+	s := open(t, t.TempDir())
+	for _, p := range []task.Project{
+		{Key: "E:/repo-a", LaunchPaneID: "w3:p1", PublicPaneID: "w3:p1"},
+		{Key: "E:/repo-b", LaunchPaneID: "w5:p1", PublicPaneID: "w5:p1"},
+	} {
+		if err := s.CreateProject(ctx, p); err != nil {
+			t.Fatalf("CreateProject(%s): %v", p.Key, err)
+		}
+	}
+	for name, mutate := range map[string]func(*task.Project){
+		"launch pane": func(p *task.Project) { p.LaunchPaneID, p.PublicPaneID = "w3:p1", "w3:p1" },
+		"public pane": func(p *task.Project) { p.PublicPaneID = "w3:p1" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := s.UpdateProject(ctx, "E:/repo-b", func(p *task.Project) error { mutate(p); return nil })
+			if !errors.Is(err, state.ErrPaneTaken) {
+				t.Fatalf("UpdateProject = %v, want ErrPaneTaken", err)
+			}
+			if got, _ := s.Project(ctx, "E:/repo-b"); got.LaunchPaneID != "w5:p1" || got.PublicPaneID != "w5:p1" {
+				t.Errorf("the refused move was written: %+v", got)
+			}
+		})
+	}
+	// The project's own panes are not "another binding's".
+	if err := s.UpdateProject(ctx, "E:/repo-b", func(p *task.Project) error {
+		p.LaunchPaneID, p.PublicPaneID = "w5:p1", "w6:p1"
+		return nil
+	}); err != nil {
+		t.Fatalf("UpdateProject(own launch pane, free public pane): %v", err)
+	}
+}
+
+// A database written before CreateProject refused a shared pane may already
+// hold two projects on one launch pane. It still opens and stays writable, and
+// a lookup by that pane fails closed instead of picking one of them.
+func TestStoreOpensADatabaseWithDuplicatedProjectPanes(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	s := open(t, dir)
+	raw := rawState(t, dir)
+	for _, key := range []string{"E:/repo-a", "E:/repo-b"} {
+		row := `{"Key":"` + key + `","LaunchPaneID":"w3:p1","PublicPaneID":"w3:p1"}`
+		if _, err := raw.ExecContext(ctx, `INSERT INTO projects (key, data) VALUES (?, ?)`, key, row); err != nil {
+			t.Fatalf("insert the legacy duplicate %s: %v", key, err)
+		}
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	reopened := open(t, dir)
+
+	for range 5 {
+		if got, err := reopened.ProjectByLaunchPane(ctx, "w3:p1"); !errors.Is(err, state.ErrAmbiguous) {
+			t.Fatalf("ProjectByLaunchPane(duplicate) = (%q, %v), want ErrAmbiguous", got.Key, err)
+		}
+	}
+	if _, err := reopened.ByPane(ctx, "w3:p1"); !errors.Is(err, state.ErrAmbiguous) {
+		t.Errorf("ByPane(duplicate) = %v, want ErrAmbiguous", err)
+	}
+	if all, err := reopened.Projects(ctx); err != nil || len(all) != 2 {
+		t.Fatalf("Projects = (%d, %v), want both legacy rows", len(all), err)
+	}
+	// A write that keeps the panes stays possible, so recording attention on a
+	// legacy duplicate is never blocked by the duplicate itself.
+	if err := reopened.UpdateProject(ctx, "E:/repo-b", func(p *task.Project) error {
+		p.PrimaryAttention = "two projects record pane w3:p1"
+		return nil
+	}); err != nil {
+		t.Fatalf("UpdateProject(keeping panes): %v", err)
+	}
+}
+
 func TestStoreConcurrentUpdateHasOneWinner(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
