@@ -1165,6 +1165,42 @@ func TestBridgeResolveClearsPrimaryAttentionAfterVerifiedRestore(t *testing.T) {
 	}
 }
 
+// A verified restore into a pane another project already records is not
+// written: the store refuses the move, the primary keeps its recorded pane and
+// session, the other project is untouched, and resolve stays inactive with
+// attention naming the conflict instead of reporting a concurrent change.
+func TestBridgeResolveDoesNotRebindAPrimaryOntoAPaneAnotherProjectRecords(t *testing.T) {
+	ctx := context.Background()
+	f := newBridgeFixture(t)
+	project := f.seedPrimary()
+	const newPane = "w7:p3"
+	other := task.Project{Key: filepath.Join(t.TempDir(), "repo-b"), LaunchPaneID: newPane, PublicPaneID: newPane, OMPSessionID: "omp-session-of-b"}
+	if err := f.store.CreateProject(ctx, other); err != nil {
+		t.Fatalf("record the other project: %v", err)
+	}
+	f.useHerdrFixture(paneEnvelope(t, newPane, "term-restored", "ws-repo-1", f.repoRoot, "omp"))
+	f.env["HERDR_PANE_ID"] = newPane
+
+	var result ResolveResult
+	f.call("resolve", primarySession, "{}").decodeResult(t, &result)
+	if result.Bound || result.Reason != ReasonUnverifiedRestore {
+		t.Fatalf("resolve = %+v, want an inactive unverified restore", result)
+	}
+	if !strings.Contains(result.Attention, "another project or task already records") {
+		t.Errorf("attention = %q, want it to name the taken pane", result.Attention)
+	}
+	after, err := f.store.Project(ctx, project.Key)
+	if err != nil {
+		t.Fatalf("read the primary: %v", err)
+	}
+	if after.LaunchPaneID != project.LaunchPaneID || after.PublicPaneID != project.PublicPaneID || after.OMPSessionID != project.OMPSessionID {
+		t.Errorf("the refused rebind changed the primary: %+v", after)
+	}
+	if kept, err := f.store.Project(ctx, other.Key); err != nil || kept.LaunchPaneID != newPane || kept.OMPSessionID != other.OMPSessionID {
+		t.Errorf("the other project = (%+v, %v), want it untouched", kept, err)
+	}
+}
+
 func TestBridgeResolveRebindsVerifiedRestore(t *testing.T) {
 	f := newBridgeFixture(t)
 	before := f.seedWorker("t1", workerPane, workerPane, workerSession)
