@@ -397,6 +397,112 @@ func TestDecodeWorktreeCreateResponse(t *testing.T) {
 	f.assertDirectChild()
 }
 
+// worktreeCreateResponse decodes the captured `worktree create` answer so one
+// test can contradict exactly one field of it.
+func worktreeCreateResponse(t *testing.T) map[string]any {
+	t.Helper()
+	var envelope map[string]any
+	if err := json.Unmarshal([]byte(readFixture(t, "worktree-create.json")), &envelope); err != nil {
+		t.Fatalf("decode worktree-create.json: %v", err)
+	}
+	return envelope
+}
+
+// worktreeCreatePayloadFor renders the captured `worktree create` answer for one
+// requested repository, which is what the client requires such an answer to
+// describe.
+func worktreeCreatePayloadFor(t *testing.T, root string) string {
+	t.Helper()
+	envelope := worktreeCreateResponse(t)
+	object(t, object(t, object(t, envelope, "result"), "workspace"), "worktree")["repo_root"] = root
+	return encodeResponse(t, envelope)
+}
+
+// TestWorktreeCreateRefusesResponsesThatContradictTheRequest pins the client's
+// fail-closed reading of a `worktree create` answer: the coordinator records the
+// checkout it names as the task's isolated worktree of the project's repository,
+// so an answer about another repository, or one whose two spellings of the
+// checkout name different places, is refused rather than interpreted. The
+// checkout may exist, so the refusal is classified as ambiguous and the caller
+// reconciles it through `worktree list`. The two contradictions the issue names
+// are checked-in variants of the captured response; the third contradicts the
+// other side of the checkout comparison.
+func TestWorktreeCreateRefusesResponsesThatContradictTheRequest(t *testing.T) {
+	const root = `C:\work\demo-repo`
+	otherPath := worktreeCreateResponse(t)
+	object(t, object(t, otherPath, "result"), "worktree")["path"] = `C:\herdr\worktrees\demo-repo\other-branch`
+	cases := []struct {
+		name    string
+		field   string
+		payload string
+	}{
+		{
+			"workspace repo root names another repository", "workspace.worktree.repo_root",
+			readFixture(t, "worktree-create-other-repo.json"),
+		},
+		{
+			"workspace checkout path disagrees with the worktree path", "workspace.worktree.checkout_path",
+			readFixture(t, "worktree-create-split-checkout.json"),
+		},
+		{
+			"worktree path disagrees with the workspace checkout path", "workspace.worktree.checkout_path",
+			encodeResponse(t, otherPath),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t).stdout(tc.payload)
+			created, err := f.client.WorktreeCreate(shortCtx(t, 5*time.Second), root, "demo-branch", "abc1234")
+			if created != nil {
+				t.Errorf("created = %+v, want nil for a contradictory response", created)
+			}
+			var identity *IdentityError
+			if !errors.As(err, &identity) {
+				t.Fatalf("err = %v, want *IdentityError", err)
+			}
+			if identity.Field != tc.field {
+				t.Errorf("IdentityError.Field = %q, want %q", identity.Field, tc.field)
+			}
+			if !errors.Is(err, ErrAmbiguous) {
+				t.Errorf("err = %v, want ErrAmbiguous: the checkout may exist", err)
+			}
+			f.assertDirectChild()
+		})
+	}
+}
+
+// TestWorktreeCreateAcceptsTheSpellingsHerdrReallyUses keeps the cross-check
+// platform-correct. On Windows the same path spelled with the other separator, a
+// trailing separator or another case names the same place; elsewhere paths
+// compare exactly, so only the response's own spelling is accepted.
+func TestWorktreeCreateAcceptsTheSpellingsHerdrReallyUses(t *testing.T) {
+	cases := []struct{ name, root, payload string }{
+		{"the same spelling as the response", `C:\work\demo-repo`, readFixture(t, "worktree-create.json")},
+	}
+	if runtime.GOOS == "windows" {
+		forwardCheckout := worktreeCreateResponse(t)
+		object(t, object(t, object(t, forwardCheckout, "result"), "workspace"), "worktree")["checkout_path"] = `C:/herdr/worktrees/demo-repo/demo-branch/`
+		cases = append(cases, []struct{ name, root, payload string }{
+			{"forward slashes and a trailing separator", `C:/work/demo-repo/`, readFixture(t, "worktree-create.json")},
+			{"checkout spelled with the other separator", `C:\work\demo-repo`, encodeResponse(t, forwardCheckout)},
+			{"a different case", `c:\WORK\Demo-Repo`, readFixture(t, "worktree-create.json")},
+		}...)
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t).stdout(tc.payload)
+			created, err := f.client.WorktreeCreate(shortCtx(t, 5*time.Second), tc.root, "demo-branch", "abc1234")
+			if err != nil {
+				t.Fatalf("WorktreeCreate(%q): %v", tc.root, err)
+			}
+			if created.WorktreePath != `C:\herdr\worktrees\demo-repo\demo-branch` {
+				t.Errorf("WorktreePath = %q, want the checkout the response named", created.WorktreePath)
+			}
+			f.assertDirectChild()
+		})
+	}
+}
+
 // TestDecodeWorktreeOpenResponse uses the response captured from a real Herdr
 // 0.9.1-preview probe of the production failure: a worker's pane was moved into a
 // new workspace (closing the worktree's own workspace), and `worktree open` is
@@ -1546,7 +1652,7 @@ func TestArgvWindowsPathsWithSpacesStayDiscrete(t *testing.T) {
 	}{
 		{
 			name:    "worktree create",
-			payload: readFixture(t, "worktree-create.json"),
+			payload: worktreeCreatePayloadFor(t, root),
 			call: func(ctx context.Context, c *Client) error {
 				_, err := c.WorktreeCreate(ctx, root, branch, base)
 				return err
