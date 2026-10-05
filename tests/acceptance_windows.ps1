@@ -5164,8 +5164,9 @@ function Invoke-PrimaryPromptNoWaitAfterDispositionAsks {
         The no-wait twin of Invoke-PrimaryPromptAfterDispositionAsks, with the same
         single retry: a primary seen blocked before anything was submitted gets its
         pending disposition Asks resolved once and the prompt is tried once more.
-        Nothing is typed while the primary is blocked, so the retry cannot answer an
-        unrelated dialog.
+        The prompt itself is never submitted while the primary is blocked; between
+        the attempts only Resolve-PendingPrimaryDispositionAsks may press Enter, and
+        only on a disposition Ask it recognizes exactly.
     #>
     param(
         [Parameter(Mandatory)][string]$PaneId,

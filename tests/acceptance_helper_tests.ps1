@@ -1275,6 +1275,20 @@ $script:PrimaryPromptCallsForTest = 0
 $transientAsyncPrimary = $null
 try { $transientAsyncPrimary = Invoke-PrimaryPromptNoWaitAfterDispositionAsks -PaneId 'w1:p1' -Text 'answer after a transient block' -TimeoutSeconds 30 } catch { }
 Check 'no-wait primary prompt retries once after a transient blocked state and submits exactly once' ($null -ne $transientAsyncPrimary -and $transientAsyncPrimary.Submitted -and $script:PrimaryPromptCallsForTest -eq 1 -and $script:PrimaryPromptTextForTest -eq 'answer after a transient block') ("calls=$($script:PrimaryPromptCallsForTest) resolves=$($script:ResolvePendingCallsForTest)")
+# When the pending Asks cannot be resolved, the prompt is never submitted.
+function Resolve-PendingPrimaryDispositionAsks {
+    param([string]$AssertionPrefix, [double]$TimeoutSeconds = 60)
+    $script:ResolvePendingCallsForTest++
+    if ($script:ResolvePendingCallsForTest -eq 1) { return [pscustomobject]@{ Resolved = $true; Observed = $false; Screen = '' } }
+    $script:PrimaryAgentStatusForTest = 'idle'
+    return [pscustomobject]@{ Resolved = $false; Observed = $true; Screen = 'unresolved Ask' }
+}
+$script:ResolvePendingCallsForTest = 0
+$script:PrimaryAgentStatusForTest = 'blocked'
+$script:PrimaryPromptCallsForTest = 0
+$unresolvedAsyncPrimary = $null
+try { $unresolvedAsyncPrimary = Invoke-PrimaryPromptNoWaitAfterDispositionAsks -PaneId 'w1:p1' -Text 'must not submit' -TimeoutSeconds 30 } catch { }
+Check 'no-wait primary prompt never submits when the blocking Ask cannot be resolved' ($null -ne $unresolvedAsyncPrimary -and -not $unresolvedAsyncPrimary.Submitted -and $script:PrimaryPromptCallsForTest -eq 0 -and $script:ResolvePendingCallsForTest -eq 2) ("calls=$($script:PrimaryPromptCallsForTest) resolves=$($script:ResolvePendingCallsForTest)")
 function Resolve-PendingPrimaryDispositionAsks {
     param([string]$AssertionPrefix, [double]$TimeoutSeconds = 60)
     return [pscustomobject]@{ Resolved = $true; Observed = $false; Screen = '' }
