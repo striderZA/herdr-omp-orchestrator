@@ -62,6 +62,9 @@ type fixturePlan struct {
 	BindPaneCwd       string `json:"bind_pane_cwd"`
 	BindPaneWorkspace string `json:"bind_pane_workspace"`
 	BindPaneAgent     string `json:"bind_pane_agent"`
+	// IntegrationStatus is the text `herdr integration status` prints; empty
+	// prints the line an installed, up-to-date OMP integration produces.
+	IntegrationStatus string `json:"integration_status"`
 	// SuppressReady makes the extension stand-in never record the handshake.
 	SuppressReady bool `json:"suppress_ready"`
 	// AnnounceOnPrompt makes the extension stand-in announce only in the turn an
@@ -251,6 +254,17 @@ func runFixture() int {
 			text = "worker terminal\n> waiting for instructions"
 		}
 		if _, err := os.Stdout.WriteString(text); err != nil {
+			return 30
+		}
+		return 0
+	case "integration status":
+		// Herdr prints a text report here, not the JSON envelope every other
+		// command answers with.
+		report := plan.IntegrationStatus
+		if report == "" {
+			report = "omp: current (v10) (C:\\Users\\fixture\\.omp\\agent\\extensions\\herdr-omp-agent-state.ts)"
+		}
+		if _, err := os.Stdout.WriteString(report + "\n"); err != nil {
 			return 30
 		}
 		return 0
@@ -1145,6 +1159,9 @@ func newCoordFixture(t *testing.T, plan fixturePlan) *coordFixture {
 		CallTimeout:      5 * time.Second,
 		ReadinessTimeout: 2 * time.Second,
 		PollInterval:     10 * time.Millisecond,
+		// These tests are about what happens after a satisfied gate; the gate
+		// itself is exercised against the setup check in bind_preflight_test.go.
+		Preflight: satisfiedPreflight,
 	})
 	if err != nil {
 		t.Fatalf("coord.New: %v", err)
@@ -2294,6 +2311,7 @@ func TestPromptRecordFailureLeavesBriefAdjudicableWithoutResending(t *testing.T)
 		ReadinessTimeout: 2 * time.Second,
 		PollInterval:     10 * time.Millisecond,
 		StepLease:        lease,
+		Preflight:        satisfiedPreflight,
 	})
 	if err != nil {
 		t.Fatalf("New short-lease coordinator: %v", err)

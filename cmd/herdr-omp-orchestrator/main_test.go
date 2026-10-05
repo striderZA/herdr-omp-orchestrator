@@ -9,13 +9,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"herdr-omp-orchestrator/internal/coord"
 	"herdr-omp-orchestrator/internal/herdr"
+	"herdr-omp-orchestrator/internal/setup"
 	"herdr-omp-orchestrator/internal/state"
 	"herdr-omp-orchestrator/internal/task"
 )
@@ -26,6 +29,8 @@ import (
 const (
 	routeFixtureEnv   = "ORCH_HERDR_ROUTE_FIXTURE"
 	routeFixtureCalls = "ORCH_HERDR_ROUTE_FIXTURE_CALLS"
+	// routeFixtureStatus is the text `herdr integration status` prints.
+	routeFixtureStatus = "ORCH_HERDR_ROUTE_FIXTURE_STATUS"
 )
 
 func TestMain(m *testing.M) {
@@ -54,6 +59,13 @@ func routeFixtureMain() int {
 	}
 	if err := file.Close(); err != nil {
 		return 34
+	}
+	if len(os.Args) >= 3 && os.Args[1] == "integration" && os.Args[2] == "status" {
+		// A text report, not the JSON envelope every other command answers with.
+		if _, err := os.Stdout.WriteString(os.Getenv(routeFixtureStatus) + "\n"); err != nil {
+			return 36
+		}
+		return 0
 	}
 	answer := `{"id":"cli:fixture","result":{"type":"plugin_pane_opened","pane":{"pane_id":"w1:p9"}}}` + "\n"
 	if _, err := os.Stdout.WriteString(answer); err != nil {
@@ -353,5 +365,204 @@ func readRouteCalls(t *testing.T, path string) [][]string {
 func TestCoordCodePreservesAmbiguousOperation(t *testing.T) {
 	if got := coordCode(herdr.ErrAmbiguous); got != "ambiguous_operation" {
 		t.Fatalf("coordCode(herdr.ErrAmbiguous) = %q, want ambiguous_operation", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// bind route
+// ---------------------------------------------------------------------------
+
+const (
+	routeStatusInstalled    = "omp: current (v10) (C:\\Users\\fixture\\.omp\\agent\\extensions\\herdr-omp-agent-state.ts)"
+	routeStatusNotInstalled = "omp: not installed (C:\\Users\\fixture\\.omp\\agent\\extensions\\herdr-omp-agent-state.ts)"
+)
+
+// bindRouteFixture is everything the bind action reads: a real Git repository
+// to bind, a state directory, an isolated OMP profile and the stand-in Herdr
+// CLI that logs every call it receives.
+type bindRouteFixture struct {
+	env        map[string]string
+	calls      string
+	stateDir   string
+	extensions string
+}
+
+func newBindRouteFixture(t *testing.T, status string) *bindRouteFixture {
+	t.Helper()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	repo := t.TempDir()
+	if out, err := exec.Command("git", "init", repo).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, out)
+	}
+	invocation, err := json.Marshal(map[string]string{
+		"focused_pane_cwd": repo,
+		"workspace_id":     "w1",
+		"focused_pane_id":  "w1:p1",
+	})
+	if err != nil {
+		t.Fatalf("encode the invocation context: %v", err)
+	}
+	home := t.TempDir()
+	extensions := filepath.Join(home, ".omp", "agent", "extensions")
+	if err := os.MkdirAll(extensions, 0o755); err != nil {
+		t.Fatalf("create the extensions directory: %v", err)
+	}
+	f := &bindRouteFixture{
+		calls:      filepath.Join(t.TempDir(), "calls.jsonl"),
+		stateDir:   t.TempDir(),
+		extensions: extensions,
+	}
+	f.env = map[string]string{
+		envStateDir:        f.stateDir,
+		envContextJSON:     string(invocation),
+		envHerdrBinary:     exe,
+		"HOME":             home,
+		routeFixtureEnv:    "1",
+		routeFixtureCalls:  f.calls,
+		routeFixtureStatus: status,
+	}
+	// The coordinator's Herdr client inherits the process environment, so the
+	// stand-in mode has to be set on it as well as on the map the route reads.
+	t.Setenv(routeFixtureEnv, "1")
+	t.Setenv(routeFixtureCalls, f.calls)
+	t.Setenv(routeFixtureStatus, status)
+	return f
+}
+
+func (f *bindRouteFixture) installIntegration(t *testing.T) {
+	t.Helper()
+	path := filepath.Join(f.extensions, "herdr-omp-agent-state.ts")
+	if err := os.WriteFile(path, []byte("// Herdr's own integration.\n"), 0o644); err != nil {
+		t.Fatalf("write the integration file: %v", err)
+	}
+}
+
+func (f *bindRouteFixture) installExtension(t *testing.T) {
+	t.Helper()
+	path := filepath.Join(f.extensions, "herdr-orchestrator.ts")
+	if err := os.WriteFile(path, []byte(setup.ManagedMarker+"\nexport default {};\n"), 0o644); err != nil {
+		t.Fatalf("write the extension: %v", err)
+	}
+}
+
+func (f *bindRouteFixture) run(t *testing.T) (int, eventAnswer) {
+	t.Helper()
+	var stdout, stderr bytes.Buffer
+	status := runBind(f.env, &stdout, &stderr)
+	return status, decodeAnswer(t, stdout.Bytes())
+}
+
+func (f *bindRouteFixture) projects(t *testing.T) []task.Project {
+	t.Helper()
+	store, err := state.Open(f.stateDir)
+	if err != nil {
+		t.Fatalf("state.Open: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+	projects, err := store.Projects(context.Background())
+	if err != nil {
+		t.Fatalf("read the projects: %v", err)
+	}
+	return projects
+}
+
+// TestBindRouteRefusesBeforeRecordingOrStartingAnything pins the founding spec's
+// first bind step through the real route: with Herdr's OMP integration or the
+// plugin's extension missing, the action answers with the setup action's own
+// code and the remedy, Herdr sees only the read-only status call, and no project
+// row exists afterwards.
+func TestBindRouteRefusesBeforeRecordingOrStartingAnything(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status string
+		setup  func(t *testing.T, f *bindRouteFixture)
+		code   string
+		remedy string
+	}{
+		{
+			name:   "Herdr reports the OMP integration is not installed",
+			status: routeStatusNotInstalled,
+			setup: func(t *testing.T, f *bindRouteFixture) {
+				f.installIntegration(t)
+				f.installExtension(t)
+			},
+			code:   "integration_missing",
+			remedy: "herdr integration install omp",
+		},
+		{
+			name:   "the plugin's extension is absent from the effective profile",
+			status: routeStatusInstalled,
+			setup:  func(t *testing.T, f *bindRouteFixture) { f.installIntegration(t) },
+			code:   "extension_missing",
+			remedy: "setup action",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newBindRouteFixture(t, tc.status)
+			tc.setup(t, f)
+
+			status, answer := f.run(t)
+			if status == 0 {
+				t.Fatal("runBind succeeded without its prerequisites")
+			}
+			if answer.Error == nil || answer.Error.Code != tc.code {
+				t.Fatalf("answer = %+v, want code %q", answer.Error, tc.code)
+			}
+			if !strings.Contains(answer.Error.Message, tc.remedy) {
+				t.Errorf("message = %q, want it to name the remedy %q", answer.Error.Message, tc.remedy)
+			}
+			if recorded := readRouteCalls(t, f.calls); len(recorded) != 1 || strings.Join(recorded[0], " ") != "integration status" {
+				t.Errorf("Herdr calls = %v, want only `integration status`", recorded)
+			}
+			if projects := f.projects(t); len(projects) != 0 {
+				t.Errorf("a refused bind recorded projects: %+v", projects)
+			}
+			if _, err := os.Stat(filepath.Join(f.extensions, "herdr-orchestrator.ts")); tc.code == "extension_missing" && !os.IsNotExist(err) {
+				t.Errorf("the check installed the extension: stat err = %v", err)
+			}
+		})
+	}
+}
+
+// TestBindRouteContinuesPastASatisfiedGate pins the other side: with both
+// prerequisites present the route does not refuse; the first Herdr call after
+// the status check is Bind's own pane lookup.
+func TestBindRouteContinuesPastASatisfiedGate(t *testing.T) {
+	f := newBindRouteFixture(t, routeStatusInstalled)
+	f.installIntegration(t)
+	f.installExtension(t)
+
+	// The stand-in answers every command with the same pane-opened envelope, so
+	// the bind itself fails further in; what matters is where it got to.
+	_, answer := f.run(t)
+	if answer.Error != nil && (answer.Error.Code == "integration_missing" || answer.Error.Code == "extension_missing") {
+		t.Fatalf("a satisfied gate refused the bind: %+v", answer.Error)
+	}
+	recorded := readRouteCalls(t, f.calls)
+	if len(recorded) < 2 {
+		t.Fatalf("Herdr calls = %v, want the status check followed by Bind's own calls", recorded)
+	}
+	if got := strings.Join(recorded[0], " "); got != "integration status" {
+		t.Errorf("the first Herdr call = %q, want `integration status`", got)
+	}
+	if len(recorded[1]) < 2 || recorded[1][0]+" "+recorded[1][1] != "pane get" {
+		t.Errorf("the second Herdr call = %v, want Bind's `pane get`", recorded[1])
+	}
+}
+
+// TestCoordCodeNamesAnUnmetBindPrerequisite pins the code mapping directly: the
+// setup check's own code when there is one, and a generic code otherwise.
+func TestCoordCodeNamesAnUnmetBindPrerequisite(t *testing.T) {
+	if got := coordCode(fmt.Errorf("%w: %w", coord.ErrNotReady, setup.ErrExtensionMissing)); got != "extension_missing" {
+		t.Errorf("coordCode(not ready: extension missing) = %q, want extension_missing", got)
+	}
+	if got := coordCode(fmt.Errorf("%w: %w", coord.ErrNotReady, setup.ErrIntegrationMissing)); got != "integration_missing" {
+		t.Errorf("coordCode(not ready: integration missing) = %q, want integration_missing", got)
+	}
+	if got := coordCode(fmt.Errorf("%w: boom", coord.ErrNotReady)); got != "not_ready" {
+		t.Errorf("coordCode(not ready) = %q, want not_ready", got)
 	}
 }
