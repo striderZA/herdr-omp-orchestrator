@@ -1309,10 +1309,8 @@ func (c *Coordinator) reconcileTask(ctx context.Context, project task.Project, s
 	ours := oursOnly(probes)
 	switch {
 	case len(ours) == 1:
-		if !checkoutListed(listed, st.WorktreePath) {
-			return taskReconcile{}, c.taskAttention(ctx, st, fmt.Sprintf(
-				"the checkout %s of task %s is no longer listed by `worktree list`; its pane binding was left as recorded",
-				st.WorktreePath, st.ID))
+		if problem := checkoutProblem(listed, st); problem != "" {
+			return taskReconcile{}, c.taskAttention(ctx, st, problem)
 		}
 		if strings.TrimSpace(identity.Session) == "" {
 			// An agent runs in the task's pane, but the binding never recorded which
@@ -1343,10 +1341,8 @@ func (c *Coordinator) reconcileTask(ctx context.Context, project task.Project, s
 			"pane %s could not be proven to be the worker of task %s, so its binding was left as recorded: %s",
 			unproven[0].Pane.PaneID, st.ID, unproven[0].Refusal))
 	}
-	if !checkoutListed(listed, st.WorktreePath) {
-		return taskReconcile{}, c.taskAttention(ctx, st, fmt.Sprintf(
-			"the checkout %s of task %s is no longer listed by `worktree list`; its pane binding was left as recorded",
-			st.WorktreePath, st.ID))
+	if problem := checkoutProblem(listed, st); problem != "" {
+		return taskReconcile{}, c.taskAttention(ctx, st, problem)
 	}
 	if resumableStep(st) {
 		if _, ok := vacantTaskPane(probes, st); ok {
@@ -1936,20 +1932,42 @@ func (c *Coordinator) worktreeList(ctx context.Context, root string) (*herdr.Wor
 	return list, nil
 }
 
-// checkoutListed reports whether a checkout is still one of the repository's
-// worktrees. A listing that could not be read, or a task that recorded no
+// checkoutProblem reports why the checkout `worktree list` shows for a task is
+// not the one the task recorded, or "" when nothing contradicts it.
+//
+// A checkout is its path and its branch. The branch is verified only when the
+// checkout is adopted (adoptWorktree); a branch switched by hand afterwards
+// leaves the path listed while the work there belongs to another branch, and
+// continuing the recorded step would hand this task's brief to it. A listed
+// checkout that reports no branch - a detached HEAD, or an entry Herdr names no
+// branch for - cannot be shown to be on the task's branch, so it is refused the
+// same way. A listing that could not be read, or a task that recorded no
 // checkout, proves nothing and is not a refusal.
-func checkoutListed(listed *herdr.WorktreeList, checkout string) bool {
-	checkout = strings.TrimSpace(checkout)
+func checkoutProblem(listed *herdr.WorktreeList, st task.Task) string {
+	checkout := strings.TrimSpace(st.WorktreePath)
 	if listed == nil || checkout == "" {
-		return true
+		return ""
 	}
 	for _, worktree := range listed.Worktrees {
-		if samePath(worktree.Path, checkout) {
-			return true
+		if !samePath(worktree.Path, checkout) {
+			continue
 		}
+		branch := strings.TrimSpace(deref(worktree.Branch))
+		switch {
+		case worktree.IsDetached:
+			return fmt.Sprintf("the checkout %s of task %s has a detached HEAD, so it cannot be shown to be on the task's branch %q; "+
+				"nothing was continued in it and its pane binding was left as recorded", checkout, st.ID, st.Branch)
+		case branch == "":
+			return fmt.Sprintf("`worktree list` reports no branch for the checkout %s of task %s, so it cannot be shown to be on the task's branch %q; "+
+				"nothing was continued in it and its pane binding was left as recorded", checkout, st.ID, st.Branch)
+		case !sameBranch(branch, st.Branch):
+			return fmt.Sprintf("the checkout %s of task %s is on branch %q, not the task's branch %q; "+
+				"nothing was continued in it and its pane binding was left as recorded", checkout, st.ID, branch, st.Branch)
+		}
+		return ""
 	}
-	return false
+	return fmt.Sprintf("the checkout %s of task %s is no longer listed by `worktree list`; its pane binding was left as recorded",
+		checkout, st.ID)
 }
 
 // ---------------------------------------------------------------------------

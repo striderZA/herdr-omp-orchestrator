@@ -177,6 +177,8 @@ type fixtureWorktree struct {
 	Base        string `json:"base"`
 	WorkspaceID string `json:"workspace_id"`
 	PaneID      string `json:"pane_id"`
+	// Detached lists the checkout with a detached HEAD: no branch.
+	Detached bool `json:"detached"`
 }
 
 // fixtureState is the stand-in CLI's durable view of the Herdr session.
@@ -736,13 +738,17 @@ func worktreeListResult(root string, state fixtureState) map[string]any {
 	}}
 	for _, wt := range state.Worktrees {
 		open := wt.WorkspaceID
+		var branch any = wt.Branch
+		if wt.Detached {
+			branch = nil
+		}
 		worktrees = append(worktrees, map[string]any{
 			"path":               wt.Path,
 			"label":              filepath.Base(wt.Path),
-			"branch":             wt.Branch,
+			"branch":             branch,
 			"open_workspace_id":  open,
 			"is_bare":            false,
-			"is_detached":        false,
+			"is_detached":        wt.Detached,
 			"is_prunable":        false,
 			"is_linked_worktree": true,
 		})

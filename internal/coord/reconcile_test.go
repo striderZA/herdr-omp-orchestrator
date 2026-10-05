@@ -3142,3 +3142,164 @@ func TestReconcileAttentionNamesTheTaskAndKeepsAnExistingBlocker(t *testing.T) {
 		t.Fatalf("attention note = %q, want it to name the task", notes[0].Summary)
 	}
 }
+
+// switchCheckout rewrites the branch `worktree list` reports for one checkout,
+// the way a manual `git switch` (or `git switch --detach`) in it would.
+func (f *coordFixture) switchCheckout(t *testing.T, path, branch string, detached bool) {
+	t.Helper()
+	found := false
+	f.rewriteState(func(current *fixtureState) {
+		for i := range current.Worktrees {
+			if samePath(current.Worktrees[i].Path, path) {
+				current.Worktrees[i].Branch, current.Worktrees[i].Detached = branch, detached
+				found = true
+			}
+		}
+	})
+	if !found {
+		t.Fatalf("the stand-in lists no checkout at %s", path)
+	}
+}
+
+// TestReconcileDoesNotContinueAStepOnASwitchedCheckout pins issue #27: a checkout
+// whose path is still listed but whose branch is no longer the task's is not the
+// task's checkout. The interrupted step is not continued (no agent is started and
+// no brief is submitted), the task records why, and putting the branch back lets
+// the next pass finish the step exactly as it would have.
+func TestReconcileDoesNotContinueAStepOnASwitchedCheckout(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		branch   string
+		detached bool
+		want     string
+	}{
+		{name: "another branch", branch: "someone/else", want: `is on branch "someone/else", not the task's branch`},
+		{name: "detached HEAD", detached: true, want: "has a detached HEAD"},
+		{name: "no branch reported", want: "reports no branch"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			f := newCoordFixture(t, fixturePlan{SuppressReady: true})
+			coord := f.shortLeaseCoordinator(t)
+			worker, err := coord.Dispatch(ctx, f.projectKey(), "interrupted", "brief interrupted",
+				[]string{"go test ./... ok"}, nil, nil, f.base)
+			if err == nil {
+				t.Fatalf("dispatch succeeded, want the readiness wait to stop the step")
+			}
+			interrupted := f.taskByID(t, worker.ID)
+			if interrupted.Phase != task.AgentStarted {
+				t.Fatalf("phase = %q, want %q", interrupted.Phase, task.AgentStarted)
+			}
+			f.switchCheckout(t, interrupted.WorktreePath, tc.branch, tc.detached)
+			f.updatePlan(func(plan *fixturePlan) { plan.SuppressReady = false })
+			time.Sleep(150 * time.Millisecond)
+			starts := f.countCalls("agent start")
+
+			if err := coord.Reconcile(ctx); !errors.Is(err, ErrAgentChanged) {
+				t.Fatalf("Reconcile err = %v, want the recorded refusal", err)
+			}
+			after := f.taskByID(t, worker.ID)
+			if after.Phase != task.AgentStarted {
+				t.Fatalf("phase = %q, want the recorded %q", after.Phase, task.AgentStarted)
+			}
+			// The task keeps the retryable reason its interrupted attempt recorded
+			// (a reconciliation never rewrites one); the finding reaches the primary
+			// as one note.
+			if after.Attention != interrupted.Attention || after.Attention == "" {
+				t.Fatalf("attention = %q, want the recorded %q kept", after.Attention, interrupted.Attention)
+			}
+			if prompts := f.prompts(interrupted.PublicPaneID); len(prompts) != 0 {
+				t.Fatalf("briefs = %v, want none submitted to a checkout on another branch", prompts)
+			}
+			if got := f.countCalls("agent start"); got != starts {
+				t.Fatalf("agent start calls = %d, want %d: nothing is started for a switched checkout", got, starts)
+			}
+			notes := f.notesOfKind(t, noteKindAttention)
+			if len(notes) != 1 {
+				t.Fatalf("attention notes = %d, want the finding reported once", len(notes))
+			}
+			if summary := notes[0].Summary; !strings.Contains(summary, tc.want) ||
+				!strings.Contains(summary, interrupted.Branch) || !strings.Contains(summary, interrupted.WorktreePath) {
+				t.Fatalf("note = %q, want it to say %q and name the checkout and branch %q", summary, tc.want, interrupted.Branch)
+			}
+
+			// The branch is back: the checkout is the task's again, and the next
+			// pass continues the recorded step from where it stopped.
+			f.switchCheckout(t, interrupted.WorktreePath, interrupted.Branch, false)
+			if err := coord.Reconcile(ctx); err != nil {
+				t.Fatalf("Reconcile after the branch was restored: %v", err)
+			}
+			assertStepCompleted(t, f, worker.ID, 1, 1)
+		})
+	}
+}
+
+// TestReconcileFlagsARunningWorkerOnASwitchedCheckout covers the proved-pane
+// path: the worker's own session is live, but its checkout is on another branch,
+// so the binding is not re-keyed and the task needs a human.
+func TestReconcileFlagsARunningWorkerOnASwitchedCheckout(t *testing.T) {
+	ctx := context.Background()
+	f := newCoordFixture(t, fixturePlan{})
+	worker := f.boundWorker(t)
+	briefs := len(f.prompts(worker.PublicPaneID))
+	f.switchCheckout(t, worker.WorktreePath, "someone/else", false)
+
+	if err := f.coord.Reconcile(ctx); !errors.Is(err, ErrAgentChanged) {
+		t.Fatalf("Reconcile err = %v, want the recorded refusal", err)
+	}
+	after := f.taskByID(t, worker.ID)
+	if !strings.Contains(after.Attention, `is on branch "someone/else"`) {
+		t.Fatalf("attention = %q, want the switched branch named", after.Attention)
+	}
+	if stage := task.StageOf(after); stage != task.NeedsInput {
+		t.Fatalf("stage = %q, want %q", stage, task.NeedsInput)
+	}
+	if after.Phase != task.PromptSubmitted || after.PublicPaneID != worker.PublicPaneID {
+		t.Fatalf("task = phase %q pane %q, want the recorded %q in %q", after.Phase, after.PublicPaneID, task.PromptSubmitted, worker.PublicPaneID)
+	}
+	if got := len(f.prompts(worker.PublicPaneID)); got != briefs {
+		t.Fatalf("briefs = %d, want %d: nothing is submitted to a switched checkout", got, briefs)
+	}
+}
+
+func TestCheckoutProblem(t *testing.T) {
+	checkout := filepath.Join(t.TempDir(), "orch_aaaaaaaaaaaa")
+	branch := "orch/aaaaaaaaaaaa"
+	st := task.Task{ID: "orch_aaaaaaaaaaaa", Branch: branch, WorktreePath: checkout}
+	listing := func(entry herdr.WorktreeInfo) *herdr.WorktreeList {
+		return &herdr.WorktreeList{Worktrees: []herdr.WorktreeInfo{
+			{Path: filepath.Dir(checkout), Branch: new("main")},
+			entry,
+		}}
+	}
+	for _, tc := range []struct {
+		name   string
+		listed *herdr.WorktreeList
+		st     task.Task
+		want   string
+	}{
+		{name: "matching branch", listed: listing(herdr.WorktreeInfo{Path: checkout, Branch: new(" " + branch + " ")}), st: st},
+		{name: "unreadable listing proves nothing", st: st},
+		{name: "no recorded checkout proves nothing", listed: listing(herdr.WorktreeInfo{Path: checkout, Branch: new("other")}), st: task.Task{ID: st.ID, Branch: branch}},
+		{name: "not listed", listed: listing(herdr.WorktreeInfo{Path: checkout + "-other", Branch: new(branch)}), st: st, want: "is no longer listed"},
+		{name: "another branch", listed: listing(herdr.WorktreeInfo{Path: checkout, Branch: new("main")}), st: st, want: `is on branch "main", not the task's branch`},
+		{name: "branch names are case-sensitive", listed: listing(herdr.WorktreeInfo{Path: checkout, Branch: new("ORCH/aaaaaaaaaaaa")}), st: st, want: "not the task's branch"},
+		{name: "detached HEAD", listed: listing(herdr.WorktreeInfo{Path: checkout, IsDetached: true}), st: st, want: "has a detached HEAD"},
+		{name: "detached with a stale branch", listed: listing(herdr.WorktreeInfo{Path: checkout, Branch: new(branch), IsDetached: true}), st: st, want: "has a detached HEAD"},
+		{name: "no branch reported", listed: listing(herdr.WorktreeInfo{Path: checkout}), st: st, want: "reports no branch"},
+		{name: "blank branch reported", listed: listing(herdr.WorktreeInfo{Path: checkout, Branch: new("  ")}), st: st, want: "reports no branch"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := checkoutProblem(tc.listed, tc.st)
+			if tc.want == "" {
+				if got != "" {
+					t.Fatalf("checkoutProblem = %q, want none", got)
+				}
+				return
+			}
+			if !strings.Contains(got, tc.want) || !strings.Contains(got, checkout) {
+				t.Fatalf("checkoutProblem = %q, want it to say %q about %s", got, tc.want, checkout)
+			}
+		})
+	}
+}
