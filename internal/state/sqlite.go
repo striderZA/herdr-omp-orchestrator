@@ -37,6 +37,12 @@ var (
 	// ErrReservedConflict reports reserved paths that a task of the same project
 	// already holds. The claim changes nothing either.
 	ErrReservedConflict = errors.New("state: reserved paths overlap another task")
+	// ErrPaneTaken reports a primary's pane that another project or a task already
+	// records as its launch or public pane. A pane names one binding: a second
+	// claim would make every lookup by that pane ambiguous. It is deliberately not
+	// ErrConflict, which callers treat as a lost compare-and-swap worth retrying;
+	// a taken pane stays taken however often the write is retried.
+	ErrPaneTaken = errors.New("state: the pane is already recorded for another binding")
 )
 
 // Role identifies whether an OMP session belongs to a primary project or a worker task.
@@ -1715,6 +1721,13 @@ func (s *Store) ReleaseStep(ctx context.Context, taskID, owner string) error {
 }
 
 // CreateProject records a new primary project.
+//
+// The project's launch and public panes must be free: a pane another project
+// or a task records (as its launch or public pane) is refused with ErrPaneTaken
+// inside the same transaction as the insert, so two primaries can never be
+// recorded on one pane. Databases written before this check may already hold
+// such a pair; they still open, and a lookup by that pane fails closed as
+// ErrAmbiguous instead of picking one.
 func (s *Store) CreateProject(ctx context.Context, p task.Project) error {
 	if p.Key == "" {
 		return fmt.Errorf("%w: project key is required", ErrInvalid)
@@ -1733,6 +1746,9 @@ func (s *Store) CreateProject(ctx context.Context, p task.Project) error {
 		return err
 	} else if taken {
 		return fmt.Errorf("%w: project %q already exists", ErrConflict, p.Key)
+	}
+	if err := checkProjectPanesFree(ctx, tx, p.Key, p.LaunchPaneID, p.PublicPaneID); err != nil {
+		return err
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO projects (key, data) VALUES (?, ?)`, p.Key, string(data)); err != nil {
 		return fmt.Errorf("create project %q: %w", p.Key, err)
@@ -1761,27 +1777,35 @@ func (s *Store) Project(ctx context.Context, key string) (task.Project, error) {
 // ID. A viewer of the pane (the bridge, after a restart) identifies the primary
 // by the pane Herdr gave its process, so this lookup is the counterpart of
 // ByLaunchPane for workers.
+//
+// A pane that more than one project records (possible only in a database
+// written before CreateProject enforced pane uniqueness) is ErrAmbiguous: the
+// lookup refuses instead of picking one.
 func (s *Store) ProjectByLaunchPane(ctx context.Context, launchPaneID string) (task.Project, error) {
 	if strings.TrimSpace(launchPaneID) == "" {
 		return task.Project{}, fmt.Errorf("%w: launch pane is required", ErrInvalid)
 	}
-	var data []byte
-	err := s.db.QueryRowContext(ctx,
-		`SELECT data FROM projects WHERE json_extract(data, '$.LaunchPaneID') = ? LIMIT 1`, launchPaneID).Scan(&data)
-	if errors.Is(err, sql.ErrNoRows) {
-		return task.Project{}, fmt.Errorf("%w: project on launch pane %q", ErrNotFound, launchPaneID)
-	}
+	projects, err := queryFacts[task.Project](ctx, s.db,
+		`SELECT data FROM projects WHERE json_extract(data, '$.LaunchPaneID') = ? ORDER BY key`, launchPaneID)
 	if err != nil {
 		return task.Project{}, fmt.Errorf("read the project on launch pane %q: %w", launchPaneID, err)
 	}
-	var p task.Project
-	if err := json.Unmarshal(data, &p); err != nil {
-		return task.Project{}, fmt.Errorf("decode the project on launch pane %q: %w", launchPaneID, err)
+	switch len(projects) {
+	case 0:
+		return task.Project{}, fmt.Errorf("%w: project on launch pane %q", ErrNotFound, launchPaneID)
+	case 1:
+		return projects[0], nil
+	default:
+		return task.Project{}, fmt.Errorf("%w: launch pane %q is recorded by %d projects", ErrAmbiguous, launchPaneID, len(projects))
 	}
-	return p, nil
 }
 
 // UpdateProject applies mutate to the stored project facts. Project keys are immutable.
+//
+// A mutation that moves the project's launch or public pane onto a pane another
+// project or a task records is refused with ErrPaneTaken, as CreateProject
+// refuses it. A write that leaves both panes as they were is never refused for
+// that reason, so a database that already holds a duplicate stays writable.
 func (s *Store) UpdateProject(ctx context.Context, key string, mutate func(*task.Project) error) error {
 	if key == "" {
 		return fmt.Errorf("%w: project key is required", ErrInvalid)
@@ -1814,6 +1838,16 @@ func (s *Store) UpdateProject(ctx context.Context, key string, mutate func(*task
 	}
 	if next.Key != current.Key {
 		return fmt.Errorf("%w: project %q key is immutable", ErrInvalid, key)
+	}
+	var moved []string
+	if next.LaunchPaneID != current.LaunchPaneID {
+		moved = append(moved, next.LaunchPaneID)
+	}
+	if next.PublicPaneID != current.PublicPaneID {
+		moved = append(moved, next.PublicPaneID)
+	}
+	if err := checkProjectPanesFree(ctx, tx, key, moved...); err != nil {
+		return err
 	}
 	updated, err := json.Marshal(next)
 	if err != nil {
@@ -2021,6 +2055,36 @@ func checkPaneFree(ctx context.Context, tx *tx, launchPaneID, taskID string) err
 	}
 	if taken {
 		return fmt.Errorf("%w: launch pane %q is bound to another task", ErrConflict, launchPaneID)
+	}
+	return nil
+}
+
+// checkProjectPanesFree refuses a pane that a project other than key, or any
+// task, records as its launch or public pane. Empty panes are skipped.
+func checkProjectPanesFree(ctx context.Context, tx *tx, key string, panes ...string) error {
+	for _, pane := range panes {
+		pane = strings.TrimSpace(pane)
+		if pane == "" {
+			continue
+		}
+		project, err := rowExists(ctx, tx,
+			`SELECT 1 FROM projects WHERE key <> ?
+			   AND (json_extract(data, '$.LaunchPaneID') = ? OR json_extract(data, '$.PublicPaneID') = ?)`,
+			key, pane, pane)
+		if err != nil {
+			return err
+		}
+		if project {
+			return fmt.Errorf("%w: pane %q is recorded for another project", ErrPaneTaken, pane)
+		}
+		worker, err := rowExists(ctx, tx,
+			`SELECT 1 FROM tasks WHERE launch_pane_id = ? OR public_pane_id = ?`, pane, pane)
+		if err != nil {
+			return err
+		}
+		if worker {
+			return fmt.Errorf("%w: pane %q is recorded for a task", ErrPaneTaken, pane)
+		}
 	}
 	return nil
 }

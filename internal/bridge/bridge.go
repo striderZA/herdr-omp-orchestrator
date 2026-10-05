@@ -885,6 +885,16 @@ func (h *handler) resolve(announced task.Announcement) (any, error) {
 				Attention: attention,
 				Protocol:  Protocol,
 			}, nil
+		case errors.Is(adoptErr, state.ErrAmbiguous):
+			// Two projects record this launch pane (a database written before the
+			// store refused it): adopting either would attribute this process to
+			// a guess.
+			return ResolveResult{
+				Bound:     false,
+				Reason:    ReasonAmbiguousSession,
+				Attention: fmt.Sprintf("launch pane %q is recorded by more than one project; a human must resolve which one owns it before its tools can activate", h.launchPaneID),
+				Protocol:  Protocol,
+			}, nil
 		case adoptErr != nil:
 			return nil, adoptErr
 		default:
@@ -926,10 +936,14 @@ func (h *handler) resolve(announced task.Announcement) (any, error) {
 		if errors.As(err, &coded) {
 			return nil, coded
 		}
-		if !errors.Is(err, state.ErrConflict) {
+		attention := fmt.Sprintf("session %s changed while its launch pane was being rebound; the binding will be re-verified before the next turn", announced.Describe())
+		switch {
+		case errors.Is(err, state.ErrPaneTaken):
+			attention = fmt.Sprintf("session %s now runs in pane %q, which another project or task already records; the binding is kept on %q and the orchestrator tools stay inactive until a human resolves it",
+				announced.Describe(), h.launchPaneID, bindingLaunchPane(binding))
+		case !errors.Is(err, state.ErrConflict):
 			return nil, fail(CodeInternal, "the verified rebind could not be stored")
 		}
-		attention := fmt.Sprintf("session %s changed while its launch pane was being rebound; the binding will be re-verified before the next turn", announced.Describe())
 		if noteErr := h.recordAttention(binding, attention); noteErr != nil {
 			return nil, fail(CodeStoreUnavailable, "the failed restore could not be recorded as attention")
 		}
@@ -969,7 +983,8 @@ func sessionOfBinding(b state.Binding) string {
 // mutating method keeps requiring that confirmation.
 //
 // Unknown pane reports state.ErrNotFound; a record that already holds a
-// different session reports errSessionMismatch and is left untouched.
+// different session reports errSessionMismatch and is left untouched; a launch
+// pane more than one project records reports state.ErrAmbiguous.
 func (h *handler) adoptAnnouncedSession(announced task.Announcement) (state.Binding, error) {
 	worker, err := h.store.ByLaunchPane(h.ctx, h.launchPaneID)
 	switch {
@@ -985,6 +1000,8 @@ func (h *handler) adoptAnnouncedSession(announced task.Announcement) (state.Bind
 		return h.adoptProjectSession(primary, announced)
 	case errors.Is(err, state.ErrNotFound):
 		return state.Binding{}, state.ErrNotFound
+	case errors.Is(err, state.ErrAmbiguous):
+		return state.Binding{}, err
 	default:
 		return state.Binding{}, fail(CodeStoreUnavailable, "the recorded project could not be read")
 	}

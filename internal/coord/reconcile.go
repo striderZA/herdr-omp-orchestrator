@@ -648,6 +648,11 @@ func (c *Coordinator) applyProjectMove(ctx context.Context, project task.Project
 	if errors.Is(err, errSuperseded) {
 		return nil
 	}
+	if errors.Is(err, state.ErrPaneTaken) {
+		return c.projectAttention(ctx, project, fmt.Sprintf(
+			"the primary of project %s moved to pane %s, which another record already owns; the move is not recorded until a human resolves it",
+			project.Key, pane.PaneID))
+	}
 	if err != nil {
 		return fmt.Errorf("record the moved public pane of project %s: %w", project.Key, err)
 	}

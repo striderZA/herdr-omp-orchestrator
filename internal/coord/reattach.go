@@ -429,6 +429,8 @@ func (c *Coordinator) recordReattach(ctx context.Context, facts reattachFacts) (
 	switch {
 	case errors.Is(err, errSuperseded):
 		return task.Project{}, fmt.Errorf("%w: the primary of %s changed while the reattach was being confirmed", ErrEvidenceChanged, old.Key)
+	case errors.Is(err, state.ErrPaneTaken):
+		return task.Project{}, fmt.Errorf("%w: record the reattached primary of %s: %w", ErrAlreadyBound, old.Key, err)
 	case err != nil:
 		return task.Project{}, fmt.Errorf("record the reattached primary of %s: %w", old.Key, err)
 	}
