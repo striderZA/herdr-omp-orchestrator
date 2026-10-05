@@ -211,7 +211,13 @@ type Principal struct {
 // enforcement is never conditional on the wiring. Tasks 4 and 5 fill these in,
 // and CoordinatorOps builds the whole set from one coordinator.
 type Ops struct {
-	Dispatch func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
+	// VerifyCaller is the live identity check every authorized method passes
+	// before its operation runs: it re-reads Herdr's `agent get` for the
+	// principal's recorded pane and refuses a caller that no longer matches. It is
+	// the one shared seam for that check, so no operation repeats it. A nil
+	// VerifyCaller refuses every method that would otherwise run (fail closed).
+	VerifyCaller func(ctx context.Context, principal Principal) error
+	Dispatch     func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
 	// Worker role. Report is the worker's whole surface: the body's `kind`
 	// (progress, question or result) selects which coordinator operation runs, and
 	// each of those is unchanged behind it.
@@ -262,6 +268,9 @@ func CoordinatorOps(c *coord.Coordinator) Ops {
 		return UnavailableOps(errors.New("no coordinator was opened"))
 	}
 	return Ops{
+		VerifyCaller: func(ctx context.Context, p Principal) error {
+			return coordError(c.VerifyCaller(ctx, p.Role, p.LaunchPaneID))
+		},
 		Dispatch: func(ctx context.Context, p Principal, params json.RawMessage) (any, error) {
 			var request coord.DispatchParams
 			if err := decodeParams(params, &request); err != nil {
@@ -463,6 +472,9 @@ func UnavailableOps(cause error) Ops {
 		return nil, &Error{Code: CodeHerdrUnavailable, Message: "the coordinator is unavailable: " + cause.Error()}
 	}
 	return Ops{
+		VerifyCaller: func(context.Context, Principal) error {
+			return &Error{Code: CodeHerdrUnavailable, Message: "the coordinator is unavailable: " + cause.Error()}
+		},
 		Dispatch:          unavailable,
 		Report:            unavailable,
 		Answer:            unavailable,
@@ -1249,9 +1261,10 @@ func (h *handler) ready(announced task.Announcement) (any, error) {
 
 // mutate authorizes one method and hands it to its coordinator operation: the
 // caller's binding must be this process's, the role must be exactly the one the
-// method requires, and the coordinator must already have confirmed this session.
-// Authorization is repeated for every call, so a call is never legal because an
-// earlier one was.
+// method requires, the coordinator must already have confirmed this session, and
+// Herdr must still report that session live in the recorded pane
+// (Ops.VerifyCaller). Authorization is repeated for every call, so a call is
+// never legal because an earlier one was.
 //
 // The read-only methods (the previews and the task and inbox listings) are
 // authorized by the same function: a read needs the same proof of role and
@@ -1272,6 +1285,17 @@ func (h *handler) mutate(req request, want state.Role, announced task.Announceme
 	if !ready {
 		return nil, fail(CodeNotReady, "%s is refused until the coordinator has confirmed this OMP session against `agent get`", req.Method)
 	}
+	principal := principalOf(binding, h.launchPaneID)
+	if h.ops.VerifyCaller == nil {
+		return nil, fail(CodeNotImplemented, "%s is refused: this build wires no live caller check, so the caller cannot be confirmed against `agent get`", req.Method)
+	}
+	if err := h.ops.VerifyCaller(h.ctx, principal); err != nil {
+		var coded *Error
+		if errors.As(err, &coded) {
+			return nil, coded
+		}
+		return nil, fail(CodeInternal, "%s: the live caller check failed", req.Method)
+	}
 	if op == nil {
 		return nil, fail(CodeNotImplemented, "%s is authorized but its coordinator operation is not wired into this build", req.Method)
 	}
@@ -1280,7 +1304,7 @@ func (h *handler) mutate(req request, want state.Role, announced task.Announceme
 	if len(params) == 0 {
 		params = json.RawMessage("{}")
 	}
-	value, err := op(h.ctx, principalOf(binding, h.launchPaneID), params)
+	value, err := op(h.ctx, principal, params)
 	if err != nil {
 		var coded *Error
 		if errors.As(err, &coded) {

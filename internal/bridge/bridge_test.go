@@ -545,8 +545,16 @@ func (f *bridgeFixture) call(method, session, params string) bridgeResponse {
 // spawns the executable but without the process boundary (TestBridgeCommand
 // exercises that). A non-nil ops field stands in for the coordinator a later
 // task wires in.
+//
+// A stand-in Ops without a VerifyCaller gets one that accepts every caller: those
+// tests exercise the bridge's own authorization, not the live check. The live
+// check is exercised through CoordinatorOps (which always wires it) and by the
+// tests that call HandleWith directly with no VerifyCaller.
 func (f *bridgeFixture) callWith(method, session, params string, ops Ops) bridgeResponse {
 	f.t.Helper()
+	if ops.VerifyCaller == nil {
+		ops.VerifyCaller = func(context.Context, Principal) error { return nil }
+	}
 	if params == "" {
 		params = "{}"
 	}
@@ -1868,6 +1876,11 @@ type stubScript struct {
 	// RemoveEchoesForced makes a successful `worktree remove` answer claim the
 	// removal was forced, which this plugin never asks for and must never accept.
 	RemoveEchoesForced bool `json:"removeEchoesForced"`
+	// AgentGetError makes every `agent get` refuse with that Herdr error code (a
+	// server that cannot be reached, for example); AgentGetMalformed makes it
+	// answer with a body that is not a Herdr envelope.
+	AgentGetError     string `json:"agentGetError"`
+	AgentGetMalformed bool   `json:"agentGetMalformed"`
 	// ProjectMovedTo makes the stand-in record a move of the named repository's
 	// project to that public pane before it answers `pane get`: another bridge call
 	// writing the same binding while this restore is being verified.
@@ -1953,6 +1966,13 @@ func runHerdrScript(path string) int {
 		}
 		return stubResult(map[string]any{"type": "pane_info", "pane": stubPaneBody(pane)})
 	case "agent get":
+		if script.AgentGetError != "" {
+			return stubError(script.AgentGetError, "the stand-in refuses agent get")
+		}
+		if script.AgentGetMalformed {
+			_, _ = os.Stdout.WriteString(`{"id":"cli:stub","result":{"type":"agent_info","agent":"not an object"}}` + "\n")
+			return 0
+		}
 		agent, ok := script.agent(argv[2])
 		if !ok {
 			return stubError("agent_not_found", "agent target "+argv[2]+" not found")
@@ -2321,9 +2341,17 @@ type herdrStub struct {
 }
 
 // useHerdrStub points the coordinator under test at this test binary as its
-// Herdr CLI and makes it answer from the script.
+// Herdr CLI and makes it answer from the script. Unless the script says
+// otherwise, the seeded primary is live in its recorded pane: every bridge call
+// re-reads it with `agent get` before the operation runs.
 func (f *bridgeFixture) useHerdrStub(script stubScript) *herdrStub {
 	f.t.Helper()
+	if script.Agents == nil {
+		script.Agents = map[string]stubAgent{}
+	}
+	if _, ok := script.Agents[primaryPane]; !ok {
+		script.Agents[primaryPane] = f.primaryAgent()
+	}
 	dir := f.t.TempDir()
 	path := filepath.Join(dir, "herdr-script.json")
 	calls := filepath.Join(dir, "herdr-calls.jsonl")
@@ -2464,6 +2492,12 @@ func notesOf(t *testing.T, f *bridgeFixture, kind string) []task.Inbox {
 // does.
 func (f *bridgeFixture) coordinator(t *testing.T) *coord.Coordinator {
 	t.Helper()
+	if os.Getenv(fixtureScriptFile) == "" {
+		// Every bridge call now asks Herdr whether the caller is still live, so a
+		// test that scripted no stand-in gets one with the seeded primary live.
+		// Without it this test binary would be run as Herdr with no script.
+		f.useHerdrStub(stubScript{RepoRoot: f.repoRoot})
+	}
 	executable, err := os.Executable()
 	if err != nil {
 		t.Fatalf("os.Executable: %v", err)
@@ -2504,6 +2538,22 @@ func workerAgentOn(pane, kind, value, worktree string) stubAgent {
 		Cwd:          worktree,
 		SessionKind:  kind,
 		SessionValue: value,
+	}
+}
+
+// primaryAgent is the stand-in's answer for the seeded primary: the recorded
+// pane, session, checkout and workspace.
+func (f *bridgeFixture) primaryAgent() stubAgent {
+	return stubAgent{
+		Name:         "primary",
+		Agent:        "omp",
+		AgentStatus:  "idle",
+		PaneID:       primaryPane,
+		TerminalID:   "term-primary",
+		WorkspaceID:  "ws-repo-1",
+		Cwd:          f.repoRoot,
+		SessionKind:  task.SessionKindID,
+		SessionValue: primarySession,
 	}
 }
 
@@ -3969,13 +4019,43 @@ func assertCheckoutNotOpened(t *testing.T, stub *herdrStub, root, checkout strin
 func (f *bridgeFixture) approve(t *testing.T, ops Ops) {
 	t.Helper()
 	f.asWorker()
-	if resp := f.callWith("report", workerSession, f.reportPayload(t, "t1", "result"), ops); !resp.OK {
-		t.Fatalf("report failed: %+v", resp.Error)
-	}
+	// The worker reports from its live pane: every bridge call re-reads its caller
+	// with `agent get`. What the test scripted for that pane afterwards (no agent,
+	// another session form) is put back once the report is recorded.
+	f.withLiveWorker(t, "t1", func() {
+		if resp := f.callWith("report", workerSession, f.reportPayload(t, "t1", "result"), ops); !resp.OK {
+			t.Fatalf("report failed: %+v", resp.Error)
+		}
+	})
 	f.asPrimary()
 	if resp := f.callWith("review", primarySession, f.reviewPayload(t, ops, "t1", "accepted"), ops); !resp.OK {
 		t.Fatalf("review failed: %+v", resp.Error)
 	}
+}
+
+// withLiveWorker runs fn while the scripted Herdr reports task id's worker live in
+// its recorded public pane, checkout and workspace, with the session the
+// fixture's handshake confirmed, then restores what the script held for that pane.
+func (f *bridgeFixture) withLiveWorker(t *testing.T, id string, fn func()) {
+	t.Helper()
+	path := os.Getenv(fixtureScriptFile)
+	if path == "" {
+		t.Fatal("withLiveWorker needs a scripted Herdr stand-in")
+	}
+	stub := &herdrStub{t: t, path: path}
+	st := f.task(t, id)
+	previous, had := stub.script().Agents[st.PublicPaneID]
+	live := workerAgent(st.PublicPaneID, workerSession, st.WorktreePath)
+	live.WorkspaceID = st.CurrentWorkspaceID
+	stub.setAgent(st.PublicPaneID, live)
+	defer func() {
+		if had {
+			stub.setAgent(st.PublicPaneID, previous)
+		} else {
+			stub.dropAgent(st.PublicPaneID)
+		}
+	}()
+	fn()
 }
 
 // movedWorkspace is the ordinary workspace a pane move puts a worker in, which is

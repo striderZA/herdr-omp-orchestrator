@@ -1458,9 +1458,9 @@ func verifyRemoval(removed *herdr.WorktreeRemoved, st task.Task) (*herdr.Worktre
 //
 // It re-reads the store on every call rather than trusting anything the caller
 // sent, and requires the record to still name that pane. Liveness is not
-// re-derived here: the bridge authorizes a mutating call only for the OMP session
-// it confirmed against `agent get` for this very pane, so the caller is the live
-// primary by construction, and a Herdr round trip would only restate it.
+// re-derived here: the bridge runs VerifyCaller, a fresh `agent get` against
+// this binding, before every operation it authorizes, so repeating it here would
+// only restate that check.
 func (c *Coordinator) primaryProject(ctx context.Context, launchPaneID string) (task.Project, error) {
 	pane := strings.TrimSpace(launchPaneID)
 	if pane == "" {
