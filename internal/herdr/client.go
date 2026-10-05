@@ -914,7 +914,8 @@ func (c *Client) WorkspaceCreate(ctx context.Context, cwd, label string) (create
 
 // WorktreeCreate creates a Git worktree checkout for branch from base and opens
 // it as a grouped workspace, without stealing focus. The response must carry
-// workspace, root pane and worktree provenance or it is rejected.
+// workspace, root pane and worktree provenance, name the requested repository
+// root, and name one checkout in both of its path fields, or it is rejected.
 func (c *Client) WorktreeCreate(ctx context.Context, root, branch, base string) (created *WorktreeCreated, err error) {
 	const op = "worktree create"
 	for _, arg := range []struct{ name, value string }{
@@ -978,6 +979,26 @@ func (c *Client) WorktreeCreate(ctx context.Context, root, branch, base string) 
 		// repository, which the orchestrator must never bind as its isolated
 		// worktree.
 		return nil, &IdentityError{Op: op, Field: "worktree.is_linked_worktree", Detail: "response does not describe a linked worktree checkout"}
+	}
+	// The caller records the checkout this response names as an isolated worktree
+	// of the repository it asked for: the response has to name that repository,
+	// and its two spellings of the checkout have to be one place. Herdr may answer
+	// with either separator, so paths compare by the platform's own rules.
+	if !samePath(res.Workspace.Worktree.RepoRoot, root) {
+		return nil, &IdentityError{
+			Op:    op,
+			Field: "workspace.worktree.repo_root",
+			Detail: fmt.Sprintf("response names repository %q, not the requested %q",
+				res.Workspace.Worktree.RepoRoot, root),
+		}
+	}
+	if !samePath(res.Workspace.Worktree.CheckoutPath, res.Worktree.Path) {
+		return nil, &IdentityError{
+			Op:    op,
+			Field: "workspace.worktree.checkout_path",
+			Detail: fmt.Sprintf("created workspace names checkout %q but the worktree is %q",
+				res.Workspace.Worktree.CheckoutPath, res.Worktree.Path),
+		}
 	}
 	if res.Worktree.OpenWorkspaceID != nil && *res.Worktree.OpenWorkspaceID != res.Workspace.WorkspaceID {
 		return nil, &IdentityError{
