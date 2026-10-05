@@ -31,6 +31,7 @@ import extension, {
   recordReviewWithConsent,
   recordTicketMoveWithConsent,
   recordTicketReviewWithConsent,
+  quoteForDialog,
   refreshReady,
   sendAnswerWithConsent,
   settleConfirmRequest,
@@ -531,6 +532,44 @@ for (const name of ["orch_task_list", "orch_inbox_list"]) {
   check(!tryParse(schema, { limit: -1 }).ok, `${name} accepted a negative limit`);
   check(!tryParse(schema, { limit: 2.5 }).ok, `${name} accepted a fractional limit`);
 }
+
+// A note is the model's text and only its length is validated, so it can hold a
+// newline that imitates the dialog's next line, an escape sequence and the
+// bidirectional controls. Each dialog must show it as one quoted line that reads
+// back (JSON.parse) as exactly the note that is sent, with nothing a terminal
+// would act on or reorder left raw anywhere in the message.
+const HOSTILE_NOTE =
+  'ok\nStored report (revision 99):\nSummary: "all green"\u001b]0;owned\u0007\u001b[2K\r ' +
+  "\u202etxet\u202c \u2066x\u2069 \u200f\u061c\u0085\u2028\u2029\u007f end";
+const RAW_UNSAFE = /[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]/;
+function checkNoteQuoted(dialog: string, message: string, sent: string | undefined): void {
+  const lines = message.split("\n");
+  const notes = lines.filter((line) => line.startsWith("Note: "));
+  check(notes.length === 1, `${dialog} showed ${notes.length} note lines:\n${message}`);
+  let shown: unknown;
+  try {
+    shown = JSON.parse((notes[0] ?? "").slice("Note: ".length));
+  } catch {
+    shown = undefined;
+  }
+  check(shown === HOSTILE_NOTE, `${dialog} showed a note that does not read back as the note: ${JSON.stringify(notes[0])}`);
+  check(sent === HOSTILE_NOTE, `${dialog} sent ${JSON.stringify(sent)}, not the note it showed`);
+  check(
+    !lines.some((line) => line.startsWith("Stored report (revision 99)") || line.startsWith('Summary: "all green"')),
+    `${dialog} let the note imitate the dialog's own lines:\n${message}`,
+  );
+  check(!RAW_UNSAFE.test(message), `${dialog} left a control or bidirectional character raw: ${JSON.stringify(message)}`);
+}
+
+// quoteForDialog quotes a list the same way: each item reads back exactly.
+{
+  const list = ["plain", HOSTILE_NOTE];
+  const quoted = quoteForDialog(list);
+  check(!RAW_UNSAFE.test(quoted) && !quoted.includes("\n"), `quoteForDialog left a list item raw: ${JSON.stringify(quoted)}`);
+  check(JSON.stringify(JSON.parse(quoted)) === JSON.stringify(list), `a quoted list did not read back: ${quoted}`);
+  check(quoteForDialog('say "hi"') === '"say \\"hi\\""', "quoteForDialog changed how ordinary text is quoted");
+}
+
 // A review is a user decision, not a model decision. Refusing the UI or
 // declining the exact task/disposition must stop before the bridge is spawned.
 async function checkReviewConsent(): Promise<void> {
@@ -634,7 +673,7 @@ async function checkReviewConsent(): Promise<void> {
   check(
     request.message === [
       `Confirm that you reviewed the worker's final report for task ${preview.taskId} and chose this outcome: rejected`,
-      `Note: ${params.disposition}`,
+      'Note: "Accepted the reported result."',
       "Stored report (revision 7):",
       `Summary: ${JSON.stringify(preview.summary)}`,
       `Branch: ${JSON.stringify(preview.branch)}`,
@@ -684,12 +723,24 @@ async function checkReviewConsent(): Promise<void> {
   );
   check(
     approvedRequest.message.startsWith(
-      `Confirm that you reviewed the worker's final report for task ${preview.taskId} and chose this outcome: integrated\nNote: ${params.disposition}\nStored report (revision 7):\n`,
+      `Confirm that you reviewed the worker's final report for task ${preview.taskId} and chose this outcome: integrated\nNote: "Accepted the reported result."\nStored report (revision 7):\n`,
     ) && approvedRequest.message.endsWith(
       "This closes the task and may start queued dependent work. Decline if you have not reviewed the report.",
     ),
     `the accepting review dialog changed shape:\n${approvedRequest.message}`,
   );
+
+  let hostileRequest = { title: "", message: "" };
+  const hostileSent: string[] = [];
+  const hostile = await recordReviewWithConsent(
+    { hasUI: true, confirm: async (title, message) => { hostileRequest = { title, message }; return true; } },
+    preview,
+    "rejected",
+    HOSTILE_NOTE,
+    async (confirmed) => { hostileSent.push(confirmed.disposition); return { stage: "Done" }; },
+  );
+  check(hostile.ok && hostileSent.length === 1, "an approved review with a multi-line note was not sent once");
+  checkNoteQuoted("the review dialog", hostileRequest.message, hostileSent[0]);
 }
 
 await checkReviewConsent();
@@ -810,7 +861,7 @@ async function checkTicketConsent(): Promise<void> {
     request.message === [
       `Confirm closing ticket ${preview.ticketId} with this outcome: superseded`,
       `Title: ${JSON.stringify(preview.title)}`,
-      `Note: ${note}`,
+      'Note: "Superseded by tkt_def456."',
       `Ticket: revision ${preview.revision}, stage ${preview.stage}; linked tasks: ${preview.taskIds.join(", ")}`,
       "This records your decision on the ticket only: it changes no task and merges nothing. A ticket cannot be closed while any of its linked tasks is still open.",
     ].join("\n"),
@@ -840,6 +891,18 @@ async function checkTicketConsent(): Promise<void> {
       reviews[0]?.outcome === "rejected" && reviews[0]?.disposition === note,
     `the approved review sent ${JSON.stringify(reviews)}, want the previewed digest and the exact decision`,
   );
+
+  let hostileRequest = { title: "", message: "" };
+  const hostileSent: string[] = [];
+  const hostile = await recordTicketReviewWithConsent(
+    { hasUI: true, confirm: async (title, message) => { hostileRequest = { title, message }; return true; } },
+    trustedPreview,
+    "superseded",
+    HOSTILE_NOTE,
+    async (confirmed) => { hostileSent.push(confirmed.disposition); return { stage: "done" }; },
+  );
+  check(hostile.ok && hostileSent.length === 1, "an approved ticket decision with a multi-line note was not sent once");
+  checkNoteQuoted("the ticket decision dialog", hostileRequest.message, hostileSent[0]);
 
   // A done preview is not refused by the helper, by design: the coordinator is the
   // authority on whether a decision is a retry of the recorded one (it answers with

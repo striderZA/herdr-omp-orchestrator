@@ -4481,12 +4481,15 @@ function Test-PrimaryReviewConfirmScreen {
     $start = $Screen.LastIndexOf('Record review disposition', [System.StringComparison]::Ordinal)
     if ($start -lt 0) { return $false }
     $panel = $Screen.Substring($start)
-    $normalized = ($panel -replace '[\s\u2502\u00B3|]+', ' ').Trim()
+    $normalized = ConvertTo-ConfirmPanelText -Panel $panel
     $description = "Confirm that you reviewed the worker's final report for task $TaskId and chose this outcome:"
     $descriptionIndex = $normalized.IndexOf($description, [System.StringComparison]::Ordinal)
     if ($descriptionIndex -lt 0) { return $false }
     $afterDescription = $normalized.Substring($descriptionIndex + $description.Length).TrimStart()
-    $expectedDecision = $Outcome.Trim() + ' Note: ' + ($Disposition -replace '\s+', ' ').Trim() + " Stored report (revision ${Revision}):"
+    # The extension quotes the note (quoteForDialog). Only whitespace is folded, as
+    # on the screen: a pipe or a box character inside the note is data and must match.
+    $quotedNote = (ConvertTo-JsonStringLiteral -Text $Disposition) -replace '\s+', ' '
+    $expectedDecision = $Outcome.Trim() + ' Note: ' + $quotedNote + " Stored report (revision ${Revision}):"
     $closing = if ($Outcome -ceq 'integrated' -or $Outcome -ceq 'kept') {
         'This closes the task and may start queued dependent work.'
     } else {
@@ -4495,6 +4498,21 @@ function Test-PrimaryReviewConfirmScreen {
     if (-not $afterDescription.StartsWith($expectedDecision, [System.StringComparison]::Ordinal) -or
         $afterDescription.IndexOf($closing, [System.StringComparison]::Ordinal) -lt 0) { return $false }
     return (Test-ConfirmChoicesEndPanel -Panel $panel)
+}
+
+function ConvertTo-ConfirmPanelText {
+    <#
+        One confirmation panel as a single line of text. Only the modal's chrome at
+        each line's edges is removed: the vertical border, and the box-drawing run
+        OMP draws around the title in the top border (corner, dashes, title, dashes,
+        corner). Whitespace runs fold to one space. A pipe or a box character inside
+        a quoted value is part of the text and stays, so it must match exactly.
+    #>
+    param([string]$Panel)
+    $visibleLines = foreach ($line in ($Panel -split "`r?`n")) {
+        $line.Trim() -replace '^[\u2500-\u257F\u00B3|](?:\s*[\u2500-\u257F\u00B3|])*\s*', '' -replace '\s*[\u2500-\u257F\u00B3|](?:\s*[\u2500-\u257F\u00B3|])*$', ''
+    }
+    return ((@($visibleLines) -join ' ') -replace '\s+', ' ').Trim()
 }
 
 function Test-ConfirmChoicesEndPanel {
@@ -4638,9 +4656,10 @@ function Test-PrimaryTicketConfirmScreen {
     $start = $Screen.LastIndexOf($heading, [System.StringComparison]::Ordinal)
     if ($start -lt 0) { return $false }
     $panel = $Screen.Substring($start)
-    $normalized = ($panel -replace '[\s\u2502\u00B3|]+', ' ').Trim()
-    # The extension quotes the title with JSON.stringify.
-    $quotedTitle = '"' + ((($TicketTitle -replace '\s+', ' ').Trim()) -replace '\\', '\\' -replace '"', '\"') + '"'
+    $normalized = ConvertTo-ConfirmPanelText -Panel $panel
+    # The extension quotes the title and the note with quoteForDialog; only
+    # whitespace is folded, so a pipe inside either must match exactly.
+    $quotedTitle = (ConvertTo-JsonStringLiteral -Text $TicketTitle) -replace '\s+', ' '
     if ($Kind -eq 'move') {
         $description = "Confirm moving ticket $TicketId to todo."
         $expectedFacts = "Title: $quotedTitle Now: backlog (stage backlog), revision $Revision " +
@@ -4648,7 +4667,8 @@ function Test-PrimaryTicketConfirmScreen {
     } else {
         $description = "Confirm closing ticket $TicketId with this outcome: $Outcome"
         $tasksText = if (@($LinkedTaskIds).Count -gt 0) { (@($LinkedTaskIds) -join ', ') } else { 'none' }
-        $expectedFacts = "Title: $quotedTitle Note: " + ($Disposition -replace '\s+', ' ').Trim() +
+        $quotedNote = (ConvertTo-JsonStringLiteral -Text $Disposition) -replace '\s+', ' '
+        $expectedFacts = "Title: $quotedTitle Note: $quotedNote" +
             " Ticket: revision $Revision, stage ${Stage}; linked tasks: $tasksText " +
             'This records your decision on the ticket only: it changes no task and merges nothing. ' +
             'A ticket cannot be closed while any of its linked tasks is still open.'
@@ -4705,10 +4725,12 @@ function Confirm-PrimaryTicketModal {
 
 function ConvertTo-JsonStringLiteral {
     <#
-        The string the extension's JSON.stringify shows for one text: the quotes,
-        backslash and control characters escaped, every other character (non-ASCII
-        included) verbatim. PowerShell's ConvertTo-Json escapes more than that, so
-        it cannot be used to predict the dialog text.
+        The string the extension's quoteForDialog shows for one text: JSON.stringify
+        escapes the quotes, backslash and C0 control characters, and quoteForDialog
+        also escapes DEL, the C1 controls, the line and paragraph separators and the
+        bidirectional marks, embeddings, overrides and isolates. Every other
+        character (non-ASCII included) is verbatim. PowerShell's ConvertTo-Json
+        escapes more than that, so it cannot be used to predict the dialog text.
     #>
     param([AllowEmptyString()][string]$Text)
     $builder = New-Object System.Text.StringBuilder
@@ -4722,7 +4744,11 @@ function ConvertTo-JsonStringLiteral {
         elseif ($code -eq 0x09) { [void]$builder.Append('\t') }
         elseif ($code -eq 0x08) { [void]$builder.Append('\b') }
         elseif ($code -eq 0x0C) { [void]$builder.Append('\f') }
-        elseif ($code -lt 0x20) { [void]$builder.Append(('\u{0:x4}' -f $code)) }
+        elseif ($code -lt 0x20 -or ($code -ge 0x7F -and $code -le 0x9F) -or $code -eq 0x061C -or
+            $code -eq 0x200E -or $code -eq 0x200F -or $code -eq 0x2028 -or $code -eq 0x2029 -or
+            ($code -ge 0x202A -and $code -le 0x202E) -or ($code -ge 0x2066 -and $code -le 0x2069)) {
+            [void]$builder.Append(('\u{0:x4}' -f $code))
+        }
         else { [void]$builder.Append($ch) }
     }
     [void]$builder.Append('"')
@@ -4743,14 +4769,7 @@ function Test-PrimaryAnswerConfirmScreen {
     $start = $Screen.LastIndexOf('Send answer to worker', [System.StringComparison]::Ordinal)
     if ($start -lt 0) { return $false }
     $panel = $Screen.Substring($start)
-    # Only the modal's chrome at each line's edges is removed: the vertical border,
-    # and the box-drawing run OMP draws around the title in the top border
-    # (corner, dashes, title, dashes, corner). A pipe or a box character inside the
-    # quoted answer is part of the text and must match.
-    $visibleLines = foreach ($line in ($panel -split "`r?`n")) {
-        $line.Trim() -replace '^[\u2500-\u257F\u00B3|](?:\s*[\u2500-\u257F\u00B3|])*\s*', '' -replace '\s*[\u2500-\u257F\u00B3|](?:\s*[\u2500-\u257F\u00B3|])*$', ''
-    }
-    $normalized = ((@($visibleLines) -join ' ') -replace '\s+', ' ').Trim()
+    $normalized = ConvertTo-ConfirmPanelText -Panel $panel
     $expected = (("Send answer to worker`nConfirm sending this answer to the worker of task ${TaskId}:`n" +
         'Answer: ' + (ConvertTo-JsonStringLiteral -Text $Text) + "`n" +
         "It is typed into that worker's session as your reply. Decline if this is not your answer.") -replace '\s+', ' ').Trim()

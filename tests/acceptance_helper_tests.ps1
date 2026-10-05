@@ -883,7 +883,7 @@ Earlier confirmation: Record review disposition
 Task orch_old; Accepted the reported result.
 Record review disposition
 Confirm that you reviewed the worker's final report for task orch_abc and chose this outcome: integrated
-Note: Accepted the reported result.
+Note: "Accepted the reported result."
 Stored report (revision 7):
 Summary: "Added subtract to a.js"
 Branch: "orch/abc"
@@ -903,7 +903,8 @@ Check 'review modal accepts a stored report whose checks state outcomes' ($state
 Check 'review modal rejects a different task' (-not (Test-PrimaryReviewConfirmScreen -Screen $reviewScreen -TaskId 'orch_other' -Revision 7 -Disposition 'Accepted the reported result.')) 'wrong task'
 Check 'review modal rejects a different report revision' (-not (Test-PrimaryReviewConfirmScreen -Screen $reviewScreen -TaskId 'orch_abc' -Revision 8 -Disposition 'Accepted the reported result.')) 'wrong revision'
 Check 'review modal rejects a different decision' (-not (Test-PrimaryReviewConfirmScreen -Screen $reviewScreen -TaskId 'orch_abc' -Revision 7 -Disposition 'Rejected the result.')) 'wrong disposition'
-Check 'review modal rejects a longer different disposition that contains the expected text' (-not (Test-PrimaryReviewConfirmScreen -Screen ($reviewScreen -replace 'Accepted the reported result\.\r?\nStored report', "Accepted the reported result. but request changes`nStored report") -TaskId 'orch_abc' -Revision 7 -Disposition 'Accepted the reported result.')) 'substring decision'
+Check 'review modal rejects a longer different disposition that contains the expected text' (-not (Test-PrimaryReviewConfirmScreen -Screen ($reviewScreen -replace 'Accepted the reported result\."\r?\nStored report', "Accepted the reported result. but request changes`"`nStored report") -TaskId 'orch_abc' -Revision 7 -Disposition 'Accepted the reported result.')) 'substring decision'
+Check 'review modal refuses the old dialog that showed the note unquoted' (-not (Test-PrimaryReviewConfirmScreen -Screen ($reviewScreen -replace 'Note: "Accepted the reported result\."', 'Note: Accepted the reported result.') -TaskId 'orch_abc' -Revision 7 -Disposition 'Accepted the reported result.')) 'unquoted note'
 Check 'review modal accepts a stored report that mentions another modal title as data' (Test-PrimaryReviewConfirmScreen -Screen ($reviewScreen -replace 'Added subtract to a.js', 'Ask 1 questions was displayed') -TaskId 'orch_abc' -Revision 7 -Disposition 'Accepted the reported result.') 'report data'
 Check 'review modal ignores an old matching modal when another confirmation is active' (-not (Test-PrimaryReviewConfirmScreen -Screen ($reviewScreen + "`nRecord review disposition`nTask orch_other`nYes`nNo") -TaskId 'orch_abc' -Revision 7 -Disposition 'Accepted the reported result.')) 'stale modal'
 Check 'review modal refuses an old confirmation followed by an active Ask' (-not (Test-PrimaryReviewConfirmScreen -Screen ($reviewScreen + "`nAsk 1 questions`n[other] What now?`nAccept`nRequest changes") -TaskId 'orch_abc' -Revision 7 -Disposition 'Accepted the reported result.')) 'new Ask'
@@ -927,7 +928,29 @@ Check 'review modal refuses a non-accepting outcome that still says it releases 
 Check 'review modal refuses an accepting outcome that says dependents stay queued' (-not (Test-PrimaryReviewConfirmScreen -Screen ($reviewScreen -replace 'This closes the task and may start queued dependent work\.', $rejectedBody) -TaskId 'orch_abc' -Revision 7 -Disposition 'Accepted the reported result.')) 'queued claim'
 Check 'review modal refuses an outcome that merely starts with the expected one' (-not (Test-PrimaryReviewConfirmScreen -Screen ($reviewScreen -replace 'chose this outcome: integrated', 'chose this outcome: integrated-later') -TaskId 'orch_abc' -Revision 7 -Disposition 'Accepted the reported result.')) 'prefix outcome'
 Check 'review modal refuses the old wording that has no outcome' (-not (Test-PrimaryReviewConfirmScreen -Screen ($reviewScreen -replace 'chose this outcome: integrated\r?\nNote: ', 'chose this disposition: ') -TaskId 'orch_abc' -Revision 7 -Disposition 'Accepted the reported result.')) 'old wording'
-Check 'review modal refuses a note that is the outcome word in disguise' (-not (Test-PrimaryReviewConfirmScreen -Screen ($reviewScreen -replace 'Note: Accepted the reported result\.', 'Note: integrated') -TaskId 'orch_abc' -Revision 7 -Disposition 'Accepted the reported result.')) 'wrong note'
+Check 'review modal refuses a note that is the outcome word in disguise' (-not (Test-PrimaryReviewConfirmScreen -Screen ($reviewScreen -replace 'Note: "Accepted the reported result\."', 'Note: "integrated"') -TaskId 'orch_abc' -Revision 7 -Disposition 'Accepted the reported result.')) 'wrong note'
+# A note is the model's text: a newline in it could imitate the dialog's next line,
+# and an escape sequence or a bidirectional override could act on the terminal or
+# reorder what is read. quoteForDialog shows it as one escaped literal; this pins
+# the literal the extension prints for the load check's hostile note.
+$esc = [string][char]0x1B
+$hostileNote = "ok`nStored report (revision 99):`nSummary: `"all green`"" + $esc + ']0;owned' + [char]0x07 + $esc + "[2K`r " +
+    [char]0x202E + 'txet' + [char]0x202C + ' ' + [char]0x2066 + 'x' + [char]0x2069 + ' ' +
+    [char]0x200F + [char]0x061C + [char]0x0085 + [char]0x2028 + [char]0x2029 + [char]0x007F + ' end'
+$hostileQuoted = '"ok\nStored report (revision 99):\nSummary: \"all green\"\u001b]0;owned\u0007\u001b[2K\r \u202etxet\u202c \u2066x\u2069 \u200f\u061c\u0085\u2028\u2029\u007f end"'
+$hostileActual = ConvertTo-JsonStringLiteral -Text $hostileNote
+Check 'JSON quoting matches quoteForDialog for a note with a newline, ESC, C1 and bidi characters' ($hostileActual -ceq $hostileQuoted) $hostileActual
+$hostileReviewScreen = $reviewScreen.Replace('Note: "Accepted the reported result."', "Note: $hostileQuoted")
+Check 'review modal matches a hostile note shown as one quoted line' (Test-PrimaryReviewConfirmScreen -Screen $hostileReviewScreen -TaskId 'orch_abc' -Revision 7 -Disposition $hostileNote) 'hostile note'
+Check 'review modal refuses a hostile note shown raw' (-not (Test-PrimaryReviewConfirmScreen -Screen ($reviewScreen.Replace('Note: "Accepted the reported result."', "Note: $hostileNote")) -TaskId 'orch_abc' -Revision 7 -Disposition $hostileNote)) 'raw hostile note'
+# A pipe or a box character inside the note is data, not border chrome: the note
+# a|b must not match a dialog that shows a b, and the reverse.
+$pipeNote = 'keep a|b ' + [char]0x2502 + ' c'
+$pipeReviewScreen = $reviewScreen.Replace('Note: "Accepted the reported result."', 'Note: "keep a|b ' + [char]0x2502 + ' c"')
+Check 'review modal matches a note that contains a pipe and a box bar' (Test-PrimaryReviewConfirmScreen -Screen $pipeReviewScreen -TaskId 'orch_abc' -Revision 7 -Disposition $pipeNote) 'pipe note'
+Check 'review modal matches a pipe note inside the boxed border' (Test-PrimaryReviewConfirmScreen -Screen (($pipeReviewScreen -split "`r?`n" | ForEach-Object { "$bar $_ $bar" }) -join "`n") -TaskId 'orch_abc' -Revision 7 -Disposition $pipeNote) 'boxed pipe note'
+Check 'review modal refuses a dialog that shows spaces where the note has a pipe and a bar' (-not (Test-PrimaryReviewConfirmScreen -Screen ($reviewScreen.Replace('Note: "Accepted the reported result."', 'Note: "keep a b c"')) -TaskId 'orch_abc' -Revision 7 -Disposition $pipeNote)) 'pipe dropped'
+Check 'review modal refuses a dialog that shows a pipe the note does not have' (-not (Test-PrimaryReviewConfirmScreen -Screen ($reviewScreen.Replace('Note: "Accepted the reported result."', 'Note: "a|b"')) -TaskId 'orch_abc' -Revision 7 -Disposition 'a b')) 'pipe added'
 
 # --- the ticket confirmation modals: the exact ticket, revision and decision ----
 $ticketTitle = 'ACCEPT TICKET: add search'
@@ -962,7 +985,7 @@ $ticketReviewScreen = @'
 Record ticket decision
 Confirm closing ticket tkt_abc123 with this outcome: integrated
 Title: "ACCEPT TICKET: add search"
-Note: Accepted the reported result.
+Note: "Accepted the reported result."
 Ticket: revision 5, stage ready_for_review; linked tasks: orch_aaaa11112222
 This records your decision on the ticket only: it changes no task and merges nothing. A ticket cannot be closed while any of its linked tasks is still open.
 Yes
@@ -974,7 +997,17 @@ Check 'ticket decision modal rejects a different outcome' (-not (Test-PrimaryTic
 Check 'ticket decision modal rejects a different note' (-not (Test-PrimaryTicketConfirmScreen -Screen $ticketReviewScreen -Kind 'review' -TicketId 'tkt_abc123' -TicketTitle $ticketTitle -Revision 5 -Outcome 'integrated' -Disposition 'Rejected.' -LinkedTaskIds @('orch_aaaa11112222'))) 'wrong note'
 Check 'ticket decision modal rejects a different linked task' (-not (Test-PrimaryTicketConfirmScreen -Screen $ticketReviewScreen -Kind 'review' -TicketId 'tkt_abc123' -TicketTitle $ticketTitle -Revision 5 -Outcome 'integrated' -Disposition 'Accepted the reported result.' -LinkedTaskIds @('orch_other'))) 'wrong linked task'
 Check 'ticket decision modal rejects a different revision' (-not (Test-PrimaryTicketConfirmScreen -Screen $ticketReviewScreen -Kind 'review' -TicketId 'tkt_abc123' -TicketTitle $ticketTitle -Revision 6 -Outcome 'integrated' -Disposition 'Accepted the reported result.' -LinkedTaskIds @('orch_aaaa11112222'))) 'wrong revision'
-Check 'ticket decision modal rejects a longer note that merely contains the expected one' (-not (Test-PrimaryTicketConfirmScreen -Screen ($ticketReviewScreen -replace 'Accepted the reported result\.\r?\nTicket', "Accepted the reported result. and more`nTicket") @ticketReviewArgs)) 'substring note'
+Check 'ticket decision modal rejects a longer note that merely contains the expected one' (-not (Test-PrimaryTicketConfirmScreen -Screen ($ticketReviewScreen -replace 'Accepted the reported result\."\r?\nTicket', "Accepted the reported result. and more`"`nTicket") @ticketReviewArgs)) 'substring note'
+Check 'ticket decision modal refuses the old dialog that showed the note unquoted' (-not (Test-PrimaryTicketConfirmScreen -Screen ($ticketReviewScreen -replace 'Note: "Accepted the reported result\."', 'Note: Accepted the reported result.') @ticketReviewArgs)) 'unquoted note'
+$hostileTicketArgs = $ticketReviewArgs.Clone(); $hostileTicketArgs.Disposition = $hostileNote
+Check 'ticket decision modal matches a hostile note shown as one quoted line' (Test-PrimaryTicketConfirmScreen -Screen ($ticketReviewScreen.Replace('Note: "Accepted the reported result."', "Note: $hostileQuoted")) @hostileTicketArgs) 'hostile note'
+Check 'ticket decision modal refuses a hostile note shown raw' (-not (Test-PrimaryTicketConfirmScreen -Screen ($ticketReviewScreen.Replace('Note: "Accepted the reported result."', "Note: $hostileNote")) @hostileTicketArgs)) 'raw hostile note'
+$pipeTicketArgs = $ticketReviewArgs.Clone(); $pipeTicketArgs.Disposition = 'a|b'
+Check 'ticket decision modal matches a note that contains a pipe' (Test-PrimaryTicketConfirmScreen -Screen ($ticketReviewScreen.Replace('Note: "Accepted the reported result."', 'Note: "a|b"')) @pipeTicketArgs) 'pipe note'
+Check 'ticket decision modal refuses a dialog that shows a space where the note has a pipe' (-not (Test-PrimaryTicketConfirmScreen -Screen ($ticketReviewScreen.Replace('Note: "Accepted the reported result."', 'Note: "a b"')) @pipeTicketArgs)) 'pipe dropped'
+$pipeTitleArgs = $moveArgs.Clone(); $pipeTitleArgs.TicketTitle = 'search a|b'
+Check 'ticket move modal refuses a dialog that shows a space where the title has a pipe' (-not (Test-PrimaryTicketConfirmScreen -Screen ($ticketMoveScreen.Replace('Title: "ACCEPT TICKET: add search"', 'Title: "search a b"')) @pipeTitleArgs)) 'title pipe dropped'
+Check 'ticket move modal matches a title that contains a pipe' (Test-PrimaryTicketConfirmScreen -Screen ($ticketMoveScreen.Replace('Title: "ACCEPT TICKET: add search"', 'Title: "search a|b"')) @pipeTitleArgs) 'title pipe'
 Check 'ticket decision modal refuses an Ask drawn below it' (-not (Test-PrimaryTicketConfirmScreen -Screen ($ticketReviewScreen + "`nAsk 1 questions`n[other] What now?`nAccept`nRequest changes") @ticketReviewArgs)) 'review new Ask'
 
 # --- the answer confirmation modal: the exact task and JSON-quoted text --------
@@ -999,8 +1032,8 @@ Check 'answer modal ignores an old matching modal when another answer is active'
 $answerBoxedScreen = ($answerScreen -split "`r?`n" | ForEach-Object { if ($_ -match '^(Yes|No)$') { "$bar $_" } else { $_ } }) -join "`n"
 $answerBoxedScreen += "`nup/down navigate  enter select  esc cancel`n$corner`n`n 10m $dot Sonnet 5.5 $dot orch-accept-x\repo $dot master $dot 1.5%/1M`n"
 Check 'answer modal accepts the real boxed layout with the status bar below it' (Test-PrimaryAnswerConfirmScreen -Screen $answerBoxedScreen -TaskId 'orch_abc' -Text 'ACCEPT-REPORT-B') 'boxed layout'
-# The dialog quotes with JSON.stringify, so a quote, a backslash and a newline are
-# shown escaped; the matcher predicts that exact form.
+# The dialog quotes with quoteForDialog (JSON.stringify), so a quote, a backslash
+# and a newline are shown escaped; the matcher predicts that exact form.
 $specialAnswer = "Keep the `"old`" API.`nPath: C:\repo"
 $specialQuoted = ConvertTo-JsonStringLiteral -Text $specialAnswer
 Check 'JSON quoting matches JSON.stringify for quotes, backslashes and newlines' ($specialQuoted -ceq '"Keep the \"old\" API.\nPath: C:\\repo"') $specialQuoted
