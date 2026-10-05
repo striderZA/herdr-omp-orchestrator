@@ -943,6 +943,14 @@ Check 'JSON quoting matches quoteForDialog for a note with a newline, ESC, C1 an
 $hostileReviewScreen = $reviewScreen.Replace('Note: "Accepted the reported result."', "Note: $hostileQuoted")
 Check 'review modal matches a hostile note shown as one quoted line' (Test-PrimaryReviewConfirmScreen -Screen $hostileReviewScreen -TaskId 'orch_abc' -Revision 7 -Disposition $hostileNote) 'hostile note'
 Check 'review modal refuses a hostile note shown raw' (-not (Test-PrimaryReviewConfirmScreen -Screen ($reviewScreen.Replace('Note: "Accepted the reported result."', "Note: $hostileNote")) -TaskId 'orch_abc' -Revision 7 -Disposition $hostileNote)) 'raw hostile note'
+# A pipe or a box character inside the note is data, not border chrome: the note
+# a|b must not match a dialog that shows a b, and the reverse.
+$pipeNote = 'keep a|b ' + [char]0x2502 + ' c'
+$pipeReviewScreen = $reviewScreen.Replace('Note: "Accepted the reported result."', 'Note: "keep a|b ' + [char]0x2502 + ' c"')
+Check 'review modal matches a note that contains a pipe and a box bar' (Test-PrimaryReviewConfirmScreen -Screen $pipeReviewScreen -TaskId 'orch_abc' -Revision 7 -Disposition $pipeNote) 'pipe note'
+Check 'review modal matches a pipe note inside the boxed border' (Test-PrimaryReviewConfirmScreen -Screen (($pipeReviewScreen -split "`r?`n" | ForEach-Object { "$bar $_ $bar" }) -join "`n") -TaskId 'orch_abc' -Revision 7 -Disposition $pipeNote) 'boxed pipe note'
+Check 'review modal refuses a dialog that shows spaces where the note has a pipe and a bar' (-not (Test-PrimaryReviewConfirmScreen -Screen ($reviewScreen.Replace('Note: "Accepted the reported result."', 'Note: "keep a b c"')) -TaskId 'orch_abc' -Revision 7 -Disposition $pipeNote)) 'pipe dropped'
+Check 'review modal refuses a dialog that shows a pipe the note does not have' (-not (Test-PrimaryReviewConfirmScreen -Screen ($reviewScreen.Replace('Note: "Accepted the reported result."', 'Note: "a|b"')) -TaskId 'orch_abc' -Revision 7 -Disposition 'a b')) 'pipe added'
 
 # --- the ticket confirmation modals: the exact ticket, revision and decision ----
 $ticketTitle = 'ACCEPT TICKET: add search'
@@ -994,6 +1002,12 @@ Check 'ticket decision modal refuses the old dialog that showed the note unquote
 $hostileTicketArgs = $ticketReviewArgs.Clone(); $hostileTicketArgs.Disposition = $hostileNote
 Check 'ticket decision modal matches a hostile note shown as one quoted line' (Test-PrimaryTicketConfirmScreen -Screen ($ticketReviewScreen.Replace('Note: "Accepted the reported result."', "Note: $hostileQuoted")) @hostileTicketArgs) 'hostile note'
 Check 'ticket decision modal refuses a hostile note shown raw' (-not (Test-PrimaryTicketConfirmScreen -Screen ($ticketReviewScreen.Replace('Note: "Accepted the reported result."', "Note: $hostileNote")) @hostileTicketArgs)) 'raw hostile note'
+$pipeTicketArgs = $ticketReviewArgs.Clone(); $pipeTicketArgs.Disposition = 'a|b'
+Check 'ticket decision modal matches a note that contains a pipe' (Test-PrimaryTicketConfirmScreen -Screen ($ticketReviewScreen.Replace('Note: "Accepted the reported result."', 'Note: "a|b"')) @pipeTicketArgs) 'pipe note'
+Check 'ticket decision modal refuses a dialog that shows a space where the note has a pipe' (-not (Test-PrimaryTicketConfirmScreen -Screen ($ticketReviewScreen.Replace('Note: "Accepted the reported result."', 'Note: "a b"')) @pipeTicketArgs)) 'pipe dropped'
+$pipeTitleArgs = $moveArgs.Clone(); $pipeTitleArgs.TicketTitle = 'search a|b'
+Check 'ticket move modal refuses a dialog that shows a space where the title has a pipe' (-not (Test-PrimaryTicketConfirmScreen -Screen ($ticketMoveScreen.Replace('Title: "ACCEPT TICKET: add search"', 'Title: "search a b"')) @pipeTitleArgs)) 'title pipe dropped'
+Check 'ticket move modal matches a title that contains a pipe' (Test-PrimaryTicketConfirmScreen -Screen ($ticketMoveScreen.Replace('Title: "ACCEPT TICKET: add search"', 'Title: "search a|b"')) @pipeTitleArgs) 'title pipe'
 Check 'ticket decision modal refuses an Ask drawn below it' (-not (Test-PrimaryTicketConfirmScreen -Screen ($ticketReviewScreen + "`nAsk 1 questions`n[other] What now?`nAccept`nRequest changes") @ticketReviewArgs)) 'review new Ask'
 
 # --- the answer confirmation modal: the exact task and JSON-quoted text --------
