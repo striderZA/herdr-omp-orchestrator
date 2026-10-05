@@ -477,6 +477,19 @@ export async function confirmThen<T>(
   }
   return { ok: true, value: await act() };
 }
+
+// Every model-supplied or stored text in a consent dialog is shown as one JSON
+// string literal. JSON.stringify escapes the quote, the backslash and the C0
+// controls, so a newline cannot start a line that imitates the dialog's own and
+// an ESC cannot reach the terminal. This also escapes what JSON.stringify leaves
+// raw but a terminal acts on or reorders: DEL, the C1 controls, the line and
+// paragraph separators, and the bidirectional marks, embeddings, overrides and
+// isolates. The literal still parses (JSON.parse) to exactly the value sent.
+const DIALOG_UNSAFE = /[\u007f-\u009f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g;
+export function quoteForDialog(value: string | readonly string[]): string {
+  return JSON.stringify(value).replace(DIALOG_UNSAFE, (ch) => `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`);
+}
+
 // The review sends exactly the persisted report revision the user approved,
 // along with their decision. A later report/task edit invalidates this token.
 export const REVIEW_OUTCOMES = ["integrated", "kept", "rejected", "superseded", "abandoned"] as const;
@@ -503,10 +516,10 @@ export function recordReviewWithConsent<T>(
     title: "Record review disposition",
     message:
       `Confirm that you reviewed the worker's final report for task ${preview.taskId} and chose this outcome: ${outcome}\n` +
-      `Note: ${disposition}\nStored report (revision ${preview.revision}):\n` +
-      `Summary: ${JSON.stringify(preview.summary)}\nBranch: ${JSON.stringify(preview.branch)}\n` +
-      `Evidence: ${JSON.stringify(preview.evidence)}\nChecks: ${JSON.stringify(preview.checks)}\n` +
-      `Risk: ${JSON.stringify(preview.risk)}\n` +
+      `Note: ${quoteForDialog(disposition)}\nStored report (revision ${preview.revision}):\n` +
+      `Summary: ${quoteForDialog(preview.summary)}\nBranch: ${quoteForDialog(preview.branch)}\n` +
+      `Evidence: ${quoteForDialog(preview.evidence)}\nChecks: ${quoteForDialog(preview.checks)}\n` +
+      `Risk: ${quoteForDialog(preview.risk)}\n` +
       (releases
         ? "This closes the task and may start queued dependent work. Decline if you have not reviewed the report."
         : "This closes the task and frees its slot and paths, but tasks that depend on it stay queued. Decline if you have not reviewed the report."),
@@ -548,7 +561,7 @@ export async function recordTicketMoveWithConsent<T>(
     title: "Move ticket to todo",
     message:
       `Confirm moving ticket ${preview.ticketId} to todo.\n` +
-      `Title: ${JSON.stringify(preview.title)}\n` +
+      `Title: ${quoteForDialog(preview.title)}\n` +
       `Now: ${preview.column} (stage ${preview.stage}), revision ${preview.revision}\n` +
       "In this version a move only records the ticket as ready for work; it starts nothing. " +
       "No task, worktree or agent is created, and dispatching work for the ticket is a separate step.",
@@ -567,8 +580,8 @@ export async function recordTicketReviewWithConsent<T>(
     title: "Record ticket decision",
     message:
       `Confirm closing ticket ${preview.ticketId} with this outcome: ${outcome}\n` +
-      `Title: ${JSON.stringify(preview.title)}\n` +
-      `Note: ${disposition}\n` +
+      `Title: ${quoteForDialog(preview.title)}\n` +
+      `Note: ${quoteForDialog(disposition)}\n` +
       `Ticket: revision ${preview.revision}, stage ${preview.stage}; linked tasks: ${preview.taskIds.length > 0 ? preview.taskIds.join(", ") : "none"}\n` +
       (preview.stage === "done"
         ? "This ticket is already decided: repeating the same decision changes nothing, and a different one is refused. "
@@ -583,7 +596,7 @@ export async function recordTicketReviewWithConsent<T>(
 
 // An answer is typed into a worker's session as the user's own reply, so it is
 // input injection: the text is the model's until the user confirms it. The dialog
-// quotes the text with JSON.stringify so a newline, a trailing space or a control
+// quotes the text with quoteForDialog so a newline, a trailing space or a control
 // character is visible rather than silently part of what is sent, and the send
 // receives exactly the task and text that were shown: nothing is re-read or
 // rebuilt between the confirmation and the bridge call.
@@ -600,7 +613,7 @@ export function answerConfirmRequest(taskId: string, text: string): ConfirmPlan 
       title: "Send answer to worker",
       message:
         `Confirm sending this answer to the worker of task ${taskId}:\n` +
-        `Answer: ${JSON.stringify(text)}\n` +
+        `Answer: ${quoteForDialog(text)}\n` +
         "It is typed into that worker's session as your reply. Decline if this is not your answer.",
     },
   };

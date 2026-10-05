@@ -4486,7 +4486,10 @@ function Test-PrimaryReviewConfirmScreen {
     $descriptionIndex = $normalized.IndexOf($description, [System.StringComparison]::Ordinal)
     if ($descriptionIndex -lt 0) { return $false }
     $afterDescription = $normalized.Substring($descriptionIndex + $description.Length).TrimStart()
-    $expectedDecision = $Outcome.Trim() + ' Note: ' + ($Disposition -replace '\s+', ' ').Trim() + " Stored report (revision ${Revision}):"
+    # The extension quotes the note (quoteForDialog); a note that wraps on screen
+    # is compared after the same whitespace and border folding as the screen.
+    $quotedNote = ((ConvertTo-JsonStringLiteral -Text $Disposition) -replace '[\s\u2502\u00B3|]+', ' ')
+    $expectedDecision = $Outcome.Trim() + ' Note: ' + $quotedNote + " Stored report (revision ${Revision}):"
     $closing = if ($Outcome -ceq 'integrated' -or $Outcome -ceq 'kept') {
         'This closes the task and may start queued dependent work.'
     } else {
@@ -4639,8 +4642,8 @@ function Test-PrimaryTicketConfirmScreen {
     if ($start -lt 0) { return $false }
     $panel = $Screen.Substring($start)
     $normalized = ($panel -replace '[\s\u2502\u00B3|]+', ' ').Trim()
-    # The extension quotes the title with JSON.stringify.
-    $quotedTitle = '"' + ((($TicketTitle -replace '\s+', ' ').Trim()) -replace '\\', '\\' -replace '"', '\"') + '"'
+    # The extension quotes the title and the note with quoteForDialog.
+    $quotedTitle = ((ConvertTo-JsonStringLiteral -Text $TicketTitle) -replace '[\s\u2502\u00B3|]+', ' ')
     if ($Kind -eq 'move') {
         $description = "Confirm moving ticket $TicketId to todo."
         $expectedFacts = "Title: $quotedTitle Now: backlog (stage backlog), revision $Revision " +
@@ -4648,7 +4651,8 @@ function Test-PrimaryTicketConfirmScreen {
     } else {
         $description = "Confirm closing ticket $TicketId with this outcome: $Outcome"
         $tasksText = if (@($LinkedTaskIds).Count -gt 0) { (@($LinkedTaskIds) -join ', ') } else { 'none' }
-        $expectedFacts = "Title: $quotedTitle Note: " + ($Disposition -replace '\s+', ' ').Trim() +
+        $quotedNote = ((ConvertTo-JsonStringLiteral -Text $Disposition) -replace '[\s\u2502\u00B3|]+', ' ')
+        $expectedFacts = "Title: $quotedTitle Note: $quotedNote" +
             " Ticket: revision $Revision, stage ${Stage}; linked tasks: $tasksText " +
             'This records your decision on the ticket only: it changes no task and merges nothing. ' +
             'A ticket cannot be closed while any of its linked tasks is still open.'
@@ -4705,10 +4709,12 @@ function Confirm-PrimaryTicketModal {
 
 function ConvertTo-JsonStringLiteral {
     <#
-        The string the extension's JSON.stringify shows for one text: the quotes,
-        backslash and control characters escaped, every other character (non-ASCII
-        included) verbatim. PowerShell's ConvertTo-Json escapes more than that, so
-        it cannot be used to predict the dialog text.
+        The string the extension's quoteForDialog shows for one text: JSON.stringify
+        escapes the quotes, backslash and C0 control characters, and quoteForDialog
+        also escapes DEL, the C1 controls, the line and paragraph separators and the
+        bidirectional marks, embeddings, overrides and isolates. Every other
+        character (non-ASCII included) is verbatim. PowerShell's ConvertTo-Json
+        escapes more than that, so it cannot be used to predict the dialog text.
     #>
     param([AllowEmptyString()][string]$Text)
     $builder = New-Object System.Text.StringBuilder
@@ -4722,7 +4728,11 @@ function ConvertTo-JsonStringLiteral {
         elseif ($code -eq 0x09) { [void]$builder.Append('\t') }
         elseif ($code -eq 0x08) { [void]$builder.Append('\b') }
         elseif ($code -eq 0x0C) { [void]$builder.Append('\f') }
-        elseif ($code -lt 0x20) { [void]$builder.Append(('\u{0:x4}' -f $code)) }
+        elseif ($code -lt 0x20 -or ($code -ge 0x7F -and $code -le 0x9F) -or $code -eq 0x061C -or
+            $code -eq 0x200E -or $code -eq 0x200F -or $code -eq 0x2028 -or $code -eq 0x2029 -or
+            ($code -ge 0x202A -and $code -le 0x202E) -or ($code -ge 0x2066 -and $code -le 0x2069)) {
+            [void]$builder.Append(('\u{0:x4}' -f $code))
+        }
         else { [void]$builder.Append($ch) }
     }
     [void]$builder.Append('"')
