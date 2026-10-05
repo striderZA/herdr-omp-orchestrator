@@ -529,12 +529,14 @@ func (c *Coordinator) applyTaskMove(ctx context.Context, st task.Task, previous 
 		if st.PublicPaneID != st.LaunchPaneID {
 			return c.taskAttention(ctx, st, fmt.Sprintf(
 				"a %s event reports pane %s moving from its launch id %s, but the task already recorded the public pane %s",
-				EventPaneMoved, pane.PaneID, previous, st.PublicPaneID))
+				EventPaneMoved, pane.PaneID, previous, st.PublicPaneID,
+			))
 		}
 	default:
 		return c.taskAttention(ctx, st, fmt.Sprintf(
 			"a %s event reports pane %s moving from %s, which is neither the task's launch pane %s nor its public pane %s",
-			EventPaneMoved, pane.PaneID, previous, st.LaunchPaneID, st.PublicPaneID))
+			EventPaneMoved, pane.PaneID, previous, st.LaunchPaneID, st.PublicPaneID,
+		))
 	}
 	identity, err := c.identityOf(ctx, st.LaunchPaneID, st.OMPSessionID)
 	if err != nil {
@@ -609,12 +611,14 @@ func (c *Coordinator) applyProjectMove(ctx context.Context, project task.Project
 		if project.PublicPaneID != project.LaunchPaneID {
 			return c.projectAttention(ctx, project, fmt.Sprintf(
 				"a %s event reports the primary pane %s moving from its launch id %s, but project %s already recorded the public pane %s",
-				EventPaneMoved, pane.PaneID, previous, project.Key, project.PublicPaneID))
+				EventPaneMoved, pane.PaneID, previous, project.Key, project.PublicPaneID,
+			))
 		}
 	default:
 		return c.projectAttention(ctx, project, fmt.Sprintf(
 			"a %s event reports pane %s moving from %s, which is neither the primary's launch pane %s nor its public pane %s",
-			EventPaneMoved, pane.PaneID, previous, project.LaunchPaneID, project.PublicPaneID))
+			EventPaneMoved, pane.PaneID, previous, project.LaunchPaneID, project.PublicPaneID,
+		))
 	}
 	identity, err := c.identityOf(ctx, project.LaunchPaneID, project.OMPSessionID)
 	if err != nil {
@@ -651,7 +655,8 @@ func (c *Coordinator) applyProjectMove(ctx context.Context, project task.Project
 	if errors.Is(err, state.ErrPaneTaken) {
 		return c.projectAttention(ctx, project, fmt.Sprintf(
 			"the primary of project %s moved to pane %s, which another record already owns; the move is not recorded until a human resolves it",
-			project.Key, pane.PaneID))
+			project.Key, pane.PaneID,
+		))
 	}
 	if err != nil {
 		return fmt.Errorf("record the moved public pane of project %s: %w", project.Key, err)
@@ -1121,7 +1126,16 @@ func (c *Coordinator) reconcileProject(ctx context.Context, project task.Project
 	if err != nil {
 		return errors.Join(append(failures, fmt.Errorf("read the tasks of %q: %w", project.Key, err))...)
 	}
+	for _, st := range tasks {
+		if st.Cleanup == nil || st.Cleanup.Refused {
+			continue
+		}
+		if err := c.reconcileCleanup(ctx, st); err != nil {
+			failures = append(failures, err)
+		}
+	}
 	var unfinished []task.Task
+
 	for _, st := range tasks {
 		if reconciles(st) {
 			unfinished = append(unfinished, st)
@@ -1166,6 +1180,26 @@ func (c *Coordinator) reconcileProject(ctx context.Context, project task.Project
 		failures = append(failures, err)
 	}
 	return errors.Join(failures...)
+}
+
+// reconcileCleanup settles only a pending cleanup whose exact checkout is
+// already absent and whose branch is still retained. Startup never removes a
+// checkout; one still listed remains pending for an explicit user-confirmed retry.
+func (c *Coordinator) reconcileCleanup(ctx context.Context, st task.Task) error {
+	if st.Cleanup == nil || st.Cleanup.Refused {
+		return nil
+	}
+	_, absent, err := c.inspectCleanup(ctx, st, *st.Cleanup)
+	if err != nil {
+		return fmt.Errorf("inspect interrupted cleanup of task %s: %w", st.ID, err)
+	}
+	if !absent {
+		return nil
+	}
+	if _, err := c.settleCleanup(ctx, st, *st.Cleanup, nil); err != nil {
+		return fmt.Errorf("settle interrupted cleanup of task %s: %w", st.ID, err)
+	}
+	return nil
 }
 
 // resumableStep reports whether a provisioning step a restart interrupted is one
@@ -1266,7 +1300,8 @@ func (c *Coordinator) reconcilePrimary(ctx context.Context, project task.Project
 	case len(ours) > 1:
 		return c.primaryUnverified(ctx, project, fmt.Sprintf(
 			"%d panes report the primary session of project %s (%s); the binding was not re-keyed",
-			len(ours), project.Key, strings.Join(paneIDs(ours), ", ")))
+			len(ours), project.Key, strings.Join(paneIDs(ours), ", "),
+		))
 	}
 	if refuted := refutedOnly(probes); len(refuted) > 0 {
 		return c.primaryUnverified(ctx, project, fmt.Sprintf("pane %s is not the primary of project %s: %s",
@@ -1319,13 +1354,15 @@ func (c *Coordinator) reconcileTask(ctx context.Context, project task.Project, s
 			// decides instead.
 			return taskReconcile{}, c.taskAttention(ctx, st, fmt.Sprintf(
 				"pane %s runs an agent whose session task %s never recorded, so the recorded step was not continued and no brief was submitted to it",
-				ours[0].Pane.PaneID, st.ID))
+				ours[0].Pane.PaneID, st.ID,
+			))
 		}
 		return taskReconcile{Proved: true, Continue: true}, c.applyTaskPane(ctx, st, ours[0])
 	case len(ours) > 1:
 		return taskReconcile{}, c.taskAttention(ctx, st, fmt.Sprintf(
 			"%d panes report the worker session of task %s (%s); the binding was not re-keyed",
-			len(ours), st.ID, strings.Join(paneIDs(ours), ", ")))
+			len(ours), st.ID, strings.Join(paneIDs(ours), ", "),
+		))
 	}
 	// No pane proved to be this worker's. A pane that positively contradicts the
 	// recorded identity is an unknown occupant: a human decides, and nothing is
@@ -1334,12 +1371,14 @@ func (c *Coordinator) reconcileTask(ctx context.Context, project task.Project, s
 	if refuted := refutedOnly(probes); len(refuted) > 0 {
 		return taskReconcile{}, c.taskAttention(ctx, st, fmt.Sprintf(
 			"pane %s is not the worker of task %s and no agent was started in its place: %s",
-			refuted[0].Pane.PaneID, st.ID, refuted[0].Refusal))
+			refuted[0].Pane.PaneID, st.ID, refuted[0].Refusal,
+		))
 	}
 	if unproven := unprovenOnly(probes); len(unproven) > 0 {
 		return taskReconcile{}, c.taskAttention(ctx, st, fmt.Sprintf(
 			"pane %s could not be proven to be the worker of task %s, so its binding was left as recorded: %s",
-			unproven[0].Pane.PaneID, st.ID, unproven[0].Refusal))
+			unproven[0].Pane.PaneID, st.ID, unproven[0].Refusal,
+		))
 	}
 	if problem := checkoutProblem(listed, st); problem != "" {
 		return taskReconcile{}, c.taskAttention(ctx, st, problem)
@@ -1412,7 +1451,8 @@ func (c *Coordinator) reconcileExit(ctx context.Context, project task.Project, s
 	}
 	summary := fmt.Sprintf(
 		"worker %s is no longer running: its pane is absent from Herdr's snapshot; the task was left at phase %s and nothing was started in its place",
-		st.ID, st.Phase)
+		st.ID, st.Phase,
+	)
 	note := c.noteFor(st, noteKindExit, summary, reconcileDelivery)
 	if probe := st; !raiseLiveness(&probe, absentAttention) {
 		// Nothing to record on the task: it is not a submitted worker, it already

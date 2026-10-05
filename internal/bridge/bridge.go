@@ -399,7 +399,7 @@ func CoordinatorOps(c *coord.Coordinator) Ops {
 			if err := decodeParams(params, &request); err != nil {
 				return nil, err
 			}
-			result, err := c.Cleanup(ctx, p.LaunchPaneID, request.TaskID)
+			result, err := c.CleanupConfirmed(ctx, p.LaunchPaneID, request)
 			return result, coordError(err)
 		},
 		TicketCreate: func(ctx context.Context, p Principal, params json.RawMessage) (any, error) {
@@ -531,6 +531,8 @@ func coordErrorCode(err error) string {
 		return "not_reviewed"
 	case errors.Is(err, coord.ErrReportChanged):
 		return "report_changed"
+	case errors.Is(err, coord.ErrCleanupChanged):
+		return "cleanup_changed"
 	case errors.Is(err, coord.ErrAlreadyDecided):
 		return "already_decided"
 	case errors.Is(err, coord.ErrWorkerLive):

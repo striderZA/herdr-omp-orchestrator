@@ -41,6 +41,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -64,6 +65,9 @@ var (
 	// ErrReportChanged refuses a decision when the task changed since the
 	// primary displayed its persisted report for confirmation.
 	ErrReportChanged = errors.New("coord: the reviewed task changed after its preview")
+	// ErrCleanupChanged refuses cleanup when the task or inspected outcome no
+	// longer matches the state the user confirmed.
+	ErrCleanupChanged = errors.New("coord: cleanup changed after its preview")
 	// ErrAlreadyDecided preserves the user's first disposition as a durable fact.
 	ErrAlreadyDecided = errors.New("coord: the worker report already has a disposition")
 	// ErrWorkerLive refuses cleanup while the task's worker agent is running.
@@ -86,7 +90,9 @@ var (
 	ErrInputPending = errors.New("coord: an input attempt is waiting for the user's settlement")
 	// ErrOwnership refuses an operation whose caller does not own the named task:
 	// the primary must be the bound primary of that task's project.
-	ErrOwnership = errors.New("coord: the caller does not own this task")
+	ErrOwnership       = errors.New("coord: the caller does not own this task")
+	errCleanupForced   = errors.New("coord: Herdr claimed a forced checkout removal")
+	errCleanupIdentity = errors.New("coord: Herdr returned a contradictory cleanup identity")
 )
 
 // Bounds on what one caller may record. They mirror the extension's own tool
@@ -325,9 +331,13 @@ type ReviewParams struct {
 	ExpectedRevision int64  `json:"expectedRevision"`
 }
 
-// CleanupParams is the orch_cleanup body.
+// CleanupParams is the orch_cleanup body. Revision, WorkspaceID, and
+// AlreadyRemoved bind the action to the read-only preview the user confirmed.
 type CleanupParams struct {
-	TaskID string `json:"taskId"`
+	TaskID         string `json:"taskId"`
+	Revision       int64  `json:"revision"`
+	WorkspaceID    string `json:"workspaceId"`
+	AlreadyRemoved bool   `json:"alreadyRemoved"`
 }
 
 // ---------------------------------------------------------------------------
@@ -429,14 +439,18 @@ type ReviewResult struct {
 // CleanupPreview is the read-only description of what cleanup would remove and
 // whether it may: the primary shows it to the user before anything is approved.
 type CleanupPreview struct {
-	TaskID      string `json:"taskId"`
-	Branch      string `json:"branch"`
-	Path        string `json:"path"`
-	WorkspaceID string `json:"workspaceId"`
-	Reviewed    bool   `json:"reviewed"`
-	Clean       bool   `json:"clean"`
-	LiveWorker  bool   `json:"liveWorker"`
-	Removable   bool   `json:"removable"`
+	TaskID         string `json:"taskId"`
+	Revision       int64  `json:"revision"`
+	Branch         string `json:"branch"`
+	Path           string `json:"path"`
+	WorkspaceID    string `json:"workspaceId"`
+	Reviewed       bool   `json:"reviewed"`
+	Clean          bool   `json:"clean"`
+	LiveWorker     bool   `json:"liveWorker"`
+	Removable      bool   `json:"removable"`
+	AlreadyRemoved bool   `json:"alreadyRemoved,omitempty"`
+	ReopenRequired bool   `json:"reopenRequired,omitempty"`
+	Reopening      bool   `json:"reopening,omitempty"` // Worktree open may have completed before its workspace was recorded.
 	// Detail explains the first reason this checkout may not be removed, or what
 	// exactly the removal will do when it may, in the words the primary shows the
 	// user.
@@ -1139,10 +1153,44 @@ func (c *Coordinator) CleanupPreview(ctx context.Context, primaryLaunchPaneID, t
 
 	preview := CleanupPreview{
 		TaskID:   st.ID,
+		Revision: st.Revision,
 		Branch:   strings.TrimSpace(st.Branch),
 		Path:     strings.TrimSpace(st.WorktreePath),
 		Reviewed: isClosed(st),
 	}
+	pending := st.Cleanup != nil
+	if pending {
+		preview.Reopening = st.Cleanup.Opening
+	}
+	var target checkoutTarget
+	if pending {
+		if st.Cleanup.Refused {
+			preview.Detail = fmt.Sprintf("Herdr returned a forced or contradictory removal result for %s; inspect checkout %s and branch %s manually", st.ID, st.Cleanup.Path, st.Cleanup.Branch)
+			return preview, nil
+		}
+		var absent bool
+		target, absent, err = c.inspectCleanup(ctx, st, *st.Cleanup)
+		if err != nil {
+			preview.Detail = err.Error()
+			return preview, nil
+		}
+		if absent {
+			preview.WorkspaceID = st.Cleanup.WorkspaceID
+			preview.Clean = true
+			preview.AlreadyRemoved = true
+			preview.Removable = preview.Reviewed
+			preview.Detail = fmt.Sprintf("checkout %s is already absent and branch %s is retained; confirm to settle the interrupted cleanup without removing it again", preview.Path, preview.Branch)
+			return preview, nil
+		}
+		if st.Cleanup.RootPaneID != "" {
+			if err := c.recordedCleanupWorkspaceIsIdle(ctx, *st.Cleanup); err != nil {
+				preview.LiveWorker = errors.Is(err, ErrWorkerLive)
+				preview.Detail = err.Error()
+				return preview, nil
+			}
+		}
+	}
+
 	blockers := []string{}
 	if !preview.Reviewed {
 		blockers = append(blockers, "the task is not a reviewed done task: only a final result with a disposition the user recorded can be cleaned")
@@ -1163,12 +1211,21 @@ func (c *Coordinator) CleanupPreview(ctx context.Context, primaryLaunchPaneID, t
 		}
 	}
 
-	target, err := c.checkoutWorkspace(ctx, st)
-	if err != nil {
-		blockers = append(blockers, err.Error())
-	} else {
+	provenanceOK := true
+	if pending {
 		preview.WorkspaceID = target.WorkspaceID
+		preview.ReopenRequired = !target.Held
 		preview.reopens = !target.Held
+	} else {
+		target, err = c.checkoutWorkspace(ctx, st)
+		if err != nil {
+			provenanceOK = false
+			blockers = append(blockers, err.Error())
+		} else {
+			preview.WorkspaceID = target.WorkspaceID
+			preview.ReopenRequired = !target.Held
+			preview.reopens = !target.Held
+		}
 	}
 
 	live, err := c.workerLive(ctx, st)
@@ -1180,12 +1237,9 @@ func (c *Coordinator) CleanupPreview(ctx context.Context, primaryLaunchPaneID, t
 		blockers = append(blockers, "the worker agent is still running in its pane; close it before removing its checkout")
 	}
 
-	preview.Removable = preview.Reviewed && preview.Clean && !preview.LiveWorker && preview.Path != ""
+	preview.Removable = preview.Reviewed && preview.Clean && !preview.LiveWorker && preview.Path != "" && provenanceOK
 	preview.Detail = strings.Join(blockers, "; ")
 	if preview.Removable {
-		// A checkout Herdr no longer holds in a workspace is still removable: the
-		// removal opens it by its recorded path first. The user is told, because
-		// the confirmation names what will happen.
 		held := fmt.Sprintf("workspace %s", preview.WorkspaceID)
 		if preview.reopens {
 			held = "no workspace holds it, so it is opened by its recorded path first"
@@ -1195,14 +1249,23 @@ func (c *Coordinator) CleanupPreview(ctx context.Context, primaryLaunchPaneID, t
 	return preview, nil
 }
 
-// Cleanup removes a reviewed worker's checkout, and nothing else.
-//
-// It revalidates the whole decision on the spot — reviewed and disposed, no live
-// worker, a clean checkout, and a worktree listing that still names the recorded
-// path and branch — then removes the checkout without `--force`. The branch
-// survives, the source workspace id alone is never trusted (a move can close it),
-// and any refusal or failure leaves the checkout exactly where it was.
+// Cleanup removes a reviewed worker's checkout, and nothing else. It records
+// intent before the non-forced removal, then settles only after verifying that
+// the exact checkout is absent and its branch is still retained. An interrupted
+// attempt is inspected before any retry.
 func (c *Coordinator) Cleanup(ctx context.Context, primaryLaunchPaneID, taskID string) (CleanupResult, error) {
+	return c.cleanup(ctx, primaryLaunchPaneID, taskID, 0, false, "")
+}
+
+// CleanupConfirmed requires the positive preview revision the user confirmed.
+func (c *Coordinator) CleanupConfirmed(ctx context.Context, primaryLaunchPaneID string, request CleanupParams) (CleanupResult, error) {
+	if request.Revision <= 0 {
+		return CleanupResult{}, ErrCleanupChanged
+	}
+	return c.cleanup(ctx, primaryLaunchPaneID, request.TaskID, request.Revision, request.AlreadyRemoved, request.WorkspaceID)
+}
+
+func (c *Coordinator) cleanup(ctx context.Context, primaryLaunchPaneID, taskID string, expectedRevision int64, previewAlreadyRemoved bool, expectedWorkspaceID string) (CleanupResult, error) {
 	project, err := c.primaryProject(ctx, primaryLaunchPaneID)
 	if err != nil {
 		return CleanupResult{}, err
@@ -1211,8 +1274,38 @@ func (c *Coordinator) Cleanup(ctx context.Context, primaryLaunchPaneID, taskID s
 	if err != nil {
 		return CleanupResult{}, err
 	}
+	if expectedRevision > 0 && st.Revision != expectedRevision {
+		return CleanupResult{}, fmt.Errorf("%w: task %s is at revision %d, not the previewed revision %d", ErrCleanupChanged, st.ID, st.Revision, expectedRevision)
+	}
+	if previewAlreadyRemoved && st.Cleanup == nil {
+		return CleanupResult{}, ErrCleanupChanged
+	}
 	if !isClosed(st) {
 		return CleanupResult{}, fmt.Errorf("%w: task %s needs a final result and a disposition the user recorded before its checkout may be removed", ErrNotReviewed, st.ID)
+	}
+
+	pending := st.Cleanup != nil
+	var attempt task.CleanupAttempt
+	var target checkoutTarget
+	if pending {
+		attempt = *st.Cleanup
+		if attempt.Refused {
+			return CleanupResult{}, fmt.Errorf("%w: a previous removal result for task %s was forced or contradictory; inspect it manually", ErrProvenance, st.ID)
+		}
+		var absent bool
+		target, absent, err = c.inspectCleanup(ctx, st, attempt)
+		if err != nil {
+			return CleanupResult{}, err
+		}
+		if absent {
+			return c.settleCleanup(ctx, st, attempt, nil)
+		}
+		if expectedRevision > 0 && expectedWorkspaceID != target.WorkspaceID {
+			return CleanupResult{}, fmt.Errorf("%w: task %s workspace changed from %q to %q after preview", ErrCleanupChanged, st.ID, expectedWorkspaceID, target.WorkspaceID)
+		}
+		if previewAlreadyRemoved {
+			return CleanupResult{}, fmt.Errorf("%w: task %s checkout is listed again after the user confirmed settlement without removal", ErrCleanupChanged, st.ID)
+		}
 	}
 
 	status, err := c.checkoutStatus(ctx, st.WorktreePath)
@@ -1231,56 +1324,82 @@ func (c *Coordinator) Cleanup(ctx context.Context, primaryLaunchPaneID, taskID s
 	if live {
 		return CleanupResult{}, fmt.Errorf("%w: the worker agent recorded for task %s is still running; close it before removing its checkout", ErrWorkerLive, st.ID)
 	}
-
-	target, err := c.checkoutWorkspace(ctx, st)
-	if err != nil {
-		return CleanupResult{}, err
-	}
-	removed, err := c.removeCheckout(ctx, target, st)
-	if err != nil {
-		return CleanupResult{}, err
+	if pending && attempt.RootPaneID != "" {
+		if err := c.recordedCleanupWorkspaceIsIdle(ctx, attempt); err != nil {
+			return CleanupResult{}, err
+		}
 	}
 
-	// The checkout is gone, so every live routing and runtime identity is cleared:
-	// the panes, the terminal, the workspaces, the worker's agent name and its OMP
-	// session all described a process that no longer has a checkout. The branch, the
-	// path, the reviewed report and the user's disposition stay as the history of
-	// what was removed.
-	updated, err := c.record(ctx, st, func(next *task.Task) error {
-		next.LaunchPaneID = ""
-		next.PublicPaneID = ""
-		next.TerminalID = ""
-		next.WorktreeWorkspaceID = ""
-		next.CurrentWorkspaceID = ""
-		next.AgentName = ""
-		next.OMPSessionID = ""
-		return nil
-	}, "record the removed checkout")
-	if err != nil {
-		return CleanupResult{}, fmt.Errorf("the checkout of task %s was removed, but the task could not be updated: %w", st.ID, err)
+	if !pending {
+		target, err = c.checkoutWorkspace(ctx, st)
+		if err != nil {
+			return CleanupResult{}, err
+		}
+		if expectedRevision > 0 && expectedWorkspaceID != target.WorkspaceID {
+			return CleanupResult{}, fmt.Errorf("%w: task %s workspace changed from %q to %q after preview", ErrCleanupChanged, st.ID, expectedWorkspaceID, target.WorkspaceID)
+		}
+		st, attempt, err = c.recordCleanupAttempt(ctx, st, target, expectedRevision)
+		if err != nil {
+			return CleanupResult{}, err
+		}
+		var absent bool
+		target, absent, err = c.inspectCleanup(ctx, st, attempt)
+		if err != nil {
+			return CleanupResult{}, err
+		}
+		if absent {
+			return c.settleCleanup(ctx, st, attempt, nil)
+		}
+		if expectedRevision > 0 && expectedWorkspaceID != target.WorkspaceID {
+			return CleanupResult{}, fmt.Errorf("%w: task %s workspace changed from %q to %q after preview", ErrCleanupChanged, st.ID, expectedWorkspaceID, target.WorkspaceID)
+		}
 	}
-	if _, err := c.note(ctx, updated, "cleanup",
-		fmt.Sprintf("checkout %s of task %s removed; branch %s kept", removed.Path, st.ID, st.Branch),
-		"worktree removed"); err != nil {
+
+	current, err := c.store.Task(ctx, st.ID)
+	if err != nil {
 		return CleanupResult{}, err
 	}
-	return CleanupResult{
-		TaskID:      updated.ID,
-		Branch:      st.Branch,
-		Path:        removed.Path,
-		WorkspaceID: removed.WorkspaceID,
-		Removed:     true,
-		Forced:      removed.Forced,
-		Stage:       task.StageOf(updated),
-	}, nil
+	if current.Revision != st.Revision || !sameCleanupAttempt(current.Cleanup, attempt) || current.Cleanup.Refused {
+		return CleanupResult{}, ErrCleanupChanged
+	}
+	st, attempt = current, *current.Cleanup
+
+	removed, st, attempt, removalAttempted, ambiguousRemoval, removeErr := c.removeCheckout(ctx, target, st, attempt)
+	if errors.Is(removeErr, errCleanupForced) || errors.Is(removeErr, errCleanupIdentity) || errors.Is(removeErr, herdr.ErrIdentity) {
+		if err := c.refuseCleanupOutcome(ctx, st, attempt); err != nil {
+			removeErr = errors.Join(removeErr, fmt.Errorf("record the refused cleanup outcome: %w", err))
+		}
+		return CleanupResult{}, removeErr
+	}
+	if errors.Is(removeErr, ErrCleanupChanged) {
+		return CleanupResult{}, removeErr
+	}
+	if removeErr != nil && (!removalAttempted || !ambiguousRemoval) {
+		return CleanupResult{}, removeErr
+	}
+	if removeErr == nil && !removalAttempted {
+		return CleanupResult{}, ErrCleanupChanged
+	}
+	_, absent, inspectErr := c.inspectCleanup(ctx, st, attempt)
+	if inspectErr != nil {
+		if removeErr != nil {
+			return CleanupResult{}, fmt.Errorf("%w; cleanup result inspection also failed: %v", removeErr, inspectErr)
+		}
+		return CleanupResult{}, inspectErr
+	}
+	if absent {
+		return c.settleCleanup(ctx, st, attempt, removed)
+	}
+	if removeErr != nil {
+		return CleanupResult{}, removeErr
+	}
+	return CleanupResult{}, fmt.Errorf("%w: Herdr acknowledged removal of task %s, but its checkout is still listed; cleanup intent remains pending", ErrProvenance, st.ID)
 }
 
-// checkoutWorkspace confirms the recorded checkout against the repository's own
-// worktree listing and reports where Herdr holds it.
+// checkoutWorkspace validates the repository source and exact linked checkout
+// against the task's recorded path and branch.
 func (c *Coordinator) checkoutWorkspace(ctx context.Context, st task.Task) (checkoutTarget, error) {
-	callCtx, cancel := c.callContext(ctx)
-	defer cancel()
-	listed, err := c.herdr.WorktreeList(callCtx, st.ProjectKey)
+	listed, err := c.worktreeList(ctx, st.ProjectKey)
 	if err != nil {
 		return checkoutTarget{}, fmt.Errorf("%w: the worktrees of %s could not be read: %w", ErrProvenance, st.ProjectKey, err)
 	}
@@ -1295,16 +1414,10 @@ type checkoutTarget struct {
 	Held        bool
 }
 
-// provenanceWorkspace picks the workspace that holds the checkout this task
-// recorded.
-//
-// The recorded path and branch are the identity; the workspace id is only a
-// pointer to it. A pane that was moved into another workspace can close the
-// source workspace, so the workspace Herdr lists as the holder is accepted when
-// it is one this task recorded, and the recorded worktree workspace is the
-// fallback when Herdr reports none (Held false: the checkout's registration has
-// to be restored before it can be removed). A checkout held by a workspace this
-// task never recorded is somebody else's, and is refused.
+// provenanceWorkspace requires the listed checkout to be linked, on the exact
+// recorded branch, and held only by a workspace this task recorded. The workspace
+// is a pointer to the path/branch identity; when no workspace holds it, its
+// recorded worktree workspace is the fallback to be reopened before removal.
 func provenanceWorkspace(st task.Task, listed *herdr.WorktreeList) (checkoutTarget, error) {
 	checkout := strings.TrimSpace(st.WorktreePath)
 	if checkout == "" || strings.TrimSpace(st.Branch) == "" {
@@ -1318,8 +1431,15 @@ func provenanceWorkspace(st task.Task, listed *herdr.WorktreeList) (checkoutTarg
 		if !samePath(entry.Path, checkout) {
 			continue
 		}
-		if entry.Branch != nil && !sameBranch(*entry.Branch, st.Branch) {
-			return checkoutTarget{}, fmt.Errorf("%w: the checkout at %s tracks branch %q, not the recorded %q", ErrProvenance, checkout, *entry.Branch, st.Branch)
+		if entry.IsDetached || !entry.IsLinkedWorktree {
+			return checkoutTarget{}, fmt.Errorf("%w: the checkout at %s is not a linked worktree", ErrProvenance, checkout)
+		}
+		if entry.Branch == nil || strings.TrimSpace(*entry.Branch) == "" || !sameBranch(*entry.Branch, st.Branch) {
+			got := ""
+			if entry.Branch != nil {
+				got = *entry.Branch
+			}
+			return checkoutTarget{}, fmt.Errorf("%w: the checkout at %s reports branch %q, not the recorded %q", ErrProvenance, checkout, got, st.Branch)
 		}
 		if entry.OpenWorkspaceID != nil && strings.TrimSpace(*entry.OpenWorkspaceID) != "" {
 			open := strings.TrimSpace(*entry.OpenWorkspaceID)
@@ -1357,30 +1477,50 @@ func (c *Coordinator) checkoutStatus(ctx context.Context, path string) (string, 
 
 // removeCheckout removes the verified checkout, and never forces anything.
 //
-// The workspace Herdr names is tried first. When Herdr refuses for a reason that
-// proves the checkout is no longer registered to that workspace — the workspace a
-// move closed is gone (`workspace_not_found`), or the workspace the pane now lives
-// in is not the checkout's Herdr-managed worktree workspace
-// (`not_linked_worktree`) — the *recorded* checkout is opened and the removal is
-// retried against the workspace Herdr reports for it. That state is expected after
-// a move and is not a reason to refuse cleanup; it is also the only recovery this
-// performs, and it happens after every refusal check, so a live worker or a dirty
-// checkout is refused before anything is opened.
-func (c *Coordinator) removeCheckout(ctx context.Context, target checkoutTarget, st task.Task) (*herdr.WorktreeRemoved, error) {
+// A held workspace is tried first. Only a definite workspace_not_found or
+// not_linked_worktree refusal permits reopening the recorded path. Before
+// worktree open, the attempt records an Opening phase; after the exact repository,
+// path, branch and root pane are reverified, the returned workspace is persisted
+// before another removal call. Ambiguous remove results are returned to Cleanup,
+// which inspects the worktree list instead of retrying them.
+func (c *Coordinator) removeCheckout(
+	ctx context.Context,
+	target checkoutTarget,
+	st task.Task,
+	attempt task.CleanupAttempt,
+) (*herdr.WorktreeRemoved, task.Task, task.CleanupAttempt, bool, bool, error) {
+	removalAttempted := false
 	if target.Held {
+		removalAttempted = true
 		removed, err := c.tryRemove(ctx, target.WorkspaceID, st)
 		switch {
 		case err == nil:
-			return removed, nil
+			return removed, st, attempt, true, false, nil
 		case !isMissingTarget(err) && !isNotLinkedWorktree(err):
-			return nil, err
+			return nil, st, attempt, true, errors.Is(err, herdr.ErrAmbiguous), err
+		}
+	}
+	if !attempt.Opening {
+		var err error
+		st, attempt, err = c.recordCleanupOpening(ctx, st, attempt)
+		if err != nil {
+			return nil, st, attempt, removalAttempted, false, err
 		}
 	}
 	opened, err := c.openCheckout(ctx, st)
 	if err != nil {
-		return nil, err
+		return nil, st, attempt, removalAttempted, false, err
 	}
-	return c.tryRemove(ctx, opened.WorkspaceID, st)
+	if err := c.openedCheckoutIsIdle(ctx, opened); err != nil {
+		return nil, st, attempt, removalAttempted, false, err
+	}
+	st, attempt, err = c.recordCleanupWorkspace(ctx, st, attempt, opened)
+	if err != nil {
+		return nil, st, attempt, removalAttempted, false, err
+	}
+	return nil, st, attempt, removalAttempted, false,
+		fmt.Errorf("%w: checkout %s is now open in workspace %s; preview and confirm this workspace before removal",
+			ErrCleanupChanged, st.WorktreePath, opened.WorkspaceID)
 }
 
 // tryRemove asks Herdr to remove one workspace's checkout, without force, and
@@ -1391,6 +1531,9 @@ func (c *Coordinator) tryRemove(ctx context.Context, workspaceID string, st task
 	removed, err := c.herdr.WorktreeRemove(callCtx, workspaceID, false)
 	if err != nil {
 		return nil, fmt.Errorf("remove the checkout of task %s from workspace %q: %w", st.ID, workspaceID, err)
+	}
+	if removed != nil && removed.Forced {
+		return nil, fmt.Errorf("%w: %w: Herdr reported a forced removal for task %s", ErrProvenance, errCleanupForced, st.ID)
 	}
 	return verifyRemoval(removed, st)
 }
@@ -1415,7 +1558,8 @@ func (c *Coordinator) openCheckout(ctx context.Context, st task.Task) (*herdr.Wo
 	if !samePath(opened.WorktreePath, checkout) {
 		return nil, fmt.Errorf("%w: Herdr opened the checkout at %s, not the recorded %s", ErrProvenance, opened.WorktreePath, checkout)
 	}
-	if branch := strings.TrimSpace(opened.Branch); branch != "" && !sameBranch(branch, st.Branch) {
+	branch := strings.TrimSpace(opened.Branch)
+	if branch == "" || !sameBranch(branch, st.Branch) {
 		return nil, fmt.Errorf("%w: the opened checkout at %s tracks branch %q, not the recorded %q", ErrProvenance, checkout, branch, st.Branch)
 	}
 	if !opened.IsLinkedWorktree {
@@ -1439,15 +1583,244 @@ func isNotLinkedWorktree(err error) bool {
 // must be the recorded one, and it must not have been a forced removal.
 func verifyRemoval(removed *herdr.WorktreeRemoved, st task.Task) (*herdr.WorktreeRemoved, error) {
 	if removed == nil {
-		return nil, fmt.Errorf("%w: Herdr reported no removed checkout for task %s", ErrProvenance, st.ID)
+		return nil, fmt.Errorf("%w: %w: Herdr reported no removed checkout for task %s", ErrProvenance, errCleanupIdentity, st.ID)
 	}
 	if removed.Forced {
-		return nil, fmt.Errorf("%w: Herdr removed the checkout of task %s by force, which this plugin never asks for; check %s", ErrProvenance, st.ID, st.WorktreePath)
+		return nil, fmt.Errorf("%w: %w: Herdr removed the checkout of task %s by force, which this plugin never asks for; check %s", ErrProvenance, errCleanupForced, st.ID, st.WorktreePath)
 	}
 	if path := strings.TrimSpace(removed.Path); path != "" && !samePath(path, st.WorktreePath) {
-		return nil, fmt.Errorf("%w: Herdr removed the checkout at %s, not the recorded %s", ErrProvenance, path, st.WorktreePath)
+		return nil, fmt.Errorf("%w: %w: Herdr removed the checkout at %s, not the recorded %s", ErrProvenance, errCleanupIdentity, path, st.WorktreePath)
 	}
 	return removed, nil
+}
+
+// inspectCleanup compares a pending intent with the authoritative worktree list.
+// An absent checkout is settled only when its exact path is gone, its branch is
+// still a local ref, and no other listed worktree holds that branch.
+func (c *Coordinator) inspectCleanup(ctx context.Context, st task.Task, attempt task.CleanupAttempt) (checkoutTarget, bool, error) {
+	path, branch := strings.TrimSpace(attempt.Path), strings.TrimSpace(attempt.Branch)
+	if !isClosed(st) || path == "" || branch == "" ||
+		!samePath(path, st.WorktreePath) || !sameBranch(branch, st.Branch) {
+		return checkoutTarget{}, false, fmt.Errorf("%w: task %s no longer matches its recorded cleanup path and branch", ErrProvenance, st.ID)
+	}
+	if attempt.Refused {
+		return checkoutTarget{}, false, fmt.Errorf("%w: Herdr returned a forced or contradictory removal result for task %s; inspect %s and branch %s manually", ErrProvenance, st.ID, path, branch)
+	}
+	listed, err := c.worktreeList(ctx, st.ProjectKey)
+	if err != nil {
+		return checkoutTarget{}, false, fmt.Errorf("%w: inspect cleanup of task %s: %w", ErrProvenance, st.ID, err)
+	}
+	target, absent, err := cleanupListingTarget(st, attempt, listed)
+	if err != nil || !absent {
+		return target, absent, err
+	}
+	if _, err := c.git(ctx, st.ProjectKey, "show-ref", "--verify", "--quiet", "--", "refs/heads/"+strings.TrimSpace(attempt.Branch)); err != nil {
+		return checkoutTarget{}, false, fmt.Errorf("%w: branch %s was not confirmed retained after cleanup: %w", ErrProvenance, attempt.Branch, err)
+	}
+	return target, true, nil
+}
+
+func cleanupListingTarget(st task.Task, attempt task.CleanupAttempt, listed *herdr.WorktreeList) (checkoutTarget, bool, error) {
+	path, branch := strings.TrimSpace(attempt.Path), strings.TrimSpace(attempt.Branch)
+	var match *herdr.WorktreeInfo
+	for i := range listed.Worktrees {
+		entry := &listed.Worktrees[i]
+		if samePath(entry.Path, path) {
+			if match != nil {
+				return checkoutTarget{}, false, fmt.Errorf("%w: worktree list names %s more than once", ErrProvenance, path)
+			}
+			match = entry
+			continue
+		}
+		if entry.IsBare || entry.IsDetached {
+			continue
+		}
+		if entry.Branch == nil || strings.TrimSpace(*entry.Branch) == "" {
+			return checkoutTarget{}, false, fmt.Errorf("%w: worktree list does not identify the branch checked out at %s", ErrProvenance, entry.Path)
+		}
+		if sameBranch(*entry.Branch, branch) {
+			return checkoutTarget{}, false, fmt.Errorf("%w: branch %s is checked out at %s instead of its recorded path %s", ErrProvenance, branch, entry.Path, path)
+		}
+	}
+	if match != nil {
+		if match.IsDetached || !match.IsLinkedWorktree || match.Branch == nil ||
+			strings.TrimSpace(*match.Branch) == "" || !sameBranch(*match.Branch, branch) {
+			got := ""
+			if match.Branch != nil {
+				got = *match.Branch
+			}
+			return checkoutTarget{}, false, fmt.Errorf("%w: checkout at %s is not a linked checkout on recorded branch %q (reported %q)", ErrProvenance, path, branch, got)
+		}
+		recorded := nonEmpty(st.WorktreeWorkspaceID, st.CurrentWorkspaceID)
+		if match.OpenWorkspaceID != nil && strings.TrimSpace(*match.OpenWorkspaceID) != "" {
+			open := strings.TrimSpace(*match.OpenWorkspaceID)
+			if containsString(recorded, open) || strings.TrimSpace(attempt.WorkspaceID) == open {
+				return checkoutTarget{WorkspaceID: open, Held: true}, false, nil
+			}
+			return checkoutTarget{}, false, fmt.Errorf("%w: Herdr holds checkout %s in unrecorded workspace %q", ErrProvenance, path, open)
+		}
+		if len(recorded) == 0 {
+			return checkoutTarget{}, false, fmt.Errorf("%w: no workspace is recorded for checkout %s", ErrProvenance, path)
+		}
+		return checkoutTarget{WorkspaceID: recorded[0]}, false, nil
+	}
+
+	if _, err := os.Lstat(path); err == nil {
+		return checkoutTarget{}, false, fmt.Errorf("%w: checkout path %s still exists but is absent from Herdr's worktree list", ErrProvenance, path)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return checkoutTarget{}, false, fmt.Errorf("%w: inspect checkout path %s: %w", ErrProvenance, path, err)
+	}
+	return checkoutTarget{WorkspaceID: attempt.WorkspaceID}, true, nil
+}
+
+func sameCleanupAttempt(record *task.CleanupAttempt, attempt task.CleanupAttempt) bool {
+	return record != nil &&
+		samePath(record.Path, attempt.Path) &&
+		sameBranch(record.Branch, attempt.Branch) &&
+		record.WorkspaceID == attempt.WorkspaceID &&
+		record.RootPaneID == attempt.RootPaneID &&
+		record.Opening == attempt.Opening &&
+		record.Refused == attempt.Refused
+}
+
+func (c *Coordinator) recordCleanupAttempt(ctx context.Context, st task.Task, target checkoutTarget, expectedRevision int64) (task.Task, task.CleanupAttempt, error) {
+	attempt := task.CleanupAttempt{
+		Path:    strings.TrimSpace(st.WorktreePath),
+		Branch:  strings.TrimSpace(st.Branch),
+		Opening: !target.Held,
+	}
+	if target.Held {
+		attempt.WorkspaceID = target.WorkspaceID
+	}
+	updated, err := c.record(ctx, st, func(next *task.Task) error {
+		if expectedRevision > 0 && next.Revision != expectedRevision {
+			return fmt.Errorf("%w: task %s changed before cleanup intent was recorded", ErrCleanupChanged, st.ID)
+		}
+		if !isClosed(*next) || !samePath(next.WorktreePath, attempt.Path) || !sameBranch(next.Branch, attempt.Branch) {
+			return fmt.Errorf("%w: task %s changed before cleanup intent was recorded", ErrProvenance, st.ID)
+		}
+		if next.Cleanup != nil {
+			return fmt.Errorf("%w: task %s already has an unsettled cleanup attempt", ErrProvenance, st.ID)
+		}
+		next.Cleanup = &attempt
+		return nil
+	}, "record cleanup intent")
+	return updated, attempt, err
+}
+
+func (c *Coordinator) recordCleanupOpening(ctx context.Context, st task.Task, attempt task.CleanupAttempt) (task.Task, task.CleanupAttempt, error) {
+	updated, err := c.record(ctx, st, func(next *task.Task) error {
+		if !sameCleanupAttempt(next.Cleanup, attempt) || next.Cleanup.Refused || next.Cleanup.Opening {
+			return fmt.Errorf("%w: task %s no longer has this cleanup opening phase", ErrCleanupChanged, st.ID)
+		}
+		nextAttempt := *next.Cleanup
+		nextAttempt.Opening = true
+		next.Cleanup = &nextAttempt
+		return nil
+	}, "record checkout reopen intent")
+	if err != nil {
+		return st, attempt, err
+	}
+	return updated, *updated.Cleanup, nil
+}
+
+func (c *Coordinator) recordCleanupWorkspace(ctx context.Context, st task.Task, attempt task.CleanupAttempt, opened *herdr.WorktreeOpened) (task.Task, task.CleanupAttempt, error) {
+	if opened == nil || strings.TrimSpace(opened.WorkspaceID) == "" || strings.TrimSpace(opened.RootPaneID) == "" {
+		return st, attempt, fmt.Errorf("%w: Herdr returned no workspace or root pane for the reopened checkout", ErrProvenance)
+	}
+	workspaceID, rootPaneID := strings.TrimSpace(opened.WorkspaceID), strings.TrimSpace(opened.RootPaneID)
+	updated, err := c.record(ctx, st, func(next *task.Task) error {
+		if !sameCleanupAttempt(next.Cleanup, attempt) || next.Cleanup.Refused || !next.Cleanup.Opening {
+			return fmt.Errorf("%w: task %s no longer has this cleanup opening phase", ErrCleanupChanged, st.ID)
+		}
+		nextAttempt := *next.Cleanup
+		nextAttempt.WorkspaceID = workspaceID
+		nextAttempt.RootPaneID = rootPaneID
+		nextAttempt.Opening = false
+		next.Cleanup = &nextAttempt
+		return nil
+	}, "record reopened checkout workspace")
+	if err != nil {
+		return st, attempt, err
+	}
+	return updated, *updated.Cleanup, nil
+}
+
+func (c *Coordinator) openedCheckoutIsIdle(ctx context.Context, opened *herdr.WorktreeOpened) error {
+	if opened == nil || strings.TrimSpace(opened.RootPaneID) == "" {
+		return fmt.Errorf("%w: Herdr returned no root pane for the reopened checkout", ErrProvenance)
+	}
+	view, err := c.agentGet(ctx, opened.RootPaneID)
+	if err != nil {
+		if isMissingTarget(err) {
+			return nil
+		}
+		return fmt.Errorf("inspect reopened checkout pane %q before removal: %w", opened.RootPaneID, err)
+	}
+	if view.Agent.WorkspaceID != opened.WorkspaceID || !samePath(view.Agent.Cwd, opened.WorktreePath) {
+		return fmt.Errorf("%w: a pane in the reopened workspace does not match checkout %s", ErrProvenance, opened.WorktreePath)
+	}
+	if !strings.EqualFold(strings.TrimSpace(view.Agent.Agent), c.opts.AgentKind) {
+		return nil
+	}
+	return fmt.Errorf("%w: an OMP agent is live in reopened workspace %s; close it before removing the checkout", ErrWorkerLive, opened.WorkspaceID)
+}
+
+func (c *Coordinator) recordedCleanupWorkspaceIsIdle(ctx context.Context, attempt task.CleanupAttempt) error {
+	if strings.TrimSpace(attempt.WorkspaceID) == "" || strings.TrimSpace(attempt.RootPaneID) == "" {
+		return fmt.Errorf("%w: the cleanup attempt records no reopened workspace pane to verify", ErrProvenance)
+	}
+	return c.openedCheckoutIsIdle(ctx, &herdr.WorktreeOpened{
+		WorkspaceID:  attempt.WorkspaceID,
+		RootPaneID:   attempt.RootPaneID,
+		WorktreePath: attempt.Path,
+	})
+}
+
+func (c *Coordinator) settleCleanup(ctx context.Context, st task.Task, attempt task.CleanupAttempt, removed *herdr.WorktreeRemoved) (CleanupResult, error) {
+	workspace := attempt.WorkspaceID
+	if removed != nil && strings.TrimSpace(removed.WorkspaceID) != "" {
+		workspace = strings.TrimSpace(removed.WorkspaceID)
+	}
+	summary := fmt.Sprintf("checkout %s of task %s removed; branch %s kept", attempt.Path, st.ID, attempt.Branch)
+	updated, _, err := c.recordWithNote(ctx, st, func(next *task.Task) error {
+		if !sameCleanupAttempt(next.Cleanup, attempt) || next.Cleanup.Refused {
+			return fmt.Errorf("%w: task %s no longer has this cleanup intent", ErrProvenance, st.ID)
+		}
+		next.LaunchPaneID = ""
+		next.PublicPaneID = ""
+		next.TerminalID = ""
+		next.WorktreeWorkspaceID = ""
+		next.CurrentWorkspaceID = ""
+		next.AgentName = ""
+		next.OMPSessionID = ""
+		next.Cleanup = nil
+		return nil
+	}, c.noteFor(st, "cleanup", summary, "worktree removed"), "record the removed checkout")
+	if err != nil {
+		return CleanupResult{}, fmt.Errorf("the checkout of task %s is removed, but the task could not be settled: %w", st.ID, err)
+	}
+	return CleanupResult{
+		TaskID:      updated.ID,
+		Branch:      attempt.Branch,
+		Path:        attempt.Path,
+		WorkspaceID: workspace,
+		Removed:     true,
+		Stage:       task.StageOf(updated),
+	}, nil
+}
+
+func (c *Coordinator) refuseCleanupOutcome(ctx context.Context, st task.Task, attempt task.CleanupAttempt) error {
+	_, err := c.record(ctx, st, func(next *task.Task) error {
+		if !sameCleanupAttempt(next.Cleanup, attempt) {
+			return fmt.Errorf("%w: task %s no longer has this cleanup intent", ErrProvenance, st.ID)
+		}
+		nextAttempt := *next.Cleanup
+		nextAttempt.Refused = true
+		next.Cleanup = &nextAttempt
+		return nil
+	}, "record refused cleanup outcome")
+	return err
 }
 
 // ---------------------------------------------------------------------------

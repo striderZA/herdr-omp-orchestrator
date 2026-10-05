@@ -453,7 +453,8 @@ func TestBridgeResolveAdoptionRaceHasOneWinnerAndNoOverwrite(t *testing.T) {
 				env[key] = value
 			}
 			out, err := HandleWith(context.Background(), env, strings.NewReader(
-				fmt.Sprintf(`{"version":1,"method":"resolve","ompSessionID":"omp-race-%d","params":{}}`, i)), Ops{})
+				fmt.Sprintf(`{"version":1,"method":"resolve","ompSessionID":"omp-race-%d","params":{}}`, i),
+			), Ops{})
 			if err != nil {
 				t.Errorf("Handle(resolve %d): %v", i, err)
 				return
@@ -1953,6 +1954,11 @@ type stubScript struct {
 	OpenContradiction string `json:"openContradiction"`
 	// RemoveError makes `worktree remove` refuse; a dirty checkout is one way.
 	RemoveError string `json:"removeError"`
+	// RemoveTimeout deletes the checkout and updates Herdr's list before answering
+	// with a timeout, modeling an ambiguous post-effect result.
+	RemoveTimeout      bool `json:"removeTimeout"`
+	RemoveTimedOut     bool `json:"removeTimedOut"`
+	RemovePathMismatch bool `json:"removePathMismatch"`
 	// RemoveEchoesForced makes a successful `worktree remove` answer claim the
 	// removal was forced, which this plugin never asks for and must never accept.
 	RemoveEchoesForced bool `json:"removeEchoesForced"`
@@ -2156,15 +2162,30 @@ func runHerdrScript(path string) int {
 		if checkout == "" {
 			return stubError("worktree_not_found", "no worktree is open in workspace "+workspace)
 		}
+		cmd := exec.Command("git", "-C", script.RepoRoot, "worktree", "remove", "--", checkout)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			return stubError("worktree_remove_failed", fmt.Sprintf("git worktree remove: %v: %s", err, output))
+		}
+
 		script.Worktree = remaining
 		script.Removed = append(script.Removed, workspace)
+		if script.RemoveTimeout {
+			script.RemoveTimedOut = true
+		}
 		if err := writeStubScript(path, script); err != nil {
 			return 39
+		}
+		if script.RemoveTimeout {
+			return stubError(herdr.CodeTimeout, "the checkout was removed before the command timed out")
+		}
+		reportedPath := checkout
+		if script.RemovePathMismatch {
+			reportedPath = filepath.Join(filepath.Dir(checkout), "someone-else")
 		}
 		return stubResult(map[string]any{
 			"type":         "worktree_removed",
 			"workspace_id": workspace,
-			"path":         checkout,
+			"path":         reportedPath,
 			"forced":       script.RemoveEchoesForced || slices.Contains(argv, "--force"),
 		})
 	default:
@@ -2721,6 +2742,20 @@ func (f *bridgeFixture) reviewPayload(t *testing.T, ops Ops, id, disposition str
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	return string(payload)
+}
+
+// cleanupPayload binds a bridge cleanup request to the state its preview returned.
+func (f *bridgeFixture) cleanupPayload(t *testing.T, ops Ops, id string) string {
+	t.Helper()
+	var preview coord.CleanupPreview
+	f.callWith("cleanup_preview", primarySession, fmt.Sprintf(`{"taskId":%q}`, id), ops).decodeResult(t, &preview)
+	payload, err := json.Marshal(coord.CleanupParams{
+		TaskID: id, Revision: preview.Revision, WorkspaceID: preview.WorkspaceID, AlreadyRemoved: preview.AlreadyRemoved,
+	})
+	if err != nil {
+		t.Fatalf("encode cleanup confirmation: %v", err)
 	}
 	return string(payload)
 }
@@ -3604,6 +3639,7 @@ func TestDialogApprovalRevalidatesTheApprovedScreen(t *testing.T) {
 		wantError(t, approve(preview.Digest, `[]`), "bad_request")
 	})
 }
+
 func TestDialogApprovalIgnoresVolatileScreenOutsideActiveDialog(t *testing.T) {
 	f := newBridgeFixture(t)
 	f.seedPrimary()
@@ -3743,7 +3779,7 @@ func TestDialogAndCleanupAcceptTheSessionFormsHerdrReallyReports(t *testing.T) {
 
 		// The worker is identified, so its liveness is the answer — not "cannot
 		// verify which session this is".
-		wantError(t, f.callWith("cleanup", primarySession, `{"taskId":"t1"}`, ops), "worker_live")
+		wantError(t, f.callWith("cleanup", primarySession, f.cleanupPayload(t, ops, "t1"), ops), "worker_live")
 	})
 
 	t.Run("an unverified handshake cannot be trusted", func(t *testing.T) {
@@ -3777,13 +3813,14 @@ func TestDialogAndCleanupAcceptTheSessionFormsHerdrReallyReports(t *testing.T) {
 // a removal is never forced, never touches the branch and never happens twice.
 func TestCleanupRequiresReviewedDoneAndACleanProvenanceCheckout(t *testing.T) {
 	f := newBridgeFixture(t)
+	root, checkout := bridgeRepoWithWorktree(t, "orch/t1")
+	f.repoRoot = root
 	f.seedPrimary()
 	worker := f.seedWorker("t1", workerPane, workerPane, workerSession)
 	f.asWorker()
 	f.asPrimary()
 
 	// A real checkout, so clean and dirty are decided by git itself.
-	root, checkout := bridgeRepoWithWorktree(t, worker.Branch)
 	if _, err := f.store.UpdateTask(context.Background(), worker.ID, worker.Revision, func(next *task.Task) error {
 		next.WorktreePath = checkout
 		return nil
@@ -3805,7 +3842,7 @@ func TestCleanupRequiresReviewedDoneAndACleanProvenanceCheckout(t *testing.T) {
 	if preview.Path != checkout || preview.Branch != worker.Branch {
 		t.Errorf("preview = %+v, want the recorded path and branch", preview)
 	}
-	wantError(t, f.callWith("cleanup", primarySession, `{"taskId":"t1"}`, ops), "not_reviewed")
+	wantError(t, f.callWith("cleanup", primarySession, f.cleanupPayload(t, ops, "t1"), ops), "not_reviewed")
 	if got := stub.script().Removed; len(got) != 0 {
 		t.Fatalf("cleanup removed a checkout the user never reviewed: %v", got)
 	}
@@ -3826,7 +3863,7 @@ func TestCleanupRequiresReviewedDoneAndACleanProvenanceCheckout(t *testing.T) {
 		if !preview.LiveWorker || preview.Removable {
 			t.Fatalf("preview with a live worker = %+v", preview)
 		}
-		wantError(t, f.callWith("cleanup", primarySession, `{"taskId":"t1"}`, ops), "worker_live")
+		wantError(t, f.callWith("cleanup", primarySession, f.cleanupPayload(t, ops, "t1"), ops), "worker_live")
 		if got := stub.script().Removed; len(got) != 0 {
 			t.Fatalf("cleanup removed a checkout under a live worker: %v", got)
 		}
@@ -3843,7 +3880,7 @@ func TestCleanupRequiresReviewedDoneAndACleanProvenanceCheckout(t *testing.T) {
 		if preview.Clean || preview.Removable {
 			t.Fatalf("preview of a dirty checkout = %+v", preview)
 		}
-		wantError(t, f.callWith("cleanup", primarySession, `{"taskId":"t1"}`, ops), "checkout_dirty")
+		wantError(t, f.callWith("cleanup", primarySession, f.cleanupPayload(t, ops, "t1"), ops), "checkout_dirty")
 		if got := stub.script().Removed; len(got) != 0 {
 			t.Fatalf("cleanup removed a dirty checkout: %v", got)
 		}
@@ -3862,7 +3899,7 @@ func TestCleanupRequiresReviewedDoneAndACleanProvenanceCheckout(t *testing.T) {
 		reviewed := f.task(t, "t1")
 
 		var result coord.CleanupResult
-		f.callWith("cleanup", primarySession, `{"taskId":"t1"}`, ops).decodeResult(t, &result)
+		f.callWith("cleanup", primarySession, f.cleanupPayload(t, ops, "t1"), ops).decodeResult(t, &result)
 		if !result.Removed || result.WorkspaceID != workerWorktree || result.Path != checkout {
 			t.Fatalf("cleanup = %+v", result)
 		}
@@ -3931,13 +3968,13 @@ func TestCleanupRequiresReviewedDoneAndACleanProvenanceCheckout(t *testing.T) {
 		}
 	})
 
-	t.Run("a second cleanup removes nothing more", func(t *testing.T) {
-		// The task no longer names a worker or a workspace, so a repeat is refused
-		// before it can look for anything to remove.
-		resp := f.callWith("cleanup", primarySession, `{"taskId":"t1"}`, ops)
-		wantError(t, resp, "agent_changed")
-		if !strings.Contains(resp.Error.Message, "no launch pane") {
-			t.Errorf("the refusal does not say the task names no worker: %q", resp.Error.Message)
+	t.Run("a second cleanup refuses the already-removed checkout", func(t *testing.T) {
+		// The real worktree is absent and there is no pending intent; a repeat
+		// cannot establish provenance for another removal.
+		resp := f.callWith("cleanup", primarySession, f.cleanupPayload(t, ops, "t1"), ops)
+		wantError(t, resp, "provenance_unconfirmed")
+		if !strings.Contains(resp.Error.Message, "could not be inspected") {
+			t.Errorf("the refusal does not identify the missing checkout: %q", resp.Error.Message)
 		}
 		if got := stub.script().Removed; len(got) != 1 {
 			t.Fatalf("a repeated cleanup removed again: %v", got)
@@ -3950,12 +3987,12 @@ func TestCleanupRequiresReviewedDoneAndACleanProvenanceCheckout(t *testing.T) {
 // somebody else's, and cleanup refuses instead of guessing by label.
 func TestCleanupRefusesACheckoutHeldInAnUnknownWorkspace(t *testing.T) {
 	f := newBridgeFixture(t)
+	root, checkout := bridgeRepoWithWorktree(t, "orch/t1")
+	f.repoRoot = root
 	f.seedPrimary()
 	worker := f.seedWorker("t1", workerPane, workerPane, workerSession)
 	f.asWorker()
 	f.asPrimary()
-
-	root, checkout := bridgeRepoWithWorktree(t, worker.Branch)
 	if _, err := f.store.UpdateTask(context.Background(), worker.ID, worker.Revision, func(next *task.Task) error {
 		next.WorktreePath = checkout
 		return nil
@@ -3969,7 +4006,7 @@ func TestCleanupRefusesACheckoutHeldInAnUnknownWorkspace(t *testing.T) {
 	ops := CoordinatorOps(f.coordinator(t))
 	f.approve(t, ops)
 
-	wantError(t, f.callWith("cleanup", primarySession, `{"taskId":"t1"}`, ops), "provenance_unconfirmed")
+	wantError(t, f.callWith("cleanup", primarySession, f.cleanupPayload(t, ops, "t1"), ops), "provenance_unconfirmed")
 	if got := stub.script().Removed; len(got) != 0 {
 		t.Fatalf("cleanup removed a checkout Herdr holds elsewhere: %v", got)
 	}
@@ -3987,12 +4024,12 @@ func TestCleanupRemovesNothingWhenTheOpenResponseContradictsItself(t *testing.T)
 	for _, contradiction := range []string{"checkout_path", "repo_root", "worktree_path"} {
 		t.Run(contradiction, func(t *testing.T) {
 			f := newBridgeFixture(t)
+			root, checkout := bridgeRepoWithWorktree(t, "orch/t1")
+			f.repoRoot = root
 			f.seedPrimary()
 			worker := f.seedWorker("t1", workerPane, workerPane, workerSession)
 			f.asWorker()
 			f.asPrimary()
-
-			root, checkout := bridgeRepoWithWorktree(t, worker.Branch)
 			if _, err := f.store.UpdateTask(context.Background(), worker.ID, worker.Revision, func(next *task.Task) error {
 				next.WorktreePath = checkout
 				next.CurrentWorkspaceID = movedWorkspace
@@ -4009,7 +4046,7 @@ func TestCleanupRemovesNothingWhenTheOpenResponseContradictsItself(t *testing.T)
 			ops := CoordinatorOps(f.coordinator(t))
 			f.approve(t, ops)
 
-			wantError(t, f.callWith("cleanup", primarySession, `{"taskId":"t1"}`, ops), "provenance_unconfirmed")
+			wantError(t, f.callWith("cleanup", primarySession, f.cleanupPayload(t, ops, "t1"), ops), "provenance_unconfirmed")
 			if got := stub.script().Removed; len(got) != 0 {
 				t.Fatalf("a contradictory open response still removed a checkout: %v", got)
 			}
@@ -4047,12 +4084,12 @@ func sameReportText(a, b *task.Report) bool {
 // nothing may be recorded as removed.
 func TestCleanupRefusesARemovalHerdrClaimsItForced(t *testing.T) {
 	f := newBridgeFixture(t)
+	root, checkout := bridgeRepoWithWorktree(t, "orch/t1")
+	f.repoRoot = root
 	f.seedPrimary()
 	worker := f.seedWorker("t1", workerPane, workerPane, workerSession)
 	f.asWorker()
 	f.asPrimary()
-
-	root, checkout := bridgeRepoWithWorktree(t, worker.Branch)
 	if _, err := f.store.UpdateTask(context.Background(), worker.ID, worker.Revision, func(next *task.Task) error {
 		next.WorktreePath = checkout
 		return nil
@@ -4068,7 +4105,7 @@ func TestCleanupRefusesARemovalHerdrClaimsItForced(t *testing.T) {
 	f.approve(t, ops)
 	before := f.task(t, "t1")
 
-	wantError(t, f.callWith("cleanup", primarySession, `{"taskId":"t1"}`, ops), "provenance_unconfirmed")
+	wantError(t, f.callWith("cleanup", primarySession, f.cleanupPayload(t, ops, "t1"), ops), "provenance_unconfirmed")
 	if stub.forced() {
 		t.Error("cleanup asked Herdr to force the removal")
 	}
@@ -4152,12 +4189,12 @@ const movedWorkspace = "wS"
 // it, without forcing anything and without touching the branch.
 func TestCleanupRecoversAMovedWorkerCheckout(t *testing.T) {
 	f := newBridgeFixture(t)
+	root, checkout := bridgeRepoWithWorktree(t, "orch/t1")
+	f.repoRoot = root
 	f.seedPrimary()
 	worker := f.seedWorker("t1", workerPane, workerPane, workerSession)
 	f.asWorker()
 	f.asPrimary()
-
-	root, checkout := bridgeRepoWithWorktree(t, worker.Branch)
 	// The record a move leaves behind: the pane lives in the workspace Herdr moved
 	// it to, while the worktree workspace it was created in is closed.
 	if _, err := f.store.UpdateTask(context.Background(), worker.ID, worker.Revision, func(next *task.Task) error {
@@ -4175,29 +4212,41 @@ func TestCleanupRecoversAMovedWorkerCheckout(t *testing.T) {
 	ops := CoordinatorOps(f.coordinator(t))
 	f.approve(t, ops)
 
+	first := f.callWith("cleanup", primarySession, f.cleanupPayload(t, ops, "t1"), ops)
+	wantError(t, first, "cleanup_changed")
+	if removed := stub.script().Removed; len(removed) != 0 {
+		t.Fatalf("cleanup removed before the user confirmed the reopened workspace: %v", removed)
+	}
+	recorded := f.task(t, "t1")
+	if recorded.Cleanup == nil || recorded.Cleanup.Opening || recorded.Cleanup.WorkspaceID != movedWorkspace {
+		t.Fatalf("reopened workspace was not durably recorded before confirmation: %+v", recorded.Cleanup)
+	}
+	var preview coord.CleanupPreview
+	f.callWith("cleanup_preview", primarySession, `{"taskId":"t1"}`, ops).decodeResult(t, &preview)
+	if !preview.Removable || preview.WorkspaceID != movedWorkspace {
+		t.Fatalf("fresh preview does not name the reopened workspace: %+v", preview)
+	}
 	var result coord.CleanupResult
-	f.callWith("cleanup", primarySession, `{"taskId":"t1"}`, ops).decodeResult(t, &result)
-	if !result.Removed || result.Path != checkout {
-		t.Fatalf("cleanup = %+v, want the recorded checkout %s removed", result, checkout)
+	f.callWith("cleanup", primarySession, f.cleanupPayload(t, ops, "t1"), ops).decodeResult(t, &result)
+	if !result.Removed || result.WorkspaceID != movedWorkspace || result.Path != checkout {
+		t.Fatalf("cleanup = %+v, want removal from the confirmed reopened workspace", result)
 	}
 	if result.Forced {
 		t.Error("Forced = true, want the removal the plugin asked for (never --force)")
 	}
 
-	// The open names the *recorded* checkout, not the listing's spelling of it.
 	open := []string{"worktree", "open", "--cwd", f.repoRoot, "--path", checkout, "--no-focus"}
 	if !stub.called(open...) {
 		t.Fatalf("cleanup did not open the recorded checkout: %v", stub.calls())
 	}
-	// The refused attempt came first, then the open, then the removal that
-	// succeeded: the retry is what the recovery is for.
-	remove := []string{"worktree", "remove", "--workspace", movedWorkspace}
+	firstRemove := []string{"worktree", "remove", "--workspace", movedWorkspace}
 	openAt := stub.callIndex(open...)
-	if stub.callIndex(remove...) > openAt {
-		t.Errorf("the refusal was never attempted before the open: %v", stub.calls())
+	if stub.callIndex(firstRemove...) < 0 || stub.callIndex(firstRemove...) > openAt {
+		t.Errorf("the refusal was not attempted before the open: %v", stub.calls())
 	}
-	if stub.lastCallIndex(remove...) < openAt {
-		t.Errorf("the removal was not retried after the checkout was re-opened: %v", stub.calls())
+	reopenedRemove := []string{"worktree", "remove", "--workspace", movedWorkspace}
+	if stub.lastCallIndex(reopenedRemove...) < openAt {
+		t.Errorf("the reopened workspace was not removed after its fresh confirmation: %v", stub.calls())
 	}
 	if stub.forced() {
 		t.Error("cleanup asked Herdr to force the removal")
@@ -4212,11 +4261,11 @@ func TestCleanupRecoversAMovedWorkerCheckout(t *testing.T) {
 // the removal has to begin by opening that exact checkout.
 func TestCleanupOpensACheckoutNoWorkspaceHolds(t *testing.T) {
 	f := newBridgeFixture(t)
+	root, checkout := bridgeRepoWithWorktree(t, "orch/t1")
+	f.repoRoot = root
 	f.seedPrimary()
 	worker := f.seedWorker("t1", workerPane, workerPane, workerSession)
 	f.asPrimary()
-
-	root, checkout := bridgeRepoWithWorktree(t, worker.Branch)
 	if _, err := f.store.UpdateTask(context.Background(), worker.ID, worker.Revision, func(next *task.Task) error {
 		next.WorktreePath = checkout
 		return nil
@@ -4232,13 +4281,20 @@ func TestCleanupOpensACheckoutNoWorkspaceHolds(t *testing.T) {
 	ops := CoordinatorOps(f.coordinator(t))
 	f.approve(t, ops)
 
-	var result coord.CleanupResult
-	f.callWith("cleanup", primarySession, `{"taskId":"t1"}`, ops).decodeResult(t, &result)
-	if !result.Removed || result.Path != checkout || result.WorkspaceID != "wT" {
-		t.Fatalf("cleanup = %+v, want the recorded checkout removed from the re-opened workspace", result)
+	first := f.callWith("cleanup", primarySession, f.cleanupPayload(t, ops, "t1"), ops)
+	wantError(t, first, "cleanup_changed")
+	if removed := stub.script().Removed; len(removed) != 0 {
+		t.Fatalf("cleanup removed before its reopened workspace was confirmed: %v", removed)
 	}
-	if result.Forced {
-		t.Error("Forced = true, want the removal the plugin asked for (never --force)")
+	var preview coord.CleanupPreview
+	f.callWith("cleanup_preview", primarySession, `{"taskId":"t1"}`, ops).decodeResult(t, &preview)
+	if !preview.Removable || preview.WorkspaceID != "wT" {
+		t.Fatalf("fresh preview does not name the reopened workspace: %+v", preview)
+	}
+	var result coord.CleanupResult
+	f.callWith("cleanup", primarySession, f.cleanupPayload(t, ops, "t1"), ops).decodeResult(t, &result)
+	if !result.Removed || result.Path != checkout || result.WorkspaceID != "wT" {
+		t.Fatalf("cleanup = %+v, want removal from the confirmed reopened workspace", result)
 	}
 
 	open := []string{"worktree", "open", "--cwd", f.repoRoot, "--path", checkout, "--no-focus"}
@@ -4254,6 +4310,147 @@ func TestCleanupOpensACheckoutNoWorkspaceHolds(t *testing.T) {
 	}
 	if branches := bridgeGit(t, root, "branch", "--list", worker.Branch); !strings.Contains(branches, worker.Branch) {
 		t.Errorf("cleanup deleted the branch: %q", branches)
+	}
+}
+
+// TestCleanupRetrySettlesAfterCheckoutRemovalBeforeTaskRecord reproduces issue 28:
+// Herdr removes the checkout, but the task update fails before it can clear the
+// worker identities. A later cleanup call must inspect the recorded path and
+// settle from the preserved branch instead of treating the missing worktree as
+// unowned.
+func TestCleanupRetrySettlesAfterCheckoutRemovalBeforeTaskRecord(t *testing.T) {
+	f := newBridgeFixture(t)
+	root, checkout := bridgeRepoWithWorktree(t, "orch/t1")
+	f.repoRoot = root
+	f.seedPrimary()
+	worker := f.seedWorker("t1", workerPane, workerPane, workerSession)
+	f.asWorker()
+	f.asPrimary()
+
+	if _, err := f.store.UpdateTask(context.Background(), worker.ID, worker.Revision, func(next *task.Task) error {
+		next.WorktreePath = checkout
+		return nil
+	}); err != nil {
+		t.Fatalf("point the task at a real checkout: %v", err)
+	}
+	stub := f.useHerdrStub(stubScript{
+		RepoRoot: root,
+		Agents:   map[string]stubAgent{workerPane: workerAgent(workerPane, workerSession, checkout)},
+		Worktree: []stubWorktree{{Path: checkout, Branch: worker.Branch, OpenWorkspaceID: workerWorktree}},
+	})
+	ops := CoordinatorOps(f.coordinator(t))
+	f.approve(t, ops)
+	stub.dropAgent(workerPane)
+
+	db, err := sql.Open("sqlite", filepath.Join(f.stateDir, "orchestrator.sqlite"))
+	if err != nil {
+		t.Fatalf("open state database for fault injection: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if _, err := db.Exec(`CREATE TRIGGER refuse_cleanup_settlement
+		BEFORE UPDATE OF launch_pane_id ON tasks
+		WHEN OLD.launch_pane_id IS NOT NULL AND NEW.launch_pane_id IS NULL
+		BEGIN SELECT RAISE(ABORT, 'injected cleanup settlement failure'); END`); err != nil {
+		t.Fatalf("install cleanup fault: %v", err)
+	}
+
+	first := f.callWith("cleanup", primarySession, f.cleanupPayload(t, ops, "t1"), ops)
+	if first.OK {
+		t.Fatal("cleanup reported success even though recording its result was refused")
+	}
+	if removed := stub.script().Removed; len(removed) != 1 {
+		t.Fatalf("first cleanup removals = %v, want the checkout removed once before the fault; response=%+v calls=%v", removed, first.Error, stub.calls())
+	}
+	if _, err := os.Stat(checkout); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("fault injection left checkout path present: stat error = %v", err)
+	}
+	if _, err := db.Exec(`DROP TRIGGER refuse_cleanup_settlement`); err != nil {
+		t.Fatalf("remove cleanup fault: %v", err)
+	}
+	var interrupted coord.CleanupPreview
+	f.callWith("cleanup_preview", primarySession, `{"taskId":"t1"}`, ops).decodeResult(t, &interrupted)
+	if !interrupted.AlreadyRemoved || interrupted.Revision == 0 {
+		t.Fatalf("interrupted cleanup preview = %+v, want revision-bound absence proof", interrupted)
+	}
+	bridgeGit(t, root, "worktree", "add", checkout, worker.Branch)
+	stub.update(func(script *stubScript) {
+		script.Worktree = []stubWorktree{{Path: checkout, Branch: worker.Branch, OpenWorkspaceID: workerWorktree}}
+	})
+	stalePayload, err := json.Marshal(coord.CleanupParams{
+		TaskID: "t1", Revision: interrupted.Revision, WorkspaceID: interrupted.WorkspaceID, AlreadyRemoved: true,
+	})
+	if err != nil {
+		t.Fatalf("encode stale settlement confirmation: %v", err)
+	}
+	wantError(t, f.callWith("cleanup", primarySession, string(stalePayload), ops), "cleanup_changed")
+	if removed := stub.script().Removed; len(removed) != 1 {
+		t.Fatalf("a stale settlement confirmation removed the reappeared checkout: %v", removed)
+	}
+	bridgeGit(t, root, "worktree", "remove", "--", checkout)
+	stub.update(func(script *stubScript) { script.Worktree = nil })
+
+	var result coord.CleanupResult
+	f.callWith("cleanup", primarySession, f.cleanupPayload(t, ops, "t1"), ops).decodeResult(t, &result)
+	if !result.Removed || result.Path != checkout || result.Branch != worker.Branch {
+		t.Fatalf("retry cleanup = %+v, want it to settle the removed checkout and retained branch", result)
+	}
+	if removed := stub.script().Removed; len(removed) != 1 {
+		t.Fatalf("retry cleanup removals = %v, want no second removal", removed)
+	}
+	if branches := bridgeGit(t, root, "branch", "--list", worker.Branch); !strings.Contains(branches, worker.Branch) {
+		t.Fatalf("retry cleanup did not preserve branch %q: %q", worker.Branch, branches)
+	}
+	after := f.task(t, "t1")
+	if after.LaunchPaneID != "" || after.PublicPaneID != "" || after.WorktreeWorkspaceID != "" {
+		t.Fatalf("settled cleanup retained routing identities: %+v", after)
+	}
+	if notes := notesOf(t, f, "cleanup"); len(notes) != 1 {
+		t.Fatalf("cleanup notes = %d, want exactly one durable note: %+v", len(notes), notes)
+	}
+}
+
+func TestCleanupInspectsAmbiguousRemovalResultWithoutRetrying(t *testing.T) {
+	f := newBridgeFixture(t)
+	root, checkout := bridgeRepoWithWorktree(t, "orch/t1")
+	f.repoRoot = root
+	f.seedPrimary()
+	worker := f.seedWorker("t1", workerPane, workerPane, workerSession)
+	f.asWorker()
+	f.asPrimary()
+	if _, err := f.store.UpdateTask(context.Background(), worker.ID, worker.Revision, func(next *task.Task) error {
+		next.WorktreePath = checkout
+		return nil
+	}); err != nil {
+		t.Fatalf("point the task at a real checkout: %v", err)
+	}
+	stub := f.useHerdrStub(stubScript{
+		RepoRoot:      root,
+		Agents:        map[string]stubAgent{workerPane: workerAgent(workerPane, workerSession, checkout)},
+		Worktree:      []stubWorktree{{Path: checkout, Branch: worker.Branch, OpenWorkspaceID: workerWorktree}},
+		RemoveTimeout: true,
+	})
+	ops := CoordinatorOps(f.coordinator(t))
+	f.approve(t, ops)
+	stub.dropAgent(workerPane)
+
+	var result coord.CleanupResult
+	f.callWith("cleanup", primarySession, f.cleanupPayload(t, ops, worker.ID), ops).decodeResult(t, &result)
+	if !result.Removed || result.Forced || result.Path != checkout {
+		t.Fatalf("cleanup after an ambiguous remove = %+v, want verified non-forced settlement", result)
+	}
+	if removed := stub.script().Removed; len(removed) != 1 {
+		t.Fatalf("ambiguous cleanup removals = %v, want exactly one non-forced attempt", removed)
+	}
+	if !stub.script().RemoveTimedOut {
+		t.Fatal("the stand-in did not return its configured post-effect timeout")
+	}
+	remove := stub.callIndex("worktree", "remove", "--workspace", workerWorktree)
+	list := stub.lastCallIndex("worktree", "list", "--cwd", root)
+	if remove < 0 || list <= remove {
+		t.Fatalf("ambiguous removal was not inspected afterward: remove index=%d, last list index=%d calls=%v", remove, list, stub.calls())
+	}
+	if branches := bridgeGit(t, root, "branch", "--list", worker.Branch); !strings.Contains(branches, worker.Branch) {
+		t.Fatalf("ambiguous cleanup did not retain branch %q: %q", worker.Branch, branches)
 	}
 }
 
@@ -4329,3 +4526,235 @@ func TestEveryMethodTheExtensionCallsIsDispatched(t *testing.T) {
 }
 
 var callBridgePattern = regexp.MustCompile(`callBridge\(\s*"([a-z_]+)"`)
+
+func TestCleanupReopenWorkspaceIsRecordedBeforeRemoval(t *testing.T) {
+	f := newBridgeFixture(t)
+	root, checkout := bridgeRepoWithWorktree(t, "orch/t1")
+	f.repoRoot = root
+	f.seedPrimary()
+	worker := f.seedWorker("t1", workerPane, workerPane, workerSession)
+	f.asWorker()
+	f.asPrimary()
+	if _, err := f.store.UpdateTask(context.Background(), worker.ID, worker.Revision, func(next *task.Task) error {
+		next.WorktreePath = checkout
+		return nil
+	}); err != nil {
+		t.Fatalf("point the task at a real checkout: %v", err)
+	}
+	stub := f.useHerdrStub(stubScript{
+		RepoRoot:      root,
+		Agents:        map[string]stubAgent{workerPane: workerAgent(workerPane, workerSession, checkout)},
+		Worktree:      []stubWorktree{{Path: checkout, Branch: worker.Branch}},
+		OpenWorkspace: "wT",
+	})
+	ops := CoordinatorOps(f.coordinator(t))
+	f.approve(t, ops)
+	stub.dropAgent(workerPane)
+
+	db, err := sql.Open("sqlite", filepath.Join(f.stateDir, "orchestrator.sqlite"))
+	if err != nil {
+		t.Fatalf("open state database for fault injection: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if _, err := db.Exec(`CREATE TRIGGER refuse_reopened_workspace
+		BEFORE UPDATE OF data ON tasks
+		WHEN json_extract(NEW.data, '$.Cleanup.WorkspaceID') = 'wT'
+			AND json_extract(NEW.data, '$.Cleanup.Opening') = 0
+		BEGIN SELECT RAISE(ABORT, 'injected reopened-workspace record failure'); END`); err != nil {
+		t.Fatalf("install reopened-workspace fault: %v", err)
+	}
+
+	first := f.callWith("cleanup", primarySession, f.cleanupPayload(t, ops, worker.ID), ops)
+	if first.OK {
+		t.Fatal("cleanup removed the checkout even though its reopened workspace was not durably recorded")
+	}
+	if removed := stub.script().Removed; len(removed) != 0 {
+		t.Fatalf("first cleanup removals = %v, want no removal before the workspace record", removed)
+	}
+	afterOpenFailure := f.task(t, worker.ID)
+	if afterOpenFailure.Cleanup == nil || !afterOpenFailure.Cleanup.Opening || afterOpenFailure.Cleanup.WorkspaceID != "" {
+		t.Fatalf("failed reopen was not left in its durable opening phase: %+v", afterOpenFailure.Cleanup)
+	}
+	if _, err := db.Exec(`DROP TRIGGER refuse_reopened_workspace`); err != nil {
+		t.Fatalf("remove reopened-workspace fault: %v", err)
+	}
+
+	var preview coord.CleanupPreview
+	f.callWith("cleanup_preview", primarySession, fmt.Sprintf(`{"taskId":%q}`, worker.ID), ops).decodeResult(t, &preview)
+	if !preview.Reopening || preview.Removable || !strings.Contains(preview.Detail, "unrecorded workspace") {
+		t.Fatalf("preview adopted the workspace whose ID was not durably recorded: %+v", preview)
+	}
+	// The user closes the unexpected workspace; the next preview can safely
+	// re-open the exact task-owned checkout and record the returned ID.
+	stub.update(func(script *stubScript) { script.Worktree[0].OpenWorkspaceID = "" })
+	f.callWith("cleanup_preview", primarySession, fmt.Sprintf(`{"taskId":%q}`, worker.ID), ops).decodeResult(t, &preview)
+	if !preview.Reopening || !preview.Removable {
+		t.Fatalf("preview after closing the unrecorded workspace = %+v, want a confirmed reopen retry", preview)
+	}
+	firstRetry := f.callWith("cleanup", primarySession, f.cleanupPayload(t, ops, worker.ID), ops)
+	wantError(t, firstRetry, "cleanup_changed")
+	if removed := stub.script().Removed; len(removed) != 0 {
+		t.Fatalf("cleanup removed before the reopened workspace was confirmed: %v", removed)
+	}
+	recorded := f.task(t, worker.ID)
+	if recorded.Cleanup == nil || recorded.Cleanup.Opening || recorded.Cleanup.WorkspaceID != "wT" {
+		t.Fatalf("workspace returned by the retry was not durably recorded: %+v", recorded.Cleanup)
+	}
+	rootPane := "wT:p1"
+	reopenedAgent := workerAgent(rootPane, "omp-reopened", checkout)
+	reopenedAgent.WorkspaceID = "wT"
+	stub.setAgent(rootPane, reopenedAgent)
+	var occupied coord.CleanupPreview
+	boundCleanupPayload := func(preview coord.CleanupPreview) string {
+		payload, err := json.Marshal(coord.CleanupParams{TaskID: worker.ID, Revision: preview.Revision, WorkspaceID: "wT"})
+		if err != nil {
+			t.Fatalf("encode bound cleanup request: %v", err)
+		}
+		return string(payload)
+	}
+	f.callWith("cleanup_preview", primarySession, fmt.Sprintf(`{"taskId":%q}`, worker.ID), ops).decodeResult(t, &occupied)
+	if !occupied.LiveWorker || occupied.Removable {
+		t.Fatalf("preview with an OMP agent in the reopened workspace = %+v", occupied)
+	}
+	wantError(t, f.callWith("cleanup", primarySession, boundCleanupPayload(occupied), ops), "worker_live")
+	if removed := stub.script().Removed; len(removed) != 0 {
+		t.Fatalf("cleanup removed a checkout with a live reopened-workspace agent: %v", removed)
+	}
+	stub.dropAgent(rootPane)
+
+	stub.setAgent(rootPane, stubAgent{Agent: "shell", PaneID: rootPane, WorkspaceID: "wT", Cwd: filepath.Join(root, "other")})
+	f.callWith("cleanup_preview", primarySession, fmt.Sprintf(`{"taskId":%q}`, worker.ID), ops).decodeResult(t, &occupied)
+	if occupied.Removable || !strings.Contains(occupied.Detail, "does not match checkout") {
+		t.Fatalf("preview accepted a shell pane with mismatched workspace CWD: %+v", occupied)
+	}
+	wantError(t, f.callWith("cleanup", primarySession, boundCleanupPayload(occupied), ops), "provenance_unconfirmed")
+	if removed := stub.script().Removed; len(removed) != 0 {
+		t.Fatalf("cleanup removed a checkout with a mismatched reopened root pane: %v", removed)
+	}
+	stub.dropAgent(rootPane)
+
+	var freshPreview coord.CleanupPreview
+	f.callWith("cleanup_preview", primarySession, fmt.Sprintf(`{"taskId":%q}`, worker.ID), ops).decodeResult(t, &freshPreview)
+	if freshPreview.Reopening || !freshPreview.Removable || freshPreview.WorkspaceID != "wT" {
+		t.Fatalf("fresh preview does not bind the reopened workspace: preview=%+v recordedCleanup=%+v", freshPreview, recorded.Cleanup)
+	}
+	var result coord.CleanupResult
+	f.callWith("cleanup", primarySession, f.cleanupPayload(t, ops, worker.ID), ops).decodeResult(t, &result)
+	if !result.Removed || result.WorkspaceID != "wT" || result.Path != checkout {
+		t.Fatalf("cleanup = %+v, want removal from the freshly confirmed workspace", result)
+	}
+	if removed := stub.script().Removed; len(removed) != 1 {
+		t.Fatalf("cleanup removals = %v, want one removal after the workspace was recorded", removed)
+	}
+	if open := stub.lastCallIndex("worktree", "open", "--cwd", root, "--path", checkout, "--no-focus"); open < 0 ||
+		stub.lastCallIndex("worktree", "remove", "--workspace", "wT") < open {
+		t.Fatalf("retry did not reverify the open before removing its recorded workspace: %v", stub.calls())
+	}
+	if branches := bridgeGit(t, root, "branch", "--list", worker.Branch); !strings.Contains(branches, worker.Branch) {
+		t.Fatalf("cleanup did not preserve branch %q: %q", worker.Branch, branches)
+	}
+}
+
+func TestCleanupRejectsRevisionlessBridgeRequest(t *testing.T) {
+	f := newBridgeFixture(t)
+	f.seedPrimary()
+	f.seedWorker("t1", workerPane, workerPane, workerSession)
+	f.asPrimary()
+	stub := f.useHerdrStub(stubScript{})
+	ops := CoordinatorOps(f.coordinator(t))
+
+	wantError(t, f.callWith("cleanup", primarySession, `{"taskId":"t1"}`, ops), "cleanup_changed")
+	if removals := stub.script().Removed; len(removals) != 0 {
+		t.Fatalf("revisionless cleanup removals = %v, want none", removals)
+	}
+}
+
+func TestCleanupRefusesContradictoryRemovalPathEvenWhenRecordedPathIsAbsent(t *testing.T) {
+	f := newBridgeFixture(t)
+	root, checkout := bridgeRepoWithWorktree(t, "orch/t1")
+	f.repoRoot = root
+	f.seedPrimary()
+	worker := f.seedWorker("t1", workerPane, workerPane, workerSession)
+	f.asWorker()
+	f.asPrimary()
+	if _, err := f.store.UpdateTask(context.Background(), worker.ID, worker.Revision, func(next *task.Task) error {
+		next.WorktreePath = checkout
+		return nil
+	}); err != nil {
+		t.Fatalf("point the task at a real checkout: %v", err)
+	}
+	stub := f.useHerdrStub(stubScript{
+		RepoRoot:           root,
+		Agents:             map[string]stubAgent{workerPane: workerAgent(workerPane, workerSession, checkout)},
+		Worktree:           []stubWorktree{{Path: checkout, Branch: worker.Branch, OpenWorkspaceID: workerWorktree}},
+		RemovePathMismatch: true,
+	})
+	ops := CoordinatorOps(f.coordinator(t))
+	f.approve(t, ops)
+	stub.dropAgent(workerPane)
+
+	wantError(t, f.callWith("cleanup", primarySession, f.cleanupPayload(t, ops, worker.ID), ops), "provenance_unconfirmed")
+	if _, err := os.Stat(checkout); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("fault injection did not remove the recorded checkout path: %v", err)
+	}
+	after := f.task(t, worker.ID)
+	if after.Cleanup == nil || !after.Cleanup.Refused || after.LaunchPaneID == "" || after.WorktreeWorkspaceID == "" {
+		t.Fatalf("a contradictory removal result was settled or lost its refusal marker: %+v", after)
+	}
+	if notes := notesOf(t, f, "cleanup"); len(notes) != 0 {
+		t.Fatalf("contradictory removal notes = %d, want none", len(notes))
+	}
+	var preview coord.CleanupPreview
+	f.callWith("cleanup_preview", primarySession, fmt.Sprintf(`{"taskId":%q}`, worker.ID), ops).decodeResult(t, &preview)
+	if preview.Removable {
+		t.Fatalf("preview allowed a refused contradictory cleanup: %+v", preview)
+	}
+	if branches := bridgeGit(t, root, "branch", "--list", worker.Branch); !strings.Contains(branches, worker.Branch) {
+		t.Fatalf("contradictory cleanup removed branch %q: %q", worker.Branch, branches)
+	}
+}
+
+func TestCleanupRejectsWorkspaceDriftSincePreview(t *testing.T) {
+	f := newBridgeFixture(t)
+	root, checkout := bridgeRepoWithWorktree(t, "orch/t1")
+	f.repoRoot = root
+	f.seedPrimary()
+	worker := f.seedWorker("t1", workerPane, workerPane, workerSession)
+	f.asWorker()
+	f.asPrimary()
+	if _, err := f.store.UpdateTask(context.Background(), worker.ID, worker.Revision, func(next *task.Task) error {
+		next.WorktreePath = checkout
+		next.CurrentWorkspaceID = "w9"
+		return nil
+	}); err != nil {
+		t.Fatalf("record the moved checkout workspace: %v", err)
+	}
+	stub := f.useHerdrStub(stubScript{
+		RepoRoot: root,
+		Agents:   map[string]stubAgent{workerPane: workerAgent(workerPane, workerSession, checkout)},
+		Worktree: []stubWorktree{{Path: checkout, Branch: worker.Branch, OpenWorkspaceID: workerWorktree}},
+	})
+	ops := CoordinatorOps(f.coordinator(t))
+	f.approve(t, ops)
+	stub.dropAgent(workerPane)
+
+	var preview coord.CleanupPreview
+	f.callWith("cleanup_preview", primarySession, `{"taskId":"t1"}`, ops).decodeResult(t, &preview)
+	if !preview.Removable || preview.WorkspaceID != workerWorktree {
+		t.Fatalf("cleanup preview = %+v, want the current listed workspace", preview)
+	}
+	stub.update(func(script *stubScript) { script.Worktree[0].OpenWorkspaceID = "w9" })
+	payload, err := json.Marshal(coord.CleanupParams{
+		TaskID: "t1", Revision: preview.Revision, WorkspaceID: preview.WorkspaceID,
+	})
+	if err != nil {
+		t.Fatalf("encode stale workspace confirmation: %v", err)
+	}
+	wantError(t, f.callWith("cleanup", primarySession, string(payload), ops), "cleanup_changed")
+	if removed := stub.script().Removed; len(removed) != 0 {
+		t.Fatalf("workspace drift cleanup removals = %v, want none: %v", len(removed), removed)
+	}
+	if after := f.task(t, "t1"); after.Cleanup != nil {
+		t.Fatalf("stale preview wrote cleanup intent: %+v", after.Cleanup)
+	}
+}
