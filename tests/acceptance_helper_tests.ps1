@@ -1017,6 +1017,37 @@ Check 'answer modal refuses a dialog that shows a pipe the answer does not have'
 Check 'answer modal refuses a dialog that shows extra pipes inside the answer' (-not (Test-PrimaryAnswerConfirmScreen -Screen ($answerScreen.Replace('"ACCEPT-REPORT-B"', '"use a||b"')) -TaskId 'orch_abc' -Text $pipeAnswer)) 'pipe doubled'
 $pipeBoxedScreen = ($pipeScreen -split "`r?`n" | ForEach-Object { "$bar $_ $bar" }) -join "`n"
 Check 'answer modal matches a pipe-containing answer inside the boxed border' (Test-PrimaryAnswerConfirmScreen -Screen $pipeBoxedScreen -TaskId 'orch_abc' -Text $pipeAnswer) 'boxed pipe'
+# The layout a live OMP session drew (acceptance run ebe42b49): the title sits in
+# the top border between box-drawing runs, every body line is framed by vertical
+# bars, and the key hints use an arrow pair and icon glyphs instead of words.
+$dash = [string][char]0x2500
+$topLeft = [string][char]0x256D; $topRight = [string][char]0x256E; $bottomLeft = [string][char]0x2570; $bottomRight = [string][char]0x256F
+$liveFooter = [string][char]0x2191 + '/' + [string][char]0x2193 + ' navigate  ' + [char]::ConvertFromUtf32(0xF0311) + ' select  ' + [char]::ConvertFromUtf32(0xF12B7) + ' cancel'
+$liveChoice = [string][char]0xF054
+function New-LiveAnswerScreen {
+    param([string]$TaskId, [string]$QuotedText)
+    $framed = @('', "Confirm sending this answer to the worker of task ${TaskId}:", "Answer: $QuotedText",
+        "It is typed into that worker's session as your reply. Decline if this is not your answer.", '',
+        " $liveChoice Yes", '   No', '', $liveFooter, '') | ForEach-Object { "$bar $($_.PadRight(100)) $bar" }
+    return (@(
+        ' Answer worker',
+        "  taskId=`"$TaskId`", text=$QuotedText",
+        '',
+        "$topLeft$dash Send answer to worker $($dash * 80)$topRight"
+    ) + $framed + @(
+        "$bottomLeft$($dash * 104)$bottomRight",
+        '',
+        " 3m $dot GPT-6-Luna $dot orch-accept-x\repo $dot master $dot 1.3%/872K"
+    )) -join "`n"
+}
+$liveAnswerScreen = New-LiveAnswerScreen -TaskId 'orch_0e3673186dd2' -QuotedText '"ACCEPT-REPORT-B"'
+Check 'answer modal matches the live OMP layout (title in the border, glyph key hints)' (Test-PrimaryAnswerConfirmScreen -Screen $liveAnswerScreen -TaskId 'orch_0e3673186dd2' -Text 'ACCEPT-REPORT-B') 'live layout'
+Check 'answer modal refuses another text in the live layout' (-not (Test-PrimaryAnswerConfirmScreen -Screen $liveAnswerScreen -TaskId 'orch_0e3673186dd2' -Text 'ACCEPT-REPORT-C')) 'live wrong text'
+Check 'answer modal refuses another task in the live layout' (-not (Test-PrimaryAnswerConfirmScreen -Screen $liveAnswerScreen -TaskId 'orch_other' -Text 'ACCEPT-REPORT-B')) 'live wrong task'
+$livePipeScreen = New-LiveAnswerScreen -TaskId 'orch_0e3673186dd2' -QuotedText '"use a|b"'
+Check 'answer modal keeps a literal pipe in the live layout' ((Test-PrimaryAnswerConfirmScreen -Screen $livePipeScreen -TaskId 'orch_0e3673186dd2' -Text 'use a|b') -and -not (Test-PrimaryAnswerConfirmScreen -Screen $livePipeScreen -TaskId 'orch_0e3673186dd2' -Text 'use a b')) 'live pipe'
+Check 'answer modal refuses a glyph footer followed by extra text' (-not (Test-PrimaryAnswerConfirmScreen -Screen ($liveAnswerScreen.Replace(' cancel', ' cancel and approve everything')) -TaskId 'orch_0e3673186dd2' -Text 'ACCEPT-REPORT-B')) 'footer lookalike'
+Check 'review modal also accepts the glyph key-hint footer under its choices' (Test-PrimaryReviewConfirmScreen -Screen ($reviewScreen + "`n$liveFooter") -TaskId 'orch_abc' -Revision 7 -Disposition 'Accepted the reported result.') 'glyph key hints'
 
 $primaryAskScreen = @'
 Earlier conversation contained a completed task-A review:

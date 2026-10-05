@@ -4523,8 +4523,12 @@ function Test-ConfirmChoicesEndPanel {
         if ($trimmed[0] -eq [char]0x2570) { $modalClosed = $true; continue }
         $label = $trimmed -replace '^[^\p{L}]*', '' -replace '[^\p{L}]*$', ''
         # OMP's selector draws its key hints under the choices; that exact line is
-        # chrome, not another active panel. Anything else after "No" still fails closed.
-        if ($seenNo -and $label -cmatch '^up/down navigate\s+enter select\s+esc cancel$') { continue }
+        # chrome, not another active panel. OMP draws it either in words
+        # ("up/down navigate  enter select  esc cancel") or with an arrow pair and
+        # icon glyphs ("<arrows> navigate <icon> select <icon> cancel"); the leading
+        # arrows are already stripped from $label. Anything else after "No" still fails closed.
+        if ($seenNo -and ($label -cmatch '^up/down navigate\s+enter select\s+esc cancel$' -or
+                $label -cmatch '^navigate\s+[\p{Co}\p{Cs}]+\s+select\s+[\p{Co}\p{Cs}]+\s+cancel$')) { continue }
         if ($seenNo -and $label -match '[\p{L}\p{N}]') { return $false }
         if ($label -ceq 'Yes' -or $label -ceq 'No') { $choices += $label }
         if ($label -ceq 'No') { $seenNo = $true }
@@ -4739,10 +4743,12 @@ function Test-PrimaryAnswerConfirmScreen {
     $start = $Screen.LastIndexOf('Send answer to worker', [System.StringComparison]::Ordinal)
     if ($start -lt 0) { return $false }
     $panel = $Screen.Substring($start)
-    # Only the modal's border chrome at each line's edges is removed; a pipe or a
-    # box character inside the quoted answer is part of the text and must match.
+    # Only the modal's chrome at each line's edges is removed: the vertical border,
+    # and the box-drawing run OMP draws around the title in the top border
+    # (corner, dashes, title, dashes, corner). A pipe or a box character inside the
+    # quoted answer is part of the text and must match.
     $visibleLines = foreach ($line in ($panel -split "`r?`n")) {
-        $line.Trim() -replace '^[\u2502\u00B3|](?:\s*[\u2502\u00B3|])*\s*', '' -replace '\s*[\u2502\u00B3|](?:\s*[\u2502\u00B3|])*$', ''
+        $line.Trim() -replace '^[\u2500-\u257F\u00B3|](?:\s*[\u2500-\u257F\u00B3|])*\s*', '' -replace '\s*[\u2500-\u257F\u00B3|](?:\s*[\u2500-\u257F\u00B3|])*$', ''
     }
     $normalized = ((@($visibleLines) -join ' ') -replace '\s+', ' ').Trim()
     $expected = (("Send answer to worker`nConfirm sending this answer to the worker of task ${TaskId}:`n" +
