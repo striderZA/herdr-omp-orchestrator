@@ -787,6 +787,10 @@ try {
         -QuestionMarker 'ACCEPT-Q-A' -Token 'ACCEPT-ANSWER-A' -TaskId 'task-b'
 } catch { }
 Check 'orch_answer for a different task is rejected after user authorization' (-not $wrongTaskAnswerRelay) 'wrong task relay'
+$authorizedAnswerText = Get-OmpAnswerCallAfterUserAuthorization -Path $primaryAuthorizationTranscriptPath `
+    -QuestionMarker 'ACCEPT-Q-A' -Token 'ACCEPT-ANSWER-A' -TaskId 'task-a'
+Check 'the authorized orch_answer text is the exact direct user message, for the answer dialog to match' ($authorizedAnswerText -ceq 'ACCEPT-ANSWER-A') ([string]$authorizedAnswerText)
+Check 'no authorized answer text is returned for another task' ($null -eq (Get-OmpAnswerCallAfterUserAuthorization -Path $primaryAuthorizationTranscriptPath -QuestionMarker 'ACCEPT-Q-A' -Token 'ACCEPT-ANSWER-A' -TaskId 'task-b')) 'wrong task'
 $reportAuthorizationWorkerPath = Join-Path $script:HarnessRoot 'report-authorization-worker.jsonl'
 $reportAuthorizationWorkerLines = @(
     '{"type":"message","message":{"role":"user","content":[{"type":"text","text":"ACCEPT-TASK-B: wait for a later user message with ACCEPT-REPORT-B"}]}}'
@@ -972,6 +976,78 @@ Check 'ticket decision modal rejects a different linked task' (-not (Test-Primar
 Check 'ticket decision modal rejects a different revision' (-not (Test-PrimaryTicketConfirmScreen -Screen $ticketReviewScreen -Kind 'review' -TicketId 'tkt_abc123' -TicketTitle $ticketTitle -Revision 6 -Outcome 'integrated' -Disposition 'Accepted the reported result.' -LinkedTaskIds @('orch_aaaa11112222'))) 'wrong revision'
 Check 'ticket decision modal rejects a longer note that merely contains the expected one' (-not (Test-PrimaryTicketConfirmScreen -Screen ($ticketReviewScreen -replace 'Accepted the reported result\.\r?\nTicket', "Accepted the reported result. and more`nTicket") @ticketReviewArgs)) 'substring note'
 Check 'ticket decision modal refuses an Ask drawn below it' (-not (Test-PrimaryTicketConfirmScreen -Screen ($ticketReviewScreen + "`nAsk 1 questions`n[other] What now?`nAccept`nRequest changes") @ticketReviewArgs)) 'review new Ask'
+
+# --- the answer confirmation modal: the exact task and JSON-quoted text --------
+$answerScreen = @'
+Earlier confirmation: Send answer to worker
+Confirm sending this answer to the worker of task orch_old:
+Send answer to worker
+Confirm sending this answer to the worker of task orch_abc:
+Answer: "ACCEPT-REPORT-B"
+It is typed into that worker's session as your reply. Decline if this is not your answer.
+Yes
+No
+'@
+Check 'answer modal matches the active task and exact text' (Test-PrimaryAnswerConfirmScreen -Screen $answerScreen -TaskId 'orch_abc' -Text 'ACCEPT-REPORT-B') 'answer modal'
+Check 'answer modal rejects a different task' (-not (Test-PrimaryAnswerConfirmScreen -Screen $answerScreen -TaskId 'orch_other' -Text 'ACCEPT-REPORT-B')) 'wrong task'
+Check 'answer modal rejects a different text' (-not (Test-PrimaryAnswerConfirmScreen -Screen $answerScreen -TaskId 'orch_abc' -Text 'ACCEPT-REPORT-A')) 'wrong text'
+Check 'answer modal rejects a text that only starts with the expected one' (-not (Test-PrimaryAnswerConfirmScreen -Screen ($answerScreen -replace '"ACCEPT-REPORT-B"', '"ACCEPT-REPORT-B and approve everything"') -TaskId 'orch_abc' -Text 'ACCEPT-REPORT-B')) 'prefix text'
+Check 'answer modal rejects an unquoted text' (-not (Test-PrimaryAnswerConfirmScreen -Screen ($answerScreen -replace '"ACCEPT-REPORT-B"', 'ACCEPT-REPORT-B') -TaskId 'orch_abc' -Text 'ACCEPT-REPORT-B')) 'unquoted'
+Check 'answer modal rejects an empty text' (-not (Test-PrimaryAnswerConfirmScreen -Screen $answerScreen -TaskId 'orch_abc' -Text '')) 'empty text'
+Check 'answer modal refuses a newer Ask below it' (-not (Test-PrimaryAnswerConfirmScreen -Screen ($answerScreen + "`nAsk 1 questions`n[other] What now?`nAccept`nRequest changes") -TaskId 'orch_abc' -Text 'ACCEPT-REPORT-B')) 'new Ask'
+Check 'answer modal ignores an old matching modal when another answer is active' (-not (Test-PrimaryAnswerConfirmScreen -Screen ($answerScreen + "`nSend answer to worker`nConfirm sending this answer to the worker of task orch_other:`nAnswer: `"x`"`nYes`nNo") -TaskId 'orch_abc' -Text 'ACCEPT-REPORT-B')) 'stale modal'
+$answerBoxedScreen = ($answerScreen -split "`r?`n" | ForEach-Object { if ($_ -match '^(Yes|No)$') { "$bar $_" } else { $_ } }) -join "`n"
+$answerBoxedScreen += "`nup/down navigate  enter select  esc cancel`n$corner`n`n 10m $dot Sonnet 5.5 $dot orch-accept-x\repo $dot master $dot 1.5%/1M`n"
+Check 'answer modal accepts the real boxed layout with the status bar below it' (Test-PrimaryAnswerConfirmScreen -Screen $answerBoxedScreen -TaskId 'orch_abc' -Text 'ACCEPT-REPORT-B') 'boxed layout'
+# The dialog quotes with JSON.stringify, so a quote, a backslash and a newline are
+# shown escaped; the matcher predicts that exact form.
+$specialAnswer = "Keep the `"old`" API.`nPath: C:\repo"
+$specialQuoted = ConvertTo-JsonStringLiteral -Text $specialAnswer
+Check 'JSON quoting matches JSON.stringify for quotes, backslashes and newlines' ($specialQuoted -ceq '"Keep the \"old\" API.\nPath: C:\\repo"') $specialQuoted
+Check 'JSON quoting escapes other control characters as \u escapes' ((ConvertTo-JsonStringLiteral -Text ("a" + [char]1 + "b`t")) -ceq '"a\u0001b\t"') (ConvertTo-JsonStringLiteral -Text ("a" + [char]1 + "b`t"))
+$specialAnswerScreen = $answerScreen.Replace('"ACCEPT-REPORT-B"', $specialQuoted)
+Check 'answer modal matches a JSON-quoted text with escapes' (Test-PrimaryAnswerConfirmScreen -Screen $specialAnswerScreen -TaskId 'orch_abc' -Text $specialAnswer) 'escaped text'
+Check 'answer modal refuses the raw text where the dialog shows it escaped' (-not (Test-PrimaryAnswerConfirmScreen -Screen ($answerScreen.Replace('"ACCEPT-REPORT-B"', '"' + $specialAnswer + '"')) -TaskId 'orch_abc' -Text $specialAnswer)) 'raw text'
+# A pipe inside the answer is text, not border chrome: it must be shown exactly.
+$pipeAnswer = 'use a|b'
+$pipeScreen = $answerScreen.Replace('"ACCEPT-REPORT-B"', '"use a|b"')
+Check 'answer modal matches an answer that contains a literal pipe' (Test-PrimaryAnswerConfirmScreen -Screen $pipeScreen -TaskId 'orch_abc' -Text $pipeAnswer) 'pipe text'
+Check 'answer modal refuses a dialog that shows a space where the answer has a pipe' (-not (Test-PrimaryAnswerConfirmScreen -Screen ($answerScreen.Replace('"ACCEPT-REPORT-B"', '"use a b"')) -TaskId 'orch_abc' -Text $pipeAnswer)) 'pipe dropped'
+Check 'answer modal refuses a dialog that shows a pipe the answer does not have' (-not (Test-PrimaryAnswerConfirmScreen -Screen $pipeScreen -TaskId 'orch_abc' -Text 'use a b')) 'pipe added'
+Check 'answer modal refuses a dialog that shows extra pipes inside the answer' (-not (Test-PrimaryAnswerConfirmScreen -Screen ($answerScreen.Replace('"ACCEPT-REPORT-B"', '"use a||b"')) -TaskId 'orch_abc' -Text $pipeAnswer)) 'pipe doubled'
+$pipeBoxedScreen = ($pipeScreen -split "`r?`n" | ForEach-Object { "$bar $_ $bar" }) -join "`n"
+Check 'answer modal matches a pipe-containing answer inside the boxed border' (Test-PrimaryAnswerConfirmScreen -Screen $pipeBoxedScreen -TaskId 'orch_abc' -Text $pipeAnswer) 'boxed pipe'
+# The layout a live OMP session drew (acceptance run ebe42b49): the title sits in
+# the top border between box-drawing runs, every body line is framed by vertical
+# bars, and the key hints use an arrow pair and icon glyphs instead of words.
+$dash = [string][char]0x2500
+$topLeft = [string][char]0x256D; $topRight = [string][char]0x256E; $bottomLeft = [string][char]0x2570; $bottomRight = [string][char]0x256F
+$liveFooter = [string][char]0x2191 + '/' + [string][char]0x2193 + ' navigate  ' + [char]::ConvertFromUtf32(0xF0311) + ' select  ' + [char]::ConvertFromUtf32(0xF12B7) + ' cancel'
+$liveChoice = [string][char]0xF054
+function New-LiveAnswerScreen {
+    param([string]$TaskId, [string]$QuotedText)
+    $framed = @('', "Confirm sending this answer to the worker of task ${TaskId}:", "Answer: $QuotedText",
+        "It is typed into that worker's session as your reply. Decline if this is not your answer.", '',
+        " $liveChoice Yes", '   No', '', $liveFooter, '') | ForEach-Object { "$bar $($_.PadRight(100)) $bar" }
+    return (@(
+        ' Answer worker',
+        "  taskId=`"$TaskId`", text=$QuotedText",
+        '',
+        "$topLeft$dash Send answer to worker $($dash * 80)$topRight"
+    ) + $framed + @(
+        "$bottomLeft$($dash * 104)$bottomRight",
+        '',
+        " 3m $dot GPT-6-Luna $dot orch-accept-x\repo $dot master $dot 1.3%/872K"
+    )) -join "`n"
+}
+$liveAnswerScreen = New-LiveAnswerScreen -TaskId 'orch_0e3673186dd2' -QuotedText '"ACCEPT-REPORT-B"'
+Check 'answer modal matches the live OMP layout (title in the border, glyph key hints)' (Test-PrimaryAnswerConfirmScreen -Screen $liveAnswerScreen -TaskId 'orch_0e3673186dd2' -Text 'ACCEPT-REPORT-B') 'live layout'
+Check 'answer modal refuses another text in the live layout' (-not (Test-PrimaryAnswerConfirmScreen -Screen $liveAnswerScreen -TaskId 'orch_0e3673186dd2' -Text 'ACCEPT-REPORT-C')) 'live wrong text'
+Check 'answer modal refuses another task in the live layout' (-not (Test-PrimaryAnswerConfirmScreen -Screen $liveAnswerScreen -TaskId 'orch_other' -Text 'ACCEPT-REPORT-B')) 'live wrong task'
+$livePipeScreen = New-LiveAnswerScreen -TaskId 'orch_0e3673186dd2' -QuotedText '"use a|b"'
+Check 'answer modal keeps a literal pipe in the live layout' ((Test-PrimaryAnswerConfirmScreen -Screen $livePipeScreen -TaskId 'orch_0e3673186dd2' -Text 'use a|b') -and -not (Test-PrimaryAnswerConfirmScreen -Screen $livePipeScreen -TaskId 'orch_0e3673186dd2' -Text 'use a b')) 'live pipe'
+Check 'answer modal refuses a glyph footer followed by extra text' (-not (Test-PrimaryAnswerConfirmScreen -Screen ($liveAnswerScreen.Replace(' cancel', ' cancel and approve everything')) -TaskId 'orch_0e3673186dd2' -Text 'ACCEPT-REPORT-B')) 'footer lookalike'
+Check 'review modal also accepts the glyph key-hint footer under its choices' (Test-PrimaryReviewConfirmScreen -Screen ($reviewScreen + "`n$liveFooter") -TaskId 'orch_abc' -Revision 7 -Disposition 'Accepted the reported result.') 'glyph key hints'
 
 $primaryAskScreen = @'
 Earlier conversation contained a completed task-A review:
@@ -1184,6 +1260,40 @@ $script:PrimaryPromptCallsForTest = 0
 $blockedAsyncPrimary = $null
 try { $blockedAsyncPrimary = Invoke-PrimaryPromptNoWaitAfterDispositionAsks -PaneId 'w1:p1' -Text 'must not type into active UI' -TimeoutSeconds 30 } catch { }
 Check 'no-wait primary prompt refuses an already blocked session without submitting' ($null -ne $blockedAsyncPrimary -and $blockedAsyncPrimary.Blocked -and -not $blockedAsyncPrimary.Submitted -and $script:PrimaryPromptCallsForTest -eq 0) 'blocked refusal'
+# A primary that Herdr reports blocked only briefly (no dialog was open) is tried
+# once more after its pending disposition Asks are resolved, as the --wait variant
+# does; the first attempt still types nothing.
+$script:ResolvePendingCallsForTest = 0
+function Resolve-PendingPrimaryDispositionAsks {
+    param([string]$AssertionPrefix, [double]$TimeoutSeconds = 60)
+    $script:ResolvePendingCallsForTest++
+    if ($script:ResolvePendingCallsForTest -ge 2) { $script:PrimaryAgentStatusForTest = 'idle' }
+    return [pscustomobject]@{ Resolved = $true; Observed = $false; Screen = '' }
+}
+$script:PrimaryAgentStatusForTest = 'blocked'
+$script:PrimaryPromptCallsForTest = 0
+$transientAsyncPrimary = $null
+try { $transientAsyncPrimary = Invoke-PrimaryPromptNoWaitAfterDispositionAsks -PaneId 'w1:p1' -Text 'answer after a transient block' -TimeoutSeconds 30 } catch { }
+Check 'no-wait primary prompt retries once after a transient blocked state and submits exactly once' ($null -ne $transientAsyncPrimary -and $transientAsyncPrimary.Submitted -and $script:PrimaryPromptCallsForTest -eq 1 -and $script:PrimaryPromptTextForTest -eq 'answer after a transient block') ("calls=$($script:PrimaryPromptCallsForTest) resolves=$($script:ResolvePendingCallsForTest)")
+# When the pending Asks cannot be resolved, the prompt is never submitted.
+function Resolve-PendingPrimaryDispositionAsks {
+    param([string]$AssertionPrefix, [double]$TimeoutSeconds = 60)
+    $script:ResolvePendingCallsForTest++
+    if ($script:ResolvePendingCallsForTest -eq 1) { return [pscustomobject]@{ Resolved = $true; Observed = $false; Screen = '' } }
+    $script:PrimaryAgentStatusForTest = 'idle'
+    return [pscustomobject]@{ Resolved = $false; Observed = $true; Screen = 'unresolved Ask' }
+}
+$script:ResolvePendingCallsForTest = 0
+$script:PrimaryAgentStatusForTest = 'blocked'
+$script:PrimaryPromptCallsForTest = 0
+$unresolvedAsyncPrimary = $null
+try { $unresolvedAsyncPrimary = Invoke-PrimaryPromptNoWaitAfterDispositionAsks -PaneId 'w1:p1' -Text 'must not submit' -TimeoutSeconds 30 } catch { }
+Check 'no-wait primary prompt never submits when the blocking Ask cannot be resolved' ($null -ne $unresolvedAsyncPrimary -and -not $unresolvedAsyncPrimary.Submitted -and $script:PrimaryPromptCallsForTest -eq 0 -and $script:ResolvePendingCallsForTest -eq 2) ("calls=$($script:PrimaryPromptCallsForTest) resolves=$($script:ResolvePendingCallsForTest)")
+function Resolve-PendingPrimaryDispositionAsks {
+    param([string]$AssertionPrefix, [double]$TimeoutSeconds = 60)
+    return [pscustomobject]@{ Resolved = $true; Observed = $false; Screen = '' }
+}
+$script:PrimaryAgentStatusForTest = 'blocked'
 $savedKeepResources = [bool]$script:KeepResources
 $script:KeepResources = $false
 if (Get-Command Preserve-ResourcesForPendingTool -ErrorAction SilentlyContinue) {
@@ -1380,6 +1490,39 @@ $wrongReview = Confirm-PrimaryReviewModal -PaneId 'w1:p1' -LaunchPaneId 'w9:p9' 
 Check 'review resolver refuses a modal for another task without sending keys' (-not $wrongReview -and $script:SentKeysCallsForTest.Count -eq 0) 'wrong review'
 Set-Item -Path Function:\Get-ReadySession -Value $savedReadySession
 $script:Project = $savedProject
+
+# --- the answer confirmation: Enter only on the exact task/text, never twice ---
+$answerPrimaryTranscriptPath = Join-Path $script:HarnessRoot 'answer-primary.jsonl'
+Set-Content -LiteralPath $answerPrimaryTranscriptPath -Encoding UTF8 -Value '{"type":"message","message":{"role":"assistant","content":[{"type":"toolCall","name":"orch_answer","arguments":{"taskId":"orch_abc","text":"ACCEPT-REPORT-B"}}]}}'
+$answerWorkerTranscriptPath = Join-Path $script:HarnessRoot 'answer-worker.jsonl'
+Set-Content -LiteralPath $answerWorkerTranscriptPath -Encoding UTF8 -Value '{"type":"message","message":{"role":"user","content":[{"type":"text","text":"ACCEPT-TASK-B brief"}]}}'
+$script:PrimaryAgentStatusForTest = 'blocked'
+$script:PrimaryScreenForTest = $answerScreen
+$script:SentKeysCallsForTest = @()
+$script:PrimarySendKeysUsed = @()
+$answerConfirmed = Confirm-PrimaryAnswerModal -TaskId 'orch_abc' -Text 'ACCEPT-REPORT-B' -TranscriptPath $answerPrimaryTranscriptPath -WorkerTranscriptPath $answerWorkerTranscriptPath -TimeoutSeconds 1
+Check 'answer confirmer sends Enter once for the transcript-linked exact dialog' ($answerConfirmed.Observed -and $answerConfirmed.Confirmed -and -not $answerConfirmed.DeliveredBeforeConfirm -and $script:SentKeysCallsForTest.Count -eq 1 -and $script:SentKeysCallsForTest[0] -eq 'enter' -and $script:PrimarySendKeysUsed.Count -eq 1) ("result=$(Get-Json $answerConfirmed); keys=$($script:SentKeysCallsForTest -join ',')")
+$script:SentKeysCallsForTest = @()
+$answerOtherTask = Confirm-PrimaryAnswerModal -TaskId 'orch_other' -Text 'ACCEPT-REPORT-B' -TranscriptPath $answerPrimaryTranscriptPath -TimeoutSeconds 1
+Check 'answer confirmer refuses a dialog for another task without sending keys' (-not $answerOtherTask.Confirmed -and $script:SentKeysCallsForTest.Count -eq 0) (Get-Json $answerOtherTask)
+$answerOtherText = Confirm-PrimaryAnswerModal -TaskId 'orch_abc' -Text 'ACCEPT-REPORT-C' -TranscriptPath $answerPrimaryTranscriptPath -TimeoutSeconds 1
+Check 'answer confirmer refuses a dialog showing another text without sending keys' (-not $answerOtherText.Confirmed -and $script:SentKeysCallsForTest.Count -eq 0) (Get-Json $answerOtherText)
+$answerNoCall = Confirm-PrimaryAnswerModal -TaskId 'orch_abc' -Text 'ACCEPT-REPORT-B' -TranscriptPath $answerWorkerTranscriptPath -TimeoutSeconds 1
+Check 'answer confirmer refuses a dialog the primary transcript does not hold an orch_answer call for' (-not $answerNoCall.Confirmed -and $script:SentKeysCallsForTest.Count -eq 0) (Get-Json $answerNoCall)
+# Herdr reports the primary "working" while an extension dialog is open, so the
+# status is not consulted: the exact visible dialog and the transcript call are.
+$script:PrimaryAgentStatusForTest = 'working'
+$answerWhileWorking = Confirm-PrimaryAnswerModal -TaskId 'orch_abc' -Text 'ACCEPT-REPORT-B' -TranscriptPath $answerPrimaryTranscriptPath -TimeoutSeconds 1
+Check 'answer confirmer confirms the exact dialog even while Herdr reports the primary working' ($answerWhileWorking.Confirmed -and $script:SentKeysCallsForTest.Count -eq 1) (Get-Json $answerWhileWorking)
+$script:SentKeysCallsForTest = @()
+$script:PrimaryScreenForTest = "Answer worker`n  taskId=`"orch_abc`", text=`"ACCEPT-REPORT-B`"`nWorking..."
+$answerNoDialog = Confirm-PrimaryAnswerModal -TaskId 'orch_abc' -Text 'ACCEPT-REPORT-B' -TranscriptPath $answerPrimaryTranscriptPath -TimeoutSeconds 1
+Check 'answer confirmer sends nothing when no answer dialog is on screen' (-not $answerNoDialog.Observed -and $script:SentKeysCallsForTest.Count -eq 0) (Get-Json $answerNoDialog)
+$script:PrimaryScreenForTest = $answerScreen
+$script:PrimaryAgentStatusForTest = 'blocked'
+Add-Content -LiteralPath $answerWorkerTranscriptPath -Encoding UTF8 -Value '{"type":"message","message":{"role":"user","content":[{"type":"text","text":"ACCEPT-REPORT-B"}]}}'
+$answerAlreadyDelivered = Confirm-PrimaryAnswerModal -TaskId 'orch_abc' -Text 'ACCEPT-REPORT-B' -TranscriptPath $answerPrimaryTranscriptPath -WorkerTranscriptPath $answerWorkerTranscriptPath -TimeoutSeconds 1
+Check 'answer confirmer reports a text that reached the worker before confirmation and sends nothing' ($answerAlreadyDelivered.Observed -and $answerAlreadyDelivered.DeliveredBeforeConfirm -and -not $answerAlreadyDelivered.Confirmed -and $script:SentKeysCallsForTest.Count -eq 0) (Get-Json $answerAlreadyDelivered)
 
 $script:DispositionWaitCallsForTest = 0
 $script:ReplacementDispositionScreen = $primaryAskScreen -replace 'task_b_review', 'task_a_review'

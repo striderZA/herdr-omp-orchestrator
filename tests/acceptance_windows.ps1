@@ -2581,9 +2581,20 @@ function Test-OmpTranscriptContainsLaterUserAuthorization {
 }
 function Test-OmpAnswerCallAfterUserAuthorization {
     param([string]$Path, [string]$QuestionMarker, [string]$Token, [string]$TaskId)
+    return ($null -ne (Get-OmpAnswerCallAfterUserAuthorization -Path $Path -QuestionMarker $QuestionMarker -Token $Token -TaskId $TaskId))
+}
+
+function Get-OmpAnswerCallAfterUserAuthorization {
+    <#
+        The exact text of the orch_answer call for this task that relays the direct
+        user message carrying the token after the worker's question note, or $null
+        when the transcript holds no such call. The answer confirmation dialog must
+        show this same text before the acceptance user confirms it.
+    #>
+    param([string]$Path, [string]$QuestionMarker, [string]$Token, [string]$TaskId)
     if ([string]::IsNullOrWhiteSpace($Path) -or [string]::IsNullOrWhiteSpace($QuestionMarker) -or
         [string]::IsNullOrWhiteSpace($Token) -or [string]::IsNullOrWhiteSpace($TaskId) -or
-        -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+        -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
     $stream = $null
     $reader = $null
     $questionObserved = $false
@@ -2610,7 +2621,7 @@ function Test-OmpAnswerCallAfterUserAuthorization {
                     $arguments = Get-Field $part 'arguments'
                     if ($authorizedText -and $toolName -ceq 'orch_answer' -and
                         [string](Get-Field $arguments 'taskId') -ceq $TaskId -and
-                        [string](Get-Field $arguments 'text') -ceq $authorizedText) { return $true }
+                        [string](Get-Field $arguments 'text') -ceq $authorizedText) { return $authorizedText }
                 }
                 continue
             }
@@ -2630,12 +2641,12 @@ function Test-OmpAnswerCallAfterUserAuthorization {
             }
         }
     } catch {
-        return $false
+        return $null
     } finally {
         if ($reader) { $reader.Dispose() }
         elseif ($stream) { $stream.Dispose() }
     }
-    return $false
+    return $null
 }
 
 function Test-OmpApprovalToolCall {
@@ -4243,7 +4254,9 @@ function Invoke-QuestionRelay {
     Add-Assertion -Id 'Q2.8a' -What 'a later user message after the worker-question note contains the exact authorization token' `
         -Status 'PASS' -Evidence "observed in $primaryTranscript" -TaskId $idA
     $relayPrompt = 'ACCEPT-Q-A-RELAY. The primary transcript contains a later user message with the exact ACCEPT-ANSWER-A token. Call orch_answer for taskId "' + $idA + '" using that user message verbatim; do not add or change any authorization text. Do not report. Reply relayed.'
-    $relay = Invoke-PrimaryPrompt -PaneId $script:PrimaryPane -Text $relayPrompt -TimeoutSeconds 300
+    # orch_answer now waits for the user to confirm the exact text, so the prompt is
+    # submitted without --wait and Confirm-PrimaryAnswerModal gates the Enter.
+    $relay = Invoke-PrimaryPromptNoWaitAfterDispositionAsks -PaneId $script:PrimaryPane -Text $relayPrompt -TimeoutSeconds 300 -AssertionPrefix 'Q3'
     if (-not $relay.Submitted) {
         Block-Item -Id 'Q3.1' -What 'the primary could not relay the already-authorized user answer' `
             -Evidence ("code=[$($relay.Code)] screen=" + (Protect-Text $relay.Screen 500))
@@ -4253,8 +4266,9 @@ function Invoke-QuestionRelay {
         return
     }
     $answerDelivery = Wait-Until -TimeoutSeconds 120 -IntervalSeconds 3 -What 'exact authorized orch_answer call after the direct user token' -Probe {
-        if (Test-OmpAnswerCallAfterUserAuthorization -Path $primaryTranscript `
-            -QuestionMarker 'ACCEPT-Q-A' -Token 'ACCEPT-ANSWER-A' -TaskId $idA) { return $true }
+        $authorizedText = Get-OmpAnswerCallAfterUserAuthorization -Path $primaryTranscript `
+            -QuestionMarker 'ACCEPT-Q-A' -Token 'ACCEPT-ANSWER-A' -TaskId $idA
+        if (-not [string]::IsNullOrEmpty($authorizedText)) { return $authorizedText }
         return $null
     }
     if (-not $answerDelivery.Ok) {
@@ -4265,9 +4279,22 @@ function Invoke-QuestionRelay {
         Preserve-ResourcesForPendingTool -AssertionId 'Q3.1.resources-preserved' -Reason 'the direct user token arrived but orch_answer was not proven'
         return
     }
-    Assert-True -Id 'Q3.1' -What 'the primary relayed the exact later user authorization to worker A' `
+    $workerReadyA = Get-ReadySession -LaunchPaneId ([string](Get-Field $script:TaskA 'LaunchPaneID'))
+    $answerModal = Confirm-PrimaryAnswerModal -TaskId $idA -Text ([string]$answerDelivery.Value) -TranscriptPath $primaryTranscript `
+        -WorkerTranscriptPath ([string](Get-Field $workerReadyA 'omp_session_file'))
+    Assert-True -Id 'Q3.1b' -What 'the authorized answer had not reached worker A before the user confirmed it' `
+        -Condition (-not $answerModal.DeliveredBeforeConfirm) -TaskId $idA -Evidence ("observed=[$($answerModal.Observed)] delivered_before_confirm=[$($answerModal.DeliveredBeforeConfirm)]")
+    if (-not $answerModal.Confirmed) {
+        Block-Item -Id 'Q3.1' -What 'the answer confirmation for worker A did not show the exact authorized text, so nothing was confirmed' `
+            -Evidence ("observed=[$($answerModal.Observed)] screen=" + (Protect-Text $answerModal.Screen 500))
+        $focusAfter = Get-FocusProjection -Snapshot (Get-Snapshot)
+        Assert-Equal -Id 'Q3.5' -What 'relaying a question never moved the session focus' -Expected $focusBefore -Actual $focusAfter
+        Preserve-ResourcesForPendingTool -AssertionId 'Q3.1.resources-preserved' -Reason 'the answer confirmation for worker A may still be open on the primary'
+        return
+    }
+    Assert-True -Id 'Q3.1' -What 'the primary relayed the exact later user authorization to worker A after the user confirmed that text' `
         -Condition $true -TaskId $idA -Command $relay.CommandLine `
-        -Evidence 'orch_answer taskId and text matched the exact direct user message after authorization'
+        -Evidence 'orch_answer taskId and text matched the exact direct user message after authorization, and the answer dialog showed that exact text before it was confirmed'
     $cleared = Wait-Until -TimeoutSeconds 240 -IntervalSeconds 8 -What 'question answered' -Probe {
         $row = Get-TaskById -Id $idA
         if (-not $row) { return $null }
@@ -4467,11 +4494,22 @@ function Test-PrimaryReviewConfirmScreen {
     }
     if (-not $afterDescription.StartsWith($expectedDecision, [System.StringComparison]::Ordinal) -or
         $afterDescription.IndexOf($closing, [System.StringComparison]::Ordinal) -lt 0) { return $false }
+    return (Test-ConfirmChoicesEndPanel -Panel $panel)
+}
+
+function Test-ConfirmChoicesEndPanel {
+    <#
+        True only when an OMP confirmation panel ends in exactly its Yes/No choices:
+        nothing but the selector's key-hint footer, the modal's closing border and
+        OMP's single status-bar line may follow "No". Any other text could be a
+        newer Ask or action modal, so it fails closed.
+    #>
+    param([string]$Panel)
     $choices = @()
     $seenNo = $false
     $modalClosed = $false
     $statusBarSeen = $false
-    foreach ($line in ($panel -split "`r?`n")) {
+    foreach ($line in ($Panel -split "`r?`n")) {
         $trimmed = $line.Trim()
         if ($trimmed.Length -eq 0) { continue }
         if ($modalClosed) {
@@ -4485,8 +4523,12 @@ function Test-PrimaryReviewConfirmScreen {
         if ($trimmed[0] -eq [char]0x2570) { $modalClosed = $true; continue }
         $label = $trimmed -replace '^[^\p{L}]*', '' -replace '[^\p{L}]*$', ''
         # OMP's selector draws its key hints under the choices; that exact line is
-        # chrome, not another active panel. Anything else after "No" still fails closed.
-        if ($seenNo -and $label -cmatch '^up/down navigate\s+enter select\s+esc cancel$') { continue }
+        # chrome, not another active panel. OMP draws it either in words
+        # ("up/down navigate  enter select  esc cancel") or with an arrow pair and
+        # icon glyphs ("<arrows> navigate <icon> select <icon> cancel"); the leading
+        # arrows are already stripped from $label. Anything else after "No" still fails closed.
+        if ($seenNo -and ($label -cmatch '^up/down navigate\s+enter select\s+esc cancel$' -or
+                $label -cmatch '^navigate\s+[\p{Co}\p{Cs}]+\s+select\s+[\p{Co}\p{Cs}]+\s+cancel$')) { continue }
         if ($seenNo -and $label -match '[\p{L}\p{N}]') { return $false }
         if ($label -ceq 'Yes' -or $label -ceq 'No') { $choices += $label }
         if ($label -ceq 'No') { $seenNo = $true }
@@ -4615,29 +4657,7 @@ function Test-PrimaryTicketConfirmScreen {
     if ($descriptionIndex -lt 0) { return $false }
     $afterDescription = $normalized.Substring($descriptionIndex + $description.Length).TrimStart()
     if (-not $afterDescription.StartsWith($expectedFacts, [System.StringComparison]::Ordinal)) { return $false }
-    $choices = @()
-    $seenNo = $false
-    $modalClosed = $false
-    $statusBarSeen = $false
-    foreach ($line in ($panel -split "`r?`n")) {
-        $trimmed = $line.Trim()
-        if ($trimmed.Length -eq 0) { continue }
-        if ($modalClosed) {
-            # After the modal's closing border only OMP's single status-bar line
-            # (several middle-dot separated segments) may follow; any other text could
-            # be a newer Ask or action modal, so it fails closed.
-            if ($statusBarSeen -or ([regex]::Matches($trimmed, '\s\u00B7\s').Count -lt 3)) { return $false }
-            $statusBarSeen = $true
-            continue
-        }
-        if ($trimmed[0] -eq [char]0x2570) { $modalClosed = $true; continue }
-        $label = $trimmed -replace '^[^\p{L}]*', '' -replace '[^\p{L}]*$', ''
-        if ($seenNo -and $label -cmatch '^up/down navigate\s+enter select\s+esc cancel$') { continue }
-        if ($seenNo -and $label -match '[\p{L}\p{N}]') { return $false }
-        if ($label -ceq 'Yes' -or $label -ceq 'No') { $choices += $label }
-        if ($label -ceq 'No') { $seenNo = $true }
-    }
-    return ($choices.Count -eq 2 -and $choices[0] -ceq 'Yes' -and $choices[1] -ceq 'No')
+    return (Test-ConfirmChoicesEndPanel -Panel $panel)
 }
 
 function Confirm-PrimaryTicketModal {
@@ -4681,6 +4701,110 @@ function Confirm-PrimaryTicketModal {
     $sent = Send-AgentKeys -PaneId $script:PrimaryPane -Keys @('enter')
     [void]($script:PrimarySendKeysUsed += 'enter')
     return ($sent.ExitCode -eq 0)
+}
+
+function ConvertTo-JsonStringLiteral {
+    <#
+        The string the extension's JSON.stringify shows for one text: the quotes,
+        backslash and control characters escaped, every other character (non-ASCII
+        included) verbatim. PowerShell's ConvertTo-Json escapes more than that, so
+        it cannot be used to predict the dialog text.
+    #>
+    param([AllowEmptyString()][string]$Text)
+    $builder = New-Object System.Text.StringBuilder
+    [void]$builder.Append('"')
+    foreach ($ch in $Text.ToCharArray()) {
+        $code = [int]$ch
+        if ($code -eq 0x22) { [void]$builder.Append('\"') }
+        elseif ($code -eq 0x5C) { [void]$builder.Append('\\') }
+        elseif ($code -eq 0x0A) { [void]$builder.Append('\n') }
+        elseif ($code -eq 0x0D) { [void]$builder.Append('\r') }
+        elseif ($code -eq 0x09) { [void]$builder.Append('\t') }
+        elseif ($code -eq 0x08) { [void]$builder.Append('\b') }
+        elseif ($code -eq 0x0C) { [void]$builder.Append('\f') }
+        elseif ($code -lt 0x20) { [void]$builder.Append(('\u{0:x4}' -f $code)) }
+        else { [void]$builder.Append($ch) }
+    }
+    [void]$builder.Append('"')
+    return $builder.ToString()
+}
+
+function Test-PrimaryAnswerConfirmScreen {
+    <#
+        True only when the primary's ACTIVE confirmation is the answer dialog of
+        sendAnswerWithConsent (omp/herdr-orchestrator.ts) for exactly this task and
+        this text, quoted as JSON.stringify quotes it, with its Yes/No choices as
+        the last panel on screen. A changed wording, another task, another text, an
+        older matching modal or a newer panel below it all refuse.
+    #>
+    param([string]$Screen, [string]$TaskId, [string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Screen) -or [string]::IsNullOrWhiteSpace($TaskId) -or
+        [string]::IsNullOrEmpty($Text)) { return $false }
+    $start = $Screen.LastIndexOf('Send answer to worker', [System.StringComparison]::Ordinal)
+    if ($start -lt 0) { return $false }
+    $panel = $Screen.Substring($start)
+    # Only the modal's chrome at each line's edges is removed: the vertical border,
+    # and the box-drawing run OMP draws around the title in the top border
+    # (corner, dashes, title, dashes, corner). A pipe or a box character inside the
+    # quoted answer is part of the text and must match.
+    $visibleLines = foreach ($line in ($panel -split "`r?`n")) {
+        $line.Trim() -replace '^[\u2500-\u257F\u00B3|](?:\s*[\u2500-\u257F\u00B3|])*\s*', '' -replace '\s*[\u2500-\u257F\u00B3|](?:\s*[\u2500-\u257F\u00B3|])*$', ''
+    }
+    $normalized = ((@($visibleLines) -join ' ') -replace '\s+', ' ').Trim()
+    $expected = (("Send answer to worker`nConfirm sending this answer to the worker of task ${TaskId}:`n" +
+        'Answer: ' + (ConvertTo-JsonStringLiteral -Text $Text) + "`n" +
+        "It is typed into that worker's session as your reply. Decline if this is not your answer.") -replace '\s+', ' ').Trim()
+    if (-not $normalized.StartsWith($expected, [System.StringComparison]::Ordinal)) { return $false }
+    return (Test-ConfirmChoicesEndPanel -Panel $panel)
+}
+
+function Confirm-PrimaryAnswerModal {
+    <#
+        Presses Enter on the primary's answer confirmation, and only on that exact
+        dialog: the primary transcript must hold the orch_answer call for this task
+        and text, and the visible dialog must show the same task and text. Both are
+        re-read immediately before the key, so a replaced dialog or a different call
+        receives nothing. With the worker's transcript, it also records whether the
+        text had already reached the worker while the dialog was still open, which
+        would mean the answer was sent without the user's confirmation.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$TaskId,
+        [Parameter(Mandatory)][string]$Text,
+        [Parameter(Mandatory)][string]$TranscriptPath,
+        [string]$WorkerTranscriptPath = '',
+        [double]$TimeoutSeconds = 180
+    )
+    $result = [pscustomobject]@{ Observed = $false; Confirmed = $false; DeliveredBeforeConfirm = $false; Screen = '' }
+    $wait = Wait-Until -TimeoutSeconds $TimeoutSeconds -IntervalSeconds 2 -What "answer confirmation for task $TaskId" -Probe {
+        # Herdr reports the primary "working", not "blocked", while an extension's
+        # confirmation dialog is open (seen live in run da682eab), so the status is
+        # not a gate; like Confirm-PrimaryModal, the exact visible dialog and the
+        # transcript's tool call are.
+        $screen = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100
+        if (-not (Test-PrimaryAnswerConfirmScreen -Screen $screen -TaskId $TaskId -Text $Text)) { return $null }
+        if (-not (Test-OmpTranscriptContainsAnswerToolCall -Path $TranscriptPath -TaskId $TaskId -Text $Text)) { return $null }
+        return $true
+    }
+    if (-not $wait.Ok) {
+        $result.Screen = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100
+        return $result
+    }
+    $result.Observed = $true
+    if (-not [string]::IsNullOrWhiteSpace($WorkerTranscriptPath)) {
+        $result.DeliveredBeforeConfirm = [bool](Test-OmpTranscriptContainsExactUserMessage -Path $WorkerTranscriptPath -Text $Text)
+    }
+    # A text already in the worker's session was sent without the user: confirming
+    # now would send it a second time, so nothing is pressed.
+    if ($result.DeliveredBeforeConfirm) { return $result }
+    if (-not (Test-OmpTranscriptContainsAnswerToolCall -Path $TranscriptPath -TaskId $TaskId -Text $Text)) { return $result }
+    $screen = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100
+    $result.Screen = $screen
+    if (-not (Test-PrimaryAnswerConfirmScreen -Screen $screen -TaskId $TaskId -Text $Text)) { return $result }
+    $sent = Send-AgentKeys -PaneId $script:PrimaryPane -Keys @('enter')
+    [void]($script:PrimarySendKeysUsed += 'enter')
+    $result.Confirmed = ($sent.ExitCode -eq 0)
+    return $result
 }
 
 function Resolve-PrimaryDispositionAsk {
@@ -5036,6 +5160,31 @@ function Invoke-PrimaryPromptAfterDispositionAsks {
 }
 
 function Invoke-PrimaryPromptNoWaitAfterDispositionAsks {
+    <#
+        The no-wait twin of Invoke-PrimaryPromptAfterDispositionAsks, with the same
+        single retry: a primary seen blocked before anything was submitted gets its
+        pending disposition Asks resolved once and the prompt is tried once more.
+        The prompt itself is never submitted while the primary is blocked; between
+        the attempts only Resolve-PendingPrimaryDispositionAsks may press Enter, and
+        only on a disposition Ask it recognizes exactly.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$PaneId,
+        [Parameter(Mandatory)][string]$Text,
+        [double]$TimeoutSeconds = 300,
+        [string]$AssertionPrefix = 'prompt'
+    )
+    $result = Invoke-PrimaryPromptNoWaitOnce -PaneId $PaneId -Text $Text -TimeoutSeconds $TimeoutSeconds -AssertionPrefix $AssertionPrefix
+    if ($result.Blocked -and $result.Code -eq 'agent_blocked' -and -not $result.Submitted) {
+        $pending = Resolve-PendingPrimaryDispositionAsks -AssertionPrefix $AssertionPrefix -TimeoutSeconds 60
+        if ($pending.Resolved) {
+            $result = Invoke-PrimaryPromptNoWaitOnce -PaneId $PaneId -Text $Text -TimeoutSeconds $TimeoutSeconds -AssertionPrefix $AssertionPrefix
+        }
+    }
+    return $result
+}
+
+function Invoke-PrimaryPromptNoWaitOnce {
     param(
         [Parameter(Mandatory)][string]$PaneId,
         [Parameter(Mandatory)][string]$Text,
@@ -5274,13 +5423,23 @@ function Invoke-BlockedDialog {
         throw 'the blocked worker dialog remained active after the user confirmation'
     }
     $reportPrompt = 'ACCEPT-B-REPORT-TRIGGER. Call the orch_answer tool exactly once with taskId "' + $idB + '" and text "ACCEPT-REPORT-B". Then reply with the words report token sent.'
-    $reportResult = Invoke-PrimaryPromptAfterDispositionAsks -PaneId $script:PrimaryPane -Text $reportPrompt -TimeoutSeconds 240 -AssertionPrefix 'K6'
+    # orch_answer waits for the user to confirm the exact text, so the prompt is
+    # submitted without --wait and Confirm-PrimaryAnswerModal gates the Enter.
+    $reportResult = Invoke-PrimaryPromptNoWaitAfterDispositionAsks -PaneId $script:PrimaryPane -Text $reportPrompt -TimeoutSeconds 240 -AssertionPrefix 'K6'
     $primaryReady = Get-ReadySession -LaunchPaneId ([string](Get-Field $script:Project 'LaunchPaneID'))
     $primaryTranscript = [string](Get-Field $primaryReady 'omp_session_file')
     $workerReady = Get-ReadySession -LaunchPaneId ([string](Get-Field $script:TaskB 'LaunchPaneID'))
     $workerTranscript = [string](Get-Field $workerReady 'omp_session_file')
     $reportDelivery = [pscustomobject]@{ Ok = $false }
+    $reportModal = [pscustomobject]@{ Observed = $false; Confirmed = $false; DeliveredBeforeConfirm = $false; Screen = '' }
     if ($reportResult.Submitted) {
+        $reportModal = Confirm-PrimaryAnswerModal -TaskId $idB -Text 'ACCEPT-REPORT-B' -TranscriptPath $primaryTranscript `
+            -WorkerTranscriptPath $workerTranscript
+        Assert-True -Id 'K6.3a' -What 'the report token had not reached worker B before the user confirmed the exact answer dialog' `
+            -Condition ($reportModal.Observed -and -not $reportModal.DeliveredBeforeConfirm) -TaskId $idB `
+            -Evidence ("observed=[$($reportModal.Observed)] confirmed=[$($reportModal.Confirmed)] delivered_before_confirm=[$($reportModal.DeliveredBeforeConfirm)] screen=" + (Protect-Text $reportModal.Screen 400))
+    }
+    if ($reportModal.Confirmed) {
         $reportDelivery = Wait-Until -TimeoutSeconds 300 -IntervalSeconds 3 -What 'exact B report authorization orch_answer reached the worker transcript' -Probe {
             $answerCall = Test-OmpTranscriptContainsAnswerToolCall -Path $primaryTranscript -TaskId $idB -Text 'ACCEPT-REPORT-B'
             $workerMessage = Test-OmpTranscriptContainsExactUserMessage -Path $workerTranscript -Text 'ACCEPT-REPORT-B'
@@ -5290,10 +5449,10 @@ function Invoke-BlockedDialog {
     }
     $reportAnswerCallObserved = Test-OmpTranscriptContainsAnswerToolCall -Path $primaryTranscript -TaskId $idB -Text 'ACCEPT-REPORT-B'
     $reportTokenObserved = Test-OmpTranscriptContainsExactUserMessage -Path $workerTranscript -Text 'ACCEPT-REPORT-B'
-    $reportSent = [bool]($reportResult.Submitted -and $reportDelivery.Ok -and $reportAnswerCallObserved -and $reportTokenObserved)
-    Assert-True -Id 'K6.3' -What 'the primary called orch_answer for worker B and the exact report token reached its transcript' `
+    $reportSent = [bool]($reportResult.Submitted -and $reportModal.Confirmed -and $reportDelivery.Ok -and $reportAnswerCallObserved -and $reportTokenObserved)
+    Assert-True -Id 'K6.3' -What 'the primary called orch_answer for worker B, the user confirmed its exact text, and the report token reached its transcript' `
         -Condition $reportSent -TaskId $idB -Command $reportResult.CommandLine `
-        -Evidence ("code=[$($reportResult.Code)] submitted=[$($reportResult.Submitted)] answerCall=[$reportAnswerCallObserved] tokenDelivered=[$reportTokenObserved] workerSession=[$(Protect-Text $workerTranscript 300)]")
+        -Evidence ("code=[$($reportResult.Code)] submitted=[$($reportResult.Submitted)] confirmed=[$($reportModal.Confirmed)] answerCall=[$reportAnswerCallObserved] tokenDelivered=[$reportTokenObserved] workerSession=[$(Protect-Text $workerTranscript 300)]")
     if (-not $reportSent) {
         Preserve-ResourcesForPendingTool -AssertionId 'K6.3.resources-preserved' -Reason 'worker B report authorization delivery was not proven'
         throw 'the exact orch_answer call and later worker user message were not proven; no retry was sent'

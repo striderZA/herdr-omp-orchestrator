@@ -20,6 +20,7 @@
 // or point OMP_TYPED_BUILDER straight at the zod module file.
 import extension, {
   adjudicateConfirmRequest,
+  answerConfirmRequest,
   afterTurnRefresh,
   cleanupConfirmRequest,
   confirmThen,
@@ -31,6 +32,7 @@ import extension, {
   recordTicketMoveWithConsent,
   recordTicketReviewWithConsent,
   refreshReady,
+  sendAnswerWithConsent,
   settleConfirmRequest,
   uiGate,
   warnOnce,
@@ -936,6 +938,132 @@ async function checkTicketConsent(): Promise<void> {
 }
 
 await checkTicketConsent();
+
+// An answer is input injection: the model proposes the text, and only the user's
+// confirmation of that exact text lets it reach the worker. Declining, failing
+// to confirm and a session with no UI all send nothing; what is sent is exactly
+// what the dialog showed.
+async function checkAnswerConsent(): Promise<void> {
+  // A text with a quote, a backslash, a newline and a trailing space: the dialog
+  // must show it JSON-quoted so none of them hides inside what the user approves.
+  const text = 'Keep the "old" API.\nPath: C:\\repo ';
+  const plan = answerConfirmRequest("orch_abc", text);
+  if (!plan.ok) {
+    failures.push(`the answer confirmation was refused: ${plan.reason}`);
+  } else {
+    check(
+      plan.request.title === "Send answer to worker",
+      `the answer confirmation is titled ${JSON.stringify(plan.request.title)}`,
+    );
+    check(
+      plan.request.message ===
+        "Confirm sending this answer to the worker of task orch_abc:\n" +
+          `Answer: ${JSON.stringify(text)}\n` +
+          "It is typed into that worker's session as your reply. Decline if this is not your answer.",
+      `the answer confirmation does not show the task and the JSON-quoted text: ${JSON.stringify(plan.request.message)}`,
+    );
+  }
+  check(!answerConfirmRequest("", text).ok, "the answer confirmation accepted no task");
+  check(!answerConfirmRequest("orch_abc", "").ok, "the answer confirmation accepted an empty answer");
+
+  const sent: Array<{ taskId: string; text: string }> = [];
+  const send = async (params: { taskId: string; text: string }) => {
+    sent.push(params);
+    return { delivered: true };
+  };
+  let prompts = 0;
+  const noUI = await sendAnswerWithConsent(
+    { hasUI: false, confirm: async () => { prompts++; return true; } },
+    "orch_abc",
+    text,
+    send,
+  );
+  check(!noUI.ok && prompts === 0 && sent.length === 0, "an answer was asked for or sent without an interactive UI");
+
+  let shown = { title: "", message: "" };
+  const declined = await sendAnswerWithConsent(
+    { hasUI: true, confirm: async (title, message) => { shown = { title, message }; return false; } },
+    "orch_abc",
+    text,
+    send,
+  );
+  check(!declined.ok && sent.length === 0, "a declined answer was sent");
+  check(
+    shown.title === "Send answer to worker" && shown.message.includes(JSON.stringify(text)) && shown.message.includes("orch_abc"),
+    `the answer dialog did not show the task and the exact text: ${JSON.stringify(shown)}`,
+  );
+
+  const failed = await sendAnswerWithConsent(
+    { hasUI: true, confirm: async () => { throw new Error("dialog closed"); } },
+    "orch_abc",
+    text,
+    send,
+  );
+  check(!failed.ok && sent.length === 0, "an answer was sent after its confirmation failed");
+
+  const approved = await sendAnswerWithConsent(
+    { hasUI: true, confirm: async (title, message) => { shown = { title, message }; return true; } },
+    "orch_abc",
+    text,
+    send,
+  );
+  check(approved.ok && sent.length === 1, `a confirmed answer was sent ${sent.length} times, want 1`);
+  check(
+    sent[0]?.taskId === "orch_abc" && sent[0]?.text === text && shown.message.includes(`Answer: ${JSON.stringify(sent[0]?.text)}`),
+    `the text sent ${JSON.stringify(sent[0])} is not the text confirmed`,
+  );
+
+  // The tool itself refuses a session with no UI before it reaches the bridge.
+  const tool = tools.find((candidate) => candidate.name === "orch_answer") as
+    | (RegisteredTool & {
+        execute: (
+          callId: string,
+          params: Record<string, unknown>,
+          signal: AbortSignal,
+          update: undefined,
+          ctx: unknown,
+        ) => Promise<{ isError?: boolean; content: Array<{ text: string }> }>;
+      })
+    | undefined;
+  if (!tool) {
+    failures.push("orch_answer was not registered");
+    return;
+  }
+  let toolPrompts = 0;
+  try {
+    const outcome = await tool.execute("orch_answer-no-ui", { taskId: "orch_abc", text }, new AbortController().signal, undefined, {
+      hasUI: false,
+      ui: { confirm: async () => { toolPrompts++; return true; } },
+      sessionManager: {
+        getSessionId: () => "sess-1",
+        getSessionFile: () => "C:/session.jsonl",
+        isSessionOnDisk: () => true,
+      },
+    });
+    check(outcome.isError === true, "orch_answer proceeded without an interactive UI");
+    check(toolPrompts === 0, "orch_answer asked for confirmation without an interactive UI");
+  } catch (error) {
+    failures.push(`orch_answer reached the bridge without a UI: ${String(error)}`);
+  }
+  // A declined confirmation returns before the bridge is spawned, so it neither
+  // throws nor sends.
+  try {
+    const declinedTool = await tool.execute("orch_answer-declined", { taskId: "orch_abc", text }, new AbortController().signal, undefined, {
+      hasUI: true,
+      ui: { confirm: async () => false },
+      sessionManager: {
+        getSessionId: () => "sess-1",
+        getSessionFile: () => "C:/session.jsonl",
+        isSessionOnDisk: () => true,
+      },
+    });
+    check(declinedTool.isError === true, "orch_answer proceeded after the user declined");
+  } catch (error) {
+    failures.push(`orch_answer reached the bridge after the user declined: ${String(error)}`);
+  }
+}
+
+await checkAnswerConsent();
 
 
 // --- the user-confirmed gates ----------------------------------------------
