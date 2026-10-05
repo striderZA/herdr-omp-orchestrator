@@ -4777,8 +4777,10 @@ function Confirm-PrimaryAnswerModal {
     )
     $result = [pscustomobject]@{ Observed = $false; Confirmed = $false; DeliveredBeforeConfirm = $false; Screen = '' }
     $wait = Wait-Until -TimeoutSeconds $TimeoutSeconds -IntervalSeconds 2 -What "answer confirmation for task $TaskId" -Probe {
-        $live = Get-LiveAgent -Target $script:PrimaryPane
-        if (-not $live.Found -or [string](Get-Field $live.Agent 'agent_status') -ne 'blocked') { return $null }
+        # Herdr reports the primary "working", not "blocked", while an extension's
+        # confirmation dialog is open (seen live in run da682eab), so the status is
+        # not a gate; like Confirm-PrimaryModal, the exact visible dialog and the
+        # transcript's tool call are.
         $screen = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100
         if (-not (Test-PrimaryAnswerConfirmScreen -Screen $screen -TaskId $TaskId -Text $Text)) { return $null }
         if (-not (Test-OmpTranscriptContainsAnswerToolCall -Path $TranscriptPath -TaskId $TaskId -Text $Text)) { return $null }

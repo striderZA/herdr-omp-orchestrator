@@ -1495,9 +1495,16 @@ $answerOtherText = Confirm-PrimaryAnswerModal -TaskId 'orch_abc' -Text 'ACCEPT-R
 Check 'answer confirmer refuses a dialog showing another text without sending keys' (-not $answerOtherText.Confirmed -and $script:SentKeysCallsForTest.Count -eq 0) (Get-Json $answerOtherText)
 $answerNoCall = Confirm-PrimaryAnswerModal -TaskId 'orch_abc' -Text 'ACCEPT-REPORT-B' -TranscriptPath $answerWorkerTranscriptPath -TimeoutSeconds 1
 Check 'answer confirmer refuses a dialog the primary transcript does not hold an orch_answer call for' (-not $answerNoCall.Confirmed -and $script:SentKeysCallsForTest.Count -eq 0) (Get-Json $answerNoCall)
+# Herdr reports the primary "working" while an extension dialog is open, so the
+# status is not consulted: the exact visible dialog and the transcript call are.
 $script:PrimaryAgentStatusForTest = 'working'
-$answerNotBlocked = Confirm-PrimaryAnswerModal -TaskId 'orch_abc' -Text 'ACCEPT-REPORT-B' -TranscriptPath $answerPrimaryTranscriptPath -TimeoutSeconds 1
-Check 'answer confirmer sends nothing while the primary is not blocked on a dialog' (-not $answerNotBlocked.Observed -and $script:SentKeysCallsForTest.Count -eq 0) (Get-Json $answerNotBlocked)
+$answerWhileWorking = Confirm-PrimaryAnswerModal -TaskId 'orch_abc' -Text 'ACCEPT-REPORT-B' -TranscriptPath $answerPrimaryTranscriptPath -TimeoutSeconds 1
+Check 'answer confirmer confirms the exact dialog even while Herdr reports the primary working' ($answerWhileWorking.Confirmed -and $script:SentKeysCallsForTest.Count -eq 1) (Get-Json $answerWhileWorking)
+$script:SentKeysCallsForTest = @()
+$script:PrimaryScreenForTest = "Answer worker`n  taskId=`"orch_abc`", text=`"ACCEPT-REPORT-B`"`nWorking..."
+$answerNoDialog = Confirm-PrimaryAnswerModal -TaskId 'orch_abc' -Text 'ACCEPT-REPORT-B' -TranscriptPath $answerPrimaryTranscriptPath -TimeoutSeconds 1
+Check 'answer confirmer sends nothing when no answer dialog is on screen' (-not $answerNoDialog.Observed -and $script:SentKeysCallsForTest.Count -eq 0) (Get-Json $answerNoDialog)
+$script:PrimaryScreenForTest = $answerScreen
 $script:PrimaryAgentStatusForTest = 'blocked'
 Add-Content -LiteralPath $answerWorkerTranscriptPath -Encoding UTF8 -Value '{"type":"message","message":{"role":"user","content":[{"type":"text","text":"ACCEPT-REPORT-B"}]}}'
 $answerAlreadyDelivered = Confirm-PrimaryAnswerModal -TaskId 'orch_abc' -Text 'ACCEPT-REPORT-B' -TranscriptPath $answerPrimaryTranscriptPath -WorkerTranscriptPath $answerWorkerTranscriptPath -TimeoutSeconds 1
