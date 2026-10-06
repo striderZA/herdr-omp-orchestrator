@@ -45,6 +45,21 @@ type Report struct {
 	Risk                  string
 }
 
+// CleanupAttempt is the durable intent for a user-confirmed checkout removal.
+// Its path and branch stay fixed while an interrupted removal is inspected.
+type CleanupAttempt struct {
+	Path        string
+	Branch      string
+	WorkspaceID string
+	RootPaneID  string
+	// Opening records a worktree.open call before it runs and remains set until
+	// Herdr's returned workspace has been durably recorded.
+	Opening bool
+	// Refused is set after a forced or contradictory removal result; such an
+	// outcome needs manual inspection and is never settled automatically.
+	Refused bool
+}
+
 // Task is the durable record of one unit of work.
 type Task struct {
 	ID, ProjectKey, Title, Brief, BaseRevision, Branch  string
@@ -64,6 +79,8 @@ type Task struct {
 	// task is created and never changes, so work cannot be linked to a ticket
 	// after the fact; a task without one reads as unlinked.
 	TicketID string
+	// Cleanup stays non-nil only while a confirmed removal is unsettled.
+	Cleanup *CleanupAttempt `json:",omitempty"`
 }
 
 // The kinds of decision a primary can record. Every kind closes the task, frees

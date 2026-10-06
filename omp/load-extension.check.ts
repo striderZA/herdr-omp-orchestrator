@@ -1174,6 +1174,7 @@ async function checkGates(): Promise<void> {
 
   const checkout = {
     taskId: "orch_abc",
+    revision: 7,
     branch: "orch/abc",
     path: "C:/worktrees/orch-abc",
     workspaceId: "w7",
@@ -1181,6 +1182,9 @@ async function checkGates(): Promise<void> {
     clean: true,
     liveWorker: false,
     removable: true,
+    alreadyRemoved: false,
+    reopenRequired: false,
+    reopening: false,
     detail: "removes the checkout",
   };
   const removal = cleanupConfirmRequest(checkout);
@@ -1198,22 +1202,64 @@ async function checkGates(): Promise<void> {
       );
     }
   }
+  const interruptedCleanup = cleanupConfirmRequest({
+    ...checkout,
+    alreadyRemoved: true,
+    detail: "checkout already absent; branch retained",
+  });
+  if (!interruptedCleanup.ok) {
+    failures.push(`the interrupted cleanup was refused: ${interruptedCleanup.reason}`);
+  } else {
+    check(
+      interruptedCleanup.request.title === "Settle interrupted checkout cleanup",
+      `the interrupted cleanup confirmation is titled ${JSON.stringify(interruptedCleanup.request.title)}`,
+    );
+    check(
+      interruptedCleanup.request.message.includes("No checkout removal will be attempted."),
+      `the interrupted cleanup confirmation does not rule out another removal: ${JSON.stringify(interruptedCleanup.request.message)}`,
+    );
+  }
+  check(
+    !cleanupConfirmRequest({ ...checkout, alreadyRemoved: true, removable: false }).ok,
+    "the interrupted cleanup accepted unverified absence",
+  );
+  const reopening = cleanupConfirmRequest({ ...checkout, reopening: true });
+  if (!reopening.ok) {
+    failures.push(`the interrupted reopen was refused: ${reopening.reason}`);
+  } else {
+    check(
+      reopening.request.message.includes("workspace w7") &&
+        reopening.request.message.includes("reverified before removal"),
+      `the interrupted reopen confirmation does not name its workspace: ${JSON.stringify(reopening.request.message)}`,
+    );
+  }
   check(!cleanupConfirmRequest({ ...checkout, reviewed: false }).ok, "the removal accepted an unreviewed task");
   check(!cleanupConfirmRequest({ ...checkout, liveWorker: true }).ok, "the removal accepted a live worker");
   check(!cleanupConfirmRequest({ ...checkout, clean: false, detail: "?? notes.txt" }).ok, "the removal accepted a dirty checkout");
   check(!cleanupConfirmRequest({ ...checkout, path: "" }).ok, "the removal accepted a task with no recorded checkout");
+  check(!cleanupConfirmRequest({ ...checkout, revision: 0 }).ok, "the removal accepted a preview without a revision");
+  check(
+    !cleanupConfirmRequest({ ...checkout, removable: false, detail: "workspace provenance is unknown" }).ok,
+    "the removal accepted a preview without safe provenance",
+  );
+
 
   // A checkout Herdr no longer holds in a workspace is still removable: the
   // bridge opens it by its recorded path first, which is the state a move leaves
   // behind. The confirmation must say so instead of naming a workspace.
-  const unheld = cleanupConfirmRequest({ ...checkout, workspaceId: "", detail: "opens it by its recorded path first" });
+  const unheld = cleanupConfirmRequest({
+    ...checkout,
+    workspaceId: "",
+    reopenRequired: true,
+    detail: "opens it by its recorded path first",
+  });
   if (!unheld.ok) {
     failures.push(`the removal refused a checkout no workspace holds: ${unheld.reason}`);
   } else {
     check(
       unheld.request.message.includes(checkout.path) &&
-        unheld.request.message.includes("opened by its recorded path first"),
-      `the unheld-checkout confirmation does not explain the re-open: ${JSON.stringify(unheld.request.message)}`,
+        unheld.request.message.includes("fresh confirmation"),
+      `the unheld-checkout confirmation does not explain its follow-up preview: ${JSON.stringify(unheld.request.message)}`,
     );
   }
 

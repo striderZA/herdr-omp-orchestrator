@@ -159,13 +159,17 @@ interface DialogPreview {
 // branch, which exact path, and whether removing it is allowed at all.
 interface CleanupPreview {
   taskId: string;
+  revision: number;
   branch: string;
   path: string;
   workspaceId: string;
+  reopenRequired: boolean;
   reviewed: boolean;
   clean: boolean;
   liveWorker: boolean;
   removable: boolean;
+  alreadyRemoved: boolean;
+  reopening: boolean;
   detail: string;
 }
 
@@ -260,12 +264,16 @@ function readCleanupPreview(value: unknown): CleanupPreview {
   return {
     taskId: previewText(value, "taskId"),
     branch: previewText(value, "branch"),
+    revision: previewNumber(value, "revision"),
     path: previewText(value, "path"),
     workspaceId: previewText(value, "workspaceId"),
     reviewed: previewFlag(value, "reviewed"),
     clean: previewFlag(value, "clean"),
     liveWorker: previewFlag(value, "liveWorker"),
     removable: previewFlag(value, "removable"),
+    alreadyRemoved: previewFlag(value, "alreadyRemoved"),
+    reopenRequired: previewFlag(value, "reopenRequired"),
+    reopening: previewFlag(value, "reopening"),
     detail: previewText(value, "detail"),
   };
 }
@@ -347,8 +355,34 @@ export function cleanupConfirmRequest(preview: CleanupPreview): ConfirmPlan {
       reason: `task ${preview.taskId} is not a reviewed done task, so its checkout may not be removed`,
     };
   }
+  if (!Number.isSafeInteger(preview.revision) || preview.revision <= 0) {
+    return { ok: false, reason: `the cleanup preview for task ${preview.taskId} has no confirmed revision` };
+  }
+
+  if (preview.alreadyRemoved) {
+    if (!preview.removable || preview.path.length === 0 || preview.branch.length === 0) {
+      return { ok: false, reason: `the interrupted cleanup for task ${preview.taskId} is not proven complete` };
+    }
+    return {
+      ok: true,
+      request: {
+        title: "Settle interrupted checkout cleanup",
+        message:
+          `Task ${preview.taskId}: checkout ${preview.path} is already absent and branch ${preview.branch} is retained. ` +
+          "Confirm to settle the cleanup record. No checkout removal will be attempted.",
+      },
+    };
+  }
   if (preview.liveWorker) {
     return { ok: false, reason: `the worker agent of task ${preview.taskId} is still running` };
+  }
+  if (!preview.removable) {
+    return {
+      ok: false,
+      reason: preview.detail.length > 0
+        ? `the checkout ${preview.path} cannot be removed: ${preview.detail}`
+        : `the cleanup preview for task ${preview.taskId} did not prove removal is safe`,
+    };
   }
   if (!preview.clean) {
     return { ok: false, reason: `the checkout ${preview.path} is not clean: ${preview.detail}` };
@@ -359,10 +393,13 @@ export function cleanupConfirmRequest(preview: CleanupPreview): ConfirmPlan {
   // A checkout Herdr no longer holds in a workspace is still removable: the bridge
   // opens it by its recorded path first, which it does for the moved state a pane
   // move leaves behind. The user is told which of the two is about to happen.
-  const where =
-    preview.workspaceId.length > 0
-      ? `workspace ${preview.workspaceId}`
-      : "no workspace currently holds it, so it is opened by its recorded path first";
+  const where = preview.reopenRequired
+    ? "no workspace currently holds it; the exact checkout will be reopened, then its returned workspace will be shown in a fresh confirmation before removal"
+    : preview.reopening
+      ? `workspace ${preview.workspaceId} from interrupted cleanup is reverified before removal`
+      : preview.workspaceId.length > 0
+        ? `workspace ${preview.workspaceId}`
+        : "no workspace currently holds it, so it is opened by its recorded path first";
   return {
     ok: true,
     request: {
@@ -1346,7 +1383,12 @@ export default function (pi: ExtensionAPI) {
       const plan = cleanupConfirmRequest(preview);
       if (!plan.ok) return toolRefusal(plan.reason);
       const gated = await confirmThen(uiGate(ctx), plan.request, () =>
-        callBridge("cleanup", { taskId: params.taskId }, identity, signal),
+        callBridge("cleanup", {
+          taskId: params.taskId,
+          revision: preview.revision,
+          alreadyRemoved: preview.alreadyRemoved,
+          workspaceId: preview.workspaceId,
+        }, identity, signal),
       );
       if (!gated.ok) return toolRefusal(gated.reason);
       return toolResult(gated.value);

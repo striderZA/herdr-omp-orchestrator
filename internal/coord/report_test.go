@@ -908,6 +908,7 @@ func TestReportOnlyAPrimaryDispositionMovesATaskToDone(t *testing.T) {
 		t.Errorf("the disposition lost the reviewed report: %+v", done.Report)
 	}
 }
+
 func TestReviewPreviewShowsDurableReportAndRefusesStaleDecision(t *testing.T) {
 	f := newReportFixture(t)
 	project, worker := f.seed()
@@ -1481,7 +1482,7 @@ func TestCleanupProvenanceFollowsTheRecordedCheckout(t *testing.T) {
 		// destination; the source workspace may already be closed.
 		listed := &herdr.WorktreeList{Worktrees: []herdr.WorktreeInfo{
 			{Path: filepath.Dir(checkout), Branch: new("main")},
-			{Path: checkout, Branch: new(branch), OpenWorkspaceID: new("w9")},
+			{Path: checkout, Branch: new(branch), OpenWorkspaceID: new("w9"), IsLinkedWorktree: true},
 		}}
 		target, err := provenanceWorkspace(worker, listed)
 		if err != nil {
@@ -1500,10 +1501,52 @@ func TestCleanupProvenanceFollowsTheRecordedCheckout(t *testing.T) {
 			t.Fatalf("provenanceWorkspace err = %v, want ErrProvenance", err)
 		}
 	})
+	t.Run("an unclassified worktree prevents an absent-checkout conclusion", func(t *testing.T) {
+		other := filepath.Join(filepath.Dir(checkout), "unknown")
+		listed := &herdr.WorktreeList{Worktrees: []herdr.WorktreeInfo{
+			{Path: other, IsLinkedWorktree: true},
+		}}
+		attempt := task.CleanupAttempt{Path: checkout, Branch: branch, WorkspaceID: "w7"}
+		if _, _, err := cleanupListingTarget(worker, attempt, listed); !errors.Is(err, ErrProvenance) {
+			t.Fatalf("cleanupListingTarget err = %v, want ErrProvenance", err)
+		}
+	})
+	t.Run("a detached stale branch report does not block absent-checkout settlement", func(t *testing.T) {
+		other := filepath.Join(filepath.Dir(checkout), "detached")
+		listed := &herdr.WorktreeList{Worktrees: []herdr.WorktreeInfo{
+			{Path: other, Branch: new(branch), IsDetached: true},
+		}}
+		attempt := task.CleanupAttempt{Path: checkout, Branch: branch, WorkspaceID: "w7"}
+		_, absent, err := cleanupListingTarget(worker, attempt, listed)
+		if err != nil || !absent {
+			t.Fatalf("cleanupListingTarget = absent %t, err %v; want stale detached branch ignored", absent, err)
+		}
+	})
+	t.Run("an attached entry on the task branch prevents absent-checkout settlement", func(t *testing.T) {
+		other := filepath.Join(filepath.Dir(checkout), "attached")
+		listed := &herdr.WorktreeList{Worktrees: []herdr.WorktreeInfo{
+			{Path: other, Branch: new(branch), IsLinkedWorktree: true},
+		}}
+		attempt := task.CleanupAttempt{Path: checkout, Branch: branch, WorkspaceID: "w7"}
+		if _, _, err := cleanupListingTarget(worker, attempt, listed); !errors.Is(err, ErrProvenance) {
+			t.Fatalf("cleanupListingTarget err = %v, want ErrProvenance for an attached task branch", err)
+		}
+	})
+	t.Run("a detached entry without a branch cannot conceal a checked-out branch", func(t *testing.T) {
+		other := filepath.Join(filepath.Dir(checkout), "detached-without-branch")
+		listed := &herdr.WorktreeList{Worktrees: []herdr.WorktreeInfo{
+			{Path: other, IsDetached: true},
+		}}
+		attempt := task.CleanupAttempt{Path: checkout, Branch: branch, WorkspaceID: "w7"}
+		_, absent, err := cleanupListingTarget(worker, attempt, listed)
+		if err != nil || !absent {
+			t.Fatalf("cleanupListingTarget = absent %t, err %v; want detached entry ignored and exact checkout absent", absent, err)
+		}
+	})
 
 	t.Run("the recorded branch must match", func(t *testing.T) {
 		listed := &herdr.WorktreeList{Worktrees: []herdr.WorktreeInfo{
-			{Path: checkout, Branch: new("orch/bbbbbbbbbbbb"), OpenWorkspaceID: new("w9")},
+			{Path: checkout, Branch: new("orch/bbbbbbbbbbbb"), OpenWorkspaceID: new("w9"), IsLinkedWorktree: true},
 		}}
 		if _, err := provenanceWorkspace(worker, listed); !errors.Is(err, ErrProvenance) {
 			t.Fatalf("provenanceWorkspace err = %v, want ErrProvenance", err)
@@ -1514,7 +1557,7 @@ func TestCleanupProvenanceFollowsTheRecordedCheckout(t *testing.T) {
 		// A workspace this task never recorded is not its checkout: a human
 		// decides what happened to it.
 		listed := &herdr.WorktreeList{Worktrees: []herdr.WorktreeInfo{
-			{Path: checkout, Branch: new(branch), OpenWorkspaceID: new("w4")},
+			{Path: checkout, Branch: new(branch), OpenWorkspaceID: new("w4"), IsLinkedWorktree: true},
 		}}
 		if _, err := provenanceWorkspace(worker, listed); !errors.Is(err, ErrProvenance) {
 			t.Fatalf("provenanceWorkspace err = %v, want ErrProvenance", err)
@@ -1525,7 +1568,7 @@ func TestCleanupProvenanceFollowsTheRecordedCheckout(t *testing.T) {
 		// Herdr names no workspace for the checkout: the workspace that held it is
 		// gone, so the removal has to open the recorded checkout first.
 		listed := &herdr.WorktreeList{Worktrees: []herdr.WorktreeInfo{
-			{Path: checkout, Branch: new(branch)},
+			{Path: checkout, Branch: new(branch), IsLinkedWorktree: true},
 		}}
 		target, err := provenanceWorkspace(worker, listed)
 		if err != nil {
@@ -1538,7 +1581,7 @@ func TestCleanupProvenanceFollowsTheRecordedCheckout(t *testing.T) {
 
 	t.Run("an unheld checkout with no recorded workspace is refused", func(t *testing.T) {
 		listed := &herdr.WorktreeList{Worktrees: []herdr.WorktreeInfo{
-			{Path: checkout, Branch: new(branch)},
+			{Path: checkout, Branch: new(branch), IsLinkedWorktree: true},
 		}}
 		unrecorded := worker
 		unrecorded.WorktreeWorkspaceID = ""
