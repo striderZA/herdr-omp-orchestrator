@@ -938,6 +938,46 @@ func TestEventWorkerStatusIsRecordedOncePerTransitionAndNeverCompletes(t *testin
 	}
 }
 
+func TestStaleWorkerStatusCannotOverwriteNewerIdleObservation(t *testing.T) {
+	ctx := context.Background()
+	f := newCoordFixture(t, fixturePlan{})
+	worker := f.boundWorker(t)
+	pane := worker.PublicPaneID
+
+	f.setAgentStatus(t, pane, "blocked")
+	f.mustHandle(t, EventAgentStatus, statusEventPayload(t, pane, "blocked"))
+	stale := f.taskByID(t, worker.ID)
+	if stale.Activity != "blocked" {
+		t.Fatalf("stale task snapshot activity = %q, want blocked", stale.Activity)
+	}
+
+	f.setAgentStatus(t, pane, "idle")
+	f.mustHandle(t, EventAgentStatus, statusEventPayload(t, pane, "idle"))
+	if current := f.taskByID(t, worker.ID); current.Activity != "idle" {
+		t.Fatalf("newer worker observation = %q, want idle", current.Activity)
+	}
+
+	// The delayed callback's probe captured this earlier working status before
+	// the idle observation was recorded.
+	f.setAgentStatus(t, pane, "working")
+
+	event := AgentStatusEvent{
+		Type:        eventKindAgentStatus,
+		PaneID:      pane,
+		WorkspaceID: workspaceOfPane(pane),
+		AgentStatus: "working",
+	}
+	if err := f.coord.observeWorkerStatus(ctx, stale, "working", event); err != nil {
+		t.Fatalf("apply the delayed working callback: %v", err)
+	}
+	if current := f.taskByID(t, worker.ID); current.Activity != "idle" {
+		t.Fatalf("stale working callback overwrote newer idle activity with %q", current.Activity)
+	}
+	if notes := f.notesOfKind(t, noteKindActivity); len(notes) != 2 {
+		t.Fatalf("activity notes = %d, want only the blocked and idle observations", len(notes))
+	}
+}
+
 func TestEventPrimaryStatusIsNotAWorkerNoticeAndIdleFlushesOnce(t *testing.T) {
 	f := newCoordFixture(t, fixturePlan{})
 	worker := f.boundWorker(t)

@@ -379,19 +379,31 @@ func (c *Coordinator) observeWorkerStatus(ctx context.Context, st task.Task, sta
 		// state it was last recorded in still retires the attention a vanished or
 		// unknown worker left behind.
 		_, err := c.record(ctx, st, func(next *task.Task) error {
+			if !sameWorkerStatusSnapshot(*next, st) {
+				return errSuperseded
+			}
 			settleLiveness(next, status)
 			return nil
 		}, "settle the worker's liveness attention")
+		if errors.Is(err, errSuperseded) {
+			return nil
+		}
 		return err
 	}
 
 	note := c.activityNote(st, previous, status, eventDigest(event), livenessEffect(st, settled))
 	updated, _, err := c.recordWithNote(ctx, st, func(next *task.Task) error {
+		if !sameWorkerStatusSnapshot(*next, st) {
+			return errSuperseded
+		}
 		next.Activity = status
 		next.ActivitySeenAt = time.Now().UnixMilli()
 		settleLiveness(next, status)
 		return nil
 	}, note, "record the observed worker status")
+	if errors.Is(err, errSuperseded) {
+		return nil
+	}
 	if err != nil {
 		return err
 	}
@@ -825,6 +837,16 @@ func sameTaskAttentionTarget(current, expected task.Task) bool {
 		current.OMPSessionID == expected.OMPSessionID &&
 		current.Attention == expected.Attention &&
 		current.Blocker == expected.Blocker
+}
+
+// sameWorkerStatusSnapshot accepts an observation only while its binding and
+// preceding activity still match the facts that the callback read. record and
+// recordWithNote retry revision conflicts, so this predicate is what prevents a
+// delayed callback from applying an older status after a newer observation.
+func sameWorkerStatusSnapshot(current, observed task.Task) bool {
+	return sameTaskAttentionTarget(current, observed) &&
+		current.Activity == observed.Activity &&
+		current.ActivitySeenAt == observed.ActivitySeenAt
 }
 
 // projectAttention records a durable attention note for a project. A project has
