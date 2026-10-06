@@ -1493,8 +1493,25 @@ func TestBindCreatesAWorkspaceWhenNoneRepresentsTheRoot(t *testing.T) {
 	if f.countCalls("workspace create") != 1 {
 		t.Errorf("workspace create calls = %d, want 1", f.countCalls("workspace create"))
 	}
-	created := f.calls()
-	argv := created[0].Argv
+	calls := f.calls()
+	snapshotIndex, workspaceCreateIndex := -1, -1
+	for i, call := range calls {
+		if len(call.Argv) < 2 {
+			continue
+		}
+		switch call.Argv[0] + " " + call.Argv[1] {
+		case "api snapshot":
+			if snapshotIndex < 0 {
+				snapshotIndex = i
+			}
+		case "workspace create":
+			workspaceCreateIndex = i
+		}
+	}
+	if snapshotIndex < 0 || workspaceCreateIndex <= snapshotIndex {
+		t.Fatalf("Herdr calls = %v, want the identity snapshot before workspace create", calls)
+	}
+	argv := calls[workspaceCreateIndex].Argv
 	if len(argv) != 5 || argv[0] != "workspace" || argv[1] != "create" || argv[2] != "--cwd" || argv[4] != "--no-focus" {
 		t.Errorf("workspace create argv = %q, want workspace create --cwd <root> --no-focus", argv)
 	}
