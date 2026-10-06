@@ -634,6 +634,43 @@ func TestReportMovesToReadyForReviewAndNotesOnce(t *testing.T) {
 	}
 }
 
+func TestDistinctFinalReportsBeyondInboxTruncationHaveDistinctNotes(t *testing.T) {
+	f := newReportFixture(t)
+	_, worker := f.seed()
+	ctx := context.Background()
+
+	firstReport := f.completeReport(worker)
+	firstReport.Evidence = make([]string, reportEvidenceLimit)
+	for i := range firstReport.Evidence {
+		firstReport.Evidence[i] = strings.Repeat("a", reportTextLimit)
+	}
+	secondReport := firstReport
+	secondReport.Evidence = append([]string(nil), firstReport.Evidence...)
+	secondReport.Evidence[len(secondReport.Evidence)-1] = "b" + strings.Repeat("a", reportTextLimit-1)
+
+	if _, err := f.coord.FinalReport(ctx, worker.LaunchPaneID, firstReport); err != nil {
+		t.Fatalf("record first final report: %v", err)
+	}
+	second, err := f.coord.FinalReport(ctx, worker.LaunchPaneID, secondReport)
+	if err != nil {
+		t.Fatalf("record revised final report: %v", err)
+	}
+	if second.Duplicate {
+		t.Fatal("distinct final report was reported as a duplicate")
+	}
+	notes := f.notes("result")
+	if len(notes) != 2 {
+		t.Fatalf("result notes = %d, want one for each distinct report", len(notes))
+	}
+	if notes[0].Summary != notes[1].Summary {
+		t.Fatal("the bounded display summaries should remain identical for evidence after the cut")
+	}
+	stored := f.reload(worker.ID).Report
+	if stored == nil || stored.Evidence[len(stored.Evidence)-1] != secondReport.Evidence[len(secondReport.Evidence)-1] {
+		t.Fatal("the revised full report was not stored")
+	}
+}
+
 // Every outcome a check can state is a recordable fact. A failed or skipped
 // check does not block the report: the worker says what happened, and the
 // primary and the user decide. The inbox note names each outcome, so a failure is
