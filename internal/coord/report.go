@@ -1632,19 +1632,14 @@ func cleanupListingTarget(st task.Task, attempt task.CleanupAttempt, listed *her
 			match = entry
 			continue
 		}
-		if entry.IsBare {
+		if entry.IsBare || entry.IsDetached {
 			continue
 		}
 		if entry.Branch == nil || strings.TrimSpace(*entry.Branch) == "" {
-			if entry.IsDetached {
-				continue
-			}
 			return checkoutTarget{}, false, fmt.Errorf("%w: worktree list does not identify the branch checked out at %s", ErrProvenance, entry.Path)
 		}
-		// Herdr can include a stale branch label on a detached entry. A matching
-		// label is contradictory evidence, so it cannot prove this branch is free.
 		if sameBranch(*entry.Branch, branch) {
-			return checkoutTarget{}, false, fmt.Errorf("%w: worktree list reports branch %s at %s instead of its recorded path %s", ErrProvenance, branch, entry.Path, path)
+			return checkoutTarget{}, false, fmt.Errorf("%w: branch %s is checked out at %s instead of its recorded path %s", ErrProvenance, branch, entry.Path, path)
 		}
 	}
 	if match != nil {
