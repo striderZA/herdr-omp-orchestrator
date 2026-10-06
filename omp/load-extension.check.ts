@@ -320,6 +320,24 @@ if (!dispatch) {
     dispatch.description.includes("duplicate:true") && dispatch.description.includes("already holds"),
     "orch_dispatch no longer tells the model that a repeat returns the existing task with duplicate:true",
   );
+  const manyDispatchItems = (count: number, prefix: string) =>
+    Array.from({ length: count }, (_, index) => `${prefix}${index}`);
+  check(
+    tryParse(schema, { ...payload, dependencies: manyDispatchItems(32, "dep") }).ok,
+    "orch_dispatch rejected 32 dependencies, which Go accepts",
+  );
+  check(
+    !tryParse(schema, { ...payload, dependencies: manyDispatchItems(33, "dep") }).ok,
+    "orch_dispatch accepted 33 dependencies, which Go refuses",
+  );
+  check(
+    tryParse(schema, { ...payload, reservedPaths: manyDispatchItems(32, "src/file") }).ok,
+    "orch_dispatch rejected 32 reserved paths, which Go accepts",
+  );
+  check(
+    !tryParse(schema, { ...payload, reservedPaths: manyDispatchItems(33, "src/file") }).ok,
+    "orch_dispatch accepted 33 reserved paths, which Go refuses",
+  );
 }
 
 // --- orch_report ------------------------------------------------------------
@@ -403,6 +421,16 @@ if (!report) {
   check(
     !tryParse(schema, { ...valid, evidence: [] }).ok,
     "orch_report accepted a report without changed-file/commit evidence",
+  );
+  const manyEvidence = (count: number) =>
+    Array.from({ length: count }, (_, index) => `evidence ${index}`);
+  check(
+    tryParse(schema, { ...valid, evidence: manyEvidence(64) }).ok,
+    "orch_report rejected 64 evidence items, which Go accepts",
+  );
+  check(
+    !tryParse(schema, { ...valid, evidence: manyEvidence(65) }).ok,
+    "orch_report accepted 65 evidence items, which Go refuses",
   );
   // One schema carries all three kinds, so each kind's own required fields must
   // still bite: a union that accepted `progress` without a summary would let a

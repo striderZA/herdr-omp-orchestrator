@@ -179,6 +179,9 @@ interface CleanupPreview {
 // The most checks one report may carry matches coord.reportChecksLimit.
 export const CHECK_OUTCOMES = ["passed", "failed", "skipped"] as const;
 const REPORT_CHECKS_MAX = 32;
+const DISPATCH_DEPENDENCIES_MAX = 32;
+const DISPATCH_RESERVED_PATHS_MAX = 32;
+const REPORT_EVIDENCE_MAX = 64;
 
 // Persisted report and revision returned by the primary-only report_preview
 // bridge operation. No model-supplied report text is used for confirmation.
@@ -1063,8 +1066,8 @@ export default function (pi: ExtensionAPI) {
       title: z.string().min(1).max(160),
       brief: z.string().min(1).max(16000),
       checks: z.array(z.string().min(1).max(512)).min(1),
-      dependencies: z.array(z.string()).default(() => []),
-      reservedPaths: z.array(z.string()).default(() => []),
+      dependencies: z.array(z.string()).max(DISPATCH_DEPENDENCIES_MAX).default(() => []),
+      reservedPaths: z.array(z.string()).max(DISPATCH_RESERVED_PATHS_MAX).default(() => []),
       baseRevision: z.string().min(7),
       // Optional: the ticket this work is for. The coordinator refuses an id that is
       // not a ticket of this project or is already decided.
@@ -1100,7 +1103,7 @@ export default function (pi: ExtensionAPI) {
         kind: z.literal("result"),
         summary: z.string().min(1).max(4000),
         branch: z.string().min(1),
-        evidence: z.array(z.string().min(1).max(512)).min(1),
+        evidence: z.array(z.string().min(1).max(512)).min(1).max(REPORT_EVIDENCE_MAX),
         // Each check says how it ended; the executable refuses a check without an
         // outcome as invalid_report (ADR 0003), so the schema asks for it up front.
         checks: z.array(z.object({
