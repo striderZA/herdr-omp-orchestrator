@@ -2292,6 +2292,8 @@ func TestEventPayloadSizeIsCheckedBeforeTrimming(t *testing.T) {
 		t.Fatalf("whitespace-only payload error = %q, want the empty-payload refusal", err)
 	}
 
+	f.setAgentStatus(t, worker.PublicPaneID, "idle")
+
 	// A payload at the bound passes the size gate and is applied: the padding is
 	// legal JSON whitespace around a real event.
 	atBound := inner + strings.Repeat(" ", MaxEventPayloadBytes-len(inner))
