@@ -66,6 +66,11 @@ interface StubAPI {
   on(event: string, handler: (...args: unknown[]) => unknown): void;
 }
 
+type ActivationBridgeStub = (
+  method: "resolve" | "ready",
+  identity: { id: string; file: string; onDisk: boolean },
+) => Promise<unknown>;
+
 // ExtensionHandler is one registered event handler, kept so the check can invoke
 // the hooks that run outside a turn (or at its end) by hand.
 type ExtensionHandler = (...args: unknown[]) => unknown;
@@ -138,7 +143,10 @@ const stub: StubAPI = {
 // Reason: OMP's ExtensionAPI is erased at runtime and far larger than the
 // surface the extension touches; this stub implements that surface and the
 // schemas it records are exercised immediately below.
-const load = extension as unknown as (api: StubAPI) => void;
+const load = extension as unknown as (
+  api: StubAPI,
+  options?: { activationBridge: ActivationBridgeStub },
+) => void;
 try {
   load(stub);
 } catch (error) {
@@ -1581,6 +1589,97 @@ async function checkSessionRefresh(): Promise<void> {
 }
 
 await checkSessionRefresh();
+async function checkResolveAttentionActivation(): Promise<void> {
+  const activationTools: RegisteredTool[] = [];
+  const activationHandlers = new Map<string, ExtensionHandler>();
+  const activeTools = new Set(["read", "write"]);
+  const activationStub: StubAPI = {
+    zod: z,
+    getActiveTools: () => [...activeTools],
+    setActiveTools: async (names: string[]) => {
+      activeTools.clear();
+      for (const name of names) activeTools.add(name);
+    },
+    registerTool: (tool: RegisteredTool) => activationTools.push(tool),
+    on: (event: string, handler: ExtensionHandler) => activationHandlers.set(event, handler),
+  };
+  let resolveResult: unknown = {
+    bound: false,
+    role: null,
+    reason: "ambiguous_session",
+    attention: "pane identity is ambiguous",
+    taskId: "",
+    projectKey: "C:/repo",
+  };
+  const bridgeMethods: string[] = [];
+  const activationBridge: ActivationBridgeStub = async (method) => {
+    bridgeMethods.push(method);
+    if (method === "resolve") return resolveResult;
+    return { acknowledged: true };
+  };
+  load(activationStub, { activationBridge });
+
+  const notices: { message: string; severity?: string }[] = [];
+  const context = {
+    hasUI: true,
+    ui: {
+      notify: (message: string, severity?: string) => notices.push({ message, severity }),
+      confirm: async () => false,
+    },
+    sessionManager: {
+      getSessionId: () => "sess-attention",
+      getSessionFile: () => "C:/sessions/attention.jsonl",
+      isSessionOnDisk: () => true,
+    },
+  };
+  const sessionStart = activationHandlers.get("session_start");
+  const beforeAgentStart = activationHandlers.get("before_agent_start");
+  if (!sessionStart || !beforeAgentStart) {
+    failures.push("the activation hooks were not registered for the attention test");
+    return;
+  }
+
+  const ownNames = activationTools.map((tool) => tool.name);
+  for (const name of ownNames) activeTools.add(name);
+  await sessionStart({}, context);
+  await beforeAgentStart({ systemPrompt: [] }, context);
+  await beforeAgentStart({ systemPrompt: [] }, context);
+  check(
+    notices.length === 1 && notices[0]?.severity === "warning" &&
+      notices[0]?.message.includes("pane identity is ambiguous"),
+    `attention-bearing unbound resolve produced ${notices.length} warnings: ${JSON.stringify(notices)}`,
+  );
+  check(
+    ownNames.every((name) => !activeTools.has(name)),
+    "attention-bearing unbound resolve activated orchestrator tools",
+  );
+  check(
+    bridgeMethods.filter((method) => method === "ready").length === 0,
+    "attention-bearing unbound resolve announced readiness",
+  );
+
+  resolveResult = {
+    bound: true,
+    role: "primary",
+    reason: "",
+    attention: "",
+    taskId: "",
+    projectKey: "C:/repo",
+  };
+  await beforeAgentStart({ systemPrompt: [] }, context);
+  check(notices.length === 1, "a later activation repeated the same attention warning");
+  check(
+    ownNames.filter((name) => name !== "orch_report").every((name) => activeTools.has(name)) &&
+      activeTools.has("orch_report") === false,
+    "a verified primary resolve did not activate only primary tools",
+  );
+  check(
+    bridgeMethods.filter((method) => method === "ready").length === 1,
+    "a verified primary resolve did not announce readiness exactly once",
+  );
+}
+
+await checkResolveAttentionActivation();
 
 if (failures.length > 0) {
   for (const failure of failures) console.error(`load check FAILED: ${failure}`);

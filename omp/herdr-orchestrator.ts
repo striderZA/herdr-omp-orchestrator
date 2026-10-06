@@ -92,6 +92,13 @@ interface SessionIdentity {
   onDisk: boolean;
 }
 
+type ActivationBridge = (method: "resolve" | "ready", identity: SessionIdentity) => Promise<unknown>;
+// The load check injects the activation boundary. Normal OMP loads omit this
+// option and use the plugin executable through callBridge.
+interface ExtensionOptions {
+  activationBridge?: ActivationBridge;
+}
+
 // sessionIdentity reads the identity surface once per call. getSessionFile() may
 // be undefined and isSessionOnDisk() may be false: OMP writes a session lazily,
 // on its first assistant message, so an allocated path is not yet a resumable
@@ -942,10 +949,12 @@ async function callBridge(
   });
 }
 
-export default function (pi: ExtensionAPI) {
+export default function (pi: ExtensionAPI, options: ExtensionOptions = {}) {
   // Only Herdr-managed pane processes belong to this plugin. Every other OMP
   // session keeps its normal tool set untouched.
   if (process.env.HERDR_ENV !== "1" || !process.env.HERDR_PANE_ID) return;
+  const activationBridge = options.activationBridge ??
+    ((method: "resolve" | "ready", identity: SessionIdentity) => callBridge(method, {}, identity));
 
   const z = pi.zod;
   // A primary decides and relays; a worker reports. The tool sets are disjoint,
@@ -969,13 +978,14 @@ export default function (pi: ExtensionAPI) {
   const workerNames = ["orch_report"];
   const ownNames = [...primaryNames, ...workerNames];
   let role: Role | null = null;
+  const warnedBindingAttention = new Set<string>();
 
   // activate asks the bridge to prove this process's binding, then activates
   // exactly the verified role's tools. It is idempotent: only this plugin's
   // tool names are filtered, so other OMP tools and other extensions' tools are
   // preserved, and nothing is written when the active set already matches.
-  async function activate(identity: SessionIdentity): Promise<Role | null> {
-    const binding = readResolveBinding(await callBridge("resolve", {}, identity));
+  async function activate(identity: SessionIdentity, notify: (message: string) => void): Promise<Role | null> {
+    const binding = readResolveBinding(await activationBridge("resolve", identity));
     const nextRole = binding.bound ? binding.role : null;
     const target = nextRole === "primary" ? primaryNames : nextRole === "worker" ? workerNames : [];
     const current = pi.getActiveTools();
@@ -983,6 +993,19 @@ export default function (pi: ExtensionAPI) {
       ...new Set([...current.filter((name: string) => !ownNames.includes(name)), ...target]),
     ];
     if (desired.join("\0") !== current.join("\0")) await pi.setActiveTools(desired);
+    if (!binding.bound && binding.attention.trim() !== "") {
+      const attention = binding.attention.trim();
+      const key = `${binding.projectKey}\0${binding.taskId}\0${attention}`;
+      if (!warnedBindingAttention.has(key)) {
+        const subject = binding.projectKey
+          ? `project ${binding.projectKey}`
+          : binding.taskId
+            ? `task ${binding.taskId}`
+            : "the current session";
+        notify(`Orchestrator binding needs attention for ${subject}: ${attention}`);
+        warnedBindingAttention.add(key);
+      }
+    }
     role = nextRole;
     if (role) await announce(identity);
     return role;
@@ -990,7 +1013,10 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     try {
-      await activate(sessionIdentity(ctx.sessionManager));
+      await activate(
+        sessionIdentity(ctx.sessionManager),
+        (message) => ctx.ui.notify(message, "warning"),
+      );
     } catch (error) {
       ctx.ui.notify(`Orchestrator binding unavailable: ${String(error)}`, "warning");
       throw error;
@@ -1008,7 +1034,7 @@ export default function (pi: ExtensionAPI) {
   // announce records the identity surface for the bound role and remembers what
   // was announced, so the post-turn refresh can tell whether anything changed.
   async function announce(identity: SessionIdentity): Promise<void> {
-    await callBridge("ready", {}, identity);
+    await activationBridge("ready", identity);
     announced = identity;
   }
 
@@ -1036,7 +1062,10 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("before_agent_start", async (event, ctx) => {
-    const currentRole = await activate(sessionIdentity(ctx.sessionManager));
+    const currentRole = await activate(
+      sessionIdentity(ctx.sessionManager),
+      (message) => ctx.ui.notify(message, "warning"),
+    );
     if (!currentRole) return;
     return {
       systemPrompt: [
