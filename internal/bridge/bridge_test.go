@@ -1967,6 +1967,8 @@ type stubScript struct {
 	// answer with a body that is not a Herdr envelope.
 	AgentGetError     string `json:"agentGetError"`
 	AgentGetMalformed bool   `json:"agentGetMalformed"`
+	// AgentGetErrors scripts a not-found or other CLI error for one pane only.
+	AgentGetErrors map[string]string `json:"agentGetErrors"`
 	// ProjectMovedTo makes the stand-in record a move of the named repository's
 	// project to that public pane before it answers `pane get`: another bridge call
 	// writing the same binding while this restore is being verified.
@@ -2052,6 +2054,9 @@ func runHerdrScript(path string) int {
 		}
 		return stubResult(map[string]any{"type": "pane_info", "pane": stubPaneBody(pane)})
 	case "agent get":
+		if code := script.AgentGetErrors[argv[2]]; code != "" {
+			return stubError(code, "the stand-in cannot resolve the pane")
+		}
 		if script.AgentGetError != "" {
 			return stubError(script.AgentGetError, "the stand-in refuses agent get")
 		}
@@ -4606,11 +4611,29 @@ func TestCleanupReopenWorkspaceIsRecordedBeforeRemoval(t *testing.T) {
 	stub.setAgent(rootPane, reopenedAgent)
 	var occupied coord.CleanupPreview
 	boundCleanupPayload := func(preview coord.CleanupPreview) string {
-		payload, err := json.Marshal(coord.CleanupParams{TaskID: worker.ID, Revision: preview.Revision, WorkspaceID: "wT"})
+		payload, err := json.Marshal(coord.CleanupParams{TaskID: worker.ID, Revision: preview.Revision, WorkspaceID: recorded.Cleanup.WorkspaceID})
 		if err != nil {
 			t.Fatalf("encode bound cleanup request: %v", err)
 		}
 		return string(payload)
+	}
+	for _, code := range []string{"pane_not_found", "workspace_not_found"} {
+		stub.update(func(script *stubScript) {
+			if script.AgentGetErrors == nil {
+				script.AgentGetErrors = make(map[string]string)
+			}
+			script.AgentGetErrors[rootPane] = code
+		})
+		var missing coord.CleanupPreview
+		f.callWith("cleanup_preview", primarySession, fmt.Sprintf(`{"taskId":%q}`, worker.ID), ops).decodeResult(t, &missing)
+		if missing.Removable || !strings.Contains(missing.Detail, "reopened workspace pane") {
+			t.Fatalf("preview accepted %s from the reopened root pane: %+v", code, missing)
+		}
+		wantError(t, f.callWith("cleanup", primarySession, boundCleanupPayload(missing), ops), "provenance_unconfirmed")
+		if removed := stub.script().Removed; len(removed) != 0 {
+			t.Fatalf("cleanup removed after %s for the reopened root pane: %v", code, removed)
+		}
+		stub.update(func(script *stubScript) { delete(script.AgentGetErrors, rootPane) })
 	}
 	f.callWith("cleanup_preview", primarySession, fmt.Sprintf(`{"taskId":%q}`, worker.ID), ops).decodeResult(t, &occupied)
 	if !occupied.LiveWorker || occupied.Removable {

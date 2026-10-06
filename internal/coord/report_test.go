@@ -1511,6 +1511,27 @@ func TestCleanupProvenanceFollowsTheRecordedCheckout(t *testing.T) {
 			t.Fatalf("cleanupListingTarget err = %v, want ErrProvenance", err)
 		}
 	})
+	t.Run("a detached stale branch report prevents absent-checkout settlement", func(t *testing.T) {
+		other := filepath.Join(filepath.Dir(checkout), "detached")
+		listed := &herdr.WorktreeList{Worktrees: []herdr.WorktreeInfo{
+			{Path: other, Branch: new(branch), IsDetached: true},
+		}}
+		attempt := task.CleanupAttempt{Path: checkout, Branch: branch, WorkspaceID: "w7"}
+		if _, _, err := cleanupListingTarget(worker, attempt, listed); !errors.Is(err, ErrProvenance) {
+			t.Fatalf("cleanupListingTarget err = %v, want ErrProvenance for a matching detached branch report", err)
+		}
+	})
+	t.Run("a detached entry without a branch cannot conceal a checked-out branch", func(t *testing.T) {
+		other := filepath.Join(filepath.Dir(checkout), "detached-without-branch")
+		listed := &herdr.WorktreeList{Worktrees: []herdr.WorktreeInfo{
+			{Path: other, IsDetached: true},
+		}}
+		attempt := task.CleanupAttempt{Path: checkout, Branch: branch, WorkspaceID: "w7"}
+		_, absent, err := cleanupListingTarget(worker, attempt, listed)
+		if err != nil || !absent {
+			t.Fatalf("cleanupListingTarget = absent %t, err %v; want detached entry ignored and exact checkout absent", absent, err)
+		}
+	})
 
 	t.Run("the recorded branch must match", func(t *testing.T) {
 		listed := &herdr.WorktreeList{Worktrees: []herdr.WorktreeInfo{
