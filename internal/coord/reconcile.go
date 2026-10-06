@@ -773,24 +773,58 @@ func (c *Coordinator) identityOf(ctx context.Context, launchPaneID, session stri
 // writes nothing but the deduplicated note.
 func (c *Coordinator) taskAttention(ctx context.Context, st task.Task, reason string) error {
 	note := c.noteFor(st, noteKindAttention, reason, reconcileDelivery)
+	matches := func(current task.Task) bool {
+		return reconciles(current) && sameTaskAttentionTarget(current, st)
+	}
 	switch {
-	case st.Attention == reason || st.Blocker != "" || st.Blocker == reason:
-		// The task already needs a human; this finding only adds its note. A
-		// blocker is never replaced by a later reconciliation.
-		if _, err := c.store.AddInbox(ctx, note); err != nil {
+	case st.Attention == reason || st.Blocker != "":
+		// The task already needs a human; add only the deduplicated note, and
+		// only while the binding this snapshot observed is still current.
+		if _, err := c.store.AddInboxForTask(ctx, note, func(current task.Task) error {
+			if !matches(current) {
+				return errSuperseded
+			}
+			return nil
+		}); err != nil {
+			if errors.Is(err, errSuperseded) {
+				return nil
+			}
 			return errors.Join(refusal(ErrAgentChanged, st.ID, reason), err)
 		}
 	default:
-		if _, _, err := c.recordWithNote(ctx, st, func(next *task.Task) error {
+		_, _, err := c.recordWithNote(ctx, st, func(next *task.Task) error {
+			if !matches(*next) {
+				return errSuperseded
+			}
 			if next.Attention == "" && next.Blocker == "" {
 				next.Attention = reason
 			}
 			return nil
-		}, note, "record the reconciliation attention"); err != nil {
+		}, note, "record the reconciliation attention")
+		if errors.Is(err, errSuperseded) {
+			return nil
+		}
+		if err != nil {
 			return errors.Join(refusal(ErrAgentChanged, st.ID, reason), err)
 		}
 	}
 	return refusal(ErrAgentChanged, st.ID, reason)
+}
+
+func sameTaskAttentionTarget(current, expected task.Task) bool {
+	return current.ID == expected.ID &&
+		current.ProjectKey == expected.ProjectKey &&
+		current.Phase == expected.Phase &&
+		current.Disposition == expected.Disposition &&
+		current.LaunchPaneID == expected.LaunchPaneID &&
+		current.PublicPaneID == expected.PublicPaneID &&
+		current.CurrentWorkspaceID == expected.CurrentWorkspaceID &&
+		current.WorktreePath == expected.WorktreePath &&
+		current.WorktreeWorkspaceID == expected.WorktreeWorkspaceID &&
+		current.TerminalID == expected.TerminalID &&
+		current.OMPSessionID == expected.OMPSessionID &&
+		current.Attention == expected.Attention &&
+		current.Blocker == expected.Blocker
 }
 
 // projectAttention records a durable attention note for a project. A project has

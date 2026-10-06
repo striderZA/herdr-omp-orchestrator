@@ -1039,6 +1039,44 @@ func TestMoveWorkerUpdatesOnlyThePublicIdentityAndKeepsReporting(t *testing.T) {
 	}
 }
 
+func TestReconcileDoesNotRecordAttentionAfterVerifiedWorkerMove(t *testing.T) {
+	ctx := context.Background()
+	f := newCoordFixture(t, fixturePlan{})
+	worker := f.boundWorker(t)
+	project := f.boundProject(t)
+	staleSnapshot, err := f.coord.snapshotView(ctx)
+	if err != nil {
+		t.Fatalf("capture pre-move Herdr snapshot: %v", err)
+	}
+
+	move := f.moveResult(t, worker.PublicPaneID)
+	movedPane, _ := move["pane"].(map[string]any)
+	newPane, _ := movedPane["pane_id"].(string)
+	if newPane == "" {
+		t.Fatalf("move result names no new pane: %v", move)
+	}
+	f.updatePlan(func(plan *fixturePlan) {
+		plan.AgentGetAliasFrom = worker.PublicPaneID
+		plan.AgentGetAliasTo = newPane
+	})
+	f.mustHandle(t, EventPaneMoved, eventFromMoveResult(t, move))
+	if current := f.taskByID(t, worker.ID); current.PublicPaneID != newPane {
+		t.Fatalf("verified move recorded public pane %q, want %q", current.PublicPaneID, newPane)
+	}
+
+	_, reconcileErr := f.coord.reconcileTask(ctx, project, worker, staleSnapshot, nil)
+	current := f.taskByID(t, worker.ID)
+	if current.Attention != "" {
+		t.Fatalf("stale snapshot recorded task attention %q after the verified move: %v", current.Attention, reconcileErr)
+	}
+	if notes := f.notesOfKind(t, noteKindAttention); len(notes) != 0 {
+		t.Fatalf("stale snapshot left %d attention notes after the verified move", len(notes))
+	}
+	if reconcileErr != nil {
+		t.Fatalf("reconciling the stale snapshot after a verified move: %v", reconcileErr)
+	}
+}
+
 func TestMovePrimaryUpdatesTheProjectAndFlushUsesTheNewPane(t *testing.T) {
 	f := newCoordFixture(t, fixturePlan{})
 	worker := f.boundWorker(t)

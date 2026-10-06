@@ -142,6 +142,10 @@ type fixturePlan struct {
 	// WorkspaceCreateTimeout creates the workspace, then reports a timeout as Herdr
 	// does when the side effect completes but its response is lost.
 	WorkspaceCreateTimeout bool `json:"workspace_create_timeout"`
+	// AgentGetAliasFrom and AgentGetAliasTo model Herdr resolving a pane's
+	// launch-time id to its current public id after a move.
+	AgentGetAliasFrom string `json:"agent_get_alias_from"`
+	AgentGetAliasTo   string `json:"agent_get_alias_to"`
 	// AgentStartError makes `agent start` fail with that Herdr code.
 	AgentStartError string `json:"agent_start_error"`
 	// AgentStartTimeout makes `agent start` start the agent and then answer with
@@ -387,7 +391,11 @@ func fixturePaneMove(dir string, plan fixturePlan, state *fixtureState, argv []s
 
 func fixtureAgentGet(dir string, plan fixturePlan, state *fixtureState, argv []string) int {
 	pane := argv[2]
-	agent := state.Agents[pane]
+	resolvedPane := pane
+	if pane == plan.AgentGetAliasFrom && plan.AgentGetAliasTo != "" {
+		resolvedPane = plan.AgentGetAliasTo
+	}
+	agent := state.Agents[resolvedPane]
 	if agent == nil {
 		return fixtureError("agent_not_found", "agent target "+pane+" not found")
 	}
@@ -421,7 +429,7 @@ func fixtureAgentGet(dir string, plan fixturePlan, state *fixtureState, argv []s
 	state.save(dir)
 	return fixtureResult(map[string]any{
 		"type":  "agent_info",
-		"agent": agentInfo(*state, pane, fixtureCwd(plan, *state, pane), agent, reported),
+		"agent": agentInfo(*state, resolvedPane, fixtureCwd(plan, *state, resolvedPane), agent, reported),
 	})
 }
 
