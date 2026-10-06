@@ -48,9 +48,11 @@ title = "Bind this repository as an orchestrated project"
 contexts = ["pane", "workspace"]
 command = ["./herdr-omp-orchestrator.exe", "bind"]
 
-# The board is read-only: it reads the task facts, derives each card's stage and
-# can focus one verified worker pane. It has no dispatch, review, merge or
-# cleanup command, so nothing here mutates a task.
+# The board is read-only for tasks: it reads task facts and derives each card's
+# stage. The human can create a ticket and move a backlog ticket to todo only
+# through its injected TicketOps, which the executable backs with internal/coord.
+# The board never writes a task, never dispatches, and never calls Herdr for a
+# ticket write; it can focus one verified worker pane.
 [[panes]]
 id = "board"
 title = "Task board"
