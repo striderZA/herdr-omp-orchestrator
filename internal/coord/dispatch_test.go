@@ -139,6 +139,9 @@ type fixturePlan struct {
 	// then answer with Herdr's own timeout code, the way a real CLI timeout
 	// arrives after the side effect.
 	WorktreeCreateTimeout bool `json:"worktree_create_timeout"`
+	// WorkspaceCreateTimeout creates the workspace, then reports a timeout as Herdr
+	// does when the side effect completes but its response is lost.
+	WorkspaceCreateTimeout bool `json:"workspace_create_timeout"`
 	// AgentStartError makes `agent start` fail with that Herdr code.
 	AgentStartError string `json:"agent_start_error"`
 	// AgentStartTimeout makes `agent start` start the agent and then answer with
@@ -231,6 +234,9 @@ func runFixture() int {
 	case "workspace create":
 		ws := state.newWorkspace(fixtureFlag(argv, "--cwd"))
 		state.save(dir)
+		if plan.WorkspaceCreateTimeout {
+			return fixtureError("timeout", "the command timed out after the workspace was created")
+		}
 		return fixtureResult(workspaceCreatedResult(ws, fixtureFlag(argv, "--cwd")))
 	case "worktree create":
 		return fixtureWorktreeCreate(dir, plan, &state, argv)
