@@ -978,6 +978,29 @@ func TestStaleWorkerStatusCannotOverwriteNewerIdleObservation(t *testing.T) {
 	}
 }
 
+func TestStaleWorkerStatusEventCannotOverwriteLiveIdleStatus(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	worker := f.boundWorker(t)
+	pane := worker.PublicPaneID
+
+	f.setAgentStatus(t, pane, "blocked")
+	f.mustHandle(t, EventAgentStatus, statusEventPayload(t, pane, "blocked"))
+	f.setAgentStatus(t, pane, "idle")
+	f.mustHandle(t, EventAgentStatus, statusEventPayload(t, pane, "idle"))
+	newer := f.taskByID(t, worker.ID)
+
+	// Herdr and the task row are already idle when an older working event arrives.
+	f.mustHandle(t, EventAgentStatus, statusEventPayload(t, pane, "working"))
+	after := f.taskByID(t, worker.ID)
+	if after.Activity != "idle" || after.Revision != newer.Revision {
+		t.Fatalf("stale event changed current task from idle/revision %d to %q/revision %d",
+			newer.Revision, after.Activity, after.Revision)
+	}
+	if notes := f.notesOfKind(t, noteKindActivity); len(notes) != 2 {
+		t.Fatalf("activity notes = %d, want only the blocked and idle observations", len(notes))
+	}
+}
+
 func TestEventPrimaryStatusIsNotAWorkerNoticeAndIdleFlushesOnce(t *testing.T) {
 	f := newCoordFixture(t, fixturePlan{})
 	worker := f.boundWorker(t)

@@ -363,6 +363,20 @@ func (c *Coordinator) observeWorkerStatus(ctx context.Context, st task.Task, sta
 		return nil
 	}
 
+	// Events can arrive after Herdr has already advanced to another status.
+	// Do not record a payload that its live agent_get no longer confirms.
+	liveStatus := strings.ToLower(strings.TrimSpace(probe.Pane.AgentStatus))
+	if !herdrAgentStatuses[liveStatus] || liveStatus != status {
+		return nil
+	}
+
+	// Event payloads can arrive after Herdr has already moved the agent on to a
+	// newer status. The live agent_get must still agree before this snapshot is
+	// eligible to update the durable activity.
+	if liveStatus := strings.ToLower(strings.TrimSpace(probe.Pane.AgentStatus)); liveStatus != status {
+		return nil
+	}
+
 	previous := strings.TrimSpace(st.Activity)
 	// What this observation does to the attention a liveness finding owns is
 	// decided on a copy first, so the note can say it; the write decides again on
