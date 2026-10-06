@@ -957,8 +957,8 @@ func TestStaleWorkerStatusCannotOverwriteNewerIdleObservation(t *testing.T) {
 		t.Fatalf("newer worker observation = %q, want idle", current.Activity)
 	}
 
-	// The delayed callback's probe captured this earlier working status before
-	// the idle observation was recorded.
+	// Keep Herdr's probe at the older working status while the durable task row
+	// has advanced to idle, so the test exercises the write-time snapshot guard.
 	f.setAgentStatus(t, pane, "working")
 
 	event := AgentStatusEvent{
