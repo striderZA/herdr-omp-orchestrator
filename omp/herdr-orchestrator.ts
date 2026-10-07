@@ -1098,9 +1098,11 @@ export default function (pi: ExtensionAPI, options: ExtensionOptions = {}) {
       dependencies: z.array(z.string()).max(DISPATCH_DEPENDENCIES_MAX).default(() => []),
       reservedPaths: z.array(z.string()).max(DISPATCH_RESERVED_PATHS_MAX).default(() => []),
       baseRevision: z.string().min(7),
-      // Optional: the ticket this work is for. The coordinator refuses an id that is
-      // not a ticket of this project or is already decided.
-      ticketId: z.string().min(1).optional(),
+      // Strict-mode calls use null for an unlinked task; the coordinator refuses ids
+      // that are not this project's ticket or are already decided.
+      ticketId: z.string().min(1).nullable().optional().describe(
+        "The ticket this work is for. Pass null when there is no ticket; never invent an id.",
+      ),
     }),
     async execute(_callId, params, signal, _update, ctx) {
       const result = await callBridge("dispatch", params, sessionIdentity(ctx.sessionManager), signal);

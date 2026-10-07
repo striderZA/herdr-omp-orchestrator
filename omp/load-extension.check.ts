@@ -41,7 +41,11 @@ import extension, {
 
 // OMP's builder returns a *callable* schema (ArkType-compatible validation from
 // @oh-my-pi/omptype), not zod's plain object: it has .parse() and no .shape.
-type ParameterSchema = { parse(value: unknown): unknown; shape?: Record<string, unknown> } & (
+type ParameterSchema = {
+  parse(value: unknown): unknown;
+  toJsonSchema?: () => Record<string, unknown>;
+  shape?: Record<string, unknown>;
+} & (
   | Record<string, unknown>
   | ((...args: unknown[]) => unknown)
 );
@@ -320,6 +324,23 @@ if (!dispatch) {
     "orch_dispatch invented a ticketId for a call that named none",
   );
   check(!tryParse(schema, { ...payload, ticketId: "" }).ok, "orch_dispatch accepted an empty ticketId");
+  const ticketIdHint = "The ticket this work is for. Pass null when there is no ticket; never invent an id.";
+  const dispatchJsonSchema = schema.toJsonSchema?.() as { properties?: Record<string, unknown> } | undefined;
+  const ticketIdProperty = dispatchJsonSchema?.properties?.ticketId;
+  const ticketIdDescription = typeof ticketIdProperty === "object" && ticketIdProperty !== null &&
+      "description" in ticketIdProperty
+    ? ticketIdProperty.description
+    : undefined;
+  check(
+    ticketIdDescription === ticketIdHint,
+    `orch_dispatch ticketId JSON Schema description = ${JSON.stringify(ticketIdDescription)}, want ${JSON.stringify(ticketIdHint)}`,
+  );
+  const noTicket = tryParse(schema, { ...payload, ticketId: null });
+  check(
+    noTicket.ok && typeof noTicket.value === "object" && noTicket.value !== null &&
+      "ticketId" in noTicket.value && noTicket.value.ticketId === null,
+    `orch_dispatch rejected null for a call without a ticket: ${noTicket.ok ? JSON.stringify(noTicket.value) : noTicket.error}`,
+  );
   // A repeated request is answered with the existing task and `duplicate:true`
   // (issue #4). The bridge hands that answer to the model verbatim, so this
   // description is the only place the model learns what the flag means and what
