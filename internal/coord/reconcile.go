@@ -363,6 +363,20 @@ func (c *Coordinator) observeWorkerStatus(ctx context.Context, st task.Task, sta
 		return nil
 	}
 
+	// Events can arrive after Herdr has already advanced to another status.
+	// Do not record a payload that its live agent_get no longer confirms.
+	liveStatus := strings.ToLower(strings.TrimSpace(probe.Pane.AgentStatus))
+	if !herdrAgentStatuses[liveStatus] || liveStatus != status {
+		return nil
+	}
+
+	// Event payloads can arrive after Herdr has already moved the agent on to a
+	// newer status. The live agent_get must still agree before this snapshot is
+	// eligible to update the durable activity.
+	if liveStatus := strings.ToLower(strings.TrimSpace(probe.Pane.AgentStatus)); liveStatus != status {
+		return nil
+	}
+
 	previous := strings.TrimSpace(st.Activity)
 	// What this observation does to the attention a liveness finding owns is
 	// decided on a copy first, so the note can say it; the write decides again on
@@ -379,19 +393,31 @@ func (c *Coordinator) observeWorkerStatus(ctx context.Context, st task.Task, sta
 		// state it was last recorded in still retires the attention a vanished or
 		// unknown worker left behind.
 		_, err := c.record(ctx, st, func(next *task.Task) error {
+			if !sameWorkerStatusSnapshot(*next, st) {
+				return errSuperseded
+			}
 			settleLiveness(next, status)
 			return nil
 		}, "settle the worker's liveness attention")
+		if errors.Is(err, errSuperseded) {
+			return nil
+		}
 		return err
 	}
 
 	note := c.activityNote(st, previous, status, eventDigest(event), livenessEffect(st, settled))
 	updated, _, err := c.recordWithNote(ctx, st, func(next *task.Task) error {
+		if !sameWorkerStatusSnapshot(*next, st) {
+			return errSuperseded
+		}
 		next.Activity = status
 		next.ActivitySeenAt = time.Now().UnixMilli()
 		settleLiveness(next, status)
 		return nil
 	}, note, "record the observed worker status")
+	if errors.Is(err, errSuperseded) {
+		return nil
+	}
 	if err != nil {
 		return err
 	}
@@ -773,24 +799,68 @@ func (c *Coordinator) identityOf(ctx context.Context, launchPaneID, session stri
 // writes nothing but the deduplicated note.
 func (c *Coordinator) taskAttention(ctx context.Context, st task.Task, reason string) error {
 	note := c.noteFor(st, noteKindAttention, reason, reconcileDelivery)
+	matches := func(current task.Task) bool {
+		return reconciles(current) && sameTaskAttentionTarget(current, st)
+	}
 	switch {
-	case st.Attention == reason || st.Blocker != "" || st.Blocker == reason:
-		// The task already needs a human; this finding only adds its note. A
-		// blocker is never replaced by a later reconciliation.
-		if _, err := c.store.AddInbox(ctx, note); err != nil {
+	case st.Attention == reason || st.Blocker != "":
+		// The task already needs a human; add only the deduplicated note, and
+		// only while the binding this snapshot observed is still current.
+		if _, err := c.store.AddInboxForTask(ctx, note, func(current task.Task) error {
+			if !matches(current) {
+				return errSuperseded
+			}
+			return nil
+		}); err != nil {
+			if errors.Is(err, errSuperseded) {
+				return nil
+			}
 			return errors.Join(refusal(ErrAgentChanged, st.ID, reason), err)
 		}
 	default:
-		if _, _, err := c.recordWithNote(ctx, st, func(next *task.Task) error {
+		_, _, err := c.recordWithNote(ctx, st, func(next *task.Task) error {
+			if !matches(*next) {
+				return errSuperseded
+			}
 			if next.Attention == "" && next.Blocker == "" {
 				next.Attention = reason
 			}
 			return nil
-		}, note, "record the reconciliation attention"); err != nil {
+		}, note, "record the reconciliation attention")
+		if errors.Is(err, errSuperseded) {
+			return nil
+		}
+		if err != nil {
 			return errors.Join(refusal(ErrAgentChanged, st.ID, reason), err)
 		}
 	}
 	return refusal(ErrAgentChanged, st.ID, reason)
+}
+
+func sameTaskAttentionTarget(current, expected task.Task) bool {
+	return current.ID == expected.ID &&
+		current.ProjectKey == expected.ProjectKey &&
+		current.Phase == expected.Phase &&
+		current.Disposition == expected.Disposition &&
+		current.LaunchPaneID == expected.LaunchPaneID &&
+		current.PublicPaneID == expected.PublicPaneID &&
+		current.CurrentWorkspaceID == expected.CurrentWorkspaceID &&
+		current.WorktreePath == expected.WorktreePath &&
+		current.WorktreeWorkspaceID == expected.WorktreeWorkspaceID &&
+		current.TerminalID == expected.TerminalID &&
+		current.OMPSessionID == expected.OMPSessionID &&
+		current.Attention == expected.Attention &&
+		current.Blocker == expected.Blocker
+}
+
+// sameWorkerStatusSnapshot accepts an observation only while its binding and
+// preceding activity still match the facts that the callback read. record and
+// recordWithNote retry revision conflicts, so this predicate is what prevents a
+// delayed callback from applying an older status after a newer observation.
+func sameWorkerStatusSnapshot(current, observed task.Task) bool {
+	return sameTaskAttentionTarget(current, observed) &&
+		current.Activity == observed.Activity &&
+		current.ActivitySeenAt == observed.ActivitySeenAt
 }
 
 // projectAttention records a durable attention note for a project. A project has

@@ -39,6 +39,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -599,7 +600,10 @@ func (c *Coordinator) FinalReport(ctx context.Context, launchPaneID string, repo
 func (c *Coordinator) finalReport(ctx context.Context, st task.Task, complete task.Report) (FinalReportResult, error) {
 	// A worker path always has a bound project (workerTask re-reads it), which is
 	// what makes the note addressable.
-	note := c.noteFor(st, "result", reportNote(complete), "worker result")
+	note, err := resultNoteFor(st, complete)
+	if err != nil {
+		return FinalReportResult{}, err
+	}
 	recorded := st
 	inserted := false
 	if st.Report == nil || !sameReport(*st.Report, complete) || isQuestionAttention(st.Attention) || isLivenessAttention(st.Attention) {
@@ -632,7 +636,7 @@ func (c *Coordinator) finalReport(ctx context.Context, st task.Task, complete ta
 		// (re)confirmed; a note that never landed is repaired here without
 		// rewriting the task.
 		var err error
-		inserted, err = c.workerNote(ctx, st, "result", reportNote(complete), "worker result")
+		inserted, err = c.workerNoteEntry(ctx, st, note)
 		if err != nil {
 			return FinalReportResult{}, err
 		}
@@ -695,6 +699,25 @@ func reportNote(report task.Report) string {
 		"checks: "+strings.Join(task.CheckLabels(report.Checks), "; "),
 		"risk: "+report.Risk,
 	), " | "), inboxSummaryLimit)
+}
+
+// resultNoteFor keeps the primary-facing summary bounded but hashes the complete
+// validated report. A later evidence item beyond the display cut is still a new
+// durable result, not a retry of the earlier note.
+func resultNoteFor(st task.Task, report task.Report) (task.Inbox, error) {
+	encoded, err := json.Marshal(report)
+	if err != nil {
+		return task.Inbox{}, fmt.Errorf("encode the complete report identity for task %s: %w", st.ID, err)
+	}
+	sum := sha256.Sum256([]byte("result\x00" + st.ID + "\x00" + string(encoded)))
+	return task.Inbox{
+		ID:         "result:" + st.ID + ":" + hex.EncodeToString(sum[:]),
+		ProjectKey: st.ProjectKey,
+		TaskID:     st.ID,
+		Kind:       "result",
+		Summary:    reportNote(report),
+		Delivery:   "worker result",
+	}, nil
 }
 
 // questionAttention is the marker a pending worker question leaves on the task.
@@ -2281,14 +2304,12 @@ func (c *Coordinator) recordWithNote(
 	return st, false, fmt.Errorf("task %s: %s: %w", st.ID, what, lastErr)
 }
 
-// noteFor builds the durable inbox entry one task fact leaves behind, with the
-// identity that makes recording it twice a no-op.
-//
-// The identity is the note's whole content, so asking the same question or
-// reporting the same progress twice writes nothing new while a different one
-// always notifies the primary. It deliberately shares one recipe with the
-// dispatch step machine's own notes: one kind, one task and one text are one
-// durable entry, whichever path wrote it first.
+// noteFor builds a durable inbox entry for task facts whose complete identity is
+// their summary. The summary is what the primary reads, so repeating the same
+// question or progress note is a no-op. Final reports use resultNoteFor instead:
+// reportNote is intentionally bounded and cannot identify the complete report.
+// Dispatch step notes share this recipe: one kind, one task and one complete
+// summary are one durable entry, whichever path wrote it first.
 func (c *Coordinator) noteFor(st task.Task, kind, summary, delivery string) task.Inbox {
 	sum := sha256.Sum256([]byte(kind + "\x00" + st.ID + "\x00" + summary))
 	return task.Inbox{
@@ -2333,12 +2354,16 @@ func (c *Coordinator) note(ctx context.Context, st task.Task, kind, summary, del
 // and writes nothing, which is what keeps a duplicate progress line or a
 // re-confirmed question or report from notifying the primary twice.
 func (c *Coordinator) workerNote(ctx context.Context, st task.Task, kind, summary, delivery string) (bool, error) {
+	return c.workerNoteEntry(ctx, st, c.noteFor(st, kind, summary, delivery))
+}
+
+func (c *Coordinator) workerNoteEntry(ctx context.Context, st task.Task, note task.Inbox) (bool, error) {
 	if strings.TrimSpace(st.ProjectKey) == "" {
 		return false, nil
 	}
-	inserted, err := c.store.AddInboxForTask(ctx, c.noteFor(st, kind, summary, delivery), workerChannelOpen)
+	inserted, err := c.store.AddInboxForTask(ctx, note, workerChannelOpen)
 	if err != nil {
-		return false, fmt.Errorf("record the %s note for task %s: %w", kind, st.ID, err)
+		return false, fmt.Errorf("record the %s note for task %s: %w", note.Kind, st.ID, err)
 	}
 	// The note is durable; the primary is told now if it can be, and otherwise on
 	// its next safe turn. A duplicate note is re-attempted too: it may be waiting

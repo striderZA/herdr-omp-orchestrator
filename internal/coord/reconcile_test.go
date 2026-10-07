@@ -938,6 +938,69 @@ func TestEventWorkerStatusIsRecordedOncePerTransitionAndNeverCompletes(t *testin
 	}
 }
 
+func TestStaleWorkerStatusCannotOverwriteNewerIdleObservation(t *testing.T) {
+	ctx := context.Background()
+	f := newCoordFixture(t, fixturePlan{})
+	worker := f.boundWorker(t)
+	pane := worker.PublicPaneID
+
+	f.setAgentStatus(t, pane, "blocked")
+	f.mustHandle(t, EventAgentStatus, statusEventPayload(t, pane, "blocked"))
+	stale := f.taskByID(t, worker.ID)
+	if stale.Activity != "blocked" {
+		t.Fatalf("stale task snapshot activity = %q, want blocked", stale.Activity)
+	}
+
+	f.setAgentStatus(t, pane, "idle")
+	f.mustHandle(t, EventAgentStatus, statusEventPayload(t, pane, "idle"))
+	if current := f.taskByID(t, worker.ID); current.Activity != "idle" {
+		t.Fatalf("newer worker observation = %q, want idle", current.Activity)
+	}
+
+	// Keep Herdr's probe at the older working status while the durable task row
+	// has advanced to idle, so the test exercises the write-time snapshot guard.
+	f.setAgentStatus(t, pane, "working")
+
+	event := AgentStatusEvent{
+		Type:        eventKindAgentStatus,
+		PaneID:      pane,
+		WorkspaceID: workspaceOfPane(pane),
+		AgentStatus: "working",
+	}
+	if err := f.coord.observeWorkerStatus(ctx, stale, "working", event); err != nil {
+		t.Fatalf("apply the delayed working callback: %v", err)
+	}
+	if current := f.taskByID(t, worker.ID); current.Activity != "idle" {
+		t.Fatalf("stale working callback overwrote newer idle activity with %q", current.Activity)
+	}
+	if notes := f.notesOfKind(t, noteKindActivity); len(notes) != 2 {
+		t.Fatalf("activity notes = %d, want only the blocked and idle observations", len(notes))
+	}
+}
+
+func TestStaleWorkerStatusEventCannotOverwriteLiveIdleStatus(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	worker := f.boundWorker(t)
+	pane := worker.PublicPaneID
+
+	f.setAgentStatus(t, pane, "blocked")
+	f.mustHandle(t, EventAgentStatus, statusEventPayload(t, pane, "blocked"))
+	f.setAgentStatus(t, pane, "idle")
+	f.mustHandle(t, EventAgentStatus, statusEventPayload(t, pane, "idle"))
+	newer := f.taskByID(t, worker.ID)
+
+	// Herdr and the task row are already idle when an older working event arrives.
+	f.mustHandle(t, EventAgentStatus, statusEventPayload(t, pane, "working"))
+	after := f.taskByID(t, worker.ID)
+	if after.Activity != "idle" || after.Revision != newer.Revision {
+		t.Fatalf("stale event changed current task from idle/revision %d to %q/revision %d",
+			newer.Revision, after.Activity, after.Revision)
+	}
+	if notes := f.notesOfKind(t, noteKindActivity); len(notes) != 2 {
+		t.Fatalf("activity notes = %d, want only the blocked and idle observations", len(notes))
+	}
+}
+
 func TestEventPrimaryStatusIsNotAWorkerNoticeAndIdleFlushesOnce(t *testing.T) {
 	f := newCoordFixture(t, fixturePlan{})
 	worker := f.boundWorker(t)
@@ -1036,6 +1099,44 @@ func TestMoveWorkerUpdatesOnlyThePublicIdentityAndKeepsReporting(t *testing.T) {
 	}
 	if notes := f.notesOfKind(t, "question"); len(notes) != 1 {
 		t.Fatalf("question notes = %d, want 1", len(notes))
+	}
+}
+
+func TestReconcileDoesNotRecordAttentionAfterVerifiedWorkerMove(t *testing.T) {
+	ctx := context.Background()
+	f := newCoordFixture(t, fixturePlan{})
+	worker := f.boundWorker(t)
+	project := f.boundProject(t)
+	staleSnapshot, err := f.coord.snapshotView(ctx)
+	if err != nil {
+		t.Fatalf("capture pre-move Herdr snapshot: %v", err)
+	}
+
+	move := f.moveResult(t, worker.PublicPaneID)
+	movedPane, _ := move["pane"].(map[string]any)
+	newPane, _ := movedPane["pane_id"].(string)
+	if newPane == "" {
+		t.Fatalf("move result names no new pane: %v", move)
+	}
+	f.updatePlan(func(plan *fixturePlan) {
+		plan.AgentGetAliasFrom = worker.PublicPaneID
+		plan.AgentGetAliasTo = newPane
+	})
+	f.mustHandle(t, EventPaneMoved, eventFromMoveResult(t, move))
+	if current := f.taskByID(t, worker.ID); current.PublicPaneID != newPane {
+		t.Fatalf("verified move recorded public pane %q, want %q", current.PublicPaneID, newPane)
+	}
+
+	_, reconcileErr := f.coord.reconcileTask(ctx, project, worker, staleSnapshot, nil)
+	current := f.taskByID(t, worker.ID)
+	if current.Attention != "" {
+		t.Fatalf("stale snapshot recorded task attention %q after the verified move: %v", current.Attention, reconcileErr)
+	}
+	if notes := f.notesOfKind(t, noteKindAttention); len(notes) != 0 {
+		t.Fatalf("stale snapshot left %d attention notes after the verified move", len(notes))
+	}
+	if reconcileErr != nil {
+		t.Fatalf("reconciling the stale snapshot after a verified move: %v", reconcileErr)
 	}
 }
 
@@ -2190,6 +2291,8 @@ func TestEventPayloadSizeIsCheckedBeforeTrimming(t *testing.T) {
 	if !strings.Contains(err.Error(), "no payload") {
 		t.Fatalf("whitespace-only payload error = %q, want the empty-payload refusal", err)
 	}
+
+	f.setAgentStatus(t, worker.PublicPaneID, "idle")
 
 	// A payload at the bound passes the size gate and is applied: the padding is
 	// legal JSON whitespace around a real event.

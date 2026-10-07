@@ -104,3 +104,53 @@ func TestBindRefusesWhenTheStoreReportsThePaneTaken(t *testing.T) {
 		t.Errorf("the refused bind recorded a project: %v", err)
 	}
 }
+
+// TestBindRetryDoesNotOrphanAnAmbiguouslyCreatedWorkspace is issue #50's
+// post-side-effect timeout: Herdr created the workspace, but Bind never received
+// its identity. A retry must not create a second workspace; binding from the
+// first one's pane is the explicit recovery path.
+func TestBindRetryDoesNotOrphanAnAmbiguouslyCreatedWorkspace(t *testing.T) {
+	ctx := context.Background()
+	f := newCoordFixture(t, fixturePlan{WorkspaceCreateTimeout: true})
+	if _, err := f.bind("", ""); err == nil {
+		t.Fatal("first Bind succeeded despite the simulated timeout after workspace creation")
+	}
+	if got := len(f.state().Workspaces); got != 1 {
+		t.Fatalf("workspaces after the ambiguous create = %d, want its one side effect", got)
+	}
+	if _, err := f.store.Project(ctx, f.root); !errors.Is(err, state.ErrNotFound) {
+		t.Fatalf("the ambiguous create recorded a project: %v", err)
+	}
+
+	f.updatePlan(func(plan *fixturePlan) { plan.WorkspaceCreateTimeout = false })
+	retryer := f.sibling()
+	retryer.opts.Preflight = satisfiedPreflight
+	_, retryErr := retryer.Bind(ctx, f.root, "", "")
+	if retryErr == nil {
+		t.Fatalf("retry succeeded after creating a second workspace (%d calls, %d workspaces)",
+			f.countCalls("workspace create"), len(f.state().Workspaces))
+	}
+	if !errors.Is(retryErr, ErrBindPending) {
+		t.Fatalf("retry error = %v, want ErrBindPending", retryErr)
+	}
+	if got := f.countCalls("workspace create"); got != 1 {
+		t.Fatalf("workspace create calls = %d, want only the original ambiguous attempt", got)
+	}
+	if got := len(f.state().Workspaces); got != 1 {
+		t.Fatalf("workspaces after refusing a blind retry = %d, want the original workspace only", got)
+	}
+	if _, err := f.store.Project(ctx, f.root); !errors.Is(err, state.ErrNotFound) {
+		t.Fatalf("a refused retry recorded a project: %v", err)
+	}
+
+	project, err := retryer.Bind(ctx, f.root, "w1", "w1:p1")
+	if err != nil {
+		t.Fatalf("Bind from the original created workspace: %v", err)
+	}
+	if project.LaunchPaneID != "w1:p1" || project.RepoWorkspaceID != "w1" {
+		t.Fatalf("recovered project = %+v, want the original workspace w1 and pane w1:p1", project)
+	}
+	if got := f.countCalls("workspace create"); got != 1 {
+		t.Fatalf("workspace create calls after recovery = %d, want 1", got)
+	}
+}

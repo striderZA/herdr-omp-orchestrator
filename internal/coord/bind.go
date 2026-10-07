@@ -98,6 +98,9 @@ var (
 	// extension). Nothing was written or started; the wrapped cause names the
 	// remedy.
 	ErrNotReady = errors.New("coord: the bind prerequisites are not met")
+	// ErrBindPending reports a previous workspace-create attempt whose outcome is
+	// not yet tied to a pane the user explicitly selected.
+	ErrBindPending = errors.New("coord: bind has an unresolved workspace creation")
 )
 
 // Defaults for one coordinator.
@@ -259,53 +262,155 @@ func (c *Coordinator) Bind(ctx context.Context, repo, workspaceID, rootPaneID st
 	}
 	switch existing, err := c.store.Project(ctx, root); {
 	case err == nil:
+		if clearErr := c.store.ClearBindIntent(ctx, root); clearErr != nil {
+			return task.Project{}, fmt.Errorf("clear the completed bind intent for %s: %w", root, clearErr)
+		}
 		return c.reopenPrimary(ctx, existing)
 	case !errors.Is(err, state.ErrNotFound):
 		return task.Project{}, err
 	}
 
 	workspace, paneID := "", ""
-	if named := strings.TrimSpace(rootPaneID); named != "" {
-		pane, err := c.paneGet(ctx, named)
-		switch {
-		case err == nil && !samePath(pane.Cwd, root):
-			return task.Project{}, fmt.Errorf("%w: pane %q works in %s, not the requested repository %s",
-				ErrDifferentRepository, named, pane.Cwd, root)
-		case err == nil && paneHostsAgent(pane):
-			// The pane already runs an agent, for example the user's own OMP
-			// session. A dedicated primary is started in its own workspace on the
-			// same checkout: this never starts a second OMP in a pane that has
-			// one, and never adopts a session whose readiness cannot be observed
-			// before the next human turn.
-		case err == nil:
-			claimed, claimErr := c.paneClaimed(ctx, pane.PaneID)
-			if claimErr != nil {
-				return task.Project{}, claimErr
-			}
-			if !claimed {
-				workspace, paneID = pane.WorkspaceID, pane.PaneID
-			}
-			// A pane another record still owns (an exited primary of another
-			// repository whose shell moved here, or a worker) is never adopted:
-			// a second record on it would make every lookup by that pane
-			// ambiguous. The primary gets its own workspace instead.
-		case isMissingTarget(err):
-			// The named pane is gone: fall through and create a workspace for the
-			// root rather than binding a pane that no longer exists.
-		case err != nil:
-			return task.Project{}, err
-		}
-		if strings.TrimSpace(workspaceID) != "" && workspace != "" && workspace != workspaceID {
-			return task.Project{}, fmt.Errorf("%w: pane %q is in workspace %q, not the requested %q",
-				ErrDifferentRepository, paneID, workspace, workspaceID)
-		}
-	}
-	if paneID == "" {
-		created, err := c.workspaceCreate(ctx, root)
+	var bindIntent *state.BindIntent
+	_, intentErr := c.store.GetBindIntent(ctx, root)
+	switch {
+	case intentErr == nil:
+		claimed, acquired, _, err := c.store.ClaimBindIntent(ctx, root, c.owner, c.opts.StepLease, nil, nil)
 		if err != nil {
 			return task.Project{}, err
 		}
-		workspace, paneID = created.WorkspaceID, created.RootPaneID
+		if !acquired {
+			return task.Project{}, bindPendingError(root, "another bind attempt still holds the workspace-create lease")
+		}
+		bindIntent = &claimed
+		if bindIntent.Phase == state.BindIntentPrepared {
+			// A prepared intent proves the external create was never entered.
+			if err := c.store.DeleteBindIntent(ctx, root, c.owner); err != nil {
+				return task.Project{}, fmt.Errorf("discard the unstarted bind intent for %s: %w", root, err)
+			}
+			bindIntent = nil
+		} else {
+			snapshot, err := c.snapshotView(ctx)
+			if err != nil {
+				if releaseErr := c.store.ReleaseBindIntent(ctx, root, c.owner); releaseErr != nil {
+					return task.Project{}, errors.Join(err, fmt.Errorf("release the bind intent for %s: %w", root, releaseErr))
+				}
+				return task.Project{}, err
+			}
+			workspace, paneID, err = c.recoverBindWorkspace(ctx, root, workspaceID, rootPaneID, snapshot, *bindIntent)
+			if err != nil {
+				if releaseErr := c.store.ReleaseBindIntent(ctx, root, c.owner); releaseErr != nil {
+					return task.Project{}, errors.Join(err, fmt.Errorf("release the bind intent for %s: %w", root, releaseErr))
+				}
+				return task.Project{}, err
+			}
+		}
+	case errors.Is(intentErr, state.ErrNotFound):
+	default:
+		return task.Project{}, fmt.Errorf("read bind intent for %s: %w", root, intentErr)
+	}
+
+	if paneID == "" {
+		if named := strings.TrimSpace(rootPaneID); named != "" {
+			pane, err := c.paneGet(ctx, named)
+			switch {
+			case err == nil && !samePath(pane.Cwd, root):
+				return task.Project{}, fmt.Errorf("%w: pane %q works in %s, not the requested repository %s",
+					ErrDifferentRepository, named, pane.Cwd, root)
+			case err == nil && paneHostsAgent(pane):
+				// The pane already runs an agent, for example the user's own OMP
+				// session. A dedicated primary is started in its own workspace on the
+				// same checkout: this never starts a second OMP in a pane that has
+				// one, and never adopts a session whose readiness cannot be observed
+				// before the next human turn.
+			case err == nil:
+				claimed, claimErr := c.paneClaimed(ctx, pane.PaneID)
+				if claimErr != nil {
+					return task.Project{}, claimErr
+				}
+				if !claimed {
+					workspace, paneID = pane.WorkspaceID, pane.PaneID
+				}
+				// A pane another record still owns (an exited primary of another
+				// repository whose shell moved here, or a worker) is never adopted:
+				// a second record on it would make every lookup by that pane
+				// ambiguous. The primary gets its own workspace instead.
+			case isMissingTarget(err):
+				// The named pane is gone: fall through and create a workspace for the
+				// root rather than binding a pane that no longer exists.
+			case err != nil:
+				return task.Project{}, err
+			}
+			if strings.TrimSpace(workspaceID) != "" && workspace != "" && workspace != workspaceID {
+				return task.Project{}, fmt.Errorf("%w: pane %q is in workspace %q, not the requested %q",
+					ErrDifferentRepository, paneID, workspace, workspaceID)
+			}
+		}
+	}
+	if paneID == "" {
+		if bindIntent == nil {
+			snapshot, err := c.snapshotView(ctx)
+			if err != nil {
+				return task.Project{}, err
+			}
+			paneIDs, workspaceIDs := bindSnapshotIDs(snapshot)
+			claimed, acquired, created, err := c.store.ClaimBindIntent(
+				ctx, root, c.owner, c.opts.StepLease, paneIDs, workspaceIDs,
+			)
+			if err != nil {
+				return task.Project{}, err
+			}
+			if !acquired {
+				return task.Project{}, bindPendingError(root, "another bind attempt holds the workspace-create lease")
+			}
+			bindIntent = &claimed
+			if !created {
+				if bindIntent.Phase == state.BindIntentPrepared {
+					if err := c.store.RefreshBindIntentBaseline(
+						ctx, root, c.owner, c.opts.StepLease, paneIDs, workspaceIDs,
+					); err != nil {
+						if releaseErr := c.store.ReleaseBindIntent(ctx, root, c.owner); releaseErr != nil {
+							return task.Project{}, errors.Join(err, fmt.Errorf("release the bind intent for %s: %w", root, releaseErr))
+						}
+						return task.Project{}, fmt.Errorf("refresh the bind baseline for %s: %w", root, err)
+					}
+				} else {
+					workspace, paneID, err = c.recoverBindWorkspace(ctx, root, workspaceID, rootPaneID, snapshot, *bindIntent)
+					if err != nil {
+						if releaseErr := c.store.ReleaseBindIntent(ctx, root, c.owner); releaseErr != nil {
+							return task.Project{}, errors.Join(err, fmt.Errorf("release the bind intent for %s: %w", root, releaseErr))
+						}
+						return task.Project{}, err
+					}
+				}
+			}
+		}
+		if paneID == "" {
+			if bindIntent == nil || bindIntent.Phase != state.BindIntentPrepared {
+				return task.Project{}, bindPendingError(root, "the previous workspace-create outcome is uncertain")
+			}
+			if err := c.store.MarkBindIntentCreating(ctx, root, c.owner, c.opts.StepLease); err != nil {
+				if releaseErr := c.store.ReleaseBindIntent(ctx, root, c.owner); releaseErr != nil {
+					return task.Project{}, errors.Join(err, fmt.Errorf("release the bind intent for %s: %w", root, releaseErr))
+				}
+				return task.Project{}, fmt.Errorf("mark the workspace create for %s: %w", root, err)
+			}
+			bindIntent.Phase = state.BindIntentCreating
+			workspaceResult, err := c.workspaceCreate(ctx, root)
+			if err != nil {
+				var settleErr error
+				if errors.Is(err, herdr.ErrAmbiguous) {
+					settleErr = c.store.MarkBindIntentUncertain(ctx, root, c.owner)
+				} else {
+					settleErr = c.store.DeleteBindIntent(ctx, root, c.owner)
+				}
+				if settleErr != nil {
+					return task.Project{}, errors.Join(err, fmt.Errorf("settle the workspace-create intent for %s: %w", root, settleErr))
+				}
+				return task.Project{}, err
+			}
+			workspace, paneID = workspaceResult.WorkspaceID, workspaceResult.RootPaneID
+		}
 	}
 
 	project := task.Project{
@@ -317,10 +422,26 @@ func (c *Coordinator) Bind(ctx context.Context, repo, workspaceID, rootPaneID st
 		AgentName:          PrimaryAgentName(root),
 	}
 	if err := c.store.CreateProject(ctx, project); err != nil {
+		if bindIntent != nil {
+			var settleErr error
+			if bindIntent.Phase == state.BindIntentCreating {
+				settleErr = c.store.MarkBindIntentUncertain(ctx, root, c.owner)
+			} else {
+				settleErr = c.store.ReleaseBindIntent(ctx, root, c.owner)
+			}
+			if settleErr != nil {
+				err = errors.Join(err, fmt.Errorf("settle the workspace-create intent for %s: %w", root, settleErr))
+			}
+		}
 		if errors.Is(err, state.ErrPaneTaken) {
 			return task.Project{}, fmt.Errorf("%w: record the primary for %s: %w", ErrAlreadyBound, root, err)
 		}
 		return task.Project{}, fmt.Errorf("record the primary for %s: %w", root, err)
+	}
+	if bindIntent != nil {
+		if err := c.store.DeleteBindIntent(ctx, root, c.owner); err != nil {
+			return project, fmt.Errorf("record the primary for %s but could not settle its bind intent: %w", root, err)
+		}
 	}
 	name, err := c.ensureAgent(ctx, paneID, PrimaryAgentName(root))
 	if err != nil {
@@ -387,6 +508,96 @@ func (c *Coordinator) paneClaimed(ctx context.Context, paneID string) (bool, err
 	default:
 		return false, fmt.Errorf("read the records of pane %q: %w", paneID, err)
 	}
+}
+
+func bindPendingError(root, detail string) error {
+	return fmt.Errorf("%w: %s: %s; inspect Herdr's workspace list before retrying. If a workspace was created, bind from its pane; the orchestrator will not create another automatically",
+		ErrBindPending, root, detail)
+}
+
+func bindSnapshotIDs(snapshot *snapshotView) ([]string, []string) {
+	var paneIDs, workspaceIDs []string
+	seenPanes, seenWorkspaces := map[string]bool{}, map[string]bool{}
+	for _, pane := range snapshot.Panes {
+		if pane.PaneID != "" && !seenPanes[pane.PaneID] {
+			seenPanes[pane.PaneID] = true
+			paneIDs = append(paneIDs, pane.PaneID)
+		}
+		if pane.WorkspaceID != "" && !seenWorkspaces[pane.WorkspaceID] {
+			seenWorkspaces[pane.WorkspaceID] = true
+			workspaceIDs = append(workspaceIDs, pane.WorkspaceID)
+		}
+	}
+	return paneIDs, workspaceIDs
+}
+
+func bindWorkspaceCandidates(snapshot *snapshotView, intent state.BindIntent, root string) []string {
+	oldPanes, oldWorkspaces := map[string]bool{}, map[string]bool{}
+	for _, pane := range intent.PaneIDs {
+		oldPanes[pane] = true
+	}
+	for _, workspace := range intent.WorkspaceIDs {
+		oldWorkspaces[workspace] = true
+	}
+	seen := map[string]bool{}
+	var candidates []string
+	for _, pane := range snapshot.Panes {
+		workspace := strings.TrimSpace(pane.WorkspaceID)
+		if workspace == "" || oldWorkspaces[workspace] || oldPanes[pane.PaneID] ||
+			seen[workspace] || !snapshotWorksIn(pane, root) {
+			continue
+		}
+		seen[workspace] = true
+		candidates = append(candidates, workspace)
+	}
+	return candidates
+}
+
+func (c *Coordinator) recoverBindWorkspace(
+	ctx context.Context,
+	root, expectedWorkspaceID, rootPaneID string,
+	snapshot *snapshotView,
+	intent state.BindIntent,
+) (string, string, error) {
+	candidates := bindWorkspaceCandidates(snapshot, intent, root)
+	if len(candidates) == 0 {
+		return "", "", bindPendingError(root, "no pane in a new workspace proves the earlier create outcome")
+	}
+	if len(candidates) != 1 {
+		return "", "", bindPendingError(root, fmt.Sprintf("Herdr reports %d possible new workspaces %s",
+			len(candidates), strings.Join(candidates, ", ")))
+	}
+	if strings.TrimSpace(rootPaneID) == "" {
+		return "", "", bindPendingError(root, fmt.Sprintf("possible workspace %s was created", candidates[0]))
+	}
+	pane, err := c.paneGet(ctx, rootPaneID)
+	if err != nil {
+		if isMissingTarget(err) {
+			return "", "", bindPendingError(root, fmt.Sprintf("possible workspace %s has no selected live pane", candidates[0]))
+		}
+		return "", "", err
+	}
+	if !samePath(pane.Cwd, root) {
+		return "", "", bindPendingError(root, fmt.Sprintf("selected pane %s works in %s", pane.PaneID, pane.Cwd))
+	}
+	if pane.WorkspaceID != candidates[0] {
+		return "", "", bindPendingError(root, fmt.Sprintf("selected pane %s is not in possible workspace %s", pane.PaneID, candidates[0]))
+	}
+	if expectedWorkspaceID != "" && pane.WorkspaceID != expectedWorkspaceID {
+		return "", "", fmt.Errorf("%w: pane %s is in workspace %s, not %s",
+			ErrDifferentRepository, pane.PaneID, pane.WorkspaceID, expectedWorkspaceID)
+	}
+	if paneHostsAgent(pane) {
+		return "", "", bindPendingError(root, fmt.Sprintf("selected pane %s already hosts an agent", pane.PaneID))
+	}
+	claimed, err := c.paneClaimed(ctx, pane.PaneID)
+	if err != nil {
+		return "", "", err
+	}
+	if claimed {
+		return "", "", bindPendingError(root, fmt.Sprintf("selected pane %s is already recorded", pane.PaneID))
+	}
+	return pane.WorkspaceID, pane.PaneID, nil
 }
 
 // reopenPrimary re-verifies a recorded primary binding. It never starts a new
@@ -845,8 +1056,10 @@ func (c *Coordinator) agentGet(ctx context.Context, target string) (agentView, e
 		{"agent.tab_id", res.Agent.TabID},
 	} {
 		if strings.TrimSpace(field.value) == "" {
-			return agentView{}, &herdr.IdentityError{Op: "agent get", Field: field.name,
-				Detail: "required identity is empty"}
+			return agentView{}, &herdr.IdentityError{
+				Op: "agent get", Field: field.name,
+				Detail: "required identity is empty",
+			}
 		}
 	}
 	view := agentView{Agent: res.Agent.AgentInfo}

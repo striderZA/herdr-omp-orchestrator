@@ -60,6 +60,26 @@ type Binding struct {
 	Task    task.Task
 }
 
+// BindIntentPhase tracks whether a workspace-create side effect may have started.
+type BindIntentPhase string
+
+const (
+	BindIntentPrepared  BindIntentPhase = "prepared"
+	BindIntentCreating  BindIntentPhase = "creating"
+	BindIntentUncertain BindIntentPhase = "uncertain"
+)
+
+// BindIntent records the pane/workspace set before a primary bind may create a
+// Herdr workspace, plus the exclusive lease that prevents a concurrent retry.
+type BindIntent struct {
+	Key          string          `json:"key"`
+	PaneIDs      []string        `json:"paneIDs"`
+	WorkspaceIDs []string        `json:"workspaceIDs"`
+	Owner        string          `json:"owner"`
+	LeaseUntil   int64           `json:"leaseUntil"`
+	Phase        BindIntentPhase `json:"phase"`
+}
+
 const dbFile = "orchestrator.sqlite"
 
 // schema keeps every indexed identity in its own column and the durable facts as JSON.
@@ -115,6 +135,10 @@ CREATE TABLE IF NOT EXISTS tickets (
 	data JSON NOT NULL
 );
 CREATE INDEX IF NOT EXISTS tickets_project_key ON tickets (project_key);
+CREATE TABLE IF NOT EXISTS bind_intents (
+	key TEXT PRIMARY KEY,
+	data JSON NOT NULL
+);
 `
 
 // readySessionColumns are the columns a ready record needs beyond its first
@@ -307,7 +331,8 @@ func (s *Store) CreateTask(ctx context.Context, t task.Task) error {
 	if err := checkPaneFree(ctx, tx, t.LaunchPaneID, t.ID); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx,
+	if _, err := tx.ExecContext(
+		ctx,
 		`INSERT INTO tasks (id, project_key, launch_pane_id, public_pane_id, revision, data)
 		 VALUES (?, ?, ?, ?, ?, ?)`,
 		t.ID, t.ProjectKey, nullablePane(t.LaunchPaneID), t.PublicPaneID, t.Revision, string(data),
@@ -529,7 +554,8 @@ func (s *Store) RecordReady(ctx context.Context, launchPaneID string, announced 
 	// A new announcement invalidates a confirmation that no longer describes it:
 	// a restart announces a different session, and the old confirmation must not
 	// outlive it.
-	if _, err := s.db.ExecContext(ctx, `
+	if _, err := s.db.ExecContext(
+		ctx, `
 		INSERT INTO ready_sessions (launch_pane_id, omp_session_id, omp_session_file, omp_session_on_disk,
 		                        protocol, verified_kind, verified_value, verified, seen_at)
 		VALUES (?, ?, ?, ?, ?, '', '', 0, ?)
@@ -1164,7 +1190,8 @@ func (s *Store) ClaimTask(ctx context.Context, t task.Task, budget int) (bool, t
 		// A brand-new record has no previous claim, so the token is simply now.
 		token = nextSlotToken(0)
 	}
-	if _, err := tx.ExecContext(ctx,
+	if _, err := tx.ExecContext(
+		ctx,
 		`INSERT INTO tasks (id, project_key, launch_pane_id, public_pane_id, revision, slot_claimed_at, slot_token, data)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		t.ID, t.ProjectKey, nullablePane(t.LaunchPaneID), t.PublicPaneID, t.Revision, token, token, string(data),

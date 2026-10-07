@@ -139,6 +139,13 @@ type fixturePlan struct {
 	// then answer with Herdr's own timeout code, the way a real CLI timeout
 	// arrives after the side effect.
 	WorktreeCreateTimeout bool `json:"worktree_create_timeout"`
+	// WorkspaceCreateTimeout creates the workspace, then reports a timeout as Herdr
+	// does when the side effect completes but its response is lost.
+	WorkspaceCreateTimeout bool `json:"workspace_create_timeout"`
+	// AgentGetAliasFrom and AgentGetAliasTo model Herdr resolving a pane's
+	// launch-time id to its current public id after a move.
+	AgentGetAliasFrom string `json:"agent_get_alias_from"`
+	AgentGetAliasTo   string `json:"agent_get_alias_to"`
 	// AgentStartError makes `agent start` fail with that Herdr code.
 	AgentStartError string `json:"agent_start_error"`
 	// AgentStartTimeout makes `agent start` start the agent and then answer with
@@ -231,6 +238,9 @@ func runFixture() int {
 	case "workspace create":
 		ws := state.newWorkspace(fixtureFlag(argv, "--cwd"))
 		state.save(dir)
+		if plan.WorkspaceCreateTimeout {
+			return fixtureError("timeout", "the command timed out after the workspace was created")
+		}
 		return fixtureResult(workspaceCreatedResult(ws, fixtureFlag(argv, "--cwd")))
 	case "worktree create":
 		return fixtureWorktreeCreate(dir, plan, &state, argv)
@@ -381,7 +391,11 @@ func fixturePaneMove(dir string, plan fixturePlan, state *fixtureState, argv []s
 
 func fixtureAgentGet(dir string, plan fixturePlan, state *fixtureState, argv []string) int {
 	pane := argv[2]
-	agent := state.Agents[pane]
+	resolvedPane := pane
+	if pane == plan.AgentGetAliasFrom && plan.AgentGetAliasTo != "" {
+		resolvedPane = plan.AgentGetAliasTo
+	}
+	agent := state.Agents[resolvedPane]
 	if agent == nil {
 		return fixtureError("agent_not_found", "agent target "+pane+" not found")
 	}
@@ -415,7 +429,7 @@ func fixtureAgentGet(dir string, plan fixturePlan, state *fixtureState, argv []s
 	state.save(dir)
 	return fixtureResult(map[string]any{
 		"type":  "agent_info",
-		"agent": agentInfo(*state, pane, fixtureCwd(plan, *state, pane), agent, reported),
+		"agent": agentInfo(*state, resolvedPane, fixtureCwd(plan, *state, resolvedPane), agent, reported),
 	})
 }
 
@@ -1479,8 +1493,25 @@ func TestBindCreatesAWorkspaceWhenNoneRepresentsTheRoot(t *testing.T) {
 	if f.countCalls("workspace create") != 1 {
 		t.Errorf("workspace create calls = %d, want 1", f.countCalls("workspace create"))
 	}
-	created := f.calls()
-	argv := created[0].Argv
+	calls := f.calls()
+	snapshotIndex, workspaceCreateIndex := -1, -1
+	for i, call := range calls {
+		if len(call.Argv) < 2 {
+			continue
+		}
+		switch call.Argv[0] + " " + call.Argv[1] {
+		case "api snapshot":
+			if snapshotIndex < 0 {
+				snapshotIndex = i
+			}
+		case "workspace create":
+			workspaceCreateIndex = i
+		}
+	}
+	if snapshotIndex < 0 || workspaceCreateIndex <= snapshotIndex {
+		t.Fatalf("Herdr calls = %v, want the identity snapshot before workspace create", calls)
+	}
+	argv := calls[workspaceCreateIndex].Argv
 	if len(argv) != 5 || argv[0] != "workspace" || argv[1] != "create" || argv[2] != "--cwd" || argv[4] != "--no-focus" {
 		t.Errorf("workspace create argv = %q, want workspace create --cwd <root> --no-focus", argv)
 	}
