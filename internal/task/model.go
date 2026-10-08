@@ -34,6 +34,11 @@ const (
 	PromptSubmitted Phase = "prompt_submitted"
 )
 
+// TaskRole labels a task's purpose without changing its ordinary task lifecycle.
+type TaskRole string
+
+const TaskRolePlan TaskRole = "plan"
+
 // Report is a worker's self-reported outcome. Only Kind "result" is final. A
 // final report's Checks each state how they ended; a report stored before that
 // was required holds free-text checks, which read as checks without an outcome
@@ -79,6 +84,8 @@ type Task struct {
 	// task is created and never changes, so work cannot be linked to a ticket
 	// after the fact; a task without one reads as unlinked.
 	TicketID string
+	// Role is empty for ordinary work and "plan" for a ticket's planner task.
+	Role TaskRole `json:",omitempty"`
 	// Cleanup stays non-nil only while a confirmed removal is unsettled.
 	Cleanup *CleanupAttempt `json:",omitempty"`
 }
