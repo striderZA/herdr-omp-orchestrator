@@ -139,28 +139,52 @@ const minRuledHeight = 4
 // the primary is unverified. It is part of the scrollable body (pageLinesOf
 // measures it too), not extra chrome, so render and scroll clamp still agree.
 func RenderPage(b *Board, d Detail, width, height int, th Theme) string {
+	return renderPageWithSearch(b, d, width, height, th, "")
+}
+
+func renderPageWithSearch(b *Board, d Detail, width, height int, th Theme, query string) string {
 	if width < 1 {
 		width = 1
 	}
+	query = strings.TrimSpace(query)
 	marker := primaryMarkerBlock(b, width, th)
 	var all []string
 	help := "Esc back, f focus, q close"
 	if ticket, isTicket := b.FindTicket(d.SelectedID); isTicket {
 		all = ticketPageLines(ticket, width, th)
 		// A ticket has no worker pane, so there is nothing to focus.
-		help = strings.Join(append(append([]string{"Esc back"}, ticketWriteKeys(ticket, d)...), "q close"), ", ")
+		help = strings.Join(append(append([]string{"Esc back", "/ search"}, ticketWriteKeys(ticket, d)...), "q close"), ", ")
 	} else if card, ok := b.Find(d.SelectedID); ok {
 		all = pageLines(card, width, th)
 	} else {
-		return strings.Join(append(marker, clip("The task is no longer on this board.", width), clip("Esc back, q close", width)), "\n")
+		lines := append([]string{}, marker...)
+		if query != "" {
+			lines = append(lines, clip("Filter: "+singleLine(query), width))
+		}
+		lines = append(lines, clip("The task is no longer on this board.", width))
+		lines = append(lines, clip(searchPageHelp(query, "Esc back, q close"), width))
+		return strings.Join(lines, "\n")
 	}
 	all = append(append([]string{}, marker...), all...)
 	notice := noticeLine(d, th, width)
 	rows, rule, showNotice := pageChrome(height, notice != "")
+	status := ""
+	if query != "" {
+		if rows > 0 {
+			status = clip("Filter: "+singleLine(query), width)
+			rows--
+		} else {
+			help = searchPageHelp(query, help)
+		}
+	}
 	body, scroll := pageWindow(all, d.Scroll, rows)
-	lines := append([]string{}, body...)
+	lines := make([]string, 0, len(body)+4)
+	lines = append(lines, body...)
 	if showNotice {
 		lines = append(lines, notice)
+	}
+	if status != "" {
+		lines = append(lines, status)
 	}
 	if len(body) > 0 && len(body) < len(all) {
 		help = fmt.Sprintf("%d-%d/%d up/down scroll, %s", scroll+1, scroll+len(body), len(all), help)
@@ -170,4 +194,11 @@ func RenderPage(b *Board, d Detail, width, height int, th Theme) string {
 	}
 	lines = append(lines, clip(help, width))
 	return strings.Join(lines, "\n")
+}
+
+func searchPageHelp(query, help string) string {
+	if query == "" {
+		return help
+	}
+	return "Filter: " + singleLine(query) + " | " + help
 }

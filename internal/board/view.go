@@ -26,15 +26,14 @@ package board
 import (
 	"context"
 	"fmt"
+	"herdr-omp-orchestrator/internal/state"
+	"herdr-omp-orchestrator/internal/task"
 	"strings"
 	"time"
 	"unicode"
 
 	"github.com/mattn/go-runewidth"
 	"github.com/muesli/termenv"
-
-	"herdr-omp-orchestrator/internal/state"
-	"herdr-omp-orchestrator/internal/task"
 )
 
 // Palette is the board's fallback palette. The board never sets a background and
@@ -267,6 +266,55 @@ func NewBoardWithTickets(cards []Card, tickets []TicketCard) *Board {
 	return b
 }
 
+// filterTaskBoard returns a display-only board containing tasks that match query.
+// Ticket cards, task stages, unknown cards and the primary marker are preserved.
+func filterTaskBoard(source *Board, query string) *Board {
+	if source == nil {
+		return NewBoard(nil)
+	}
+	needle := strings.ToLower(strings.TrimSpace(query))
+	if needle == "" {
+		return source
+	}
+	cards := make([]Card, 0, len(source.cards))
+	for _, card := range source.cards {
+		if taskMatchesQuery(card, needle) {
+			cards = append(cards, card)
+		}
+	}
+	tickets := make([]TicketCard, 0, len(source.tickets)+len(source.unplacedTickets))
+	tickets = append(tickets, source.tickets...)
+	tickets = append(tickets, source.unplacedTickets...)
+	filtered := NewBoardWithTickets(cards, tickets)
+	filtered.primaryAttention = source.primaryAttention
+	return filtered
+}
+
+// taskMatchesQuery searches task fields, displayed dependency blocks and report labels.
+func taskMatchesQuery(card Card, needle string) bool {
+	fields := []string{
+		card.Task.ID,
+		card.Task.Title,
+		card.Task.Brief,
+		card.Task.Blocker,
+		card.Task.Attention,
+	}
+	fields = append(fields, card.DependencyBlocks...)
+	if report := card.Task.Report; report != nil {
+		fields = append(fields, report.Kind, report.Summary, report.Branch, report.Risk)
+		fields = append(fields, report.Evidence...)
+		for _, check := range report.Checks {
+			fields = append(fields, check.Label())
+		}
+	}
+	for _, field := range fields {
+		if strings.Contains(strings.ToLower(strings.TrimSpace(field)), needle) {
+			return true
+		}
+	}
+	return false
+}
+
 // Cards returns every card in column order, with the cards this build could not
 // place last.
 func (b *Board) Cards() []Card {
@@ -328,19 +376,26 @@ const (
 // Render draws the board at width columns. Every line is clipped or wrapped to
 // width, in both layouts.
 func Render(b *Board, d Detail, width int, th Theme) string {
+	return renderWithSearch(b, d, width, th, "")
+}
+
+func renderWithSearch(b *Board, d Detail, width int, th Theme, query string) string {
 	if width < 1 {
 		width = 1
 	}
-	// The primary's absence heads the board in every layout, above the columns, so
-	// it is the first thing a reader meets.
+	query = strings.TrimSpace(query)
+	// Keep the primary marker first; search status follows it.
 	lines := primaryMarkerBlock(b, width, th)
+	if query != "" {
+		lines = append(lines, th.paint(Focus, clip("Filter: "+singleLine(query), width)))
+	}
 	if len(b.Cards()) == 0 && !b.hasTickets() && !d.TicketWrites {
-		lines = append(lines, wrap(noTasksMessage, width)...)
+		lines = append(lines, wrap(taskEmptyMessage(query), width)...)
 		lines = append(lines, "")
 		if notice := noticeLine(d, th, width); notice != "" {
 			lines = append(lines, notice)
 		}
-		return strings.Join(append(lines, clip("q close", width)), "\n")
+		return strings.Join(append(lines, clip("/ search, q close", width)), "\n")
 	}
 	if b.showsTickets(d) {
 		lines = append(lines, ticketColumnLines(b, d, width, th)...)
@@ -348,15 +403,14 @@ func Render(b *Board, d Detail, width int, th Theme) string {
 	}
 	switch {
 	case len(b.Cards()) == 0:
-		lines = append(lines, wrap(noTasksMessage, width)...)
+		lines = append(lines, wrap(taskEmptyMessage(query), width)...)
 	case width >= MinWideWidth:
 		lines = append(lines, wideColumns(b, d, width, th)...)
 	default:
 		lines = append(lines, narrowSections(b, d, width, th)...)
 	}
+	// A card this build cannot place is still shown rather than silently dropped.
 	if b != nil && (len(b.unplaced) > 0 || len(b.unplacedTickets) > 0) {
-		// Unreachable through ProjectCards (task.StageOf returns only the five
-		// columns), but a card this build cannot place is still shown.
 		lines = append(lines, "", clip("Not placed by this build:", width))
 		for _, card := range b.unplaced {
 			lines = append(lines, clip(cardText(card, card.ID() == d.SelectedID), width))
@@ -368,6 +422,13 @@ func Render(b *Board, d Detail, width int, th Theme) string {
 	lines = append(lines, strings.Repeat(th.rule(), width))
 	lines = append(lines, detailLines(b, d, width, th)...)
 	return strings.Join(lines, "\n")
+}
+
+func taskEmptyMessage(query string) string {
+	if strings.TrimSpace(query) == "" {
+		return noTasksMessage
+	}
+	return fmt.Sprintf("No tasks match %q", singleLine(query))
 }
 
 // noTasksMessage is what a board with no task says; it is also drawn under the
@@ -579,20 +640,20 @@ func cardSummary(card Card) string {
 // whenever ticket writes are enabled; a read-only board offers only q.
 func noSelectionHelp(d Detail) string {
 	if d.TicketWrites {
-		return "n new ticket, q close"
+		return "/ search, n new ticket, q close"
 	}
-	return "q close"
+	return "/ search, q close"
 }
 
 // helpLine is the short keyboard help: the board has no other chrome.
 func helpLine(d Detail) string {
 	if d.Expanded {
-		return "Esc collapse, f focus, q close"
+		return "Esc collapse, / search, f focus, q close"
 	}
 	if d.TicketWrites {
-		return "Enter details, f focus, n new ticket, q close"
+		return "Enter details, / search, f focus, n new ticket, q close"
 	}
-	return "Enter details, f focus, q close"
+	return "Enter details, / search, f focus, q close"
 }
 
 // noticeLine renders the last action's outcome, if it said anything, as one line
