@@ -404,6 +404,8 @@ func (m *Model) reselectSearch(previous string) {
 	if len(cards) == 0 {
 		m.selected = ""
 		m.inTickets = false
+		m.expanded = false
+		m.scroll = 0
 		return
 	}
 	m.selectTaskCard(cards[0])
@@ -571,14 +573,12 @@ func (m *Model) moveCursor(delta int) {
 		m.selected = ""
 		return
 	}
-	index := 0
-	for i, id := range order {
-		if id == m.selected {
-			index = i
-			break
-		}
+	index := slices.Index(order, m.selected)
+	if index < 0 {
+		index = 0
+	} else {
+		index += delta
 	}
-	index += delta
 	if index < 0 {
 		index = 0
 	}

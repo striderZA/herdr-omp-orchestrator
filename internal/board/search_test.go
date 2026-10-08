@@ -370,3 +370,60 @@ func TestBoardSearchPromptAndNoMatchFitNarrowASCII(t *testing.T) {
 		t.Errorf("the applied query or empty-result message is missing:\n%s", filtered)
 	}
 }
+
+func TestBoardSearchRefreshToNoMatchesClosesTheFilteredDetailPage(t *testing.T) {
+	f := newBoardFixture(t, fixturePlan{})
+	card := sampleTask("orch_refresh", func(x *task.Task) { x.Title = "compiler work" })
+	f.seed(t, card)
+	m := f.model(t, Options{})
+	applySearch(t, m, "compiler")
+	press(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	if !m.expanded {
+		t.Fatal("enter did not open the filtered detail page")
+	}
+
+	current := f.task(card.ID)
+	if _, err := f.store.UpdateTask(context.Background(), card.ID, current.Revision, func(next *task.Task) error {
+		next.Title = "documentation work"
+		return nil
+	}); err != nil {
+		t.Fatalf("change task text before refresh: %v", err)
+	}
+	press(t, m, tickMsg{})
+
+	if m.expanded || m.scroll != 0 {
+		t.Errorf("a refresh with no matches kept the stale detail page: expanded=%v scroll=%d", m.expanded, m.scroll)
+	}
+	view := m.View()
+	if !strings.Contains(view, `No tasks match "compiler"`) || strings.Contains(view, "no longer on this board") {
+		t.Errorf("a refreshed no-match search did not return to the explicit empty state:\n%s", view)
+	}
+}
+
+func TestBoardSearchDownFromEmptyTaskResultsSelectsFirstTicket(t *testing.T) {
+	f := newBoardFixture(t, fixturePlan{})
+	taskCard := sampleTask("orch_hidden", nil)
+	f.seed(t, taskCard)
+	f.addTicket(t, "tkt_a_first", task.ColumnBacklog)
+	f.addTicket(t, "tkt_b_second", task.ColumnBacklog)
+	m := f.model(t, Options{})
+	tickets := m.board.Tickets()
+	if len(tickets) != 2 {
+		t.Fatalf("ticket cards = %d, want 2", len(tickets))
+	}
+	firstTicketID := tickets[0].ID()
+
+	press(t, m, tea.KeyMsg{Type: tea.KeyDown})
+	press(t, m, tea.KeyMsg{Type: tea.KeyDown})
+	if got := m.SelectedID(); got != taskCard.ID {
+		t.Fatalf("selection before filtering = %q, want task %q", got, taskCard.ID)
+	}
+	applySearch(t, m, "no matching task")
+	if got := m.SelectedID(); got != "" {
+		t.Fatalf("no-match selection = %q, want none", got)
+	}
+	press(t, m, tea.KeyMsg{Type: tea.KeyDown})
+	if got := m.SelectedID(); got != firstTicketID {
+		t.Errorf("down from empty results selected %q, want first visible ticket %q", got, firstTicketID)
+	}
+}
