@@ -287,6 +287,72 @@ func TestClaimTaskAcceptsABacklogTicket(t *testing.T) {
 	}
 }
 
+func TestTicketPlannerGateAndRoleAreImmutable(t *testing.T) {
+	ctx := context.Background()
+	s := open(t, t.TempDir())
+	mustCreateTicket(t, s, seedTicket("tkt_a", "repo-a"))
+
+	planner := ticketTask("plan_a", "tkt_a", 1)
+	planner.Role = task.TaskRolePlan
+	if err := s.CreateTask(ctx, planner); err != nil {
+		t.Fatalf("CreateTask for the planner: %v", err)
+	}
+	implementation := ticketTask("impl_open_plan", "tkt_a", 2)
+	if err := s.CreateTask(ctx, implementation); !errors.Is(err, state.ErrTicketUnavailable) {
+		t.Fatalf("CreateTask before plan approval = %v, want ErrTicketUnavailable", err)
+	}
+	if _, err := s.Task(ctx, implementation.ID); !errors.Is(err, state.ErrNotFound) {
+		t.Fatalf("a task before plan approval was stored: %v", err)
+	}
+	implementation.ID = "claim_open_plan"
+	if _, _, _, err := s.ClaimTask(ctx, implementation, 3); !errors.Is(err, state.ErrTicketUnavailable) {
+		t.Fatalf("ClaimTask before plan approval = %v, want ErrTicketUnavailable", err)
+	}
+	if _, err := s.Task(ctx, implementation.ID); !errors.Is(err, state.ErrNotFound) {
+		t.Fatalf("a claimed task before plan approval was stored: %v", err)
+	}
+
+	if _, err := s.UpdateTask(ctx, planner.ID, 1, func(next *task.Task) error {
+		next.Role = ""
+		return nil
+	}); !errors.Is(err, state.ErrInvalid) {
+		t.Fatalf("changing the planner role = %v, want ErrInvalid", err)
+	}
+	if _, err := s.UpdateTask(ctx, planner.ID, 1, func(next *task.Task) error {
+		next.Outcome, next.Disposition = task.OutcomeIntegrated, task.OutcomeIntegrated
+		return nil
+	}); err != nil {
+		t.Fatalf("accept planner: %v", err)
+	}
+	implementation.ID = "impl_after_accepted_plan"
+	if err := s.CreateTask(ctx, implementation); err != nil {
+		t.Fatalf("CreateTask after accepting the plan: %v", err)
+	}
+
+	mustCreateTicket(t, s, seedTicket("tkt_b", "repo-a"))
+	rejected := ticketTask("plan_b", "tkt_b", 3)
+	rejected.Role = task.TaskRolePlan
+	if err := s.CreateTask(ctx, rejected); err != nil {
+		t.Fatalf("CreateTask for the second planner: %v", err)
+	}
+	if _, err := s.UpdateTask(ctx, rejected.ID, 1, func(next *task.Task) error {
+		next.Outcome, next.Disposition = task.OutcomeRejected, task.OutcomeRejected
+		return nil
+	}); err != nil {
+		t.Fatalf("reject planner: %v", err)
+	}
+	implementation = ticketTask("impl_rejected_plan", "tkt_b", 4)
+	if err := s.CreateTask(ctx, implementation); !errors.Is(err, state.ErrTicketUnavailable) {
+		t.Fatalf("CreateTask after rejecting the plan = %v, want ErrTicketUnavailable", err)
+	}
+
+	invalidRole := ticketTask("bad_role", "", 5)
+	invalidRole.Role = task.TaskRole("worker")
+	if err := s.CreateTask(ctx, invalidRole); !errors.Is(err, state.ErrInvalid) {
+		t.Fatalf("CreateTask with unknown role = %v, want ErrInvalid", err)
+	}
+}
+
 func TestDecideTicketRefusesWhileALinkedTaskIsOpen(t *testing.T) {
 	ctx := context.Background()
 	s := open(t, t.TempDir())

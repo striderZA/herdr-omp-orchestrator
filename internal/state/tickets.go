@@ -58,7 +58,8 @@ func (s *Store) CreateTicket(ctx context.Context, t task.Ticket) error {
 	} else if taken {
 		return fmt.Errorf("%w: ticket %q already exists", ErrConflict, t.ID)
 	}
-	if _, err := tx.ExecContext(ctx,
+	if _, err := tx.ExecContext(
+		ctx,
 		`INSERT INTO tickets (id, project_key, revision, data) VALUES (?, ?, ?, ?)`,
 		t.ID, t.ProjectKey, t.Revision, string(data),
 	); err != nil {
@@ -129,6 +130,59 @@ func (s *Store) UpdateTicket(ctx context.Context, id string, expectedRevision in
 		return task.Ticket{}, err
 	}
 	return next, nil
+}
+
+// MoveTicketToTodoWithPlannerTask records the human's move and the planner's
+// zero-slot intent in one transaction. A crash can therefore leave neither fact
+// or both, never a todo ticket without the task this move promised.
+func (s *Store) MoveTicketToTodoWithPlannerTask(
+	ctx context.Context, id string, expectedRevision int64, planner task.Task,
+) (task.Ticket, task.Task, error) {
+	if strings.TrimSpace(id) == "" {
+		return task.Ticket{}, task.Task{}, fmt.Errorf("%w: ticket id is required", ErrInvalid)
+	}
+	if err := checkTaskRole(planner); err != nil {
+		return task.Ticket{}, task.Task{}, err
+	}
+	if planner.Role != task.TaskRolePlan || planner.TicketID != id ||
+		planner.Phase != task.Intent || planner.Report != nil ||
+		planner.Outcome != "" || planner.Disposition != "" {
+		return task.Ticket{}, task.Task{}, fmt.Errorf("%w: planner intent does not match ticket %q", ErrInvalid, id)
+	}
+	operation := "move ticket " + id + " to todo with planner " + planner.ID
+	tx, err := s.begin(ctx, operation)
+	if err != nil {
+		return task.Ticket{}, task.Task{}, err
+	}
+	defer tx.rollback()
+
+	current, err := readTicketForUpdate(ctx, tx, id, expectedRevision)
+	if err != nil {
+		return task.Ticket{}, task.Task{}, err
+	}
+	if current.Decided() {
+		return task.Ticket{}, task.Task{}, fmt.Errorf("%w: ticket %q is already decided", ErrTicketUnavailable, id)
+	}
+	if current.Column != task.ColumnBacklog {
+		return task.Ticket{}, task.Task{}, fmt.Errorf("%w: ticket %q is not in the backlog", ErrConflict, id)
+	}
+	if planner.ProjectKey != current.ProjectKey {
+		return task.Ticket{}, task.Task{}, fmt.Errorf("%w: planner task project does not match ticket %q", ErrInvalid, id)
+	}
+	next := current
+	next.Column = task.ColumnTodo
+	moved, err := writeTicket(ctx, tx, current, next)
+	if err != nil {
+		return task.Ticket{}, task.Task{}, err
+	}
+	_, recorded, _, err := s.claimTaskTx(ctx, tx, planner, 0, false)
+	if err != nil {
+		return task.Ticket{}, task.Task{}, err
+	}
+	if err := tx.commit(operation); err != nil {
+		return task.Ticket{}, task.Task{}, err
+	}
+	return moved, recorded, nil
 }
 
 // DecideTicket records the user's decision for a ticket as one revision later,
@@ -205,7 +259,37 @@ func checkTicketUsable(ctx context.Context, tx *tx, t task.Task) error {
 	case ticket.Decided():
 		return fmt.Errorf("%w: ticket %q is already decided", ErrTicketUnavailable, t.TicketID)
 	}
+	if t.Role == task.TaskRolePlan {
+		return nil
+	}
+	linked, err := queryFacts[task.Task](ctx, tx,
+		`SELECT data FROM tasks WHERE project_key = ?`, t.ProjectKey)
+	if err != nil {
+		return fmt.Errorf("read the planner tasks of ticket %q: %w", t.TicketID, err)
+	}
+	for _, existing := range linked {
+		if existing.TicketID == t.TicketID && existing.Role == task.TaskRolePlan && !existing.Accepted() {
+			return fmt.Errorf("%w: planner task %s for ticket %s has no accepting disposition",
+				ErrTicketUnavailable, existing.ID, t.TicketID)
+		}
+	}
 	return nil
+}
+
+// checkTaskRole accepts the empty role for legacy and ordinary work, and the
+// plan role only when the task is linked to a ticket.
+func checkTaskRole(t task.Task) error {
+	switch t.Role {
+	case "":
+		return nil
+	case task.TaskRolePlan:
+		if strings.TrimSpace(t.TicketID) != "" {
+			return nil
+		}
+		return fmt.Errorf("%w: a planner task needs a ticket id", ErrInvalid)
+	default:
+		return fmt.Errorf("%w: task %q has unknown role %q", ErrInvalid, t.ID, t.Role)
+	}
 }
 
 // checkTicketShape rejects a ticket whose stored shape would be unreadable to

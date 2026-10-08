@@ -306,6 +306,9 @@ func (s *Store) CreateTask(ctx context.Context, t task.Task) error {
 	if t.ID == "" || t.ProjectKey == "" {
 		return fmt.Errorf("%w: task id and project key are required", ErrInvalid)
 	}
+	if err := checkTaskRole(t); err != nil {
+		return err
+	}
 	now := time.Now().UnixMilli()
 	t.Revision = 1
 	t.CreatedAt, t.UpdatedAt = now, now
@@ -459,6 +462,9 @@ func updateTask(ctx context.Context, tx *tx, id string, expectedRevision int64, 
 	}
 	if next.TicketID != current.TicketID {
 		return task.Task{}, fmt.Errorf("%w: task %q ticket id is immutable", ErrInvalid, id)
+	}
+	if next.Role != current.Role {
+		return task.Task{}, fmt.Errorf("%w: task %q role is immutable", ErrInvalid, id)
 	}
 	if next.LaunchPaneID != current.LaunchPaneID {
 		if err := checkPaneFree(ctx, tx, next.LaunchPaneID, id); err != nil {
@@ -1142,8 +1148,36 @@ func (s *Store) ClaimTask(ctx context.Context, t task.Task, budget int) (bool, t
 }
 
 func (s *Store) claimTask(ctx context.Context, t task.Task, budget int, claimSlot bool) (bool, task.Task, int64, error) {
+	action := "record task intent"
+	operation := action + " " + t.ID
+	if claimSlot {
+		action = "claim task"
+		operation = action + " " + t.ID
+	}
+	tx, err := s.begin(ctx, operation)
+	if err != nil {
+		return false, task.Task{}, 0, err
+	}
+	defer tx.rollback()
+
+	claimed, recorded, token, err := s.claimTaskTx(ctx, tx, t, budget, claimSlot)
+	if err != nil {
+		return false, task.Task{}, 0, err
+	}
+	if err := tx.commit(operation); err != nil {
+		return false, task.Task{}, 0, err
+	}
+	return claimed, recorded, token, nil
+}
+
+// claimTaskTx records one task intent through the durable ticket, duplicate,
+// pane, reservation and optional capacity gates. Its caller owns the transaction.
+func (s *Store) claimTaskTx(ctx context.Context, tx *tx, t task.Task, budget int, claimSlot bool) (bool, task.Task, int64, error) {
 	if t.ID == "" || t.ProjectKey == "" {
 		return false, task.Task{}, 0, fmt.Errorf("%w: task id and project key are required", ErrInvalid)
+	}
+	if err := checkTaskRole(t); err != nil {
+		return false, task.Task{}, 0, err
 	}
 	if claimSlot && budget < 1 {
 		return false, task.Task{}, 0, fmt.Errorf("%w: a provisioning budget of at least one is required", ErrInvalid)
@@ -1157,17 +1191,9 @@ func (s *Store) claimTask(ctx context.Context, t task.Task, budget int, claimSlo
 	}
 
 	action := "record task intent"
-	operation := action + " " + t.ID
 	if claimSlot {
 		action = "claim task"
-		operation = action + " " + t.ID
 	}
-	tx, err := s.begin(ctx, operation)
-	if err != nil {
-		return false, task.Task{}, 0, err
-	}
-	defer tx.rollback()
-
 	if taken, err := rowExists(ctx, tx, `SELECT 1 FROM tasks WHERE id = ?`, t.ID); err != nil {
 		return false, task.Task{}, 0, err
 	} else if taken {
@@ -1218,9 +1244,6 @@ func (s *Store) claimTask(ctx context.Context, t task.Task, budget int, claimSlo
 		return false, task.Task{}, 0, fmt.Errorf("%s %q: %w", action, t.ID, err)
 	}
 	if err := recordCreated(ctx, tx, t); err != nil {
-		return false, task.Task{}, 0, err
-	}
-	if err := tx.commit(operation); err != nil {
 		return false, task.Task{}, 0, err
 	}
 	return claimed, t, token, nil
