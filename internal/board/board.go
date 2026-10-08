@@ -3,6 +3,9 @@ package board
 import (
 	"context"
 	"fmt"
+	"herdr-omp-orchestrator/internal/herdr"
+	"herdr-omp-orchestrator/internal/state"
+	"herdr-omp-orchestrator/internal/task"
 	"io"
 	"slices"
 	"strings"
@@ -12,10 +15,6 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/muesli/termenv"
-
-	"herdr-omp-orchestrator/internal/herdr"
-	"herdr-omp-orchestrator/internal/state"
-	"herdr-omp-orchestrator/internal/task"
 )
 
 // DefaultRefreshInterval is how often the board re-reads the store. It is a
@@ -99,9 +98,15 @@ type Model struct {
 	opts    Options
 	ctx     context.Context
 
-	board   *Board
-	cursors []int
-	stage   int
+	// board is the visible projection; sourceBoard is the latest unfiltered project read.
+	board        *Board
+	sourceBoard  *Board
+	searchQuery  string
+	searchDraft  string
+	searchReturn string // selection restored if search is cleared
+	searchOpen   bool
+	cursors      []int
+	stage        int
 	// inTickets says the reader is in the ticket area (the ticket columns, drawn
 	// before the five task columns when they are shown); ticketStage and
 	// ticketCursors are its position there, as stage and cursors are for tasks.
@@ -233,6 +238,9 @@ func (m *Model) key(key tea.KeyMsg) tea.Cmd {
 	if m.promptOpen {
 		return m.promptKey(key)
 	}
+	if m.searchOpen {
+		return m.searchKey(key)
+	}
 	switch key.Type {
 	case tea.KeyCtrlC:
 		return tea.Quit
@@ -282,8 +290,10 @@ func (m *Model) key(key tea.KeyMsg) tea.Cmd {
 		return nil
 
 	case tea.KeyEnter:
-		m.expanded = !m.expanded
-		m.scroll = 0
+		if m.selected != "" {
+			m.expanded = !m.expanded
+			m.scroll = 0
+		}
 		return nil
 
 	case tea.KeyRunes:
@@ -304,6 +314,8 @@ func (m *Model) key(key tea.KeyMsg) tea.Cmd {
 			m.notice = ""
 			m.noticeErr = false
 			m.refresh()
+		case "/":
+			return m.openSearch()
 		}
 	}
 	return nil
@@ -328,9 +340,14 @@ func (m *Model) refresh() {
 		return
 	}
 	m.loadErr = nil
-	m.board = NewBoardWithTickets(cards, tickets).WithPrimaryAttention(attention)
 	before := m.selected
-	m.reselect()
+	m.sourceBoard = NewBoardWithTickets(cards, tickets).WithPrimaryAttention(attention)
+	m.board = filterTaskBoard(m.sourceBoard, m.searchQuery)
+	if m.searchQuery != "" {
+		m.reselectSearch(before)
+	} else {
+		m.reselect()
+	}
 	if m.selected != before {
 		m.scroll = 0
 	}
@@ -364,6 +381,50 @@ func (m *Model) reselect() {
 		return
 	}
 	m.selectFirstCard()
+}
+
+// reselectSearch keeps a task or ticket selected when it remains visible. A
+// task filtered out by the query falls to the first matching task; an empty
+// result has no task selection rather than jumping to an unrelated ticket.
+func (m *Model) reselectSearch(previous string) {
+	if card, ok := m.board.Find(previous); ok {
+		m.selectTaskCard(card)
+		return
+	}
+	if ticket, ok := m.board.FindTicket(previous); ok && m.showsTickets() {
+		m.selected = ticket.ID()
+		m.followTicket(ticket)
+		return
+	}
+	if m.searchQuery == "" {
+		m.reselect()
+		return
+	}
+	cards := m.board.Cards()
+	if len(cards) == 0 {
+		m.selected = ""
+		m.inTickets = false
+		m.expanded = false
+		m.scroll = 0
+		return
+	}
+	m.selectTaskCard(cards[0])
+}
+
+func (m *Model) selectTaskCard(card Card) {
+	m.selected = card.ID()
+	m.inTickets = false
+	stage := stageIndex(card.Stage)
+	if stage < 0 {
+		return
+	}
+	m.stage = stage
+	for i, inColumn := range m.board.Column(card.Stage) {
+		if inColumn.ID() == card.ID() {
+			m.cursors[stage] = i
+			return
+		}
+	}
 }
 
 // followTicket puts the reader's position on the column a ticket is in now.
@@ -466,6 +527,9 @@ func (m *Model) step(delta int) {
 // pageSize is how far PgUp/PgDn move the detail page.
 func (m *Model) pageSize() int {
 	rows, _, _ := pageChrome(m.height, strings.TrimSpace(m.notice) != "")
+	if m.searchQuery != "" && rows > 0 {
+		rows--
+	}
 	if rows > 1 {
 		return rows - 1
 	}
@@ -483,7 +547,11 @@ func (m *Model) scrollBy(delta int) {
 	}
 	total := len(lines)
 	max := 0
-	if rows, _, _ := pageChrome(m.height, strings.TrimSpace(m.notice) != ""); rows >= 0 && total > rows {
+	rows, _, _ := pageChrome(m.height, strings.TrimSpace(m.notice) != "")
+	if m.searchQuery != "" && rows > 0 {
+		rows--
+	}
+	if rows >= 0 && total > rows {
 		max = total - rows
 	}
 	m.scroll += delta
@@ -505,14 +573,12 @@ func (m *Model) moveCursor(delta int) {
 		m.selected = ""
 		return
 	}
-	index := 0
-	for i, id := range order {
-		if id == m.selected {
-			index = i
-			break
-		}
+	index := slices.Index(order, m.selected)
+	if index < 0 {
+		index = 0
+	} else {
+		index += delta
 	}
-	index += delta
 	if index < 0 {
 		index = 0
 	}
@@ -626,14 +692,26 @@ func (m *Model) View() string {
 	d := m.detail()
 	var out string
 	if m.expanded {
-		out = RenderPage(m.board, d, m.width, m.height, m.opts.Theme)
+		out = renderPageWithSearch(m.board, d, m.width, m.height, m.opts.Theme, m.searchQuery)
 	} else {
-		out = Render(m.board, d, m.width, m.opts.Theme)
+		out = renderWithSearch(m.board, d, m.width, m.opts.Theme, m.searchQuery)
 	}
-	if m.promptOpen {
+	if m.searchOpen {
+		out += "\n" + strings.Join(m.searchPromptLines(), "\n")
+	} else if m.promptOpen {
 		out += "\n" + strings.Join(m.promptLines(), "\n")
 	}
 	return out
+}
+
+func (m *Model) openSearch() tea.Cmd {
+	m.expanded = false
+	m.scroll = 0
+	m.searchOpen = true
+	m.searchDraft = m.searchQuery
+	m.notice = ""
+	m.noticeErr = false
+	return nil
 }
 
 // openPrompt opens the new-ticket title prompt. The prompt belongs to the board,
@@ -675,6 +753,72 @@ func (m *Model) promptKey(key tea.KeyMsg) tea.Cmd {
 		m.typeIntoPrompt(string(key.Runes))
 	}
 	return nil
+}
+
+func (m *Model) searchKey(key tea.KeyMsg) tea.Cmd {
+	switch key.Type {
+	case tea.KeyEsc, tea.KeyCtrlC:
+		m.searchOpen = false
+		m.searchDraft = ""
+	case tea.KeyEnter:
+		m.applySearch()
+	case tea.KeyBackspace:
+		if runes := []rune(m.searchDraft); len(runes) > 0 {
+			m.searchDraft = string(runes[:len(runes)-1])
+		}
+	case tea.KeyCtrlU:
+		m.searchDraft = ""
+	case tea.KeySpace:
+		m.typeIntoSearch(" ")
+	case tea.KeyRunes:
+		m.typeIntoSearch(string(key.Runes))
+	}
+	return nil
+}
+
+func (m *Model) typeIntoSearch(text string) {
+	for _, r := range text {
+		if unicode.IsSpace(r) {
+			r = ' '
+		} else if unsafeRune(r) < 0 {
+			continue
+		}
+		m.searchDraft += string(r)
+	}
+}
+
+func (m *Model) applySearch() {
+	query := strings.TrimSpace(m.searchDraft)
+	previous := m.selected
+	m.searchOpen = false
+	m.searchDraft = ""
+	m.expanded = false
+	m.scroll = 0
+	m.notice = ""
+	m.noticeErr = false
+
+	if query == "" {
+		m.searchQuery = ""
+		m.board = m.sourceBoard
+		if m.searchReturn != "" {
+			previous = m.searchReturn
+		}
+		m.searchReturn = ""
+	} else {
+		if m.searchQuery == "" {
+			m.searchReturn = previous
+		}
+		m.searchQuery = query
+		m.board = filterTaskBoard(m.sourceBoard, query)
+	}
+	m.reselectSearch(previous)
+}
+
+func (m *Model) searchPromptLines() []string {
+	return []string{
+		m.opts.Theme.paint(Focus, clip("Search tasks: "+singleLine(m.searchDraft)+"_", m.width)),
+		clip("Enter apply, Esc cancel, Ctrl+U clear", m.width),
+	}
 }
 
 // typeIntoPrompt appends text, up to the title bound and never in the middle of a

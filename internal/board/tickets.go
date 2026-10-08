@@ -3,11 +3,10 @@ package board
 import (
 	"context"
 	"fmt"
-	"strconv"
-	"strings"
-
 	"herdr-omp-orchestrator/internal/state"
 	"herdr-omp-orchestrator/internal/task"
+	"strconv"
+	"strings"
 )
 
 // TicketColumns are the two columns a ticket rests in before any task exists for
@@ -295,6 +294,7 @@ func ticketHelpLine(card TicketCard, d Detail) string {
 	if d.Expanded {
 		parts = []string{"Esc collapse"}
 	}
+	parts = append(parts, "/ search")
 	parts = append(parts, ticketWriteKeys(card, d)...)
 	return strings.Join(append(parts, "q close"), ", ")
 }
