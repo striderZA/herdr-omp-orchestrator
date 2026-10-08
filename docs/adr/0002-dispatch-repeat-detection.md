@@ -26,4 +26,5 @@ The only existing brake was the reserved-path guard, which is a path lock: it re
 - Dispatching the same work again after a decision, including a rejection, creates a new task.
 - A ticket is part of the work: the same text for two tickets is two tasks.
 - Rejected: a caller-supplied key (a per-invocation key cannot catch a model that re-invokes the tool, and needs a protocol change); a ticket-scoped guard for the planner (does not close the general duplicate); no change (a persisted, blocked task is visible, but the duplicate it invites starts a second agent).
+- If a queue drain fails after the zero-slot intent is recorded, dispatch returns an error naming the task and leaves it queued. A later successful `DrainQueued` or startup reconciliation can process it; duplicate dispatch still does not auto-resume it.
 - Follow-up, not decided here: a task killed before its first provisioning step is resumed only by startup reconciliation in `internal/coord` (callers outside that package were not checked), so a repeat that returns it does not move it forward.
