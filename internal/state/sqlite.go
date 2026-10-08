@@ -1116,26 +1116,36 @@ func taskHoldsSlot(ctx context.Context, q rowQueryer, id string) (bool, error) {
 	return holds == 1, nil
 }
 
-// ClaimTask records a new task and, when the project still has a provisioning
-// slot, claims one for it in the same write transaction.
+// RecordTaskIntent records a zero-slot intent through the same atomic duplicate,
+// ticket, pane and reserved-path gates as ClaimTask. Dispatch uses it before
+// draining older queued work, so a concurrent repeat can see the durable task
+// and return without causing that drain.
+func (s *Store) RecordTaskIntent(ctx context.Context, t task.Task) (task.Task, error) {
+	_, recorded, _, err := s.claimTask(ctx, t, 0, false)
+	return recorded, err
+}
+
+// ClaimTask atomically records a task and, when the project still has a
+// provisioning slot, claims one for it. The coordinator uses RecordTaskIntent
+// followed by ClaimProvisioningSlot so its duplicate gate commits before it
+// drains older queued work; this method remains the one-transaction path for
+// callers that need creation and slot acquisition together.
 //
-// This is the dispatch gate: the concurrency budget and the reserved paths are
-// decided against the database's current contents inside one transaction, so two
-// coordinator processes cannot both pass and provision workers past the limit,
-// and cannot both take the same reserved paths. Both outcomes are durable: a task
-// whose claim was refused for the budget is recorded (a queued task holds no
-// resource) and must be claimed again before it is provisioned, while a
-// reservation that another task holds refuses the whole request and records
-// nothing.
+// Both paths share the same project-scoped duplicate, ticket and reserved-path
+// gates. A task whose slot is refused for budget is durable and queued, while a
+// reservation held by another task refuses the request without recording it.
 //
-// The claim it took is returned as its token (the slot_token column), so the
-// caller that acquired the capacity is the one that can give it back. A refused
-// slot reports a zero token: this call took none.
+// The claim token (slot_token) is returned to the caller that acquired capacity.
+// A refused slot reports a zero token: this call took none.
 func (s *Store) ClaimTask(ctx context.Context, t task.Task, budget int) (bool, task.Task, int64, error) {
+	return s.claimTask(ctx, t, budget, true)
+}
+
+func (s *Store) claimTask(ctx context.Context, t task.Task, budget int, claimSlot bool) (bool, task.Task, int64, error) {
 	if t.ID == "" || t.ProjectKey == "" {
 		return false, task.Task{}, 0, fmt.Errorf("%w: task id and project key are required", ErrInvalid)
 	}
-	if budget < 1 {
+	if claimSlot && budget < 1 {
 		return false, task.Task{}, 0, fmt.Errorf("%w: a provisioning budget of at least one is required", ErrInvalid)
 	}
 	now := time.Now().UnixMilli()
@@ -1146,7 +1156,13 @@ func (s *Store) ClaimTask(ctx context.Context, t task.Task, budget int) (bool, t
 		return false, task.Task{}, 0, fmt.Errorf("encode task %q: %w", t.ID, err)
 	}
 
-	tx, err := s.begin(ctx, "claim task "+t.ID)
+	action := "record task intent"
+	operation := action + " " + t.ID
+	if claimSlot {
+		action = "claim task"
+		operation = action + " " + t.ID
+	}
+	tx, err := s.begin(ctx, operation)
 	if err != nil {
 		return false, task.Task{}, 0, err
 	}
@@ -1180,15 +1196,18 @@ func (s *Store) ClaimTask(ctx context.Context, t task.Task, budget int) (bool, t
 				ErrReservedConflict, owner, theirs, mine)
 		}
 	}
-	count, err := claimedSlots(ctx, tx, t.ProjectKey, t.ID)
-	if err != nil {
-		return false, task.Task{}, 0, err
-	}
-	claimed := count < budget
+	claimed := false
 	var token int64
-	if claimed {
-		// A brand-new record has no previous claim, so the token is simply now.
-		token = nextSlotToken(0)
+	if claimSlot {
+		count, err := claimedSlots(ctx, tx, t.ProjectKey, t.ID)
+		if err != nil {
+			return false, task.Task{}, 0, err
+		}
+		claimed = count < budget
+		if claimed {
+			// A brand-new record has no previous claim, so the token is simply now.
+			token = nextSlotToken(0)
+		}
 	}
 	if _, err := tx.ExecContext(
 		ctx,
@@ -1196,12 +1215,12 @@ func (s *Store) ClaimTask(ctx context.Context, t task.Task, budget int) (bool, t
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		t.ID, t.ProjectKey, nullablePane(t.LaunchPaneID), t.PublicPaneID, t.Revision, token, token, string(data),
 	); err != nil {
-		return false, task.Task{}, 0, fmt.Errorf("claim task %q: %w", t.ID, err)
+		return false, task.Task{}, 0, fmt.Errorf("%s %q: %w", action, t.ID, err)
 	}
 	if err := recordCreated(ctx, tx, t); err != nil {
 		return false, task.Task{}, 0, err
 	}
-	if err := tx.commit("claim task " + t.ID); err != nil {
+	if err := tx.commit(operation); err != nil {
 		return false, task.Task{}, 0, err
 	}
 	return claimed, t, token, nil

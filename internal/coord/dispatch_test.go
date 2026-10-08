@@ -3724,8 +3724,6 @@ func TestDrainNeverProvisionsATaskAnotherCallerOwns(t *testing.T) {
 	f := newCoordFixture(t, fixturePlan{})
 	sibling := f.sibling()
 	checks := []string{"go test ./... ok"}
-
-	// A admits the task exactly as Dispatch does, then stops before any side effect.
 	request, err := newDispatchRequest("one", "brief one", checks, nil, nil)
 	if err != nil {
 		t.Fatalf("newDispatchRequest: %v", err)
@@ -3734,9 +3732,17 @@ func TestDrainNeverProvisionsATaskAnotherCallerOwns(t *testing.T) {
 	if err != nil {
 		t.Fatalf("committedSHA: %v", err)
 	}
-	admitted, claimed, admittedToken, err := f.coord.createTask(context.Background(), f.root, request, base)
+
+	// Dispatch records the zero-slot intent before the queue drain, then claims
+	// capacity after older work has had its turn. There is no queue here, so make
+	// that claim directly and stop before any provisioning side effect.
+	admitted, duplicate, err := f.coord.recordTaskIntent(context.Background(), f.root, request, base)
+	if err != nil || duplicate {
+		t.Fatalf("record the intent = (%+v, %v, %v), want a new task", admitted, duplicate, err)
+	}
+	claimed, admittedToken, err := f.store.ClaimProvisioningSlot(context.Background(), admitted.ID, f.coord.opts.Concurrency)
 	if err != nil || !claimed {
-		t.Fatalf("admit the task = (%+v, %v, %v), want a claim", admitted, claimed, err)
+		t.Fatalf("claim the admitted task's slot = (%v, %v), want a claim", claimed, err)
 	}
 
 	// B drains the project: the claimed task is the queue's only candidate.

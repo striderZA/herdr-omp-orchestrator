@@ -536,8 +536,8 @@ func TestDispatchRefusesATicketDecidedAfterThePreCheck(t *testing.T) {
 	if _, err := f.store.DecideTicket(ctx, ticket.ID, ticket.Revision, task.OutcomeAbandoned, "dropped"); err != nil {
 		t.Fatalf("decide: %v", err)
 	}
-	if _, _, _, err := f.coord.createTask(ctx, key, request, f.base); !errors.Is(err, ErrAlreadyDecided) {
-		t.Fatalf("createTask for a ticket decided after the pre-check = %v, want ErrAlreadyDecided", err)
+	if _, _, err := f.coord.recordTaskIntent(ctx, key, request, f.base); !errors.Is(err, ErrAlreadyDecided) {
+		t.Fatalf("recordTaskIntent for a ticket decided after the pre-check = %v, want ErrAlreadyDecided", err)
 	}
 	if tasks, err := f.store.Tasks(ctx, key); err != nil || len(tasks) != 0 {
 		t.Fatalf("no task may exist after the refusal: %+v, %v", tasks, err)

@@ -249,6 +249,62 @@ func TestConcurrentIdenticalDispatchesYieldOneTask(t *testing.T) {
 	}
 }
 
+func TestConcurrentDispatchReturnsDuplicateBeforeDrainingQueuedWork(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	var running []task.Task
+	for _, title := range []string{"one", "two", "three"} {
+		running = append(running, f.mustDispatch(title, "brief "+title))
+	}
+	queued := f.mustDispatch("four", "brief four")
+	if task.StageOf(queued) != task.Queued {
+		t.Fatalf("fourth task stage = %q, want queued", task.StageOf(queued))
+	}
+	f.block(running[0], func(next *task.Task) { next.Disposition = "integrated" })
+	f.updatePlan(func(p *fixturePlan) { p.PromptDelayMillis = 1500 })
+
+	projectKey := f.projectKey()
+	params := DispatchParams{
+		Title: "racing task", Brief: "same work", Checks: repeatChecks, BaseRevision: f.base,
+	}
+	type answer struct {
+		result DispatchResult
+		err    error
+	}
+	firstDone := make(chan answer, 1)
+	go func() {
+		result, err := f.coord.DispatchFor(context.Background(), projectKey, params)
+		firstDone <- answer{result: result, err: err}
+	}()
+
+	waitForFixtureFile(t, filepath.Join(f.dir, "prompt_started"), 10*time.Second)
+	callsBeforeRepeat := len(f.calls())
+	repeat, repeatErr := f.coord.DispatchFor(context.Background(), projectKey, params)
+	if repeatErr != nil {
+		t.Errorf("concurrent repeat: %v", repeatErr)
+	}
+	if !repeat.Duplicate {
+		t.Errorf("concurrent repeat = %+v, want the first caller's task with duplicate:true", repeat)
+	}
+	if got := len(f.calls()); got != callsBeforeRepeat {
+		t.Errorf("concurrent repeat made %d Herdr calls while queued work was draining, want none", got-callsBeforeRepeat)
+	}
+
+	select {
+	case first := <-firstDone:
+		if first.err != nil {
+			t.Fatalf("first dispatch: %v", first.err)
+		}
+		if first.result.Duplicate {
+			t.Errorf("first dispatch was marked duplicate: %+v", first.result)
+		}
+		if first.result.TaskID != repeat.TaskID {
+			t.Errorf("first task id = %s, repeat task id = %s", first.result.TaskID, repeat.TaskID)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("first dispatch did not finish after the queued prompt delay")
+	}
+}
+
 func TestRepeatNeverMatchesATaskOfAnotherProject(t *testing.T) {
 	f := newCoordFixture(t, fixturePlan{})
 	other := task.Task{
