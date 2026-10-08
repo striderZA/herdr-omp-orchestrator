@@ -14,6 +14,7 @@ package coord
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"path/filepath"
@@ -246,6 +247,143 @@ func TestConcurrentIdenticalDispatchesYieldOneTask(t *testing.T) {
 	}
 	if got := f.countCalls("worktree create"); got != 1 {
 		t.Errorf("worktree create ran %d times, want once", got)
+	}
+}
+
+func TestConcurrentDispatchReturnsDuplicateBeforeDrainingQueuedWork(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	var running []task.Task
+	for _, title := range []string{"one", "two", "three"} {
+		running = append(running, f.mustDispatch(title, "brief "+title))
+	}
+	queued := f.mustDispatch("four", "brief four")
+	if task.StageOf(queued) != task.Queued {
+		t.Fatalf("fourth task stage = %q, want queued", task.StageOf(queued))
+	}
+	f.block(running[0], func(next *task.Task) { next.Disposition = "integrated" })
+	f.updatePlan(func(p *fixturePlan) { p.PromptDelayMillis = 1500 })
+
+	projectKey := f.projectKey()
+	params := DispatchParams{
+		Title: "racing task", Brief: "same work", Checks: repeatChecks, BaseRevision: f.base,
+	}
+	type answer struct {
+		result DispatchResult
+		err    error
+	}
+	firstDone := make(chan answer, 1)
+	go func() {
+		result, err := f.coord.DispatchFor(context.Background(), projectKey, params)
+		firstDone <- answer{result: result, err: err}
+	}()
+
+	waitForFixtureFile(t, filepath.Join(f.dir, "prompt_started"), 10*time.Second)
+	callsBeforeRepeat := len(f.calls())
+	repeat, repeatErr := f.coord.DispatchFor(context.Background(), projectKey, params)
+	if repeatErr != nil {
+		t.Errorf("concurrent repeat: %v", repeatErr)
+	}
+	if !repeat.Duplicate {
+		t.Errorf("concurrent repeat = %+v, want the first caller's task with duplicate:true", repeat)
+	}
+	if got := len(f.calls()); got != callsBeforeRepeat {
+		t.Errorf("concurrent repeat made %d Herdr calls while queued work was draining, want none", got-callsBeforeRepeat)
+	}
+
+	select {
+	case first := <-firstDone:
+		if first.err != nil {
+			t.Fatalf("first dispatch: %v", first.err)
+		}
+		if first.result.Duplicate {
+			t.Errorf("first dispatch was marked duplicate: %+v", first.result)
+		}
+		if first.result.TaskID != repeat.TaskID {
+			t.Errorf("first task id = %s, repeat task id = %s", first.result.TaskID, repeat.TaskID)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("first dispatch did not finish after the queued prompt delay")
+	}
+}
+
+func TestDispatchDrainFailureLeavesIntentQueuedForLaterDrain(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	var running []task.Task
+	for _, title := range []string{"one", "two", "three"} {
+		running = append(running, f.mustDispatch(title, "brief "+title))
+	}
+	queued := f.mustDispatch("four", "brief four")
+	if task.StageOf(queued) != task.Queued {
+		t.Fatalf("fourth task stage = %q, want queued", task.StageOf(queued))
+	}
+	f.block(running[0], func(next *task.Task) { next.Disposition = "integrated" })
+
+	ctx := context.Background()
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(f.stateDir, "orchestrator.sqlite")))
+	if err != nil {
+		t.Fatalf("open state database: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	// Fail the older queued task's slot claim after RecordTaskIntent commits. The
+	// new intent must remain durable and recoverable by a later queue drain.
+	if _, err := db.ExecContext(ctx, `CREATE TRIGGER fail_issue4_slot_claim
+		BEFORE UPDATE OF slot_claimed_at ON tasks
+		BEGIN SELECT RAISE(ABORT, 'injected queue slot failure'); END`); err != nil {
+		t.Fatalf("install queue drain failure: %v", err)
+	}
+
+	projectKey := f.projectKey()
+	params := DispatchParams{
+		Title: "durable intent", Brief: "recover after a failed drain", Checks: repeatChecks, BaseRevision: f.base,
+	}
+	callsBefore := len(f.calls())
+	failed, err := f.coord.DispatchFor(ctx, projectKey, params)
+	if err == nil {
+		t.Fatal("dispatch succeeded despite the queued task slot claim failure")
+	}
+	if failed.TaskID == "" || failed.Duplicate {
+		t.Fatalf("failed dispatch result = %+v, want its newly recorded task", failed)
+	}
+	if !strings.Contains(err.Error(), failed.TaskID) {
+		t.Errorf("drain error %q does not identify persisted task %s", err, failed.TaskID)
+	}
+	stored, err := f.store.Task(ctx, failed.TaskID)
+	if err != nil {
+		t.Fatalf("read persisted intent: %v", err)
+	}
+	if stored.Phase != task.Intent || stored.Attention != "" || stored.Blocker != "" {
+		t.Errorf("intent after drain failure = %+v, want a clear queued intent", stored)
+	}
+	if slots, err := f.store.ProvisioningSlots(ctx, projectKey); err != nil || slots != 2 {
+		t.Errorf("slots after drain failure = (%d, %v), want only the two existing workers", slots, err)
+	}
+	if got := len(f.calls()); got != callsBefore {
+		t.Errorf("failed drain made %d Herdr calls, want none", got-callsBefore)
+	}
+
+	repeat, err := f.coord.DispatchFor(ctx, projectKey, params)
+	if err != nil || !repeat.Duplicate || repeat.TaskID != failed.TaskID {
+		t.Fatalf("repeat after drain failure = (%+v, %v), want duplicate of %s", repeat, err, failed.TaskID)
+	}
+	if got := len(f.calls()); got != callsBefore {
+		t.Errorf("duplicate retry made %d Herdr calls, want none", got-callsBefore)
+	}
+
+	if _, err := db.ExecContext(ctx, `DROP TRIGGER fail_issue4_slot_claim`); err != nil {
+		t.Fatalf("remove injected queue drain failure: %v", err)
+	}
+	drained, err := f.coord.DrainQueued(ctx, projectKey)
+	if err != nil || len(drained) != 1 || drained[0].ID != queued.ID {
+		t.Fatalf("first drain after recovery = (%+v, %v), want older queued task %s", drained, err, queued.ID)
+	}
+	f.block(running[1], func(next *task.Task) { next.Disposition = "integrated" })
+	drained, err = f.coord.DrainQueued(ctx, projectKey)
+	if err != nil || len(drained) != 1 || drained[0].ID != failed.TaskID {
+		t.Fatalf("second drain after recovery = (%+v, %v), want persisted intent %s", drained, err, failed.TaskID)
+	}
+	recovered, err := f.store.Task(ctx, failed.TaskID)
+	if err != nil || recovered.Phase != task.PromptSubmitted {
+		t.Fatalf("recovered task = (%+v, %v), want a submitted prompt", recovered, err)
 	}
 }
 

@@ -126,10 +126,9 @@ func (c *Coordinator) Dispatch(
 //
 // The bool reports a repeat (issue #4): the request asks for work an undecided
 // task of this project already holds, so nothing is created or touched (not even
-// the queue drain) and that task is returned as it stands. The check before the
-// drain is a read-only convenience; the store's gate inside the claim
-// transaction decides it again, which is what settles two callers racing with
-// the same work.
+// the queue drain) and that task is returned as it stands. The read-only check is
+// a fast path; the store's transaction records the zero-slot intent and decides
+// again before draining, which is what settles concurrent identical callers.
 func (c *Coordinator) dispatch(
 	ctx context.Context,
 	projectKey, ticketID, title, brief string,
@@ -169,37 +168,34 @@ func (c *Coordinator) dispatch(
 		return holder, true, nil
 	}
 
-	// Queued work goes first: a free slot belongs to the tasks that have been
-	// waiting, not to the request that happens to arrive after them. The drain
-	// claims its slots durably, so a request that arrives when the queue takes the
-	// last slot is queued rather than provisioned past the budget. A drain that
-	// could not run is reported: it admitted nothing, and quietly taking
-	// resources for this request instead would hide a stalled queue.
-	if _, err := c.drainQueued(ctx, project.Key, ""); err != nil {
-		return task.Task{}, false, err
+	// Record the intent through the durable duplicate and reservation gates before
+	// draining. It has no slot yet, so older queued work still gets first use of
+	// available capacity and a concurrent repeat can return without draining.
+	st, duplicate, err := c.recordTaskIntent(ctx, project.Key, request, base)
+	if err != nil || duplicate {
+		return st, duplicate, err
+	}
+	if _, err := c.drainQueued(ctx, project.Key, st.ID); err != nil {
+		return st, false, fmt.Errorf("drain queued work before dispatching task %s: %w", st.ID, err)
 	}
 
-	// The budget and the reserved paths are decided by the durable gate, in one
-	// transaction with the task's own creation: a second coordinator process
-	// cannot pass the same checks and provision past the limit or take paths this
-	// request holds. The same transaction answers a repeat that lost a race.
-	st, claimed, token, err := c.createTask(ctx, project.Key, request, base)
-	if err != nil {
-		var repeat *state.DuplicateError
-		if errors.As(err, &repeat) {
-			return repeat.Existing, true, nil
-		}
-		return task.Task{}, false, err
-	}
-	if !claimed {
-		// The durable gate refused the slot: the task is recorded queued and
-		// records no side effect.
+	claimed, token, err := c.store.ClaimProvisioningSlot(ctx, st.ID, c.opts.Concurrency)
+	switch {
+	case errors.Is(err, state.ErrBudgetExhausted):
 		return st, false, nil
+	case err != nil:
+		return st, false, fmt.Errorf("claim the provisioning slot for task %s: %w", st.ID, err)
+	case !claimed:
+		current, readErr := c.store.Task(ctx, st.ID)
+		if readErr != nil {
+			return st, false, fmt.Errorf("read task %s after another caller claimed it: %w", st.ID, readErr)
+		}
+		return current, false, nil
 	}
-	// ClaimTask has committed the intent. Re-read dependencies at that point: a
-	// primary disposition may have landed after the earlier existence check but
-	// before the task was created, and a stale snapshot would leave this task
-	// queued after the Review drain had already run.
+
+	// Re-read dependencies after the queue drain: a primary disposition may have
+	// landed since validation, and a stale snapshot would leave this task queued
+	// after the Review drain already ran.
 	current, err := c.projectTasks(ctx, project.Key)
 	if err != nil {
 		if _, releaseErr := c.releaseSlot(ctx, st, token); releaseErr != nil {
@@ -209,8 +205,6 @@ func (c *Coordinator) dispatch(
 		return st, false, fmt.Errorf("recheck dependencies for task %s: %w", st.ID, err)
 	}
 	if ok, _ := c.dispatchable(current, st); !ok {
-		// A dependency is still open: give the slot this request took (its own token)
-		// back so another queued task can use it.
 		if _, err := c.releaseSlot(ctx, st, token); err != nil {
 			return st, false, fmt.Errorf("release provisioning slot for dependency-gated task %s: %w", st.ID, err)
 		}
@@ -471,43 +465,41 @@ func findTask(existing []task.Task, id string) (task.Task, bool) {
 // task creation
 // ---------------------------------------------------------------------------
 
-// createTask records one task in its intent phase through the durable dispatch
-// gate, which decides the concurrency budget and the reserved paths in the same
-// transaction. It reports whether the task also claimed a provisioning slot;
-// only the identity collision and the id-less insert are retried, because both
-// touch nothing.
-func (c *Coordinator) createTask(ctx context.Context, projectKey string, request dispatchRequest, base string) (task.Task, bool, int64, error) {
+// recordTaskIntent writes a zero-slot intent through the durable dispatch gate.
+// The transaction decides duplicate identity and reserved paths before the
+// coordinator drains older queued work. Only identity collisions are retried;
+// those attempts wrote nothing.
+func (c *Coordinator) recordTaskIntent(ctx context.Context, projectKey string, request dispatchRequest, base string) (task.Task, bool, error) {
 	var lastErr error
 	for range idAttempts {
 		id, branch, err := c.newIdentity()
 		if err != nil {
-			return task.Task{}, false, 0, err
+			return task.Task{}, false, err
 		}
 		st := request.work(projectKey, base)
 		st.ID, st.Branch = id, branch
-		claimed, created, token, err := c.store.ClaimTask(ctx, st, c.opts.Concurrency)
+		recorded, err := c.store.RecordTaskIntent(ctx, st)
 		if err == nil {
-			return created, claimed, token, nil
+			return recorded, false, nil
+		}
+		var repeat *state.DuplicateError
+		if errors.As(err, &repeat) {
+			return repeat.Existing, true, nil
 		}
 		lastErr = err
 		if errors.Is(err, state.ErrReservedConflict) {
-			// The reservation is held by another task: the request is refused and
-			// nothing was recorded. Report it as the coordinator's own refusal so
-			// callers classify it the same way as before.
-			return task.Task{}, false, 0, fmt.Errorf("%w: %s", ErrReservedConflict, err)
+			return task.Task{}, false, fmt.Errorf("%w: %s", ErrReservedConflict, err)
 		}
 		if errors.Is(err, state.ErrTicketUnavailable) {
-			// The ticket was decided (or went away) after the pre-check passed. The
-			// gate recorded nothing; report the refusal the pre-check would have given.
 			if refusal := c.checkTicketForDispatch(ctx, projectKey, request.ticketID); refusal != nil {
-				return task.Task{}, false, 0, refusal
+				return task.Task{}, false, refusal
 			}
 		}
 		if !errors.Is(err, state.ErrConflict) {
-			return task.Task{}, false, 0, fmt.Errorf("record task intent for %q: %w", projectKey, err)
+			return task.Task{}, false, fmt.Errorf("record task intent for %q: %w", projectKey, err)
 		}
 	}
-	return task.Task{}, false, 0, fmt.Errorf("record task intent for %q: %w", projectKey, lastErr)
+	return task.Task{}, false, fmt.Errorf("record task intent for %q: %w", projectKey, lastErr)
 }
 
 // releaseSlot gives back a claimed slot after a step failed before recording any
@@ -810,7 +802,8 @@ func (c *Coordinator) provision(ctx context.Context, st task.Task, claim slotCla
 				// about).
 				return current, c.abandonSlotClaim(ctx, st, claim, fmt.Errorf(
 					"%w: task %s is already running its %s step elsewhere",
-					ErrStepInFlight, st.ID, phaseStep(st.Phase)))
+					ErrStepInFlight, st.ID, phaseStep(st.Phase),
+				))
 			}
 			st = current
 			continue
@@ -1751,7 +1744,8 @@ func (c *Coordinator) recordStepFailure(
 		if current.Phase != st.Phase {
 			return st, fmt.Errorf("task %s: %s: %w", st.ID, what, fmt.Errorf(
 				"%w: task %s advanced from %s to %s while its failed step was being recorded",
-				state.ErrConflict, st.ID, st.Phase, current.Phase))
+				state.ErrConflict, st.ID, st.Phase, current.Phase,
+			))
 		}
 		// The phase is checked again inside the mutation, because the assertion above
 		// is only against the snapshot this attempt read.
