@@ -507,6 +507,17 @@ $script:HerdrCallerEnvKeys = @(
     'HERDR_ORCH_HERDR_BIN_PATH', 'HERDR_CONFIG_PATH'
 )
 $script:MarkerPrefix = 'ACCEPT-'          # every fact this run injects is greppable
+# The tools a read-only coordinator session keeps (omp/herdr-orchestrator.ts): the
+# primary and a planner may call only OMP's read-only tools plus their own role
+# tools. Spelled out here so a changed extension list fails the run instead of
+# silently widening what it accepts.
+$script:ReadOnlyToolNames = @('read', 'grep', 'find', 'glob')
+$script:PrimaryToolNames = @(
+    'orch_dispatch', 'orch_answer', 'orch_approve_dialog', 'orch_review', 'orch_settle_input',
+    'orch_adjudicate_dispatch', 'orch_cleanup', 'orch_ticket_create', 'orch_ticket_list',
+    'orch_ticket_move', 'orch_ticket_review', 'orch_task_list', 'orch_inbox_list'
+)
+$script:WorkerToolNames = @('orch_report')
 $script:Assertions = New-Object System.Collections.ArrayList
 $script:Failures = 0
 $script:Blocked = 0
@@ -2731,6 +2742,138 @@ function Test-RestoredReviewRefusal {
         $Screen.IndexOf('already_decided', [System.StringComparison]::Ordinal) -ge 0)
 }
 
+function Get-OmpTranscriptToolEntries {
+    <#
+        The tool calls the assistant made in one OMP transcript (its toolCall parts,
+        in transcript order) and the ids of the calls whose tool result is recorded.
+        Only assistant messages carry calls: a user message or a tool result that
+        quotes one is not a call. Half-written lines are skipped. A missing or
+        unreadable transcript yields nothing and Readable is false, so a check that
+        needs this evidence fails closed.
+    #>
+    param([string]$Path)
+    $entries = [pscustomobject]@{ Readable = $false; Calls = @(); ResultIds = @() }
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $entries }
+    $calls = New-Object System.Collections.ArrayList
+    $resultIds = New-Object System.Collections.ArrayList
+    $stream = $null
+    $reader = $null
+    try {
+        $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        $reader = New-Object System.IO.StreamReader($stream)
+        while ($null -ne ($line = $reader.ReadLine())) {
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            try { $entry = ConvertFrom-Json -InputObject $line -ErrorAction Stop } catch { continue }
+            if ([string](Get-Field $entry 'type') -cne 'message') { continue }
+            $message = Get-Field $entry 'message' $null
+            $role = [string](Get-Field $message 'role')
+            if ($role -ceq 'toolResult') {
+                $resultId = [string](Get-Field $message 'toolCallId')
+                if ($resultId -ne '') { [void]$resultIds.Add($resultId) }
+                continue
+            }
+            if ($role -cne 'assistant') { continue }
+            foreach ($part in @(Get-Field $message 'content' @())) {
+                if ([string](Get-Field $part 'type') -ceq 'toolCall') { [void]$calls.Add($part) }
+            }
+        }
+    } catch {
+        return $entries
+    } finally {
+        if ($reader) { $reader.Dispose() }
+        elseif ($stream) { $stream.Dispose() }
+    }
+    $entries.Readable = $true
+    $entries.Calls = @($calls)
+    $entries.ResultIds = @($resultIds)
+    return $entries
+}
+
+function Get-OmpToolCalls {
+    # The arguments of every call the assistant made to one tool, in transcript
+    # order; none for a missing or unreadable transcript.
+    param([string]$Path, [Parameter(Mandatory)][string]$Name)
+    $found = New-Object System.Collections.ArrayList
+    foreach ($call in @((Get-OmpTranscriptToolEntries -Path $Path).Calls)) {
+        if ([string](Get-Field $call 'name') -cne $Name) { continue }
+        $callArguments = Get-Field $call 'arguments' $null
+        if ($null -ne $callArguments) { [void]$found.Add($callArguments) }
+    }
+    return @($found)
+}
+
+function Get-OmpPendingToolCalls {
+    <#
+        The arguments of the calls to one tool that are still running: the
+        assistant made the call and the transcript records no tool result for its
+        id. A call without an id cannot be linked to its result, so it is never
+        reported as pending.
+    #>
+    param([string]$Path, [Parameter(Mandatory)][string]$Name)
+    $entries = Get-OmpTranscriptToolEntries -Path $Path
+    $pending = New-Object System.Collections.ArrayList
+    foreach ($call in @($entries.Calls)) {
+        $callId = [string](Get-Field $call 'id')
+        if ($callId -eq '' -or [string](Get-Field $call 'name') -cne $Name -or @($entries.ResultIds) -ccontains $callId) { continue }
+        $callArguments = Get-Field $call 'arguments' $null
+        if ($null -ne $callArguments) { [void]$pending.Add($callArguments) }
+    }
+    return @($pending)
+}
+
+function Test-OmpPendingToolCall {
+    <#
+        True when the transcript holds a pending call of this tool (made, with no
+        recorded result) whose arguments carry exactly these values. Other
+        arguments, such as the intent OMP adds, are ignored; a missing one reads as
+        empty, as the extension's schema defaults it.
+    #>
+    param([string]$Path, [Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)][hashtable]$Arguments)
+    foreach ($call in @(Get-OmpPendingToolCalls -Path $Path -Name $Name)) {
+        $same = $true
+        foreach ($key in @($Arguments.Keys)) {
+            if ([string](Get-Field $call $key) -cne [string]$Arguments[$key]) { $same = $false; break }
+        }
+        if ($same) { return $true }
+    }
+    return $false
+}
+
+function Select-OmpToolCallNames {
+    # The distinct names of transcript tool calls, in first-seen order.
+    param([object[]]$Calls = @())
+    $names = New-Object System.Collections.ArrayList
+    foreach ($call in @($Calls)) {
+        $name = [string](Get-Field $call 'name')
+        if ($name -ne '' -and -not ($names -ccontains $name)) { [void]$names.Add($name) }
+    }
+    return @($names)
+}
+
+function Get-OmpToolCallNames {
+    # The distinct tool names the assistant called, in first-seen order.
+    param([string]$Path)
+    return @(Select-OmpToolCallNames -Calls @((Get-OmpTranscriptToolEntries -Path $Path).Calls))
+}
+
+function Test-OmpToolCallsWithin {
+    <#
+        Whether one session called only tools of an allowed set, read from its
+        transcript. Ok needs a readable transcript with at least one tool call and
+        no name outside Allowed: a session whose calls cannot be read, or that
+        called nothing, proves nothing. Outside names the tools that broke the rule.
+    #>
+    param([string]$Path, [string[]]$Allowed = @())
+    $entries = Get-OmpTranscriptToolEntries -Path $Path
+    $names = @(Select-OmpToolCallNames -Calls @($entries.Calls))
+    $outside = @($names | Where-Object { @($Allowed) -cnotcontains $_ })
+    return [pscustomobject]@{
+        Ok      = [bool]($entries.Readable -and $names.Count -gt 0 -and $outside.Count -eq 0)
+        Names   = $names
+        Outside = $outside
+    }
+}
+
 
 
 
@@ -3917,11 +4060,25 @@ function Invoke-Dispatch {
     Write-Step 'Phase 9: two independent worker changes'
     New-TaskBriefs
     $prompt = Get-DispatchPrompt
-    $result = Invoke-PrimaryPrompt -PaneId $script:PrimaryPane -Text $prompt -TimeoutSeconds 420
-    Assert-True -Id 'D1.1' -What 'the primary accepts the dispatch prompt' -Condition ($result.ExitCode -eq 0) -Command $result.CommandLine -Evidence ("code=[$($result.Code)] blocked=[$($result.Blocked)] stderr=[" + (Protect-Text $result.Stderr 300) + "] screen=[" + (Protect-Text $result.Screen 500) + "]")
+    # Neither call names a ticket, so each starts only after the user confirms its
+    # exact request. The prompt is submitted without --wait (its turn cannot finish
+    # while a dialog is open) and both dialogs are confirmed from the transcript.
+    $result = Invoke-PrimaryPromptNoWaitAfterDispositionAsks -PaneId $script:PrimaryPane -Text $prompt -TimeoutSeconds 420 -AssertionPrefix 'D1'
+    Assert-True -Id 'D1.1' -What 'the primary accepts the dispatch prompt' -Condition $result.Submitted -Command $result.CommandLine -Evidence ("code=[$($result.Code)] blocked=[$($result.Blocked)] stderr=[" + (Protect-Text $result.Stderr 300) + "] screen=[" + (Protect-Text $result.Screen 500) + "]")
     if ($result.Blocked) { Block-Item -Id 'D1.1b' -What 'the primary was blocked when the dispatch prompt was due' -Evidence (Protect-Text $result.Screen 500) }
-    if ($result.ExitCode -ne 0) {
+    if (-not $result.Submitted) {
         Block-Item -Id 'D1.1c' -What 'the dispatch prompt could not be submitted, so the worker phases cannot run' -Evidence (Protect-Text ($result.Stdout + $result.Stderr) 500)
+        return
+    }
+    $dispatchConfirmation = Confirm-PrimaryDispatchModals -Titles @('ACCEPT A: helper in a.js', 'ACCEPT B: helper in b.js') -TimeoutSeconds 300
+    $confirmedRequests = @($dispatchConfirmation.Requests)
+    $dispatchConfirmed = [bool]$dispatchConfirmation.Confirmed -and $confirmedRequests.Count -eq 2
+    Assert-True -Id 'D1.1d' -What 'the acceptance user confirmed the exact dialog of both ticketless dispatch requests' -Condition $dispatchConfirmed `
+        -Evidence ("confirmed=[" + (@($confirmedRequests | ForEach-Object { [string](Get-Field $_ 'title') }) -join ' | ') + "]")
+    if (-not $dispatchConfirmed) {
+        Preserve-ResourcesForPendingTool -AssertionId 'D1.1d.resources-preserved' -Reason 'a ticketless dispatch dialog may still be open on the primary'
+        Block-Item -Id 'D1.1e' -What 'the ticketless dispatch dialogs were not safely confirmed, so the worker phases cannot run' `
+            -Evidence (Protect-Text (Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100) 800)
         return
     }
 
@@ -3945,6 +4102,15 @@ function Invoke-Dispatch {
         Assert-Match -Id "D2.id/$id" -What "task $id has a generated orch_<12 hex> id" -Pattern '^orch_[0-9a-f]{12}$' -Actual $id
         Assert-Match -Id "D2.branch/$id" -What "task $id owns a matching orch/<12 hex> branch" -Pattern '^orch/[0-9a-f]{12}$' -Actual ([string](Get-Field $fact 'Branch'))
         Assert-Equal -Id "D2.base/$id" -What "task $id is based on the committed base revision" -Expected $script:BaseRevision -Actual ([string](Get-Field $fact 'BaseRevision'))
+        $request = @($confirmedRequests | Where-Object { ([string](Get-Field $_ 'title')).Trim() -ceq [string](Get-Field $fact 'Title') })
+        $stored = [pscustomobject]@{
+            Title = [string](Get-Field $fact 'Title'); Brief = [string](Get-Field $fact 'Brief'); Checks = @(Get-Field $fact 'Checks' @())
+            Dependencies = @(Get-Field $fact 'Dependencies' @()); ReservedPaths = @(Get-Field $fact 'ReservedPaths' @())
+            BaseRevision = [string](Get-Field $fact 'BaseRevision'); TicketID = [string](Get-Field $fact 'TicketID')
+        }
+        Assert-True -Id "D2.request/$id" -What "task $id stores exactly the request the user confirmed, and no ticket" `
+            -Condition ($request.Count -eq 1 -and (Test-TaskMatchesDispatchRequest -Fact $fact -Request $request[0])) -TaskId $id `
+            -Evidence ("confirmed=" + (Protect-Text (Get-Json $request) 400) + " stored=" + (Protect-Text (Get-Json $stored) 400))
         Assert-True -Id "D2.phase/$id" -What "task $id reached a provisioned phase" -Condition ((Get-Field $fact 'Phase') -in @('worktree_created', 'agent_started', 'prompt_submitted')) -Evidence (Get-Field $fact 'Phase')
         Assert-NonEmpty -Id "D2.worktree/$id" -What "task $id records its checkout path" -Value ([string](Get-Field $fact 'WorktreePath'))
         Assert-NonEmpty -Id "D2.workspace/$id" -What "task $id records its worktree workspace" -Value ([string](Get-Field $fact 'WorktreeWorkspaceID'))
@@ -4029,11 +4195,23 @@ Do not ask a question, wait for another message, modify other files, merge, or c
 $($script:MarkerPrefix)SINGLE-DISPATCH. Call orch_dispatch exactly once with title "ACCEPT SINGLE: helper in a.js", the following brief unchanged, checks ["git log -1 --format=%H"], dependencies [], reservedPaths ["a.js"], and baseRevision "$($script:BaseRevision)". Do no implementation work yourself. Reply with the new task id only.
 BRIEF: $brief
 "@
-    $result = Invoke-PrimaryPrompt -PaneId $script:PrimaryPane -Text $prompt -TimeoutSeconds 300
+    # The call names no ticket, so it starts only after the user confirms its exact
+    # request; the prompt is submitted without --wait and the dialog is confirmed.
+    $result = Invoke-PrimaryPromptNoWaitAfterDispositionAsks -PaneId $script:PrimaryPane -Text $prompt -TimeoutSeconds 300 -AssertionPrefix 'SW0'
     Assert-True -Id 'SW0.1' -What 'the real primary accepts the single-worker dispatch prompt' `
-        -Condition ($result.ExitCode -eq 0) -Command $result.CommandLine `
+        -Condition $result.Submitted -Command $result.CommandLine `
         -Evidence ("code=[$($result.Code)] blocked=[$($result.Blocked)] stderr=[" + (Protect-Text $result.Stderr 300) + "]")
-    if ($result.ExitCode -ne 0) { throw 'single-worker dispatch prompt was not accepted' }
+    if (-not $result.Submitted) { throw 'single-worker dispatch prompt was not accepted' }
+    $dispatchConfirmation = Confirm-PrimaryDispatchModals -Titles @('ACCEPT SINGLE: helper in a.js') -TimeoutSeconds 300
+    $confirmedRequests = @($dispatchConfirmation.Requests)
+    $dispatchConfirmed = [bool]$dispatchConfirmation.Confirmed -and $confirmedRequests.Count -eq 1
+    Assert-True -Id 'SW0.1c' -What 'the acceptance user confirmed the exact dialog of the ticketless dispatch request' -Condition $dispatchConfirmed `
+        -Evidence ("confirmed=[" + (@($confirmedRequests | ForEach-Object { [string](Get-Field $_ 'title') }) -join ' | ') + "] screen=[" +
+            (Protect-Text (Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100) 500) + "]")
+    if (-not $dispatchConfirmed) {
+        Preserve-ResourcesForPendingTool -AssertionId 'SW0.1c.resources-preserved' -Reason 'the ticketless dispatch dialog may still be open on the primary'
+        throw 'the single-worker dispatch dialog was not safely confirmed'
+    }
     Assert-OmpSessionModel -Id 'SW0.1b' -What 'the primary session ran on the requested model' -LaunchPaneId $script:PrimaryPane
 
     $wait = Wait-ForTasks -Count 1 -TimeoutSeconds 300
@@ -4051,6 +4229,9 @@ BRIEF: $brief
     Assert-True -Id 'SW0.5' -What 'the task has its own recorded worktree and public pane' `
         -Condition (([string](Get-Field $script:TaskA 'WorktreePath') -ne '') -and ([string](Get-Field $script:TaskA 'PublicPaneID') -ne '')) `
         -TaskId $id -Evidence ("worktree=$(Get-Field $script:TaskA 'WorktreePath') pane=$(Get-Field $script:TaskA 'PublicPaneID')")
+    Assert-True -Id 'SW0.request' -What 'the task stores exactly the request the user confirmed, and no ticket' `
+        -Condition (Test-TaskMatchesDispatchRequest -Fact $script:TaskA -Request $confirmedRequests[0]) -TaskId $id `
+        -Evidence ("confirmed=" + (Protect-Text (Get-Json $confirmedRequests[0]) 400) + " stored title=[$(Get-Field $script:TaskA 'Title')] ticket=[$(Get-Field $script:TaskA 'TicketID')]")
     $live = Get-LiveAgent -Target ([string](Get-Field $script:TaskA 'PublicPaneID'))
     $handshake = Get-ReadySession -LaunchPaneId ([string](Get-Field $script:TaskA 'LaunchPaneID'))
     Assert-True -Id 'SW0.6' -What 'Herdr reports a live worker on its recorded pane' `
@@ -4554,6 +4735,51 @@ function Test-ConfirmChoicesEndPanel {
     return ($choices.Count -eq 2 -and $choices[0] -ceq 'Yes' -and $choices[1] -ceq 'No')
 }
 
+function Get-ExtensionConsentDialogTitles {
+    <#
+        The titles of the extension's consent dialogs: every ConfirmRequest in
+        omp/herdr-orchestrator.ts (the helper tests compare this list with that
+        source). Each heads an OMP Yes/No panel, and the extension marks the
+        primary blocked in Herdr while one is open.
+    #>
+    return @(
+        'Approve worker choice',
+        'Settle interrupted checkout cleanup',
+        'Remove worker checkout',
+        'Settle worker input',
+        'Decide an uncertain dispatch',
+        'Record review disposition',
+        'Move ticket to todo',
+        'Dispatch work without a ticket',
+        'Record ticket decision',
+        'Send answer to worker'
+    )
+}
+
+function Get-PrimaryConsentDialogTitle {
+    <#
+        The title of the extension consent dialog that is the primary's ACTIVE
+        panel, or $null. The panel starts at the newest line whose text, without the
+        modal's edge chrome, is exactly one of the titles (OMP draws it in the top
+        border), and it must end in its Yes/No choices (Test-ConfirmChoicesEndPanel).
+        A tool header that names the dialog, a title quoted inside a value, an older
+        dialog in the scrollback and a newer Ask or action below all fail closed. The
+        title is evidence only: the one thing the harness does to a dialog no step
+        asked for is decline it.
+    #>
+    param([string]$Screen)
+    if ([string]::IsNullOrWhiteSpace($Screen)) { return $null }
+    $titles = @(Get-ExtensionConsentDialogTitles)
+    $lines = @($Screen -split "`r?`n")
+    for ($index = $lines.Count - 1; $index -ge 0; $index--) {
+        $heading = ConvertTo-ConfirmPanelText -Panel $lines[$index]
+        if ($titles -cnotcontains $heading) { continue }
+        if (Test-ConfirmChoicesEndPanel -Panel (@($lines[$index..($lines.Count - 1)]) -join "`n")) { return $heading }
+        return $null
+    }
+    return $null
+}
+
 function Test-PrimaryApprovalConfirmScreen {
     param([string]$Screen, [string]$DialogMarker, [Parameter(Mandatory)][string]$ExpectedQuestion, [string[]]$Keys)
     if ([string]::IsNullOrWhiteSpace($Screen) -or [string]::IsNullOrWhiteSpace($DialogMarker) -or
@@ -4590,6 +4816,16 @@ function Test-PrimaryApprovalConfirmScreen {
 
 
 function Confirm-PrimaryReviewModal {
+    <#
+        Presses Enter once on the primary's review dialog for this task, and only
+        while the task's stored report is undecided at the revision the dialog
+        shows, the primary transcript holds the pending orch_review call with this
+        exact decision, and the visible dialog matches it as the last panel. The
+        extension marks the primary blocked while its dialog is open (herdr:blocked;
+        TK1.3c-blocked observes it), but the gate is any active turn (working or
+        blocked): the exact call and dialog decide, not the status. The call, the
+        dialog and the task are read again before the key.
+    #>
     param(
         [Parameter(Mandatory)][string]$PaneId,
         [Parameter(Mandatory)][string]$LaunchPaneId,
@@ -4597,12 +4833,16 @@ function Confirm-PrimaryReviewModal {
         [Parameter(Mandatory)][string]$Disposition,
         [string]$Outcome = 'integrated'
     )
+    $transcript = [string](Get-Field (Get-ReadySession -LaunchPaneId $LaunchPaneId) 'omp_session_file')
+    $reviewCall = @{ taskId = $TaskId; outcome = $Outcome; disposition = $Disposition }
     $wait = Wait-Until -TimeoutSeconds 120 -IntervalSeconds 2 -What "review confirmation for task $TaskId" -Probe {
         $fact = Get-Field (Get-TaskById -Id $TaskId) 'fact'
         $revision = [long](Get-Field $fact 'Revision' 0)
-        if ($null -eq (Get-Field $fact 'Report' $null) -or $revision -le 0) { return $null }
+        if ($null -eq (Get-Field $fact 'Report' $null) -or $revision -le 0 -or
+            -not [string]::IsNullOrEmpty([string](Get-Field $fact 'Disposition'))) { return $null }
         $live = Get-LiveAgent -Target $PaneId
-        if (-not $live.Found -or [string](Get-Field $live.Agent 'agent_status') -ne 'blocked') { return $null }
+        if (-not $live.Found -or [string](Get-Field $live.Agent 'agent_status') -notin @('working', 'blocked')) { return $null }
+        if (-not (Test-OmpPendingToolCall -Path $transcript -Name 'orch_review' -Arguments $reviewCall)) { return $null }
         $screen = Get-PaneScreen -PaneId $PaneId -Source 'visible' -Lines 100
         if (Test-PrimaryReviewConfirmScreen -Screen $screen -TaskId $TaskId -Revision $revision -Disposition $Disposition -Outcome $Outcome) {
             return [pscustomobject]@{ Kind = 'modal'; Screen = $screen; Revision = $revision }
@@ -4612,16 +4852,15 @@ function Confirm-PrimaryReviewModal {
     if (-not $wait.Ok) { return $false }
     if ($wait.Value.Kind -ne 'modal') { return $false }
     $revision = [long]$wait.Value.Revision
-    $ready = Get-ReadySession -LaunchPaneId $LaunchPaneId
-    $transcript = [string](Get-Field $ready 'omp_session_file')
-    if (-not (Test-OmpReviewToolCall -Path $transcript -TaskId $TaskId -Disposition $Disposition -Outcome $Outcome)) { return $false }
+    if (-not (Test-OmpPendingToolCall -Path $transcript -Name 'orch_review' -Arguments $reviewCall)) { return $false }
     $screen = Get-PaneScreen -PaneId $PaneId -Source 'visible' -Lines 100
     if (-not (Test-PrimaryReviewConfirmScreen -Screen $screen -TaskId $TaskId -Revision $revision -Disposition $Disposition -Outcome $Outcome)) { return $false }
     $fact = Get-Field (Get-TaskById -Id $TaskId) 'fact'
-    if ([long](Get-Field $fact 'Revision' 0) -ne $revision -or $null -eq (Get-Field $fact 'Report' $null)) { return $false }
+    if ([long](Get-Field $fact 'Revision' 0) -ne $revision -or $null -eq (Get-Field $fact 'Report' $null) -or
+        -not [string]::IsNullOrEmpty([string](Get-Field $fact 'Disposition'))) { return $false }
     $screen = Get-PaneScreen -PaneId $PaneId -Source 'visible' -Lines 100
     if (-not (Test-PrimaryReviewConfirmScreen -Screen $screen -TaskId $TaskId -Revision $revision -Disposition $Disposition -Outcome $Outcome)) { return $false }
-    if (-not (Test-OmpReviewToolCall -Path $transcript -TaskId $TaskId -Disposition $Disposition -Outcome $Outcome)) { return $false }
+    if (-not (Test-OmpPendingToolCall -Path $transcript -Name 'orch_review' -Arguments $reviewCall)) { return $false }
     $sent = Send-AgentKeys -PaneId $PaneId -Keys @('enter')
     [void]($script:PrimarySendKeysUsed += 'enter')
     return ($sent.ExitCode -eq 0)
@@ -4629,20 +4868,19 @@ function Confirm-PrimaryReviewModal {
 
 function Test-PrimaryTicketConfirmScreen {
     <#
-        True only when the primary's ACTIVE confirmation is the ticket move or the
-        ticket decision for exactly this ticket, title and revision (and, for a
-        decision, this outcome, note and linked tasks), with its Yes/No choices as
-        the last panel on screen. The wording is the extension's own
-        (recordTicketMoveWithConsent and recordTicketReviewWithConsent in
-        omp/herdr-orchestrator.ts), so a changed dialog fails closed here instead of
-        being confirmed blind. Like the review matcher, an older matching modal, a
-        newer Ask or a different action modal below it all refuse.
+        True only when the primary's active dialog is exactly this ticket's move or
+        decision: id/title/revision, plus the body for a move or outcome/note/tasks
+        for a decision, with Yes/No as the last panel on screen. The extension's
+        wording (recordTicketMoveWithConsent and recordTicketReviewWithConsent in
+        omp/herdr-orchestrator.ts) is matched, so changed dialogs, older matching
+        modals, a newer Ask or another action below this one all fail closed.
     #>
     param(
         [string]$Screen,
         [ValidateSet('move', 'review')][string]$Kind,
         [string]$TicketId,
         [string]$TicketTitle,
+        [string]$TicketBody = '',
         [long]$Revision,
         [string]$Outcome = '',
         [string]$Disposition = '',
@@ -4657,13 +4895,14 @@ function Test-PrimaryTicketConfirmScreen {
     if ($start -lt 0) { return $false }
     $panel = $Screen.Substring($start)
     $normalized = ConvertTo-ConfirmPanelText -Panel $panel
-    # The extension quotes the title and the note with quoteForDialog; only
-    # whitespace is folded, so a pipe inside either must match exactly.
+    # The extension quotes ticket text with quoteForDialog; only whitespace is
+    # folded, so pipes and terminal controls inside the quoted strings must match.
     $quotedTitle = (ConvertTo-JsonStringLiteral -Text $TicketTitle) -replace '\s+', ' '
+    $quotedBody = (ConvertTo-JsonStringLiteral -Text $TicketBody) -replace '\s+', ' '
     if ($Kind -eq 'move') {
-        $description = "Confirm moving ticket $TicketId to todo."
-        $expectedFacts = "Title: $quotedTitle Now: backlog (stage backlog), revision $Revision " +
-            'In this version a move only records the ticket as ready for work; it starts nothing.'
+        $description = "Confirm moving ticket $TicketId to todo and starting its planner."
+        $expectedFacts = "Title: $quotedTitle Body: $quotedBody Now: backlog (stage backlog), revision $Revision " +
+            'Moving records one planner task and starts or queues its worker. The worker returns a plan only; implementation work still requires your approval and explicit dispatch.'
     } else {
         $description = "Confirm closing ticket $TicketId with this outcome: $Outcome"
         $tasksText = if (@($LinkedTaskIds).Count -gt 0) { (@($LinkedTaskIds) -join ', ') } else { 'none' }
@@ -4682,31 +4921,38 @@ function Test-PrimaryTicketConfirmScreen {
 
 function Confirm-PrimaryTicketModal {
     <#
-        Presses Enter on the primary's ticket move or ticket decision dialog, and only
-        on that exact dialog: the ticket's persisted revision and the on-screen text
-        must both match, are re-read immediately before the key, and the revision
-        must not have moved in between. The transcript check the review path adds is
-        not repeated here: the dialog text is built from the persisted preview, which
-        is what the user is being asked to confirm.
+        Presses Enter once on the primary's ticket move or decision dialog, and only
+        while the ticket's persisted revision, the pending orch_ticket_move or
+        orch_ticket_review call in the primary transcript and the exact visible text
+        all match. The move caller also supplies the stored ticket body, so neither
+        title nor planner context can be changed. The extension marks the primary
+        blocked while its dialog is open (TK1.3c-blocked observes it), but the gate is
+        any active turn (working or blocked): the exact call and dialog decide; the
+        revision, the call and the dialog are read again before the key is sent.
     #>
     param(
         [Parameter(Mandatory)][ValidateSet('move', 'review')][string]$Kind,
         [Parameter(Mandatory)][string]$TicketId,
         [Parameter(Mandatory)][string]$TicketTitle,
+        [string]$TicketBody = '',
         [string]$Outcome = '',
         [string]$Disposition = '',
         [string[]]$LinkedTaskIds = @(),
         [double]$TimeoutSeconds = 120
     )
+    $transcript = [string](Get-Field (Get-ReadySession -LaunchPaneId ([string](Get-Field $script:Project 'LaunchPaneID'))) 'omp_session_file')
+    $ticketCallName = if ($Kind -eq 'move') { 'orch_ticket_move' } else { 'orch_ticket_review' }
+    $ticketCall = if ($Kind -eq 'move') { @{ ticketId = $TicketId } } else { @{ ticketId = $TicketId; outcome = $Outcome; disposition = $Disposition } }
     $wait = Wait-Until -TimeoutSeconds $TimeoutSeconds -IntervalSeconds 2 -What "ticket $Kind confirmation for $TicketId" -Probe {
         $fact = Get-Field (Get-TicketById -Id $TicketId) 'fact'
         $revision = [long](Get-Field $fact 'Revision' 0)
         if ($revision -le 0) { return $null }
         $live = Get-LiveAgent -Target $script:PrimaryPane
-        if (-not $live.Found -or [string](Get-Field $live.Agent 'agent_status') -ne 'blocked') { return $null }
+        if (-not $live.Found -or [string](Get-Field $live.Agent 'agent_status') -notin @('working', 'blocked')) { return $null }
+        if (-not (Test-OmpPendingToolCall -Path $transcript -Name $ticketCallName -Arguments $ticketCall)) { return $null }
         $screen = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100
         if (Test-PrimaryTicketConfirmScreen -Screen $screen -Kind $Kind -TicketId $TicketId -TicketTitle $TicketTitle `
-                -Revision $revision -Outcome $Outcome -Disposition $Disposition -LinkedTaskIds $LinkedTaskIds) {
+                -Revision $revision -TicketBody $TicketBody -Outcome $Outcome -Disposition $Disposition -LinkedTaskIds $LinkedTaskIds) {
             return [pscustomobject]@{ Revision = $revision }
         }
         return $null
@@ -4715,9 +4961,10 @@ function Confirm-PrimaryTicketModal {
     $revision = [long]$wait.Value.Revision
     $latest = Get-Field (Get-TicketById -Id $TicketId) 'fact'
     if ([long](Get-Field $latest 'Revision' 0) -ne $revision) { return $false }
+    if (-not (Test-OmpPendingToolCall -Path $transcript -Name $ticketCallName -Arguments $ticketCall)) { return $false }
     $screen = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100
     if (-not (Test-PrimaryTicketConfirmScreen -Screen $screen -Kind $Kind -TicketId $TicketId -TicketTitle $TicketTitle `
-            -Revision $revision -Outcome $Outcome -Disposition $Disposition -LinkedTaskIds $LinkedTaskIds)) { return $false }
+            -Revision $revision -TicketBody $TicketBody -Outcome $Outcome -Disposition $Disposition -LinkedTaskIds $LinkedTaskIds)) { return $false }
     $sent = Send-AgentKeys -PaneId $script:PrimaryPane -Keys @('enter')
     [void]($script:PrimarySendKeysUsed += 'enter')
     return ($sent.ExitCode -eq 0)
@@ -4753,6 +5000,145 @@ function ConvertTo-JsonStringLiteral {
     }
     [void]$builder.Append('"')
     return $builder.ToString()
+}
+
+function ConvertTo-JsonArrayLiteral {
+    <#
+        The text quoteForDialog shows for a list of strings: JSON.stringify's array
+        form, each item quoted as ConvertTo-JsonStringLiteral quotes it, joined by
+        commas with no spaces. An empty list is [].
+    #>
+    param([string[]]$Items = @())
+    if ($null -eq $Items) { return '[]' }
+    $quoted = foreach ($item in $Items) { ConvertTo-JsonStringLiteral -Text ([string]$item) }
+    return '[' + (@($quoted) -join ',') + ']'
+}
+
+function Test-PrimaryDispatchConfirmScreen {
+    <#
+        True only when the primary's ACTIVE confirmation is the dialog of
+        dispatchConfirmRequest (omp/herdr-orchestrator.ts) for exactly this
+        orch_dispatch request: its title, brief, checks, dependencies, reserved paths
+        and base revision, each as quoteForDialog shows it, in the last "Dispatch
+        work without a ticket" panel, followed directly by its Yes/No choices, which
+        end the panel. A request without dependencies or reserved paths shows [] for
+        them, as the tool's schema defaults do. Only whitespace is folded, so a
+        changed request, an older matching dialog, extra text before the choices or
+        a newer panel below it all refuse.
+    #>
+    param([string]$Screen, $Request)
+    if ([string]::IsNullOrWhiteSpace($Screen) -or $null -eq $Request) { return $false }
+    $title = [string](Get-Field $Request 'title')
+    $brief = [string](Get-Field $Request 'brief')
+    $baseRevision = [string](Get-Field $Request 'baseRevision')
+    if ([string]::IsNullOrWhiteSpace($title) -or [string]::IsNullOrWhiteSpace($brief) -or [string]::IsNullOrWhiteSpace($baseRevision)) { return $false }
+    $start = $Screen.LastIndexOf('Dispatch work without a ticket', [System.StringComparison]::Ordinal)
+    if ($start -lt 0) { return $false }
+    $panel = $Screen.Substring($start)
+    $expected = ((@(
+        'Dispatch work without a ticket',
+        'Confirm starting or queueing one worker for this request. It names no ticket, so no accepted plan covers it.',
+        ('Title: ' + (ConvertTo-JsonStringLiteral -Text $title)),
+        ('Brief: ' + (ConvertTo-JsonStringLiteral -Text $brief)),
+        ('Checks: ' + (ConvertTo-JsonArrayLiteral -Items @(Get-Field $Request 'checks' @()))),
+        ('Dependencies: ' + (ConvertTo-JsonArrayLiteral -Items @(Get-Field $Request 'dependencies' @()))),
+        ('Reserved paths: ' + (ConvertTo-JsonArrayLiteral -Items @(Get-Field $Request 'reservedPaths' @()))),
+        ('Base revision: ' + (ConvertTo-JsonStringLiteral -Text $baseRevision)),
+        'The worker gets its own branch and checkout, and nothing merges without your review.'
+    ) -join ' ') -replace '\s+', ' ').Trim()
+    $normalized = ConvertTo-ConfirmPanelText -Panel $panel
+    if (-not $normalized.StartsWith($expected, [System.StringComparison]::Ordinal)) { return $false }
+    # Only the choices may follow the request; the selector's marker before "Yes"
+    # is not a letter.
+    $rest = $normalized.Substring($expected.Length) -replace '^[^\p{L}]*', ''
+    if (-not $rest.StartsWith('Yes', [System.StringComparison]::Ordinal)) { return $false }
+    return (Test-ConfirmChoicesEndPanel -Panel $panel)
+}
+
+function Test-TaskMatchesDispatchRequest {
+    <#
+        True when a stored task holds exactly the work of one orch_dispatch request
+        as the coordinator records it: title, brief, each check and each dependency
+        trimmed, reserved paths trimmed, slash-separated and case-folded (Windows),
+        the same base revision, and no ticket.
+    #>
+    param($Fact, $Request)
+    if ($null -eq $Fact -or $null -eq $Request) { return $false }
+    $requestChecks = @(@(Get-Field $Request 'checks' @()) | ForEach-Object { ([string]$_).Trim() })
+    $requestDependencies = @(@(Get-Field $Request 'dependencies' @()) | ForEach-Object { ([string]$_).Trim() })
+    $requestPaths = @(@(Get-Field $Request 'reservedPaths' @()) | ForEach-Object { ([string]$_).Trim().Replace('\', '/').ToLowerInvariant() })
+    $storedPaths = @(@(Get-Field $Fact 'ReservedPaths' @()) | ForEach-Object { ([string]$_).ToLowerInvariant() })
+    return ([string](Get-Field $Fact 'Title') -ceq ([string](Get-Field $Request 'title')).Trim() -and
+        [string](Get-Field $Fact 'Brief') -ceq ([string](Get-Field $Request 'brief')).Trim() -and
+        (ConvertTo-JsonArrayLiteral -Items @(Get-Field $Fact 'Checks' @())) -ceq (ConvertTo-JsonArrayLiteral -Items $requestChecks) -and
+        (ConvertTo-JsonArrayLiteral -Items @(Get-Field $Fact 'Dependencies' @())) -ceq (ConvertTo-JsonArrayLiteral -Items $requestDependencies) -and
+        (ConvertTo-JsonArrayLiteral -Items $storedPaths) -ceq (ConvertTo-JsonArrayLiteral -Items $requestPaths) -and
+        [string](Get-Field $Fact 'BaseRevision') -ceq [string](Get-Field $Request 'baseRevision') -and
+        [string]::IsNullOrEmpty([string](Get-Field $Fact 'TicketID')))
+}
+
+function Find-PrimaryDispatchModal {
+    <#
+        The pending ticketless orch_dispatch request whose exact dialog is the
+        primary's active confirmation, or $null. The primary's turn must still be
+        running (working, or blocked: the extension marks the primary blocked while
+        its dialog is open), so an idle or finished primary is refused.
+        The candidates are the latest pending call of each title that names no
+        ticket (a finished or superseded call never is one); the transcript is read
+        before the screen, and exactly one candidate must match the visible dialog.
+    #>
+    param([string]$LaunchPaneId, [string[]]$Titles = @())
+    $live = Get-LiveAgent -Target $script:PrimaryPane
+    if (-not $live.Found -or [string](Get-Field $live.Agent 'agent_status') -notin @('working', 'blocked')) { return $null }
+    $transcript = [string](Get-Field (Get-ReadySession -LaunchPaneId $LaunchPaneId) 'omp_session_file')
+    $ticketless = @(Get-OmpPendingToolCalls -Path $transcript -Name 'orch_dispatch' | Where-Object { $null -eq (Get-Field $_ 'ticketId' $null) })
+    $candidates = @(foreach ($title in @($Titles)) {
+        $sameTitle = @($ticketless | Where-Object { [string](Get-Field $_ 'title') -ceq $title })
+        if ($sameTitle.Count -gt 0) { $sameTitle[$sameTitle.Count - 1] }
+    })
+    if ($candidates.Count -eq 0) { return $null }
+    $screen = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100
+    $shown = @($candidates | Where-Object { Test-PrimaryDispatchConfirmScreen -Screen $screen -Request $_ })
+    if ($shown.Count -ne 1) { return $null }
+    return $shown[0]
+}
+
+function Confirm-PrimaryDispatchModals {
+    <#
+        Presses Enter on the primary's ticketless dispatch dialogs, one for each
+        title, in whatever order the primary opens them, and only on the exact
+        dialog of a pending orch_dispatch call (Find-PrimaryDispatchModal). Before
+        each key the transcript call and then the dialog are read again and must
+        show the request the round found, so a replaced dialog or a changed request
+        receives nothing. Returns one object: Confirmed is true only when every
+        title's dialog was confirmed, and Requests holds the confirmed requests in
+        the order they were confirmed. One object keeps Requests a flat array
+        however a caller assigns, wraps or pipes the result.
+    #>
+    param(
+        [Parameter(Mandatory)][string[]]$Titles,
+        [double]$TimeoutSeconds = 180
+    )
+    $launchPane = [string](Get-Field $script:Project 'LaunchPaneID')
+    $unconfirmed = New-Object System.Collections.ArrayList
+    foreach ($title in $Titles) { if ($unconfirmed -cnotcontains $title) { [void]$unconfirmed.Add([string]$title) } }
+    $confirmed = New-Object System.Collections.ArrayList
+    $complete = $true
+    while ($unconfirmed.Count -gt 0) {
+        $round = Wait-Until -TimeoutSeconds $TimeoutSeconds -IntervalSeconds 2 -What ('ticketless dispatch confirmation for ' + ($unconfirmed -join ' | ')) -Probe {
+            Find-PrimaryDispatchModal -LaunchPaneId $launchPane -Titles @($unconfirmed)
+        }
+        if (-not $round.Ok -or $null -eq $round.Value) { $complete = $false; break }
+        $found = $round.Value
+        $current = Find-PrimaryDispatchModal -LaunchPaneId $launchPane -Titles @([string](Get-Field $found 'title'))
+        if ($null -eq $current -or (Get-Json $current) -cne (Get-Json $found)) { $complete = $false; break }
+        $sent = Send-AgentKeys -PaneId $script:PrimaryPane -Keys @('enter')
+        [void]($script:PrimarySendKeysUsed += 'enter')
+        if ($sent.ExitCode -ne 0) { $complete = $false; break }
+        [void]$confirmed.Add($current)
+        $unconfirmed.Remove([string](Get-Field $current 'title'))
+    }
+    return [pscustomobject]@{ Confirmed = $complete; Requests = $confirmed.ToArray() }
 }
 
 function Test-PrimaryAnswerConfirmScreen {
@@ -4796,10 +5182,10 @@ function Confirm-PrimaryAnswerModal {
     )
     $result = [pscustomobject]@{ Observed = $false; Confirmed = $false; DeliveredBeforeConfirm = $false; Screen = '' }
     $wait = Wait-Until -TimeoutSeconds $TimeoutSeconds -IntervalSeconds 2 -What "answer confirmation for task $TaskId" -Probe {
-        # Herdr reports the primary "working", not "blocked", while an extension's
-        # confirmation dialog is open (seen live in run da682eab), so the status is
-        # not a gate; like Confirm-PrimaryModal, the exact visible dialog and the
-        # transcript's tool call are.
+        # The status is not a gate: the extension marks the primary blocked while
+        # its dialog is open, but before that mark existed Herdr reported it
+        # "working" (run da682eab). Like Confirm-PrimaryModal, the exact visible
+        # dialog and the transcript's tool call are the gate.
         $screen = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100
         if (-not (Test-PrimaryAnswerConfirmScreen -Screen $screen -TaskId $TaskId -Text $Text)) { return $null }
         if (-not (Test-OmpTranscriptContainsAnswerToolCall -Path $TranscriptPath -TaskId $TaskId -Text $Text)) { return $null }
@@ -5008,27 +5394,72 @@ function Resolve-PrimaryWorkerQuestionAsk {
     return [pscustomobject]@{ Observed = $true; Resolved = $resolved; Screen = $screen }
 }
 
-# Try-ConfirmPrimaryReview attempts to confirm an orch_review confirmation modal
-# when the primary is blocked on one. Returns $true if the review was confirmed,
-# $false if no review modal was found.
-function Try-ConfirmPrimaryReview {
+function Deny-PrimaryConsentDialog {
+    <#
+        Declines the extension consent dialog that is the primary's active panel,
+        for a dialog no step of this run asked for. The acceptance user confirms
+        only the exact dialog a step requested (the Confirm-* drivers); any other is
+        an action the user never asked for. Escape closes OMP's selector as "No", so
+        the extension refuses the tool and records nothing. Enter would select the
+        highlighted Yes, so it is never sent here. Escape on OMP's editor would
+        interrupt a running turn instead, so the pane is read again right before
+        the key and nothing is sent once the dialog is gone. Returns {Declined,
+        Title, Reason, Screen}; Title is empty when no consent dialog was open at
+        that read.
+    #>
+    param([string]$AssertionPrefix = 'prompt')
     $screen = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100
-    # Quick check: the review confirmation shows "Record review disposition"
-    if ($screen -notmatch 'Record review disposition') { return $false }
-    # Extract task ID from the screen text
-    $taskIdMatch = [regex]::Match($screen, 'task (orch_[a-z0-9]+)')
-    if (-not $taskIdMatch.Success) { return $false }
-    $taskId = $taskIdMatch.Groups[1].Value
-    # Extract disposition from the screen text
-    $dispMatch = [regex]::Match($screen, 'disposition "([^"]+)"')
-    if (-not $dispMatch.Success) { return $false }
-    $disposition = $dispMatch.Groups[1].Value
-    return Confirm-PrimaryReviewModal -PaneId $script:PrimaryPane `
-        -LaunchPaneId ([string](Get-Field $script:Project 'LaunchPaneID')) `
-        -TaskId $taskId -Disposition $disposition
+    $title = Get-PrimaryConsentDialogTitle -Screen $screen
+    if (-not $title) {
+        return [pscustomobject]@{ Declined = $false; Title = ''; Reason = 'no extension consent dialog is open on the primary'; Screen = $screen }
+    }
+    $sent = Send-AgentKeys -PaneId $script:PrimaryPane -Keys @('esc')
+    [void]($script:PrimarySendKeysUsed += 'esc')
+    $closed = Wait-Until -TimeoutSeconds 30 -IntervalSeconds 1 -What "the declined '$title' dialog closed" -Probe {
+        $now = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100
+        if ($null -eq (Get-PrimaryConsentDialogTitle -Screen $now)) { return $true }
+        return $null
+    }
+    [void](Add-Assertion -Id "$AssertionPrefix.declined" -Status 'INFO' -Command $sent.CommandLine `
+        -What "the acceptance user declined an unrequested '$title' dialog on the primary (a declined dialog records nothing)" `
+        -Evidence ("sent=$($sent.ExitCode) closed=$($closed.Ok) screen=" + (Protect-Text $screen 600)))
+    $reason = if ($sent.ExitCode -ne 0) {
+        "Escape could not be sent to the unrequested '$title' dialog (exit $($sent.ExitCode))"
+    } elseif (-not $closed.Ok) {
+        "the unrequested '$title' dialog stayed open after Escape"
+    } else { '' }
+    return [pscustomobject]@{ Declined = ($reason -eq ''); Title = $title; Reason = $reason; Screen = $screen }
+}
+
+function Get-PrimaryUnsettledReason {
+    # Why the primary did not settle in time, for a refusal that typed nothing. A
+    # consent dialog marks the pane blocked while it is open, so one that is open
+    # while Herdr reports anything else is named: that is the extension's defect.
+    # A pane that stays blocked with neither a disposition Ask nor a consent dialog
+    # on screen is blocked on something this run does not answer.
+    param([string]$Screen, [double]$TimeoutSeconds)
+    $live = Get-LiveAgent -Target $script:PrimaryPane
+    $status = if ($live.Found) { [string](Get-Field $live.Agent 'agent_status') } else { 'absent' }
+    if ([string]::IsNullOrWhiteSpace($status)) { $status = 'without a status' }
+    $title = Get-PrimaryConsentDialogTitle -Screen $Screen
+    if ($status -ceq 'blocked' -and -not $title -and -not (Get-PrimaryAskId -Screen $Screen)) {
+        return "the primary stayed blocked for ${TimeoutSeconds}s on a screen that is neither a disposition Ask this run resolves nor an extension consent dialog"
+    }
+    $reason = "the primary did not settle (idle, done or blocked) within ${TimeoutSeconds}s; Herdr reports it $status"
+    if ($title) { $reason += "; the extension consent dialog '$title' is open, which should have marked it blocked" }
+    return $reason
 }
 
 function Resolve-PendingPrimaryDispositionAsks {
+    <#
+        Settles the primary before the harness types a prompt into it. Returns
+        {Resolved, Observed, Screen, Reason}: Resolved only once Herdr reports the
+        primary idle or done, never mid-turn. While it is blocked, a disposition Ask
+        this run recognizes exactly, for a task whose report waits for a decision,
+        is resolved (Observed), and an extension consent dialog no step asked for is
+        declined (Deny-PrimaryConsentDialog). Anything else stops with the reason
+        and nothing typed.
+    #>
     param([string]$AssertionPrefix = 'V0', [double]$TimeoutSeconds = 30)
     $observed = $false
     for ($attempt = 0; $attempt -lt 4; $attempt++) {
@@ -5040,23 +5471,26 @@ function Resolve-PendingPrimaryDispositionAsks {
             if ($status -ne 'blocked') { return $null }
             $screen = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100
             $askId = Get-PrimaryAskId -Screen $screen
-            if (-not $askId) { return [pscustomobject]@{ Kind = 'unknown'; Screen = $screen } }
-            return [pscustomobject]@{ Kind = 'ask'; AskId = $askId; Screen = $screen }
+            if ($askId) { return [pscustomobject]@{ Kind = 'ask'; AskId = $askId; Screen = $screen } }
+            if (Get-PrimaryConsentDialogTitle -Screen $screen) { return [pscustomobject]@{ Kind = 'consent'; Screen = $screen } }
+            # Blocked with neither on screen: Herdr can still report a dialog that just
+            # closed (the cleared mark reaches it a moment later), so keep waiting; at
+            # the timeout the reason names the screen.
+            return $null
         }
         if (-not $wait.Ok) {
-            return [pscustomobject]@{ Resolved = $false; Observed = $observed; Screen = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100 }
+            $screen = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100
+            return [pscustomobject]@{ Resolved = $false; Observed = $observed; Screen = $screen
+                Reason = (Get-PrimaryUnsettledReason -Screen $screen -TimeoutSeconds $TimeoutSeconds) }
         }
         if ($wait.Value.Kind -eq 'settled') {
-            return [pscustomobject]@{ Resolved = $true; Observed = $observed; Screen = '' }
+            return [pscustomobject]@{ Resolved = $true; Observed = $observed; Screen = ''; Reason = '' }
         }
-        if ($wait.Value.Kind -ne 'ask') {
-            # The primary is blocked but no recognizable Ask was found.
-            # This could be an orch_review confirmation modal — try to confirm it.
-            if ($wait.Value.Screen -match 'Record review disposition') {
-                $confirmed = Try-ConfirmPrimaryReview
-                if ($confirmed) { continue }
-            }
-            return [pscustomobject]@{ Resolved = $false; Observed = $observed; Screen = $wait.Value.Screen }
+        if ($wait.Value.Kind -eq 'consent') {
+            $declined = Deny-PrimaryConsentDialog -AssertionPrefix $AssertionPrefix
+            # Declined, or already gone at the read before the key: look again.
+            if ($declined.Declined -or -not $declined.Title) { continue }
+            return [pscustomobject]@{ Resolved = $false; Observed = $observed; Screen = $declined.Screen; Reason = $declined.Reason }
         }
 
         $taskAFact = $script:TaskA
@@ -5077,29 +5511,43 @@ function Resolve-PendingPrimaryDispositionAsks {
         )
         $target = @($targets | Where-Object { $_.AskId -eq $wait.Value.AskId })
         if ($target.Count -ne 1 -or [string]::IsNullOrWhiteSpace($target[0].TaskId)) {
-            return [pscustomobject]@{ Resolved = $false; Observed = $observed; Screen = $wait.Value.Screen }
+            return [pscustomobject]@{ Resolved = $false; Observed = $observed; Screen = $wait.Value.Screen
+                Reason = "the primary is blocked on Ask '$($wait.Value.AskId)', which is not a disposition Ask this run resolves" }
         }
         $task = Get-TaskById -Id $target[0].TaskId
         $fact = Get-Field $task 'fact'
         if (-not $task -or $null -eq (Get-Field $fact 'Report' $null) -or
             -not [string]::IsNullOrWhiteSpace([string](Get-Field $fact 'Disposition'))) {
-            return [pscustomobject]@{ Resolved = $false; Observed = $observed; Screen = $wait.Value.Screen }
+            return [pscustomobject]@{ Resolved = $false; Observed = $observed; Screen = $wait.Value.Screen
+                Reason = "Ask '$($wait.Value.AskId)' names task $($target[0].TaskId), which has no report waiting for a decision" }
         }
         $result = Resolve-PrimaryDispositionAsk -Marker $target[0].Marker -AskId $target[0].AskId `
             -TaskId $target[0].TaskId -AssertionId $target[0].AssertionId
         if (-not $result.Resolved) {
-            return [pscustomobject]@{ Resolved = $false; Observed = $observed; Screen = $result.Screen }
+            return [pscustomobject]@{ Resolved = $false; Observed = $observed; Screen = $result.Screen
+                Reason = "the disposition Ask '$($wait.Value.AskId)' for task $($target[0].TaskId) was not resolved" }
         }
         $observed = $observed -or $result.Observed
     }
-    return [pscustomobject]@{ Resolved = $false; Observed = $observed; Screen = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100 }
+    return [pscustomobject]@{ Resolved = $false; Observed = $observed; Screen = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100
+        Reason = 'the primary was still not settled after four rounds of resolving its pending input' }
 }
 
-function Invoke-PrimaryDispositionAskForPendingReport {
+function Invoke-PrimaryReviewForPendingReport {
+    <#
+        Records the user's decision on a worker report that waits for review before
+        the next phase needs the primary. The primary has no Ask tool, so the
+        decision is the review dialog itself: the primary is asked to call
+        orch_review for exactly that task, and the acceptance user confirms the
+        exact dialog (Confirm-PrimaryReviewModal). Returns {Resolved, Observed,
+        Screen}: Observed when a review was requested, Resolved when nothing was
+        pending or the confirmed disposition is recorded.
+    #>
     param([string]$AssertionPrefix = 'review')
+    $disposition = 'Accepted the reported result.'
     foreach ($target in @(
-        @{ fact = $script:TaskA; marker = 'ACCEPT-A'; askId = 'worker_a_disposition'; worker = 'Worker A'; suffix = 'a.js' },
-        @{ fact = $script:TaskB; marker = 'ACCEPT-B'; askId = 'worker_b_disposition'; worker = 'Worker B'; suffix = 'b.js' }
+        @{ fact = $script:TaskA; marker = 'ACCEPT-A' },
+        @{ fact = $script:TaskB; marker = 'ACCEPT-B' }
     )) {
         $taskFact = $target.fact
         if (-not $taskFact) {
@@ -5110,54 +5558,33 @@ function Invoke-PrimaryDispositionAskForPendingReport {
         if (-not $taskId) { continue }
         $taskRow = Get-TaskById -Id $taskId
         $fact = Get-Field $taskRow 'fact'
-        $report = Get-Field $fact 'Report' $null
-        if (-not $taskRow -or $null -eq $report -or
+        if (-not $taskRow -or $null -eq (Get-Field $fact 'Report' $null) -or
             -not [string]::IsNullOrWhiteSpace([string](Get-Field $fact 'Disposition'))) { continue }
 
-        $commit = ''
-        foreach ($item in @(Get-Field $report 'Evidence' @())) {
-            $match = [regex]::Match([string]$item, '(?i)\b[0-9a-f]{40}\b')
-            if ($match.Success) { $commit = $match.Value.ToLowerInvariant(); break }
-        }
-        $paths = @(Get-Field $fact 'ReservedPaths' @())
-        $file = if ($paths.Count -gt 0) { [string]$paths[0] } else { $target.suffix }
-        if (-not $commit -or $file -ne $target.suffix) {
-            return [pscustomobject]@{ Resolved = $false; Observed = $false; Screen = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100 }
-        }
-
-        $question = $target.worker + ' reports commit ' + $commit + ' for ' + $file + '. What disposition should I record?'
-        $prompt = 'ACCEPT-REVIEW. I have reviewed the exact report for ' + $target.worker + ': commit ' + $commit + ' for ' + $file + '. Ask the user with one OMP ask tool call only, id "' + $target.askId + '", question "' + $question + '", and exactly two options in this order: Accept (description: Record the reported result as accepted; no merge or cleanup is performed.), Request changes (description: Keep the result unaccepted and specify what should change.). Wait for the user choice. Do not call orch_review until the user chooses, do not ask about any other task, and do not merge or clean up.'
-        $submitted = Invoke-PrimaryPrompt -PaneId $script:PrimaryPane -Text $prompt -TimeoutSeconds 240
+        $prompt = 'ACCEPT-REVIEW. Review this one worker result only: ' + $target.marker + ' taskId "' + $taskId +
+            '". Call orch_review exactly once for this exact taskId with outcome "integrated" and disposition "' + $disposition +
+            '". The user confirms the dialog. Do not review any other task and do not merge or clean up either checkout. Reply reviewed after the tool result.'
+        $submitted = Invoke-PrimaryPromptNoWaitAfterDispositionAsks -PaneId $script:PrimaryPane -Text $prompt -TimeoutSeconds 240 -AssertionPrefix "$AssertionPrefix.$($target.marker)"
         if (-not $submitted.Submitted) {
+            [void](Assert-True -Id "$AssertionPrefix.review/$($target.marker)" -What "the primary accepted the review prompt for the pending report of $($target.marker)" -Condition $false `
+                -TaskId $taskId -Command $submitted.CommandLine -Evidence ("code=[$($submitted.Code)] screen=" + (Protect-Text $submitted.Screen 600)))
             return [pscustomobject]@{ Resolved = $false; Observed = $false; Screen = $submitted.Screen }
         }
-
-        $ask = Wait-Until -TimeoutSeconds 90 -IntervalSeconds 2 -What "primary disposition Ask $($target.askId)" -Probe {
-            $live = Get-LiveAgent -Target $script:PrimaryPane
-            if (-not $live.Found) { return $null }
-            $status = [string](Get-Field $live.Agent 'agent_status')
-            if ($status -in @('idle', 'done')) {
-                $latest = Get-TaskById -Id $taskId
-                $latestFact = Get-Field $latest 'fact'
-                if (-not [string]::IsNullOrWhiteSpace([string](Get-Field $latestFact 'Disposition'))) {
-                    return [pscustomobject]@{ Kind = 'settled'; Screen = '' }
-                }
+        $confirmed = Confirm-PrimaryReviewModal -PaneId $script:PrimaryPane -LaunchPaneId ([string](Get-Field $script:Project 'LaunchPaneID')) `
+            -TaskId $taskId -Disposition $disposition
+        $recorded = $false
+        if ($confirmed) {
+            $settled = Wait-Until -TimeoutSeconds 180 -IntervalSeconds 3 -What "the recorded disposition of $($target.marker)" -Probe {
+                $latest = Get-Field (Get-TaskById -Id $taskId) 'fact'
+                if ([string](Get-Field $latest 'Disposition') -ceq $disposition) { return $true }
                 return $null
             }
-            if ($status -ne 'blocked') { return $null }
-            $screen = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100
-            if (Test-PrimaryDispositionAskScreen -Screen $screen -AskId $target.askId -TaskId $taskId) {
-                return [pscustomobject]@{ Kind = 'ask'; Screen = $screen }
-            }
-            return [pscustomobject]@{ Kind = 'other'; Screen = $screen }
+            $recorded = [bool]$settled.Ok
         }
-        if (-not $ask.Ok -or $ask.Value.Kind -ne 'ask') {
-            $screen = if ($ask.Ok) { $ask.Value.Screen } else { Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100 }
-            [void](Assert-True -Id "$AssertionPrefix.ask-request/$($target.marker)" -What "the primary exposed the exact report Ask for $($target.marker)" -Condition $false -Evidence (Protect-Text $screen 600))
-            return [pscustomobject]@{ Resolved = $false; Observed = $false; Screen = $screen }
-        }
-        [void](Assert-True -Id "$AssertionPrefix.ask-request/$($target.marker)" -What "the primary exposed the exact report Ask for $($target.marker)" -Condition ($submitted.Submitted -and $ask.Value.Kind -eq 'ask') -Evidence (Protect-Text $ask.Value.Screen 600))
-        return Resolve-PrimaryDispositionAsk -Marker $target.marker -AskId $target.askId -TaskId $taskId -AssertionId "$AssertionPrefix.ask/$($target.marker)"
+        $screen = if ($recorded) { '' } else { Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100 }
+        [void](Assert-True -Id "$AssertionPrefix.review/$($target.marker)" -What "the acceptance user confirmed the exact review dialog for $($target.marker) and its disposition is recorded" `
+            -Condition $recorded -TaskId $taskId -Command $submitted.CommandLine -Evidence ("confirmed=[$confirmed] recorded=[$recorded] screen=" + (Protect-Text $screen 600)))
+        return [pscustomobject]@{ Resolved = $recorded; Observed = $true; Screen = $screen }
     }
     return [pscustomobject]@{ Resolved = $true; Observed = $false; Screen = '' }
 }
@@ -5166,7 +5593,8 @@ function Invoke-PrimaryPromptAfterDispositionAsks {
     param([Parameter(Mandatory)][string]$PaneId, [Parameter(Mandatory)][string]$Text, [double]$TimeoutSeconds = 300, [string]$AssertionPrefix = 'prompt')
     $pending = Resolve-PendingPrimaryDispositionAsks -AssertionPrefix $AssertionPrefix -TimeoutSeconds 30
     if (-not $pending.Resolved) {
-        return [pscustomobject]@{ ExitCode = -1; Code = 'agent_blocked'; Blocked = $true; Submitted = $false; Screen = $pending.Screen; Stderr = 'a primary disposition Ask is unresolved'; CommandLine = '' }
+        return [pscustomobject]@{ ExitCode = -1; Code = 'agent_blocked'; Blocked = $true; Submitted = $false; Screen = $pending.Screen
+            Stderr = [string](Get-Field $pending 'Reason' 'the primary''s pending input could not be settled'); CommandLine = '' }
     }
     $result = Invoke-PrimaryPrompt -PaneId $PaneId -Text $Text -TimeoutSeconds $TimeoutSeconds
     if ($result.Blocked -and $result.Code -eq 'agent_blocked' -and -not $result.Submitted) {
@@ -5218,7 +5646,7 @@ function Invoke-PrimaryPromptNoWaitOnce {
             Blocked = $true
             Submitted = $false
             Screen = $pending.Screen
-            Stderr = 'a primary disposition Ask is unresolved'
+            Stderr = [string](Get-Field $pending 'Reason' 'the primary''s pending input could not be settled')
             Stdout = ''
             CommandLine = ''
         }
@@ -5370,18 +5798,22 @@ function Invoke-BlockedDialog {
         Assert-NonEmpty -Id 'K3.4' -What 'the preview carries a digest that ties an approval to this dialog' -Value ([string](Get-Field $preview.Result 'digest')) -TaskId $idB
         Assert-Equal -Id 'K3.5' -What 'the preview names the exact current public pane' -Expected $paneB -Actual ([string](Get-Field $preview.Result 'publicPaneId')) -TaskId $idB
     }
+    # A report already waiting for review is decided first, through the primary's
+    # own review dialog (the primary has no Ask tool), so no review dialog can open
+    # in the middle of the approval below.
     $primaryAsks = Resolve-PendingPrimaryDispositionAsks -AssertionPrefix 'K3.6' -TimeoutSeconds 60
     if ($primaryAsks.Resolved -and -not $primaryAsks.Observed) {
-        $requestedAsk = Invoke-PrimaryDispositionAskForPendingReport -AssertionPrefix 'K3.6'
-        if (-not $requestedAsk.Resolved) {
-            $primaryAsks = [pscustomobject]@{ Resolved = $false; Observed = $requestedAsk.Observed; Screen = $requestedAsk.Screen }
-        } elseif ($requestedAsk.Observed) {
+        $pendingReview = Invoke-PrimaryReviewForPendingReport -AssertionPrefix 'K3.6'
+        if (-not $pendingReview.Resolved) {
+            $primaryAsks = [pscustomobject]@{ Resolved = $false; Observed = $pendingReview.Observed; Screen = $pendingReview.Screen }
+        } elseif ($pendingReview.Observed) {
             $primaryAsks = Resolve-PendingPrimaryDispositionAsks -AssertionPrefix 'K3.6' -TimeoutSeconds 60
         }
     }
     if (-not $primaryAsks.Resolved) {
-        Block-Item -Id 'K3.6b' -What 'the primary disposition Ask could not be answered before dialog approval' -Evidence (Protect-Text $primaryAsks.Screen 600)
-        throw 'a primary disposition Ask blocked worker-dialog approval'
+        Block-Item -Id 'K3.6b' -What 'the pending report review could not be settled before dialog approval' `
+            -Evidence ("reason=[$([string](Get-Field $primaryAsks 'Reason'))] screen=" + (Protect-Text ([string](Get-Field $primaryAsks 'Screen')) 600))
+        throw 'a pending report review blocked worker-dialog approval'
     }
 
     $prompt = 'ACCEPT-DIALOG. I have reviewed the exact dialog for worker ' + $idB + ': question "ACCEPT-Q-DIALOG: which contract should b.js use?" with options "keep the current contract" and "change the contract". As the acceptance user, I explicitly authorize sending only enter to choose "keep the current contract" for this task. Call orch_approve_dialog with taskId "' + $idB + '" and keys ["enter"]; do not act if the confirmation UI shows a different dialog. Then reply with the word approved.'
@@ -5884,14 +6316,15 @@ function Invoke-Reviews {
     $pending = Resolve-PendingPrimaryDispositionAsks -AssertionPrefix 'V0' -TimeoutSeconds 60
     if (-not $pending.Resolved) {
         Preserve-ResourcesForPendingTool -AssertionId 'V0.ask-blocked.resources-preserved' -Reason 'a primary disposition Ask was not safely resolved'
-        Block-Item -Id 'V0.ask-blocked' -What 'the primary disposition Ask could not be safely resolved' -Evidence (Protect-Text $pending.Screen 600)
+        Block-Item -Id 'V0.ask-blocked' -What 'the primary disposition Ask could not be safely resolved' `
+            -Evidence ("reason=[$([string](Get-Field $pending 'Reason'))] screen=" + (Protect-Text ([string](Get-Field $pending 'Screen')) 600))
         return
     }
 
     $reviewTasks = New-Object System.Collections.ArrayList
     $reviewTargets = @(
-        @{ id = $idA; marker = 'ACCEPT-A'; askId = 'task_a_review'; label = 'Task A' },
-        @{ id = $idB; marker = 'ACCEPT-B'; askId = 'task_b_review'; label = 'Task B' }
+        @{ id = $idA; marker = 'ACCEPT-A'; label = 'Task A' },
+        @{ id = $idB; marker = 'ACCEPT-B'; label = 'Task B' }
     )
     foreach ($item in $reviewTargets) {
         if (-not $item.id) { continue }
@@ -5907,29 +6340,33 @@ function Invoke-Reviews {
         }
     }
     if ($reviewTasks.Count -gt 0) {
+        $reviewDisposition = 'Accepted the reported result.'
         foreach ($reviewTask in $reviewTasks) {
+            # The primary has no Ask tool: the user decides in orch_review's own dialog.
             $prompt = 'ACCEPT-REVIEW. Review this one worker result only: ' + $reviewTask.marker +
-                ' taskId "' + $reviewTask.id + '". Ask the user with one single-question Ask using id "' +
-                $reviewTask.askId + '" and header "' + $reviewTask.label +
-                '". Offer "Accept report", "Request changes", then "Reject report" in that order. Wait for the choice, then call orch_review for this exact taskId with outcome "integrated" and disposition "Accepted the reported result." Do not ask about any other task in the same Ask and do not merge or clean up either checkout. Reply reviewed after the tool result.'
+                ' taskId "' + $reviewTask.id + '". Call orch_review exactly once for this exact taskId with outcome "integrated" and disposition "' +
+                $reviewDisposition + '". The user confirms the dialog. Do not review any other task and do not merge or clean up either checkout. Reply reviewed after the tool result.'
             $result = Invoke-PrimaryPromptNoWaitAfterDispositionAsks -PaneId $script:PrimaryPane -Text $prompt -TimeoutSeconds 300 -AssertionPrefix "V1.$($reviewTask.marker)"
             Assert-True -Id "V1.submit/$($reviewTask.marker)" -What "the primary accepted the review prompt for $($reviewTask.label)" -Condition ($result.Submitted -and ($result.ExitCode -eq 0 -or $result.Blocked)) `
                 -Command $result.CommandLine -Evidence ("code=[$($result.Code)] blocked=[$($result.Blocked)] submitted=[$($result.Submitted)] stderr=[" + (Protect-Text $result.Stderr 300) + "] screen=[" + (Protect-Text $result.Screen 500) + "]")
             if (-not $result.Submitted) {
                 Block-Item -Id "V1.submit-blocked/$($reviewTask.marker)" -What "the review prompt for $($reviewTask.label) was not submitted" -Evidence (Protect-Text $result.Screen 500)
-                Preserve-ResourcesForPendingTool -AssertionId "V1.submit-blocked/$($reviewTask.marker).resources-preserved" -Reason 'a review Ask may still be active'
+                Preserve-ResourcesForPendingTool -AssertionId "V1.submit-blocked/$($reviewTask.marker).resources-preserved" -Reason 'a review dialog may still be open on the primary'
                 return
             }
-            $resolvedAsk = Resolve-PrimaryDispositionAsk -Marker $reviewTask.marker -AskId $reviewTask.askId -TaskId $reviewTask.id -AssertionId "V1.ask/$($reviewTask.marker)"
-            if (-not $resolvedAsk.Resolved -or -not $resolvedAsk.Observed) {
-                Block-Item -Id "V1.ask-blocked/$($reviewTask.marker)" -What "the primary Ask for $($reviewTask.label) was not safely resolved" -Evidence (Protect-Text $resolvedAsk.Screen 600)
-                Preserve-ResourcesForPendingTool -AssertionId "V1.ask-blocked/$($reviewTask.marker).resources-preserved" -Reason 'the review disposition Ask was not observed to resolve'
+            $confirmed = Confirm-PrimaryReviewModal -PaneId $script:PrimaryPane -LaunchPaneId ([string](Get-Field $script:Project 'LaunchPaneID')) `
+                -TaskId $reviewTask.id -Disposition $reviewDisposition
+            Assert-True -Id "V1.confirm/$($reviewTask.marker)" -What "the acceptance user confirmed the exact review dialog for $($reviewTask.label)" -Condition $confirmed -TaskId $reviewTask.id
+            if (-not $confirmed) {
+                Preserve-ResourcesForPendingTool -AssertionId "V1.confirm/$($reviewTask.marker).resources-preserved" -Reason 'the review dialog may still be open on the primary'
+                Block-Item -Id "V1.confirm-blocked/$($reviewTask.marker)" -What "the review dialog for $($reviewTask.label) was not safely confirmed" `
+                    -Evidence (Protect-Text (Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100) 600)
                 return
             }
         }
-        Add-Assertion -Id 'V1.1' -What 'each outstanding report was confirmed in a separate primary Ask' -Status 'PASS'
+        Add-Assertion -Id 'V1.1' -What 'each outstanding report was decided in its own confirmed review dialog' -Status 'PASS'
     } else {
-        Add-Assertion -Id 'V1.1' -What 'all report dispositions were already recorded through the primary Ask' -Status 'PASS'
+        Add-Assertion -Id 'V1.1' -What 'all report dispositions were already recorded through confirmed review dialogs' -Status 'PASS'
     }
 
 
@@ -5991,19 +6428,20 @@ function Wait-ForTickets {
 }
 
 function Invoke-Tickets {
-    Write-Step 'Phase 16b: a ticket moves backlog -> todo, is dispatched, reviewed and closed by the user'
+    Write-Step 'Phase 16b: a ticket move starts a planner, the approved plan permits explicit dispatch, and the ticket is reviewed'
     $key = [string](Get-Field $script:Project 'Key')
     $launch = [string](Get-Field $script:Project 'LaunchPaneID')
     if (-not $script:PrimaryPane -or -not $key) {
         Block-Item -Id 'TK0.0' -What 'the ticket phase' -Evidence 'the primary or the bound project is not available'
         return
     }
-    $ticketTitle = "ACCEPT TICKET $($script:RunId): add a subtract helper"
+    $ticketTitle = "ACCEPT TICKET $($script:RunId): add an exported ticket helper"
+    $ticketBody = 'Add an exported ticket() helper to t.js that returns 1. Disposable acceptance ticket.'
     $tasksBefore = @(Get-ProjectTasks -Key $key)
     $ticketsBefore = @(Get-ProjectTickets -Key $key)
 
     # TK1.1: orch_ticket_create records a backlog ticket.
-    $prompt = "$($script:MarkerPrefix)TICKET-CREATE. Call orch_ticket_create exactly once with title ""$ticketTitle"" and body ""Add a subtract helper to t.js. Disposable acceptance ticket."" Reply with the new ticket id only."
+    $prompt = "$($script:MarkerPrefix)TICKET-CREATE. Call orch_ticket_create exactly once with title ""$ticketTitle"" and body ""$ticketBody"". Reply with the new ticket id only."
     $result = Invoke-PrimaryPrompt -PaneId $script:PrimaryPane -Text $prompt -TimeoutSeconds 300
     Assert-True -Id 'TK1.0' -What 'the real primary accepts the ticket-create prompt' -Condition ($result.ExitCode -eq 0) -Command $result.CommandLine `
         -Evidence ("code=[$($result.Code)] blocked=[$($result.Blocked)] stderr=[" + (Protect-Text $result.Stderr 300) + "] screen=[" + (Protect-Text $result.Screen 400) + "]")
@@ -6023,6 +6461,7 @@ function Invoke-Tickets {
     Assert-Match -Id 'TK1.1c' -What 'the ticket has a generated id' -Pattern '^tkt_[0-9a-f]{12}$' -Actual $ticketId
     Assert-Equal -Id 'TK1.1d' -What 'a new ticket is in the backlog at revision 1 with no decision' -Expected 'backlog|1|' `
         -Actual ('{0}|{1}|{2}' -f (Get-Field $ticketFact 'Column'), (Get-Field $ticketFact 'Revision'), (Get-Field $ticketFact 'Disposition'))
+    Assert-Equal -Id 'TK1.1e' -What 'the new ticket stores the requested planner context' -Expected $ticketBody -Actual ([string](Get-Field $ticketFact 'Body'))
 
     # TK1.2: a dispatch naming a ticket that does not exist is refused and creates nothing.
     $ghost = 'tkt_000000000000'
@@ -6035,7 +6474,7 @@ function Invoke-Tickets {
     Assert-Equal -Id 'TK1.2b' -What 'no task carries the missing ticket id' -Expected 0 `
         -Actual @($afterGhost | Where-Object { [string](Get-Field (Get-Field $_ 'fact') 'TicketID') -ceq $ghost }).Count
 
-    # TK1.3: the user confirms the move dialog; the ticket is todo and nothing started.
+    # TK1.3: the user confirms the move dialog; the ticket is todo and its planner is recorded.
     $prompt = "$($script:MarkerPrefix)TICKET-MOVE. Call orch_ticket_move exactly once for ticketId ""$ticketId"". The user confirms the dialog. Reply moved after the tool result."
     $result = Invoke-PrimaryPromptNoWaitAfterDispositionAsks -PaneId $script:PrimaryPane -Text $prompt -TimeoutSeconds 300 -AssertionPrefix 'TK1.move'
     Assert-True -Id 'TK1.3a' -What 'the real primary accepts the ticket-move prompt' -Condition $result.Submitted -Command $result.CommandLine `
@@ -6045,7 +6484,20 @@ function Invoke-Tickets {
         Preserve-ResourcesForPendingTool -AssertionId 'TK1.3b.resources-preserved' -Reason 'the ticket-move prompt was not submitted, so its confirmation dialog may be open on the primary'
         return
     }
-    $moveConfirmed = Confirm-PrimaryTicketModal -Kind 'move' -TicketId $ticketId -TicketTitle $ticketTitle
+    # The move dialog marks the primary blocked in Herdr while it waits for the user
+    # (the extension's herdr:blocked), which is what makes Herdr refuse an `agent
+    # prompt` instead of typing into it. Observed before the dialog is confirmed;
+    # the confirmation does not depend on it.
+    $blockedOnMove = Wait-Until -TimeoutSeconds 120 -IntervalSeconds 2 -What 'the primary blocked on its ticket move dialog' -Probe {
+        $live = Get-LiveAgent -Target $script:PrimaryPane
+        if (-not $live.Found -or [string](Get-Field $live.Agent 'agent_status') -cne 'blocked') { return $null }
+        $screen = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100
+        if ((Get-PrimaryConsentDialogTitle -Screen $screen) -cne 'Move ticket to todo') { return $null }
+        return 'blocked'
+    }
+    [void](Assert-True -Id 'TK1.3c-blocked' -What 'Herdr reports the primary blocked while its ticket move dialog is open' -Condition $blockedOnMove.Ok `
+        -Evidence (("after {0:N0}s; screen=" -f $blockedOnMove.Elapsed) + (Protect-Text (Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 60) 400)))
+    $moveConfirmed = Confirm-PrimaryTicketModal -Kind 'move' -TicketId $ticketId -TicketTitle $ticketTitle -TicketBody $ticketBody
     Assert-True -Id 'TK1.3c' -What 'the acceptance user confirmed the exact ticket move dialog' -Condition $moveConfirmed
     if (-not $moveConfirmed) {
         Preserve-ResourcesForPendingTool -AssertionId 'TK1.3c.resources-preserved' -Reason 'the ticket move dialog may still be open on the primary'
@@ -6058,10 +6510,119 @@ function Invoke-Tickets {
         return $null
     }
     Assert-True -Id 'TK1.3' -What 'after the user confirms the dialog the ticket is in todo' -Condition $moved.Ok
-    Assert-Equal -Id 'TK1.3e' -What 'the move started no task' -Expected $tasksBefore.Count -Actual @(Get-ProjectTasks -Key $key).Count
     if (-not $moved.Ok) { return }
 
-    # TK1.4: a dispatch naming the ticket creates a worker whose task carries its id.
+    $plannerWait = Wait-Until -TimeoutSeconds 180 -IntervalSeconds 4 -What 'the planner task recorded for this ticket' -Probe {
+        $rows = @(Get-ProjectTasks -Key $key | Where-Object {
+            [string](Get-Field (Get-Field $_ 'fact') 'TicketID') -ceq $ticketId -and
+            [string](Get-Field (Get-Field $_ 'fact') 'Role') -ceq 'plan'
+        })
+        if ($rows.Count -lt 1) { return $null }
+        return $rows
+    }
+    Assert-True -Id 'TK1.3e' -What 'the confirmed move recorded its planner task' -Condition ($plannerWait.Ok -and @($plannerWait.Value).Count -eq 1) `
+        -Evidence ("after {0:N0}s planner tasks={1}" -f $plannerWait.Elapsed, @($plannerWait.Value).Count)
+    if (-not $plannerWait.Ok -or @($plannerWait.Value).Count -ne 1) {
+        Block-Item -Id 'TK1.3f' -What 'the ticket move did not record exactly one planner task' -Evidence (Protect-Text (Get-Json @(Get-ProjectTasks -Key $key)) 800)
+        return
+    }
+    $plannerRow = @($plannerWait.Value)[0]
+    $plannerFact = Get-Field $plannerRow 'fact'
+    $plannerId = [string](Get-Field $plannerFact 'ID')
+    $script:Tasks = @($script:Tasks | Where-Object { [string](Get-Field $_ 'id') -cne [string](Get-Field $plannerRow 'id') }) + @($plannerRow)
+    Assert-Match -Id 'TK1.3g' -What 'the planner task has a generated task id' -Pattern '^orch_[0-9a-f]{12}$' -Actual $plannerId
+    Assert-Equal -Id 'TK1.3h' -What 'the task records the planning role and links to this ticket' -Expected "plan|$ticketId" `
+        -Actual ("{0}|{1}" -f (Get-Field $plannerFact 'Role'), (Get-Field $plannerFact 'TicketID')) -TaskId $plannerId
+    Assert-Equal -Id 'TK1.3i' -What 'the planner title includes the ticket title' -Expected "Plan: $ticketTitle" -Actual ([string](Get-Field $plannerFact 'Title')) -TaskId $plannerId
+    $plannerBrief = [string](Get-Field $plannerFact 'Brief')
+    Assert-True -Id 'TK1.3j' -What 'the planner brief includes the ticket context and forbids implementation' `
+        -Condition ($plannerBrief.Contains($ticketTitle) -and $plannerBrief.Contains($ticketBody) -and $plannerBrief.ToLowerInvariant().Contains('do not edit')) -TaskId $plannerId
+    Assert-Equal -Id 'TK1.3k' -What 'planning has no reserved implementation paths' -Expected 0 -Actual @((Get-Field $plannerFact 'ReservedPaths' @())).Count -TaskId $plannerId
+    Assert-True -Id 'TK1.3l' -What 'the planner follows the ordinary durable dispatch phases' `
+        -Condition ((Get-Field $plannerFact 'Phase') -in @('intent', 'worktree_created', 'agent_started', 'prompt_submitted')) -TaskId $plannerId `
+        -Evidence ([string](Get-Field $plannerFact 'Phase'))
+
+    # TK1.4: the ordinary planner reports a plan; the primary reviews it, but
+    # accepting it does not dispatch implementation work.
+    $planReported = Wait-Until -TimeoutSeconds 600 -IntervalSeconds 10 -What 'the planner final report' -Probe {
+        $fact = Get-Field (Get-TaskById -Id $plannerId) 'fact'
+        $report = Get-Field $fact 'Report' $null
+        if ($report -and [string](Get-Field $report 'Kind') -ceq 'result') { return $fact }
+        return $null
+    }
+    Assert-True -Id 'TK1.4a' -What 'the planner returned its plan as a normal final report' -Condition $planReported.Ok -TaskId $plannerId
+    if (-not $planReported.Ok) {
+        $latestPlanner = Get-TaskById -Id $plannerId
+        if ($latestPlanner) {
+            $script:Tasks = @($script:Tasks | Where-Object { [string](Get-Field $_ 'id') -cne [string](Get-Field $latestPlanner 'id') }) + @($latestPlanner)
+        }
+        Block-Item -Id 'TK1.4b' -What 'the planner did not report, so plan review and explicit dispatch cannot run' `
+            -Evidence (Protect-Text (Get-Json (Get-Field (Get-TaskById -Id $plannerId) 'fact')) 600)
+        return
+    }
+    # The planner plans from a read-only session: its transcript may hold only
+    # read-only tools and its own report tool.
+    $plannerTranscript = [string](Get-Field (Get-ReadySession -LaunchPaneId ([string](Get-Field $planReported.Value 'LaunchPaneID'))) 'omp_session_file')
+    $plannerTools = Test-OmpToolCallsWithin -Path $plannerTranscript -Allowed (@($script:ReadOnlyToolNames) + @($script:WorkerToolNames))
+    Assert-True -Id 'TK1.4k' -What 'the planner called only read-only tools and orch_report' -Condition $plannerTools.Ok -TaskId $plannerId `
+        -Evidence ("transcript=[$plannerTranscript] tools=[" + (@($plannerTools.Names) -join ', ') + "] outside=[" + (@($plannerTools.Outside) -join ', ') + "]")
+    $planPreview = Invoke-BridgeAs -LaunchPaneId $launch -Method 'ticket_move_preview' -Params @{ ticketId = $ticketId }
+    Assert-True -Id 'TK1.4b-stage' -What 'the ticket preview derives plan_ready from the planner report' -Condition $planPreview.Ok -TaskId $plannerId `
+        -Evidence (Protect-Text (Get-Json $planPreview.Result) 400)
+    if ($planPreview.Ok) {
+        Assert-Equal -Id 'TK1.4b-stage-value' -What 'the planner report projects to plan_ready before review' -Expected 'plan_ready' `
+            -Actual ([string](Get-Field $planPreview.Result 'stage')) -TaskId $plannerId
+    }
+    $plannerRow = Get-TaskById -Id $plannerId
+    $plannerFact = Get-Field $plannerRow 'fact'
+    $plannerPath = [string](Get-Field $plannerFact 'WorktreePath')
+    Assert-NonEmpty -Id 'TK1.4c-path' -What 'the planner has a recorded checkout' -Value $plannerPath -TaskId $plannerId
+    $plannerStatusResult = if ($plannerPath) { Invoke-Git -Arguments @('status', '--porcelain') -Directory $plannerPath } else { $null }
+    $plannerStatusExit = if ($plannerStatusResult) { [int]$plannerStatusResult.ExitCode } else { -1 }
+    $plannerStatus = if ($plannerStatusResult) { $plannerStatusResult.Stdout.Trim() } else { '<missing planner checkout>' }
+    Assert-Equal -Id 'TK1.4c-exit' -What 'git status successfully checked the planner checkout' -Expected 0 -Actual $plannerStatusExit -TaskId $plannerId
+    Assert-Equal -Id 'TK1.4c' -What 'the planning-only worker left its checkout unchanged' -Expected '' -Actual $plannerStatus -TaskId $plannerId
+    if ($plannerStatusExit -ne 0 -or $plannerStatus -ne '') { return }
+    $script:Tasks = @($script:Tasks | Where-Object { [string](Get-Field $_ 'id') -cne [string](Get-Field $plannerRow 'id') }) + @($plannerRow)
+    $linkedBeforePlanReview = @(Get-ProjectTasks -Key $key | Where-Object { [string](Get-Field (Get-Field $_ 'fact') 'TicketID') -ceq $ticketId })
+    Assert-Equal -Id 'TK1.4d' -What 'the planner is the only task linked before plan approval' -Expected 1 -Actual $linkedBeforePlanReview.Count
+
+    $plannerDisposition = 'Accepted the plan; implementation still requires an explicit dispatch.'
+    $prompt = "$($script:MarkerPrefix)TICKET-PLAN-REVIEW. Call orch_review exactly once for taskId ""$plannerId"" with outcome ""integrated"" and disposition ""$plannerDisposition"". The user confirms the dialog. Reply reviewed after the tool result."
+    $result = Invoke-PrimaryPromptNoWaitAfterDispositionAsks -PaneId $script:PrimaryPane -Text $prompt -TimeoutSeconds 300 -AssertionPrefix 'TK1.planreview'
+    Assert-True -Id 'TK1.4e' -What 'the primary submitted the planner review prompt' -Condition $result.Submitted -Command $result.CommandLine `
+        -Evidence ("code=[$($result.Code)] stderr=[" + (Protect-Text $result.Stderr 300) + "] screen=[" + (Protect-Text $result.Screen 400) + "]")
+    if (-not $result.Submitted) {
+        Preserve-ResourcesForPendingTool -AssertionId 'TK1.4e.resources-preserved' -Reason 'the planner review prompt may still be open on the primary'
+        Block-Item -Id 'TK1.4f' -What 'the planner review prompt was not submitted' -Evidence (Protect-Text $result.Screen 500)
+        return
+    }
+    $plannerConfirmed = Confirm-PrimaryReviewModal -PaneId $script:PrimaryPane -LaunchPaneId $launch -TaskId $plannerId -Disposition $plannerDisposition
+    Assert-True -Id 'TK1.4g' -What 'the acceptance user confirmed the exact planner review dialog' -Condition $plannerConfirmed -TaskId $plannerId
+    if (-not $plannerConfirmed) {
+        Preserve-ResourcesForPendingTool -AssertionId 'TK1.4g.resources-preserved' -Reason 'the planner review dialog may still be open on the primary'
+        Block-Item -Id 'TK1.4h' -What 'the planner review dialog was not safely confirmed' -Evidence (Protect-Text (Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100) 600)
+        return
+    }
+    $plannerAccepted = Wait-Until -TimeoutSeconds 180 -IntervalSeconds 4 -What 'the accepted planner disposition' -Probe {
+        $fact = Get-Field (Get-TaskById -Id $plannerId) 'fact'
+        if ([string](Get-Field $fact 'Outcome') -ceq 'integrated' -and [string](Get-Field $fact 'Disposition') -ceq $plannerDisposition) { return $fact }
+        return $null
+    }
+    Assert-True -Id 'TK1.4i' -What 'the user disposition accepts the planner report' -Condition $plannerAccepted.Ok -TaskId $plannerId
+    if (-not $plannerAccepted.Ok) { return }
+    $afterPlanReview = @(Get-ProjectTasks -Key $key | Where-Object { [string](Get-Field (Get-Field $_ 'fact') 'TicketID') -ceq $ticketId })
+    Assert-Equal -Id 'TK1.4j' -What 'accepting a plan does not auto-dispatch implementation work' -Expected 1 -Actual $afterPlanReview.Count
+    $acceptedPlanPreview = Invoke-BridgeAs -LaunchPaneId $launch -Method 'ticket_move_preview' -Params @{ ticketId = $ticketId }
+    Assert-True -Id 'TK1.4j-stage' -What 'the accepted planner leaves the ticket ready for explicit implementation dispatch' `
+        -Condition $acceptedPlanPreview.Ok -TaskId $plannerId -Evidence (Protect-Text (Get-Json $acceptedPlanPreview.Result) 400)
+    if ($acceptedPlanPreview.Ok) {
+        Assert-Equal -Id 'TK1.4j-stage-value' -What 'a closed accepted planner with no implementation task projects to todo' `
+            -Expected 'todo' -Actual ([string](Get-Field $acceptedPlanPreview.Result 'stage')) -TaskId $plannerId
+    }
+    if (-not $acceptedPlanPreview.Ok -or [string](Get-Field $acceptedPlanPreview.Result 'stage') -cne 'todo') { return }
+
+    # TK1.5: only an explicit orch_dispatch creates the implementation worker.
     $brief = @"
 $($script:MarkerPrefix)TICKET-WORKER. You are in your own Git worktree of a disposable test repository. Do exactly this:
 1. Create t.js containing ``function ticket() { return 1; }`` and ``module.exports = { ticket };``.
@@ -6074,87 +6635,113 @@ $($script:MarkerPrefix)TICKET-DISPATCH. Call orch_dispatch exactly once with tit
 BRIEF: $brief
 "@
     $result = Invoke-PrimaryPrompt -PaneId $script:PrimaryPane -Text $prompt -TimeoutSeconds 420
-    Assert-True -Id 'TK1.4a' -What 'the real primary accepts the ticket dispatch prompt' -Condition ($result.ExitCode -eq 0) -Command $result.CommandLine `
+    Assert-True -Id 'TK1.5a' -What 'the primary accepts the explicit implementation dispatch prompt' -Condition ($result.ExitCode -eq 0) -Command $result.CommandLine `
         -Evidence ("code=[$($result.Code)] blocked=[$($result.Blocked)] stderr=[" + (Protect-Text $result.Stderr 300) + "]")
     if ($result.ExitCode -ne 0) {
-        Block-Item -Id 'TK1.4b' -What 'the ticket dispatch prompt was not submitted' -Evidence (Protect-Text ($result.Stdout + $result.Stderr + $result.Screen) 500)
+        Block-Item -Id 'TK1.5b' -What 'the implementation dispatch prompt was not submitted' -Evidence (Protect-Text ($result.Stdout + $result.Stderr + $result.Screen) 500)
         return
     }
-    $linked = Wait-Until -TimeoutSeconds 300 -IntervalSeconds 8 -What 'the ticket worker task' -Probe {
-        $rows = @(Get-ProjectTasks -Key $key | Where-Object { [string](Get-Field (Get-Field $_ 'fact') 'TicketID') -ceq $ticketId })
+    $linked = Wait-Until -TimeoutSeconds 300 -IntervalSeconds 8 -What 'the implementation task linked to the ticket' -Probe {
+        $rows = @(Get-ProjectTasks -Key $key | Where-Object {
+            [string](Get-Field (Get-Field $_ 'fact') 'TicketID') -ceq $ticketId -and
+            [string](Get-Field (Get-Field $_ 'fact') 'Role') -cne 'plan'
+        })
         if ($rows.Count -lt 1) { return $null }
         return $rows
     }
-    Assert-True -Id 'TK1.4' -What 'the dispatch naming the ticket created exactly one task that carries the ticket id' `
-        -Condition ($linked.Ok -and @($linked.Value).Count -eq 1) -Evidence ("after {0:N0}s linked={1}" -f $linked.Elapsed, @($linked.Value).Count)
+    Assert-True -Id 'TK1.5c' -What 'explicit dispatch created one ordinary implementation task linked to the ticket' `
+        -Condition ($linked.Ok -and @($linked.Value).Count -eq 1) -Evidence ("after {0:N0}s implementation tasks={1}" -f $linked.Elapsed, @($linked.Value).Count)
     if (-not $linked.Ok -or @($linked.Value).Count -ne 1) {
-        Block-Item -Id 'TK1.4c' -What 'no ticket worker task was created' -Evidence (Protect-Text (Get-PaneScreen -PaneId $script:PrimaryPane -Source 'recent-unwrapped' -Lines 120) 800)
+        Block-Item -Id 'TK1.5d' -What 'no linked implementation worker task was created' -Evidence (Protect-Text (Get-PaneScreen -PaneId $script:PrimaryPane -Source 'recent-unwrapped' -Lines 120) 800)
         return
     }
-    $workerFact = Get-Field @($linked.Value)[0] 'fact'
+    $workerRow = @($linked.Value)[0]
+    $workerFact = Get-Field $workerRow 'fact'
     $workerId = [string](Get-Field $workerFact 'ID')
-    # The ticket worker belongs to this run: tracking it lets cleanup delete its
-    # ready-session row with the other workers' and record its checkout.
-    $script:Tasks = @($script:Tasks) + @(@($linked.Value)[0])
-    Assert-Match -Id 'TK1.4d' -What 'the ticket worker task has a generated task id' -Pattern '^orch_[0-9a-f]{12}$' -Actual $workerId
-    Assert-Equal -Id 'TK1.4e' -What 'the dispatch created exactly one new task' -Expected ($tasksBefore.Count + 1) -Actual @(Get-ProjectTasks -Key $key).Count
+    $script:Tasks = @($script:Tasks | Where-Object { [string](Get-Field $_ 'id') -cne [string](Get-Field $workerRow 'id') }) + @($workerRow)
+    Assert-Match -Id 'TK1.5e' -What 'the implementation task has a generated task id' -Pattern '^orch_[0-9a-f]{12}$' -Actual $workerId
+    Assert-Equal -Id 'TK1.5f' -What 'the implementation task remains an ordinary task linked to this ticket' -Expected "|$ticketId" `
+        -Actual ("{0}|{1}" -f [string](Get-Field $workerFact 'Role'), [string](Get-Field $workerFact 'TicketID')) -TaskId $workerId
+    Assert-Equal -Id 'TK1.5g' -What 'the explicit dispatch left exactly the planner and implementation task' -Expected ($tasksBefore.Count + 2) -Actual @(Get-ProjectTasks -Key $key).Count
     $live = Get-LiveAgent -Target ([string](Get-Field $workerFact 'PublicPaneID'))
-    Assert-True -Id 'TK1.4f' -What 'Herdr reports a live worker on the ticket task pane' -Condition $live.Found -TaskId $workerId -Evidence (Protect-Text (Get-Json $live.Agent) 300)
+    Assert-True -Id 'TK1.5h' -What 'Herdr reports a live implementation worker on the ticket task pane' -Condition $live.Found -TaskId $workerId -Evidence (Protect-Text (Get-Json $live.Agent) 300)
 
-    # TK1.5: the worker reports, the user's review closes the task, then the user's
-    # ticket decision records the ticket outcome.
-    $reported = Wait-Until -TimeoutSeconds 600 -IntervalSeconds 10 -What 'the ticket worker final report' -Probe {
+    # TK1.6: the explicit implementation worker reports and is reviewed separately.
+    $reported = Wait-Until -TimeoutSeconds 600 -IntervalSeconds 10 -What 'the ticket implementation worker final report' -Probe {
         $fact = Get-Field (Get-TaskById -Id $workerId) 'fact'
         $report = Get-Field $fact 'Report' $null
         if ($report -and [string](Get-Field $report 'Kind') -eq 'result') { return $fact }
         return $null
     }
-    Assert-True -Id 'TK1.5a' -What 'the ticket worker recorded its final result report' -Condition $reported.Ok -TaskId $workerId
+    Assert-True -Id 'TK1.6a' -What 'the implementation worker recorded its final result report' -Condition $reported.Ok -TaskId $workerId
     if (-not $reported.Ok) {
-        Block-Item -Id 'TK1.5b' -What 'the ticket worker never reported, so its review and the ticket decision cannot run' -Evidence (Protect-Text (Get-Json (Get-Field (Get-TaskById -Id $workerId) 'fact')) 500)
+        Block-Item -Id 'TK1.6b' -What 'the implementation worker never reported, so its review and the ticket decision cannot run' -Evidence (Protect-Text (Get-Json (Get-Field (Get-TaskById -Id $workerId) 'fact')) 500)
         return
     }
-    $taskDisposition = 'Accepted the reported result.'
+    $implementationReportView = Invoke-BridgeAs -LaunchPaneId $launch -Method 'ticket_move_preview' -Params @{ ticketId = $ticketId }
+    Assert-True -Id 'TK1.6c' -What 'the open implementation task keeps the ticket in progress' -Condition $implementationReportView.Ok -TaskId $workerId
+    if ($implementationReportView.Ok) {
+        Assert-Equal -Id 'TK1.6c-stage' -What 'an implementation report is not a ticket completion decision' -Expected 'in_progress' `
+            -Actual ([string](Get-Field $implementationReportView.Result 'stage')) -TaskId $workerId
+    }
+    $taskDisposition = 'Accepted the reported implementation.'
     $prompt = "$($script:MarkerPrefix)TICKET-TASK-REVIEW. Call orch_review exactly once for taskId ""$workerId"" with outcome ""integrated"" and disposition ""$taskDisposition"". The user confirms the dialog. Reply reviewed after the tool result."
-    $result = Invoke-PrimaryPromptNoWaitAfterDispositionAsks -PaneId $script:PrimaryPane -Text $prompt -TimeoutSeconds 300 -AssertionPrefix 'TK1.review'
-    Assert-True -Id 'TK1.5c' -What 'the real primary accepts the review prompt for the ticket worker' -Condition $result.Submitted -Command $result.CommandLine `
+    $result = Invoke-PrimaryPromptNoWaitAfterDispositionAsks -PaneId $script:PrimaryPane -Text $prompt -TimeoutSeconds 300 -AssertionPrefix 'TK1.impl-review'
+    Assert-True -Id 'TK1.6d' -What 'the real primary accepts the implementation review prompt' -Condition $result.Submitted -Command $result.CommandLine `
         -Evidence ("code=[$($result.Code)] stderr=[" + (Protect-Text $result.Stderr 300) + "] screen=[" + (Protect-Text $result.Screen 400) + "]")
     if (-not $result.Submitted) {
-        Block-Item -Id 'TK1.5d' -What 'the ticket worker review prompt was not submitted' -Evidence (Protect-Text $result.Screen 500)
-        Preserve-ResourcesForPendingTool -AssertionId 'TK1.5d.resources-preserved' -Reason 'the ticket worker review prompt was not submitted, so its review dialog may be open on the primary'
+        Block-Item -Id 'TK1.6e' -What 'the implementation review prompt was not submitted' -Evidence (Protect-Text $result.Screen 500)
+        Preserve-ResourcesForPendingTool -AssertionId 'TK1.6e.resources-preserved' -Reason 'the implementation review prompt may still be open on the primary'
         return
     }
     $taskConfirmed = Confirm-PrimaryReviewModal -PaneId $script:PrimaryPane -LaunchPaneId $launch -TaskId $workerId -Disposition $taskDisposition
-    Assert-True -Id 'TK1.5e' -What 'the acceptance user confirmed the exact review dialog of the ticket worker' -Condition $taskConfirmed -TaskId $workerId
+    Assert-True -Id 'TK1.6f' -What 'the acceptance user confirmed the exact implementation review dialog' -Condition $taskConfirmed -TaskId $workerId
     if (-not $taskConfirmed) {
-        Preserve-ResourcesForPendingTool -AssertionId 'TK1.5e.resources-preserved' -Reason 'the ticket worker review dialog may still be open on the primary'
-        Block-Item -Id 'TK1.5f' -What 'the ticket worker review dialog was not safely confirmed' -Evidence (Protect-Text (Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100) 600)
+        Preserve-ResourcesForPendingTool -AssertionId 'TK1.6f.resources-preserved' -Reason 'the implementation review dialog may still be open on the primary'
+        Block-Item -Id 'TK1.6g' -What 'the implementation review dialog was not safely confirmed' -Evidence (Protect-Text (Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100) 600)
         return
     }
-    $taskClosed = Wait-Until -TimeoutSeconds 180 -IntervalSeconds 4 -What 'the ticket worker disposition' -Probe {
+    $taskClosed = Wait-Until -TimeoutSeconds 180 -IntervalSeconds 4 -What 'the implementation worker disposition' -Probe {
         $fact = Get-Field (Get-TaskById -Id $workerId) 'fact'
         if (-not [string]::IsNullOrWhiteSpace([string](Get-Field $fact 'Disposition'))) { return $fact }
         return $null
     }
-    Assert-True -Id 'TK1.5g' -What 'the ticket worker task carries its recorded disposition' -Condition $taskClosed.Ok -TaskId $workerId
+    Assert-True -Id 'TK1.6h' -What 'the implementation task carries its recorded disposition' -Condition $taskClosed.Ok -TaskId $workerId
     if (-not $taskClosed.Ok) { return }
 
-    $ticketNote = 'Ticket accepted after its worker was reviewed.'
+    $readyPreview = Invoke-BridgeAs -LaunchPaneId $launch -Method 'ticket_move_preview' -Params @{ ticketId = $ticketId }
+    Assert-True -Id 'TK1.6i' -What 'the closed plan and implementation tasks project the ticket to ready_for_review' -Condition $readyPreview.Ok -TaskId $workerId
+    if ($readyPreview.Ok) {
+        Assert-Equal -Id 'TK1.6i-stage' -What 'all linked implementation tasks are closed before ticket review' -Expected 'ready_for_review' `
+            -Actual ([string](Get-Field $readyPreview.Result 'stage')) -TaskId $workerId
+    }
+    $ticketTaskIds = @((Get-Field $readyPreview.Result 'taskIds' @()) | ForEach-Object { [string]$_ })
+    $expectedTicketTaskIds = @($plannerId, $workerId)
+    $expectedTicketTaskIds = @($expectedTicketTaskIds | Sort-Object)
+    $actualTicketTaskIds = @($ticketTaskIds | Sort-Object)
+    Assert-Equal -Id 'TK1.6j' -What 'the ticket preview includes exactly the reviewed planner and implementation tasks' `
+        -Expected ($expectedTicketTaskIds -join '|') -Actual ($actualTicketTaskIds -join '|')
+    if (-not $readyPreview.Ok -or
+        [string](Get-Field $readyPreview.Result 'stage') -cne 'ready_for_review' -or
+        ($actualTicketTaskIds -join '|') -cne ($expectedTicketTaskIds -join '|')) { return }
+
+    # TK1.7: ticket closure remains a separate explicit user decision.
+    $ticketNote = 'Ticket accepted after its plan and implementation were reviewed.'
     $prompt = "$($script:MarkerPrefix)TICKET-REVIEW. Call orch_ticket_review exactly once for ticketId ""$ticketId"" with outcome ""integrated"" and disposition ""$ticketNote"". The user confirms the dialog. Reply closed after the tool result."
     $result = Invoke-PrimaryPromptNoWaitAfterDispositionAsks -PaneId $script:PrimaryPane -Text $prompt -TimeoutSeconds 300 -AssertionPrefix 'TK1.ticketreview'
-    Assert-True -Id 'TK1.5h' -What 'the real primary accepts the ticket review prompt' -Condition $result.Submitted -Command $result.CommandLine `
+    Assert-True -Id 'TK1.7a' -What 'the real primary accepts the ticket review prompt' -Condition $result.Submitted -Command $result.CommandLine `
         -Evidence ("code=[$($result.Code)] stderr=[" + (Protect-Text $result.Stderr 300) + "] screen=[" + (Protect-Text $result.Screen 400) + "]")
     if (-not $result.Submitted) {
-        Block-Item -Id 'TK1.5i' -What 'the ticket review prompt was not submitted' -Evidence (Protect-Text $result.Screen 500)
-        Preserve-ResourcesForPendingTool -AssertionId 'TK1.5i.resources-preserved' -Reason 'the ticket review prompt was not submitted, so its decision dialog may be open on the primary'
+        Block-Item -Id 'TK1.7b' -What 'the ticket review prompt was not submitted' -Evidence (Protect-Text $result.Screen 500)
+        Preserve-ResourcesForPendingTool -AssertionId 'TK1.7b.resources-preserved' -Reason 'the ticket decision dialog may be open on the primary'
         return
     }
     $ticketConfirmed = Confirm-PrimaryTicketModal -Kind 'review' -TicketId $ticketId -TicketTitle $ticketTitle `
-        -Outcome 'integrated' -Disposition $ticketNote -LinkedTaskIds @($workerId)
-    Assert-True -Id 'TK1.5j' -What 'the acceptance user confirmed the exact ticket decision dialog' -Condition $ticketConfirmed
+        -Outcome 'integrated' -Disposition $ticketNote -LinkedTaskIds $ticketTaskIds
+    Assert-True -Id 'TK1.7c' -What 'the acceptance user confirmed the exact ticket decision dialog with both linked tasks' -Condition $ticketConfirmed
     if (-not $ticketConfirmed) {
-        Preserve-ResourcesForPendingTool -AssertionId 'TK1.5j.resources-preserved' -Reason 'the ticket decision dialog may still be open on the primary'
-        Block-Item -Id 'TK1.5k' -What 'the ticket decision dialog was not safely confirmed' -Evidence (Protect-Text (Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100) 600)
+        Preserve-ResourcesForPendingTool -AssertionId 'TK1.7c.resources-preserved' -Reason 'the ticket decision dialog may still be open on the primary'
+        Block-Item -Id 'TK1.7d' -What 'the ticket decision dialog was not safely confirmed' -Evidence (Protect-Text (Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100) 600)
         return
     }
     $decided = Wait-Until -TimeoutSeconds 120 -IntervalSeconds 4 -What 'the ticket outcome' -Probe {
@@ -6162,22 +6749,29 @@ BRIEF: $brief
         if ($row -and [string](Get-Field (Get-Field $row 'fact') 'Outcome') -ceq 'integrated') { return $row }
         return $null
     }
-    Assert-True -Id 'TK1.5' -What 'after the user confirms the dialog the ticket records its outcome' -Condition $decided.Ok
+    Assert-True -Id 'TK1.7e' -What 'after the user confirms the dialog the ticket records its outcome' -Condition $decided.Ok
     if ($decided.Ok) {
         $decidedFact = Get-Field $decided.Value 'fact'
-        Assert-Equal -Id 'TK1.5l' -What 'the ticket keeps the user note as its disposition' -Expected $ticketNote -Actual ([string](Get-Field $decidedFact 'Disposition'))
+        Assert-Equal -Id 'TK1.7f' -What 'the ticket keeps the user note as its disposition' -Expected $ticketNote -Actual ([string](Get-Field $decidedFact 'Disposition'))
     }
 
-    # TK1.6: a worker session has no ticket authority: its bridge call is forbidden
+    # TK1.8: a worker session has no ticket authority: its bridge call is forbidden
     # and writes nothing.
     $revisionBefore = [long](Get-Field (Get-Field (Get-TicketById -Id $ticketId) 'fact') 'Revision' 0)
     $forbidden = Invoke-BridgeAs -LaunchPaneId ([string](Get-Field $workerFact 'LaunchPaneID')) -Method 'ticket_move' `
         -Params @{ ticketId = $ticketId; digest = 'not-the-digest' }
-    Assert-True -Id 'TK1.6' -What 'a worker session cannot move a ticket: the bridge answers forbidden' `
+    Assert-True -Id 'TK1.8' -What 'an implementation worker cannot move a ticket: the bridge answers forbidden' `
         -Condition ($forbidden.Envelope -and -not $forbidden.Ok -and ([string](Get-Field $forbidden.Error 'code') -ceq 'forbidden')) `
         -TaskId $workerId -Evidence ("envelope=[$($forbidden.Envelope)] ok=[$($forbidden.Ok)] error=[" + (Protect-Text (Get-Json $forbidden.Error) 300) + "]")
     $revisionAfter = [long](Get-Field (Get-Field (Get-TicketById -Id $ticketId) 'fact') 'Revision' 0)
-    Assert-Equal -Id 'TK1.6b' -What 'the refused worker call wrote nothing to the ticket' -Expected $revisionBefore -Actual $revisionAfter
+    Assert-Equal -Id 'TK1.8b' -What 'the refused worker call wrote nothing to the ticket' -Expected $revisionBefore -Actual $revisionAfter
+
+    # TK1.9: the primary coordinated the run from a read-only session: its
+    # transcript may hold only read-only tools and the primary's own tools.
+    $primaryTranscript = [string](Get-Field (Get-ReadySession -LaunchPaneId $launch) 'omp_session_file')
+    $primaryTools = Test-OmpToolCallsWithin -Path $primaryTranscript -Allowed (@($script:ReadOnlyToolNames) + @($script:PrimaryToolNames))
+    Assert-True -Id 'TK1.9' -What 'the primary called only read-only tools and its own orchestrator tools' -Condition $primaryTools.Ok `
+        -Evidence ("transcript=[$primaryTranscript] tools=[" + (@($primaryTools.Names) -join ', ') + "] outside=[" + (@($primaryTools.Outside) -join ', ') + "]")
 }
 
 # ---------------------------------------------------------------------------
@@ -6374,6 +6968,17 @@ function Invoke-CleanupRefusals {
 
 function Invoke-AmbiguousPrompt {
     Write-Step 'Phase 18: an ambiguous agent prompt timeout, inspected before any retry'
+    # The probe is typed only into a settled primary. `agent prompt` types into
+    # whatever the pane shows - Herdr refuses only a blocked agent before any
+    # input - and typed into an open selector, its Enter picks the highlighted Yes.
+    # So the primary's pending input is settled first, as for every other prompt.
+    $ready = Resolve-PendingPrimaryDispositionAsks -AssertionPrefix 'G0' -TimeoutSeconds 120
+    if (-not $ready.Resolved) {
+        [void](Block-Item -Id 'G0.settled' -What 'the ambiguous prompt needs a settled primary; it is never typed into an open dialog or a running turn' `
+            -Evidence ("reason=[$([string](Get-Field $ready 'Reason'))] screen=" + (Protect-Text ([string](Get-Field $ready 'Screen')) 500)))
+        return
+    }
+    [void](Assert-True -Id 'G0.settled' -What 'the primary was settled (idle or done) before the ambiguous prompt' -Condition $true)
     $marker = "ACCEPT-PING-$($script:RunId)"
     $text = "$marker reply with exactly the word pong and nothing else"
     $result = Invoke-Herdr -Arguments @('agent', 'prompt', $script:PrimaryPane, $text, '--wait', '--timeout', '1500') -TimeoutSeconds 60
@@ -6484,6 +7089,20 @@ function Get-StartupLogEntries {
     return @($matches.ToArray())
 }
 
+function Test-RestartReconcilesTask {
+    <#
+        True when startup reconciliation re-derives this task's live identity after
+        a restart - the rule of reconciles() in internal/coord/reconcile.go: an
+        undecided task in a provisioned phase. A decided task is history: startup
+        leaves its pane, terminal and session as recorded, so a restored pane is not
+        expected to prove them.
+    #>
+    param($Fact)
+    if ($null -eq $Fact) { return $false }
+    if (-not [string]::IsNullOrWhiteSpace([string](Get-Field $Fact 'Disposition'))) { return $false }
+    return ([string](Get-Field $Fact 'Phase') -cin @('worktree_created', 'agent_started', 'prompt_submitted'))
+}
+
 
 function Invoke-Restart {
     Write-Step 'Phase 19: restart the isolated Herdr server and prove recovery'
@@ -6566,6 +7185,19 @@ function Invoke-Restart {
         -Evidence ("pane=$restoredProjectPane session=$restoredProjectSession terminal=$restoredProjectTerminal")
     foreach ($row in @($after.Tasks)) {
         $fact = Get-Field $row 'fact'
+        $taskId = [string](Get-Field $fact 'ID')
+        # Only the tasks startup reconciles must prove a live identity here. Herdr
+        # gives a restored pane a new terminal id, and startup re-derives it for
+        # those tasks alone; a decided task keeps its recorded pane and terminal, and
+        # T5.1 already holds its durable facts unchanged.
+        if (-not (Test-RestartReconcilesTask -Fact $fact)) {
+            if (-not [string]::IsNullOrWhiteSpace([string](Get-Field $fact 'Disposition'))) {
+                [void](Add-Assertion -Id "T5.session/$taskId" -Status 'INFO' -TaskId $taskId `
+                    -What "decided task $taskId is history: startup does not re-derive its pane, so its live identity is not checked" `
+                    -Evidence ("disposition=[$([string](Get-Field $fact 'Disposition'))] recorded terminal=$([string](Get-Field $fact 'TerminalID'))"))
+            }
+            continue
+        }
         # The pane that must exist after a restart is the task's *current* pane,
         # not its launch-time one. The M phase moves a worker pane and by design a
         # move never re-keys the launch id (M4.3), so the launch id names a pane
