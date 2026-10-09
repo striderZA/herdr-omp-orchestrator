@@ -499,6 +499,39 @@ $identityFactsAfter.Tasks[0].fact.LaunchPaneID = 'p8'
 $identityProjectionAfter = ''
 try { $identityProjectionAfter = Get-IdentityProjection -Facts $identityFactsAfter } catch { }
 Check 'restart identity projection permits runtime pane rekeys while preserving session facts' ($identityProjection -ceq $identityProjectionAfter) "before=[$identityProjection] after=[$identityProjectionAfter]"
+$decidedIdentityFacts = [pscustomobject]@{
+    Tasks = @(
+        [pscustomobject]@{ fact = [pscustomobject]@{
+            ID = 'decided1'; Disposition = 'kept'; LaunchPaneID = 'w1:p2'; PublicPaneID = 'w1:p3'
+            TerminalID = 'term1'; AgentName = 'worker1'
+        } },
+        [pscustomobject]@{ fact = [pscustomobject]@{
+            ID = 'open1'; Disposition = ''; LaunchPaneID = 'w1:p4'; PublicPaneID = 'w1:p5'
+            TerminalID = 'term2'; AgentName = 'worker2'
+        } }
+    )
+}
+$decidedIdentityProjection = ''
+try { $decidedIdentityProjection = Get-DecidedTaskIdentityProjection -Facts $decidedIdentityFacts } catch { }
+Check 'decided-task projection captures identity without including open-task pane rekeys' `
+    ($decidedIdentityProjection -match 'task/decided1/LaunchPaneID=w1:p2' -and
+        $decidedIdentityProjection -match 'task/decided1/PublicPaneID=w1:p3' -and
+        $decidedIdentityProjection -match 'task/decided1/TerminalID=term1' -and
+        $decidedIdentityProjection -match 'task/decided1/AgentName=worker1' -and
+        $decidedIdentityProjection -notmatch 'open1') $decidedIdentityProjection
+foreach ($field in @('LaunchPaneID', 'PublicPaneID', 'TerminalID', 'AgentName')) {
+    $changedTask = $decidedIdentityFacts.Tasks[0].fact.PSObject.Copy()
+    $changedTask.$field = "changed-$field"
+    $changedFacts = [pscustomobject]@{
+        Tasks = @(
+            [pscustomobject]@{ fact = $changedTask },
+            $decidedIdentityFacts.Tasks[1]
+        )
+    }
+    $changedProjection = ''
+    try { $changedProjection = Get-DecidedTaskIdentityProjection -Facts $changedFacts } catch { }
+    Check "decided-task projection detects changed $field" ($changedProjection -cne $decidedIdentityProjection) $changedProjection
+}
 $boardOrderScreen = @'
 Ready for review
 [task_b] B
@@ -1972,13 +2005,12 @@ function Send-AgentKeys {
     $script:DispatchDriverShown++
     return [pscustomobject]@{ ExitCode = 0; CommandLine = "send-keys $PaneId $($Keys -join ' ')" }
 }
+$dispatchExpectedRequests = @($dispatchRequest, $dispatchRequestB)
 $dispatchTitles = @('ACCEPT A: helper in a.js', 'ACCEPT B: helper in b.js')
-# Each check reads the result the way D1.1d/SW0.1c and D2.request/SW0.request do:
-# Confirmed, then @(Requests). The driver returns one result object, so its
-# requests stay a flat array however a caller assigns, wraps or pipes it.
+
 Reset-DispatchDriver -Screens @($dispatchScreen, $dispatchScreenB)
 $bothConfirmed = $null
-try { $bothConfirmed = Confirm-PrimaryDispatchModals -Titles $dispatchTitles -TimeoutSeconds 1 } catch { }
+try { $bothConfirmed = Confirm-PrimaryDispatchModals -ExpectedRequests $dispatchExpectedRequests -TimeoutSeconds 1 } catch { }
 Check 'dispatch confirmations: the first of two calls made in one message, then the second' (Test-Safely {
         $requests = @($bothConfirmed.Requests)
         $null -ne $bothConfirmed -and $bothConfirmed.Confirmed -and $requests.Count -eq 2 -and
@@ -1991,46 +2023,54 @@ Check 'dispatch confirmations: a result wrapped in @() and piped still holds bot
         $wrapped.Count -eq 1 -and @($wrapped[0].Requests).Count -eq 2 }) 'wrapped result'
 Reset-DispatchDriver -Screens @($dispatchScreenB, $dispatchScreen)
 $reversedConfirmed = $null
-try { $reversedConfirmed = Confirm-PrimaryDispatchModals -Titles $dispatchTitles -TimeoutSeconds 1 } catch { }
+try { $reversedConfirmed = Confirm-PrimaryDispatchModals -ExpectedRequests $dispatchExpectedRequests -TimeoutSeconds 1 } catch { }
 Check 'dispatch confirmations: dialogs shown in the other order are confirmed in that order' (Test-Safely {
         $null -ne $reversedConfirmed -and $reversedConfirmed.Confirmed -and
         (@(@($reversedConfirmed.Requests) | ForEach-Object { [string](Get-Field $_ 'title') }) -join '|') -ceq 'ACCEPT B: helper in b.js|ACCEPT A: helper in a.js' -and
         $script:SentKeysCallsForTest.Count -eq 2 }) ("result=$(Get-Json $reversedConfirmed) keys=$($script:SentKeysCallsForTest -join ',')")
 Reset-DispatchDriver -Screens @($dispatchScreen)
 $oneConfirmed = $null
-try { $oneConfirmed = Confirm-PrimaryDispatchModals -Titles @('ACCEPT A: helper in a.js') -TimeoutSeconds 1 } catch { }
+try { $oneConfirmed = Confirm-PrimaryDispatchModals -ExpectedRequests @($dispatchRequest) -TimeoutSeconds 1 } catch { }
 Check 'dispatch confirmations: one confirmed call reads as one request the stored task is compared with' (Test-Safely {
         $requests = @($oneConfirmed.Requests)
         $null -ne $oneConfirmed -and $oneConfirmed.Confirmed -and $requests.Count -eq 1 -and
         [string](Get-Field $requests[0] 'title') -ceq 'ACCEPT A: helper in a.js' -and
         (Test-TaskMatchesDispatchRequest -Fact $storedDispatchFact -Request $requests[0]) }) ("result=$(Get-Json $oneConfirmed)")
 Reset-DispatchDriver -Screens @($dispatchScreen)
+$alteredExpected = Copy-DispatchRequest $dispatchRequest @{ brief = 'ACCEPT-TASK-A, but changed' }
+$alteredExpectation = $null
+try { $alteredExpectation = Confirm-PrimaryDispatchModals -ExpectedRequests @($alteredExpected) -TimeoutSeconds 1 } catch { }
+Check 'dispatch confirmations refuse a same-title pending request that differs from the prompt expectations' (Test-Safely {
+        $null -ne $alteredExpectation -and -not $alteredExpectation.Confirmed -and
+        @($alteredExpectation.Requests).Count -eq 0 -and $script:SentKeysCallsForTest.Count -eq 0
+    }) ("result=$(Get-Json $alteredExpectation) keys=$($script:SentKeysCallsForTest -join ',')")
+Reset-DispatchDriver -Screens @($dispatchScreen)
 $partlyConfirmed = $null
-try { $partlyConfirmed = Confirm-PrimaryDispatchModals -Titles $dispatchTitles -TimeoutSeconds 1 } catch { }
+try { $partlyConfirmed = Confirm-PrimaryDispatchModals -ExpectedRequests $dispatchExpectedRequests -TimeoutSeconds 1 } catch { }
 Check 'dispatch confirmations: a second dialog that never opens leaves the result unconfirmed with only the first request' (Test-Safely {
         $null -ne $partlyConfirmed -and -not $partlyConfirmed.Confirmed -and @($partlyConfirmed.Requests).Count -eq 1 -and
         ($script:SentKeysCallsForTest -join ',') -ceq 'enter' }) ("result=$(Get-Json $partlyConfirmed) keys=$($script:SentKeysCallsForTest -join ',')")
 Reset-DispatchDriver -Screens @($dispatchScreen.Replace('C:\\repo|x', 'C:\\repo|y'))
 $changedRequest = 'unset'
-try { $changedRequest = Confirm-PrimaryDispatchModals -Titles $dispatchTitles -TimeoutSeconds 1 } catch { }
+try { $changedRequest = Confirm-PrimaryDispatchModals -ExpectedRequests $dispatchExpectedRequests -TimeoutSeconds 1 } catch { }
 Check 'dispatch confirmations: a dialog whose request differs from the pending call gets nothing' (Test-Safely {
         $null -ne $changedRequest -and -not $changedRequest.Confirmed -and @($changedRequest.Requests).Count -eq 0 -and
         $script:SentKeysCallsForTest.Count -eq 0 }) "keys=$($script:SentKeysCallsForTest.Count)"
 Reset-DispatchDriver -Screens @($dispatchScreen) -Status 'idle'
 $idleDialog = 'unset'
-try { $idleDialog = Confirm-PrimaryDispatchModals -Titles @('ACCEPT A: helper in a.js') -TimeoutSeconds 1 } catch { }
+try { $idleDialog = Confirm-PrimaryDispatchModals -ExpectedRequests @($dispatchRequest) -TimeoutSeconds 1 } catch { }
 Check 'dispatch confirmations: an idle primary gets nothing, even with a matching dialog on screen' (Test-Safely {
         $null -ne $idleDialog -and -not $idleDialog.Confirmed -and @($idleDialog.Requests).Count -eq 0 -and
         $script:SentKeysCallsForTest.Count -eq 0 }) "keys=$($script:SentKeysCallsForTest.Count)"
 Reset-DispatchDriver -Screens @($dispatchScreen) -AnsweredIds @('call_a')
 $answeredDialog = 'unset'
-try { $answeredDialog = Confirm-PrimaryDispatchModals -Titles @('ACCEPT A: helper in a.js') -TimeoutSeconds 1 } catch { }
+try { $answeredDialog = Confirm-PrimaryDispatchModals -ExpectedRequests @($dispatchRequest) -TimeoutSeconds 1 } catch { }
 Check 'dispatch confirmations: a call whose result is recorded is never confirmed' (Test-Safely {
         $null -ne $answeredDialog -and -not $answeredDialog.Confirmed -and @($answeredDialog.Requests).Count -eq 0 -and
         $script:SentKeysCallsForTest.Count -eq 0 }) "keys=$($script:SentKeysCallsForTest.Count)"
 Reset-DispatchDriver -Screens @($dispatchScreen) -ReplaceAfterRead 1
 $replacedDialog = 'unset'
-try { $replacedDialog = Confirm-PrimaryDispatchModals -Titles @('ACCEPT A: helper in a.js') -TimeoutSeconds 1 } catch { }
+try { $replacedDialog = Confirm-PrimaryDispatchModals -ExpectedRequests @($dispatchRequest) -TimeoutSeconds 1 } catch { }
 Check 'dispatch confirmations: the screen is read again before Enter and a replaced dialog gets nothing' (Test-Safely {
         $null -ne $replacedDialog -and -not $replacedDialog.Confirmed -and @($replacedDialog.Requests).Count -eq 0 -and
         $script:SentKeysCallsForTest.Count -eq 0 -and $script:DispatchDriverReads -ge 2 }) "reads=$($script:DispatchDriverReads) keys=$($script:SentKeysCallsForTest.Count)"
@@ -3358,6 +3398,13 @@ try {
         (Test-Safely { $null -eq (Get-PrimaryConsentDialogTitle -Screen ($toolHeader + "`n 10m $dot Sonnet 5.5 $dot master $dot 1.5%/1M")) }) 'header only'
     Check 'a newer Ask below a consent dialog makes it not the active panel' `
         (Test-Safely { $null -eq (Get-PrimaryConsentDialogTitle -Screen ($unrequestedReview + "`nAsk 1 questions`n[other] What now?`nAccept`nRequest changes")) }) 'newer Ask'
+    $olderDispositionAsk = "Ask 1 questions`n[task_a_review] Should this result be accepted?`nAccept report`nRequest changes"
+    $staleAskUnderConsent = $olderDispositionAsk + "`n" + $unrequestedReview
+    Check 'a newer consent panel makes the older disposition Ask inactive' `
+        (Test-Safely { (Get-PrimaryConsentDialogTitle -Screen $staleAskUnderConsent) -ceq 'Record review disposition' -and
+            -not (Test-PrimaryDispositionAskScreen -Screen $staleAskUnderConsent -AskId 'task_a_review') }) 'stale Ask beneath consent'
+    Check 'the primary Ask id parser ignores an older Ask beneath a newer consent panel' `
+        (Test-Safely { (Get-PrimaryAskId -Screen $staleAskUnderConsent) -ceq '' }) 'stale Ask id'
     Check 'a Yes/No dialog the extension does not draw is not a consent dialog' `
         (Test-Safely { $null -eq (Get-PrimaryConsentDialogTitle -Screen (New-ConsentPanel -Title 'Delete every file')) }) 'foreign dialog'
     $quotedTitles = New-ConsentPanel -Title 'Dispatch work without a ticket' -Message @(
@@ -3440,6 +3487,13 @@ try {
     Check 'an unrequested consent dialog is declined with Escape, then the settled primary resolves' `
         ($null -ne $declined -and $declined.Resolved -and ($script:ConsentKeys -join ',') -ceq 'esc' -and $declineRecords.Count -eq 1 -and @($script:PrimarySendKeysUsed) -contains 'esc') `
         ("result=$(Get-Json $declined) keys=[$($script:ConsentKeys -join ',')] records=$($declineRecords.Count)")
+    Reset-ConsentScenario -Status 'blocked' -Screen $staleAskUnderConsent
+    $staleAskConsent = Invoke-ConsentResolve
+    Check 'an older Ask under a newer unrequested consent dialog is declined, never answered with Enter' `
+        ($null -ne $staleAskConsent -and $staleAskConsent.Resolved -and
+            ($script:ConsentKeys -join ',') -ceq 'esc' -and
+            @($script:ConsentKeys | Where-Object { $_ -ceq 'enter' }).Count -eq 0) `
+        ("result=$(Get-Json $staleAskConsent) keys=[$($script:ConsentKeys -join ',')]")
 
     # Herdr may still report the pane blocked for a moment after the declined dialog
     # closed. That is no unknown dialog to stop on: the resolver keeps waiting for the

@@ -4070,7 +4070,25 @@ function Invoke-Dispatch {
         Block-Item -Id 'D1.1c' -What 'the dispatch prompt could not be submitted, so the worker phases cannot run' -Evidence (Protect-Text ($result.Stdout + $result.Stderr) 500)
         return
     }
-    $dispatchConfirmation = Confirm-PrimaryDispatchModals -Titles @('ACCEPT A: helper in a.js', 'ACCEPT B: helper in b.js') -TimeoutSeconds 300
+    $expectedDispatchRequests = @(
+        [pscustomobject]@{
+            title = 'ACCEPT A: helper in a.js'
+            brief = $script:BriefA
+            checks = @('git log -1 --format=%H')
+            dependencies = @()
+            reservedPaths = @('a.js')
+            baseRevision = $script:BaseRevision
+        },
+        [pscustomobject]@{
+            title = 'ACCEPT B: helper in b.js'
+            brief = $script:BriefB
+            checks = @('git status --porcelain')
+            dependencies = @()
+            reservedPaths = @('b.js')
+            baseRevision = $script:BaseRevision
+        }
+    )
+    $dispatchConfirmation = Confirm-PrimaryDispatchModals -ExpectedRequests $expectedDispatchRequests -TimeoutSeconds 300
     $confirmedRequests = @($dispatchConfirmation.Requests)
     $dispatchConfirmed = [bool]$dispatchConfirmation.Confirmed -and $confirmedRequests.Count -eq 2
     Assert-True -Id 'D1.1d' -What 'the acceptance user confirmed the exact dialog of both ticketless dispatch requests' -Condition $dispatchConfirmed `
@@ -4202,7 +4220,15 @@ BRIEF: $brief
         -Condition $result.Submitted -Command $result.CommandLine `
         -Evidence ("code=[$($result.Code)] blocked=[$($result.Blocked)] stderr=[" + (Protect-Text $result.Stderr 300) + "]")
     if (-not $result.Submitted) { throw 'single-worker dispatch prompt was not accepted' }
-    $dispatchConfirmation = Confirm-PrimaryDispatchModals -Titles @('ACCEPT SINGLE: helper in a.js') -TimeoutSeconds 300
+    $expectedDispatchRequest = [pscustomobject]@{
+        title = 'ACCEPT SINGLE: helper in a.js'
+        brief = $brief
+        checks = @('git log -1 --format=%H')
+        dependencies = @()
+        reservedPaths = @('a.js')
+        baseRevision = $script:BaseRevision
+    }
+    $dispatchConfirmation = Confirm-PrimaryDispatchModals -ExpectedRequests @($expectedDispatchRequest) -TimeoutSeconds 300
     $confirmedRequests = @($dispatchConfirmation.Requests)
     $dispatchConfirmed = [bool]$dispatchConfirmation.Confirmed -and $confirmedRequests.Count -eq 1
     Assert-True -Id 'SW0.1c' -What 'the acceptance user confirmed the exact dialog of the ticketless dispatch request' -Condition $dispatchConfirmed `
@@ -4520,6 +4546,7 @@ function Send-AgentKeys {
 function Get-PrimaryAskId {
     param([string]$Screen)
     if ([string]::IsNullOrWhiteSpace($Screen)) { return '' }
+    if (Get-PrimaryConsentDialogTitle -Screen $Screen) { return '' }
     $askIndex = $Screen.LastIndexOf('Ask 1 questions', [System.StringComparison]::OrdinalIgnoreCase)
     if ($askIndex -lt 0) { return '' }
     $panel = $Screen.Substring($askIndex)
@@ -5077,24 +5104,48 @@ function Test-TaskMatchesDispatchRequest {
         [string]::IsNullOrEmpty([string](Get-Field $Fact 'TicketID')))
 }
 
+function Test-DispatchRequestMatchesExpected {
+    param($Request, $Expected)
+    if ($null -eq $Request -or $null -eq $Expected) { return $false }
+    foreach ($field in @('title', 'brief', 'baseRevision')) {
+        $actual = Get-Field $Request $field $null
+        $wanted = Get-Field $Expected $field $null
+        if ($null -eq $actual -or $null -eq $wanted -or [string]$actual -cne [string]$wanted) { return $false }
+    }
+    foreach ($field in @('checks', 'dependencies', 'reservedPaths')) {
+        $actual = @(Get-Field $Request $field @())
+        $wanted = @(Get-Field $Expected $field @())
+        if ($actual.Count -ne $wanted.Count) { return $false }
+        for ($index = 0; $index -lt $wanted.Count; $index++) {
+            if ([string]$actual[$index] -cne [string]$wanted[$index]) { return $false }
+        }
+    }
+    return ($null -eq (Get-Field $Request 'ticketId' $null))
+}
+
 function Find-PrimaryDispatchModal {
     <#
         The pending ticketless orch_dispatch request whose exact dialog is the
         primary's active confirmation, or $null. The primary's turn must still be
         running (working, or blocked: the extension marks the primary blocked while
         its dialog is open), so an idle or finished primary is refused.
-        The candidates are the latest pending call of each title that names no
-        ticket (a finished or superseded call never is one); the transcript is read
-        before the screen, and exactly one candidate must match the visible dialog.
+        The candidates are the latest pending call for each expected title that
+        matches every expected argument and names no ticket; a finished or
+        superseded call never qualifies. The transcript is read before the screen.
     #>
-    param([string]$LaunchPaneId, [string[]]$Titles = @())
+    param([string]$LaunchPaneId, [object[]]$ExpectedRequests = @())
     $live = Get-LiveAgent -Target $script:PrimaryPane
     if (-not $live.Found -or [string](Get-Field $live.Agent 'agent_status') -notin @('working', 'blocked')) { return $null }
     $transcript = [string](Get-Field (Get-ReadySession -LaunchPaneId $LaunchPaneId) 'omp_session_file')
     $ticketless = @(Get-OmpPendingToolCalls -Path $transcript -Name 'orch_dispatch' | Where-Object { $null -eq (Get-Field $_ 'ticketId' $null) })
-    $candidates = @(foreach ($title in @($Titles)) {
+    $candidates = @(foreach ($expected in @($ExpectedRequests)) {
+        $title = [string](Get-Field $expected 'title' '')
+        if ([string]::IsNullOrWhiteSpace($title)) { continue }
         $sameTitle = @($ticketless | Where-Object { [string](Get-Field $_ 'title') -ceq $title })
-        if ($sameTitle.Count -gt 0) { $sameTitle[$sameTitle.Count - 1] }
+        if ($sameTitle.Count -gt 0) {
+            $candidate = $sameTitle[$sameTitle.Count - 1]
+            if (Test-DispatchRequestMatchesExpected -Request $candidate -Expected $expected) { $candidate }
+        }
     })
     if ($candidates.Count -eq 0) { return $null }
     $screen = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100
@@ -5105,32 +5156,41 @@ function Find-PrimaryDispatchModal {
 
 function Confirm-PrimaryDispatchModals {
     <#
-        Presses Enter on the primary's ticketless dispatch dialogs, one for each
-        title, in whatever order the primary opens them, and only on the exact
-        dialog of a pending orch_dispatch call (Find-PrimaryDispatchModal). Before
-        each key the transcript call and then the dialog are read again and must
-        show the request the round found, so a replaced dialog or a changed request
-        receives nothing. Returns one object: Confirmed is true only when every
-        title's dialog was confirmed, and Requests holds the confirmed requests in
-        the order they were confirmed. One object keeps Requests a flat array
-        however a caller assigns, wraps or pipes the result.
+        Presses Enter only on each expected ticketless dispatch request, in
+        whatever order its exact confirmation appears. The pending transcript call
+        must match the prompt's fixed title, brief, checks, dependencies, paths and
+        base revision, and its visible dialog must match that call. Before each key
+        the transcript and screen are read again; any changed request receives
+        nothing. Requests contains only those confirmed, in confirmation order.
+        One result object keeps Requests flat whether a caller assigns, wraps or pipes it.
     #>
     param(
-        [Parameter(Mandatory)][string[]]$Titles,
+        [Parameter(Mandatory)][object[]]$ExpectedRequests,
         [double]$TimeoutSeconds = 180
     )
-    $launchPane = [string](Get-Field $script:Project 'LaunchPaneID')
+    $expected = @($ExpectedRequests)
+    if ($expected.Count -eq 0) { return [pscustomobject]@{ Confirmed = $false; Requests = @() } }
     $unconfirmed = New-Object System.Collections.ArrayList
-    foreach ($title in $Titles) { if ($unconfirmed -cnotcontains $title) { [void]$unconfirmed.Add([string]$title) } }
+    foreach ($request in $expected) {
+        $title = [string](Get-Field $request 'title' '')
+        if ([string]::IsNullOrWhiteSpace($title) -or $unconfirmed -ccontains $title) {
+            return [pscustomobject]@{ Confirmed = $false; Requests = @() }
+        }
+        [void]$unconfirmed.Add($title)
+    }
+    $launchPane = [string](Get-Field $script:Project 'LaunchPaneID')
     $confirmed = New-Object System.Collections.ArrayList
     $complete = $true
     while ($unconfirmed.Count -gt 0) {
+        $remaining = @($expected | Where-Object { $unconfirmed -ccontains [string](Get-Field $_ 'title' '') })
         $round = Wait-Until -TimeoutSeconds $TimeoutSeconds -IntervalSeconds 2 -What ('ticketless dispatch confirmation for ' + ($unconfirmed -join ' | ')) -Probe {
-            Find-PrimaryDispatchModal -LaunchPaneId $launchPane -Titles @($unconfirmed)
+            Find-PrimaryDispatchModal -LaunchPaneId $launchPane -ExpectedRequests $remaining
         }
         if (-not $round.Ok -or $null -eq $round.Value) { $complete = $false; break }
         $found = $round.Value
-        $current = Find-PrimaryDispatchModal -LaunchPaneId $launchPane -Titles @([string](Get-Field $found 'title'))
+        $request = @($expected | Where-Object { [string](Get-Field $_ 'title' '') -ceq [string](Get-Field $found 'title') })
+        if ($request.Count -ne 1) { $complete = $false; break }
+        $current = Find-PrimaryDispatchModal -LaunchPaneId $launchPane -ExpectedRequests $request
         if ($null -eq $current -or (Get-Json $current) -cne (Get-Json $found)) { $complete = $false; break }
         $sent = Send-AgentKeys -PaneId $script:PrimaryPane -Keys @('enter')
         [void]($script:PrimarySendKeysUsed += 'enter')
@@ -5470,9 +5530,9 @@ function Resolve-PendingPrimaryDispositionAsks {
             if ($status -in @('idle', 'done')) { return [pscustomobject]@{ Kind = 'settled'; Screen = '' } }
             if ($status -ne 'blocked') { return $null }
             $screen = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100
+            if (Get-PrimaryConsentDialogTitle -Screen $screen) { return [pscustomobject]@{ Kind = 'consent'; Screen = $screen } }
             $askId = Get-PrimaryAskId -Screen $screen
             if ($askId) { return [pscustomobject]@{ Kind = 'ask'; AskId = $askId; Screen = $screen } }
-            if (Get-PrimaryConsentDialogTitle -Screen $screen) { return [pscustomobject]@{ Kind = 'consent'; Screen = $screen } }
             # Blocked with neither on screen: Herdr can still report a dialog that just
             # closed (the cleared mark reaches it a moment later), so keep waiting; at
             # the timeout the reason names the screen.
@@ -7058,6 +7118,23 @@ function Get-IdentityProjection {
     }
     return ($parts -join ';')
 }
+
+function Get-DecidedTaskIdentityProjection {
+    # Decided tasks are history: startup does not rederive their pane, terminal
+    # or agent identity. Compare those durable fields separately from active tasks,
+    # whose pane ids may legitimately be rekeyed during reconciliation.
+    param($Facts)
+    $parts = New-Object System.Collections.ArrayList
+    foreach ($row in @($Facts.Tasks)) {
+        $fact = Get-Field $row 'fact'
+        if ([string]::IsNullOrWhiteSpace([string](Get-Field $fact 'Disposition'))) { continue }
+        $taskId = [string](Get-Field $fact 'ID')
+        foreach ($field in @('LaunchPaneID', 'PublicPaneID', 'TerminalID', 'AgentName')) {
+            [void]$parts.Add("task/$taskId/$field=$([string](Get-Field $fact $field))")
+        }
+    }
+    return (@($parts.ToArray() | Sort-Object -CaseSensitive) -join ';')
+}
 function Test-InboxRowsPreserved {
     param($Before, $After)
     $afterById = @{}
@@ -7109,6 +7186,7 @@ function Invoke-Restart {
     $before = Get-ProjectFacts
     $projectionBefore = Get-IdentityProjection -Facts $before
     Add-Assertion -Id 'T1.1' -What 'identity projection captured before the restart' -Status 'INFO' -Evidence (Protect-Text $projectionBefore 800)
+    $decidedIdentityBefore = Get-DecidedTaskIdentityProjection -Facts $before
 
     $script:RestartLogWatermarkMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
     $stop = Invoke-Herdr -Arguments @('server', 'stop') -TimeoutSeconds 90
@@ -7162,6 +7240,12 @@ function Invoke-Restart {
         ForEach-Object { "$($_.SideIndicator) $($_.InputObject)" })
     Assert-True -Id 'T5.1' -What 'stable identities, stages, reports and dispositions survive the restart' `
         -Condition ($projectionDifferences.Count -eq 0) -Evidence (Protect-Text ($projectionDifferences -join ' | ') 1600)
+    $decidedIdentityAfter = Get-DecidedTaskIdentityProjection -Facts $after
+    $decidedIdentityDifferences = @(Compare-Object -ReferenceObject @($decidedIdentityBefore -split ';') `
+        -DifferenceObject @($decidedIdentityAfter -split ';') -CaseSensitive |
+        ForEach-Object { "$($_.SideIndicator) $($_.InputObject)" })
+    Assert-True -Id 'T5.decided-identities' -What 'pane, terminal and agent identities of decided task history survive restart without a live-pane check' `
+        -Condition ($decidedIdentityDifferences.Count -eq 0) -Evidence (Protect-Text ($decidedIdentityDifferences -join ' | ') 1200)
     $restoredProjectPane = [string](Get-Field $after.Project 'LaunchPaneID')
     $restoredProjectReady = Get-ReadySession -LaunchPaneId $restoredProjectPane
     $restoredProjectAgent = Get-LiveAgent -Target $restoredProjectPane
