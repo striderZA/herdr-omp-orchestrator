@@ -432,7 +432,7 @@ func CoordinatorOps(c *coord.Coordinator) Ops {
 				return nil, err
 			}
 			result, err := c.MoveTicketFor(ctx, p.ProjectKey, request.TicketID, request.Digest)
-			return result, coordError(err)
+			return ticketMoveAnswer(result, err)
 		},
 		TicketReview: func(ctx context.Context, p Principal, params json.RawMessage) (any, error) {
 			var request coord.TicketReviewParams
@@ -509,6 +509,27 @@ func decodeParams(params json.RawMessage, into any) error {
 	return nil
 }
 
+// movedTicket is the ticket_move answer for a move that was recorded although its
+// planner did not start: the moved ticket, plus why its planner has not started.
+// The field is additive, so the protocol version is unchanged.
+type movedTicket struct {
+	coord.TicketView
+	PlannerNotStarted string `json:"plannerNotStarted"`
+}
+
+// ticketMoveAnswer answers a recorded move as moved even when its planner could
+// not start, so the primary neither reports a failed move nor retries a confirmed
+// one (the changed digest would refuse it as ticket_changed). Any other error is
+// the move's refusal; a move whose ticket could not be read back stays an error
+// whose message still says the ticket moved.
+func ticketMoveAnswer(view coord.TicketView, err error) (any, error) {
+	var notStarted *coord.PlannerNotStartedError
+	if errors.As(err, &notStarted) && view.TicketID != "" {
+		return movedTicket{TicketView: view, PlannerNotStarted: notStarted.Error()}, nil
+	}
+	return view, coordError(err)
+}
+
 // coordError turns one coordinator failure into a stable code. It mirrors the
 // executable's own mapping for its bind route, so the same failure classifies the
 // same way whether it arrived through a tool call or a plugin action.
@@ -563,6 +584,8 @@ func coordErrorCode(err error) string {
 		return "ticket_changed"
 	case errors.Is(err, coord.ErrTicketOpen):
 		return "ticket_open"
+	case errors.Is(err, coord.ErrTicketPlanNotAccepted):
+		return "ticket_plan_not_accepted"
 	case errors.Is(err, coord.ErrProjectUnknown):
 		return "project_unknown"
 	case errors.Is(err, coord.ErrPrimaryNotLive):
@@ -831,6 +854,9 @@ func (h *handler) prepare() error {
 // ResolveResult is what resolve returns: either a bound role with its recorded
 // identities, or an explicit reason it could not be proven. It is an exported
 // wire contract because the generated extension and the tests read these names.
+// TaskRole and Branch are additive worker facts (protocol 1 is unchanged): the
+// extension reads the persisted role to give a planner its read-only tools, and
+// a planner without a shell learns the branch its final report must name.
 type ResolveResult struct {
 	Bound        bool   `json:"bound"`
 	Reason       string `json:"reason,omitempty"`
@@ -838,6 +864,8 @@ type ResolveResult struct {
 	Role         string `json:"role,omitempty"`
 	ProjectKey   string `json:"projectKey,omitempty"`
 	TaskID       string `json:"taskId,omitempty"`
+	TaskRole     string `json:"taskRole,omitempty"`
+	Branch       string `json:"branch,omitempty"`
 	LaunchPaneID string `json:"launchPaneId,omitempty"`
 	PublicPaneID string `json:"publicPaneId,omitempty"`
 	TerminalID   string `json:"terminalId,omitempty"`
@@ -1441,6 +1469,8 @@ func boundResult(b state.Binding, rebound bool) ResolveResult {
 	}
 	result.ProjectKey = b.Task.ProjectKey
 	result.TaskID = b.Task.ID
+	result.TaskRole = string(b.Task.Role)
+	result.Branch = b.Task.Branch
 	result.TerminalID = b.Task.TerminalID
 	result.WorktreeID = b.Task.WorktreeWorkspaceID
 	return result

@@ -132,7 +132,7 @@ func TestBridgeTicketMethodsWithoutWiringAreAuthorizedThenUnavailable(t *testing
 	}
 }
 
-func TestBridgeTicketRoundTrip(t *testing.T) {
+func TestBridgeTicketPreflightAndReviewRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	f, ops := primaryTicketBridge(t)
 
@@ -151,17 +151,15 @@ func TestBridgeTicketRoundTrip(t *testing.T) {
 	if preview.Digest == "" || preview.Digest != created.Digest {
 		t.Fatalf("preview digest %q must be the ticket's confirmation token %q", preview.Digest, created.Digest)
 	}
-	moved := f.ticketView(ops, MethodTicketMove, ticketBody(t, map[string]any{"ticketId": created.TicketID, "digest": preview.Digest}))
-	if moved.Column != task.ColumnTodo || moved.Stage != task.TicketTodo {
-		t.Fatalf("moved = %+v, want todo", moved)
-	}
-
-	f.ticketCall(ops, MethodTicketList, `{}`).decodeResult(t, &listed)
-	if len(listed.Tickets) != 1 || listed.Tickets[0].Column != task.ColumnTodo {
-		t.Fatalf("list after the move = %+v, want todo", listed)
+	wantError(t, f.ticketCall(ops, MethodTicketMove, ticketBody(t, map[string]any{
+		"ticketId": created.TicketID, "digest": preview.Digest,
+	})), "bad_base_revision")
+	if after, err := f.store.Ticket(ctx, created.TicketID); err != nil ||
+		after.Column != task.ColumnBacklog || after.Revision != 1 {
+		t.Fatalf("a move without a committed project HEAD must leave the ticket unchanged: %+v, %v", after, err)
 	}
 	if tasks, err := f.store.Tasks(ctx, f.repoRoot); err != nil || len(tasks) != 0 {
-		t.Fatalf("a move through the bridge must start no task: %+v, %v", tasks, err)
+		t.Fatalf("a refused bridge move must leave no planner task: %+v, %v", tasks, err)
 	}
 
 	review := f.ticketView(ops, MethodTicketMovePreview, ticketBody(t, map[string]any{"ticketId": created.TicketID}))
@@ -170,6 +168,54 @@ func TestBridgeTicketRoundTrip(t *testing.T) {
 	}))
 	if closed.Stage != task.TicketDone || closed.Outcome != "abandoned" || closed.Disposition != "not needed" {
 		t.Fatalf("closed = %+v, want done/abandoned", closed)
+	}
+}
+
+// A move the coordinator recorded answers ok even when its planner could not
+// start afterwards (here the stand-in Herdr refuses to create the worktree): the
+// answer is the moved ticket plus why its planner has not started, so the primary
+// neither reports a failed move nor retries a confirmed one, which the changed
+// digest would refuse as ticket_changed. The field is additive; the protocol
+// stays 1.
+func TestBridgeTicketMoveAnswersAMoveWhosePlannerDidNotStart(t *testing.T) {
+	ctx := context.Background()
+	f, ops := primaryTicketBridge(t)
+	bridgeCommittedRepo(t, f.repoRoot)
+	created := f.ticketView(ops, MethodTicketCreate, `{"title":"Plan search","body":"find things"}`)
+	resp := f.ticketCall(ops, MethodTicketMove, ticketBody(t, map[string]any{"ticketId": created.TicketID, "digest": created.Digest}))
+	var answer struct {
+		coord.TicketView
+		PlannerNotStarted string `json:"plannerNotStarted"`
+	}
+	resp.decodeResult(t, &answer)
+	tasks, err := f.store.Tasks(ctx, f.repoRoot)
+	if err != nil || len(tasks) != 1 || tasks[0].Role != task.TaskRolePlan {
+		t.Fatalf("the move must keep its one planner task: %+v, %v", tasks, err)
+	}
+	if answer.TicketID != created.TicketID || answer.Column != task.ColumnTodo ||
+		!reflect.DeepEqual(answer.TaskIDs, []string{tasks[0].ID}) || !strings.Contains(answer.PlannerNotStarted, tasks[0].ID) {
+		t.Fatalf("the answer must be the moved ticket and why its planner %s did not start: %+v", tasks[0].ID, answer)
+	}
+}
+
+func TestBridgeDispatchRefusesAnUnacceptedTicketPlan(t *testing.T) {
+	ctx := context.Background()
+	f, ops := primaryTicketBridge(t)
+	created := f.ticketView(ops, MethodTicketCreate, `{"title":"Add search","body":"find things"}`)
+	planner := task.Task{
+		ID: "orch_plan", ProjectKey: f.repoRoot, Title: "Plan: Add search",
+		TicketID: created.TicketID, Role: task.TaskRolePlan, Phase: task.PromptSubmitted,
+	}
+	if err := f.store.CreateTask(ctx, planner); err != nil {
+		t.Fatalf("seed an open planner task: %v", err)
+	}
+	response := f.ticketCall(ops, MethodDispatch, ticketBody(t, map[string]any{
+		"title": "implement search", "brief": "Add the search feature.",
+		"checks": []string{"go test ./..."}, "baseRevision": "0123456", "ticketId": created.TicketID,
+	}))
+	wantError(t, response, "ticket_plan_not_accepted")
+	if tasks, err := f.store.Tasks(ctx, f.repoRoot); err != nil || len(tasks) != 1 || tasks[0].ID != planner.ID {
+		t.Fatalf("dispatch before plan approval must create no implementation task: %+v, %v", tasks, err)
 	}
 }
 
@@ -190,16 +236,27 @@ func TestBridgeTicketRefusalsAreCoded(t *testing.T) {
 		t.Fatalf("the other project's ticket must be untouched: %+v", after)
 	}
 
-	// A digest from before another move is refused as changed.
+	// A digest from before another ticket edit is refused as changed.
 	moving := f.ticketView(ops, MethodTicketCreate, `{"title":"moves once"}`)
-	move := ticketBody(t, map[string]any{"ticketId": moving.TicketID, "digest": moving.Digest})
-	if resp := f.ticketCall(ops, MethodTicketMove, move); !resp.OK {
-		t.Fatalf("the first move: %+v", resp.Error)
+	if _, err := f.store.UpdateTicket(ctx, moving.TicketID, moving.Revision, func(next *task.Ticket) error {
+		next.Title = "moves once edited"
+		return nil
+	}); err != nil {
+		t.Fatalf("edit the ticket: %v", err)
 	}
+	move := ticketBody(t, map[string]any{"ticketId": moving.TicketID, "digest": moving.Digest})
 	wantError(t, f.ticketCall(ops, MethodTicketMove, move), "ticket_changed")
 
-	// A decision with an open linked task is refused, and writes nothing.
+	// A decision with an open linked task is refused, and writes nothing. Linked
+	// work needs the ticket's plan accepted first.
 	busy := f.ticketView(ops, MethodTicketCreate, `{"title":"has work"}`)
+	accepted := task.Task{
+		ID: "orch_plan_busy", ProjectKey: f.repoRoot, TicketID: busy.TicketID, Role: task.TaskRolePlan,
+		Title: "Plan: has work", Phase: task.PromptSubmitted, Outcome: task.OutcomeIntegrated, Disposition: "accepted the plan",
+	}
+	if err := f.store.CreateTask(ctx, accepted); err != nil {
+		t.Fatalf("seed the accepted planner: %v", err)
+	}
 	linked := task.Task{ID: "orch_linked", ProjectKey: f.repoRoot, TicketID: busy.TicketID, Title: "work", Phase: task.PromptSubmitted}
 	if err := f.store.CreateTask(ctx, linked); err != nil {
 		t.Fatalf("seed a linked task: %v", err)
@@ -214,7 +271,8 @@ func TestBridgeTicketRefusalsAreCoded(t *testing.T) {
 	// A blank digest is a malformed request.
 	wantError(t, f.ticketCall(ops, MethodTicketMove, ticketBody(t, map[string]any{"ticketId": busy.TicketID, "digest": ""})), "bad_request")
 
-	// Dispatch naming a ticket the caller cannot use: unknown, or decided.
+	// Dispatch naming a ticket the caller cannot use: unknown, decided, or
+	// without an accepted plan.
 	dispatch := func(ticketID string) bridgeResponse {
 		return f.ticketCall(ops, MethodDispatch, ticketBody(t, map[string]any{
 			"title": "t", "brief": "b", "checks": []string{"go test ./..."}, "baseRevision": "0123456", "ticketId": ticketID,
@@ -225,8 +283,9 @@ func TestBridgeTicketRefusalsAreCoded(t *testing.T) {
 	done := f.ticketView(ops, MethodTicketCreate, `{"title":"closed"}`)
 	f.ticketView(ops, MethodTicketReview, ticketBody(t, map[string]any{"ticketId": done.TicketID, "digest": done.Digest, "outcome": "abandoned"}))
 	wantError(t, dispatch(done.TicketID), "already_decided")
-	if tasks, err := f.store.Tasks(ctx, f.repoRoot); err != nil || len(tasks) != 1 || tasks[0].ID != "orch_linked" {
-		t.Fatalf("a refused dispatch must create no task: %+v, %v", tasks, err)
+	wantError(t, dispatch(moving.TicketID), "ticket_plan_not_accepted")
+	if tasks, err := f.store.Tasks(ctx, f.repoRoot); err != nil || len(tasks) != 2 {
+		t.Fatalf("a refused dispatch must create no task beyond the seeded planner and linked task: %+v, %v", tasks, err)
 	}
 }
 

@@ -31,6 +31,51 @@ func gateTask(t *testing.T, id, projectKey string, reserved []string) task.Task 
 	}
 }
 
+// A queued task's slot claim that no caller is using is one a drain may continue:
+// it is older than the step lease and no step claim is live. A fresh claim, a
+// claim under a live step and a released claim all belong to somebody else, or to
+// nobody, so none of them is abandoned.
+func TestStoreSlotClaimAbandonedOnlyAfterTheLeaseWithNoLiveStep(t *testing.T) {
+	ctx := context.Background()
+	s := open(t, t.TempDir())
+	const lease = 50 * time.Millisecond
+
+	claimed, stored, token, err := s.ClaimTask(ctx, gateTask(t, "t1", "repo-a", nil), 3)
+	if err != nil || !claimed {
+		t.Fatalf("ClaimTask = (%v, %v), want a slot", claimed, err)
+	}
+	if abandoned, err := s.SlotClaimAbandoned(ctx, stored.ID, lease); err != nil || abandoned {
+		t.Fatalf("a fresh claim = (%v, %v), want its caller's", abandoned, err)
+	}
+	time.Sleep(2 * lease)
+	if abandoned, err := s.SlotClaimAbandoned(ctx, stored.ID, lease); err != nil || !abandoned {
+		t.Fatalf("a claim older than the lease with no step = (%v, %v), want abandoned", abandoned, err)
+	}
+	// A live step claim is a caller provisioning the task right now.
+	if took, err := s.ClaimStep(ctx, stored.ID, task.Intent, "owner-a", time.Minute); err != nil || !took {
+		t.Fatalf("ClaimStep = (%v, %v), want the step", took, err)
+	}
+	if abandoned, err := s.SlotClaimAbandoned(ctx, stored.ID, lease); err != nil || abandoned {
+		t.Fatalf("a claim under a live step = (%v, %v), want its owner's", abandoned, err)
+	}
+	if err := s.ReleaseStep(ctx, stored.ID, "owner-a"); err != nil {
+		t.Fatalf("ReleaseStep: %v", err)
+	}
+	if abandoned, err := s.SlotClaimAbandoned(ctx, stored.ID, lease); err != nil || !abandoned {
+		t.Fatalf("a claim whose step was given back = (%v, %v), want abandoned again", abandoned, err)
+	}
+	// A released claim is no claim at all.
+	if err := s.ReleaseProvisioningSlot(ctx, stored.ID, token); err != nil {
+		t.Fatalf("ReleaseProvisioningSlot: %v", err)
+	}
+	if abandoned, err := s.SlotClaimAbandoned(ctx, stored.ID, lease); err != nil || abandoned {
+		t.Fatalf("a released claim = (%v, %v), want nothing to continue", abandoned, err)
+	}
+	if _, err := s.SlotClaimAbandoned(ctx, "missing", lease); !errors.Is(err, state.ErrNotFound) {
+		t.Fatalf("an unknown task = %v, want ErrNotFound", err)
+	}
+}
+
 func TestStoreClaimTaskRespectsTheBudgetAndReservations(t *testing.T) {
 	ctx := context.Background()
 	s := open(t, t.TempDir())

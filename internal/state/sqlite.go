@@ -1397,6 +1397,44 @@ func (s *Store) RenewProvisioningSlot(ctx context.Context, id, owner string) (in
 	return token, nil
 }
 
+// SlotClaimAbandoned reports whether a queued (intent) task holds a provisioning
+// slot claim that no caller is using: the claim is older than lease and no step
+// claim is live. A caller takes the step claim moments after it claims the slot
+// and holds it while the step runs, so such a claim was left by a caller that
+// stopped in between (a crash, or a bridge killed on its timeout), and nothing
+// else would ever continue the task. A drain may continue it the way a deliberate
+// resume does: the step claim first, then the renewal (RenewProvisioningSlot). A
+// fresh claim, a live step, a released claim, a task past intent and a decided
+// task are never abandoned; an unknown task is ErrNotFound.
+func (s *Store) SlotClaimAbandoned(ctx context.Context, id string, lease time.Duration) (bool, error) {
+	if strings.TrimSpace(id) == "" {
+		return false, fmt.Errorf("%w: task id is required", ErrInvalid)
+	}
+	if lease <= 0 {
+		return false, fmt.Errorf("%w: a positive step lease is required", ErrInvalid)
+	}
+	var phase, disposition, owner string
+	var claimedAt, until int64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COALESCE(json_extract(data, '$.Phase'), ''), COALESCE(json_extract(data, '$.Disposition'), ''),
+		        slot_claimed_at, step_claim_owner, step_claim_until
+		 FROM tasks WHERE id = ?`, id).Scan(&phase, &disposition, &claimedAt, &owner, &until)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, fmt.Errorf("%w: task %s", ErrNotFound, id)
+	}
+	if err != nil {
+		return false, fmt.Errorf("read the slot claim of task %s: %w", id, err)
+	}
+	now := time.Now().UnixMilli()
+	switch {
+	case phase != string(task.Intent), strings.TrimSpace(disposition) != "", claimedAt <= 0:
+		return false, nil
+	case owner != "" && until > now:
+		return false, nil
+	}
+	return claimedAt <= now-lease.Milliseconds(), nil
+}
+
 // ReleaseProvisioningSlot gives a claimed slot back, for a task whose
 // provisioning failed before it recorded any resource. The phase still decides
 // the slot for a task that reached one, so releasing a claim never frees a

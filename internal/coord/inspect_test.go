@@ -47,8 +47,12 @@ func TestListTasksReportsRecordedFactsOpenWorkFirst(t *testing.T) {
 	ticket := f.newTicket(key, "Add search")
 
 	// Created oldest to newest. Ids ascend with creation, so the store's order is
-	// t01..t07 and the listing's order is the only thing under test.
-	f.seedTask(key, "t01", func(x *task.Task) { x.Outcome, x.Disposition = task.OutcomeIntegrated, "merged by hand" })
+	// t01..t07 and the listing's order is the only thing under test. t01 is the
+	// ticket's accepted planner, which lets t03 be linked to the ticket.
+	f.seedTask(key, "t01", func(x *task.Task) {
+		x.Outcome, x.Disposition = task.OutcomeIntegrated, "accepted the plan"
+		x.Role, x.TicketID = task.TaskRolePlan, ticket.ID
+	})
 	f.seedTask(key, "t02", func(x *task.Task) { x.Blocker = "Which branch should I target?" })
 	f.seedTask(key, "t03", func(x *task.Task) { x.Activity, x.TicketID = "working", ticket.ID })
 	f.seedTask(key, "t04", func(x *task.Task) { x.Report = &task.Report{Kind: "result", Summary: "done"} })
@@ -75,7 +79,7 @@ func TestListTasksReportsRecordedFactsOpenWorkFirst(t *testing.T) {
 		byID[entry.TaskID] = entry
 	}
 	for id, want := range map[string]TaskEntry{
-		"t01": {TaskID: "t01", Title: "title of t01", Stage: task.Done, Outcome: task.OutcomeIntegrated, Disposition: "merged by hand"},
+		"t01": {TaskID: "t01", Title: "title of t01", Stage: task.Done, Outcome: task.OutcomeIntegrated, Disposition: "accepted the plan", TicketID: ticket.ID},
 		"t02": {TaskID: "t02", Title: "title of t02", Stage: task.NeedsInput, Blocker: "Which branch should I target?"},
 		"t03": {TaskID: "t03", Title: "title of t03", Stage: task.Running, Activity: "working", TicketID: ticket.ID},
 		"t04": {TaskID: "t04", Title: "title of t04", Stage: task.ReadyForReview},

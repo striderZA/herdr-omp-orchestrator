@@ -185,6 +185,44 @@ func (f *bridgeFixture) seedWorker(id, launchPane, publicPane, session string) t
 	return stored
 }
 
+// seedPlanner records a ticket's planner the way a confirmed move does: an
+// ordinary bound worker whose task links to the ticket and carries the plan role.
+func (f *bridgeFixture) seedPlanner(id, launchPane, publicPane, session string) task.Task {
+	f.t.Helper()
+	ctx := context.Background()
+	ticket := task.Ticket{ID: "tkt_0123456789ab", ProjectKey: f.repoRoot, Title: "Plan the thing", Column: task.ColumnTodo}
+	if err := f.store.CreateTicket(ctx, ticket); err != nil {
+		f.t.Fatalf("create the planner's ticket: %v", err)
+	}
+	planner := task.Task{
+		ID:                  id,
+		ProjectKey:          f.repoRoot,
+		TicketID:            ticket.ID,
+		Role:                task.TaskRolePlan,
+		Title:               "Plan: " + ticket.Title,
+		Brief:               "Plan the bounded thing.",
+		BaseRevision:        "0123456",
+		Branch:              "orch/" + id,
+		WorktreePath:        f.worktree,
+		WorktreeWorkspaceID: workerWorktree,
+		CurrentWorkspaceID:  workerWorktree,
+		TerminalID:          "term-" + id,
+		LaunchPaneID:        launchPane,
+		PublicPaneID:        publicPane,
+		AgentName:           "orch-" + id,
+		OMPSessionID:        session,
+		Phase:               task.PromptSubmitted,
+	}
+	if err := f.store.CreateTask(ctx, planner); err != nil {
+		f.t.Fatalf("create planner %s: %v", id, err)
+	}
+	stored, err := f.store.Task(ctx, id)
+	if err != nil {
+		f.t.Fatalf("read planner %s: %v", id, err)
+	}
+	return stored
+}
+
 // seedPrimary records a bound primary project.
 func (f *bridgeFixture) seedPrimary() task.Project {
 	f.t.Helper()
@@ -1130,6 +1168,77 @@ func TestBridgeResolveDirectBindingNeedsNoHerdr(t *testing.T) {
 	if !result.Bound || result.Role != string(state.RolePrimary) || result.TaskID != "" {
 		t.Fatalf("primary resolve = %+v", result)
 	}
+}
+
+// TestBridgeResolveReportsTheWorkerTaskRoleAndBranch pins the additive resolve
+// fields the extension uses to pick a worker's tools: the persisted task role
+// (only a planner has one) and the task's own branch, which a read-only planner
+// cannot ask Git for. A primary answer carries neither, and the protocol is
+// still 1.
+func TestBridgeResolveReportsTheWorkerTaskRoleAndBranch(t *testing.T) {
+	const (
+		plannerPane    = "w1:p9"
+		plannerSession = "omp-planner-1"
+	)
+	f := newBridgeFixture(t)
+	f.seedPrimary()
+	f.seedWorker("t1", workerPane, workerPane, workerSession)
+	f.seedPlanner("p1", plannerPane, plannerPane, plannerSession)
+
+	resolve := func(pane, session string) (ResolveResult, map[string]json.RawMessage) {
+		t.Helper()
+		f.env["HERDR_PANE_ID"] = pane
+		resp := f.call("resolve", session, "{}")
+		var result ResolveResult
+		resp.decodeResult(t, &result)
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(resp.Result, &raw); err != nil {
+			t.Fatalf("decode the raw resolve result: %v", err)
+		}
+		return result, raw
+	}
+
+	worker, raw := resolve(workerPane, workerSession)
+	if !worker.Bound || worker.Role != string(state.RoleWorker) || worker.TaskID != "t1" {
+		t.Fatalf("worker resolve = %+v, want the bound worker t1", worker)
+	}
+	if worker.TaskRole != "" || worker.Branch != "orch/t1" {
+		t.Errorf("worker resolve role/branch = %q/%q, want \"\"/orch/t1", worker.TaskRole, worker.Branch)
+	}
+	if _, ok := raw["taskRole"]; ok {
+		t.Errorf("an implementation worker's resolve must omit taskRole: %s", f.rawKeys(raw))
+	}
+
+	planner, _ := resolve(plannerPane, plannerSession)
+	if !planner.Bound || planner.Role != string(state.RoleWorker) || planner.TaskID != "p1" {
+		t.Fatalf("planner resolve = %+v, want the bound worker p1", planner)
+	}
+	if planner.TaskRole != string(task.TaskRolePlan) || planner.Branch != "orch/p1" {
+		t.Errorf("planner resolve role/branch = %q/%q, want plan/orch/p1", planner.TaskRole, planner.Branch)
+	}
+
+	primary, raw := resolve(primaryPane, primarySession)
+	if !primary.Bound || primary.Role != string(state.RolePrimary) {
+		t.Fatalf("primary resolve = %+v, want the bound primary", primary)
+	}
+	if primary.TaskRole != "" || primary.Branch != "" || primary.Protocol != 1 {
+		t.Errorf("primary resolve role/branch/protocol = %q/%q/%d, want \"\"/\"\"/1", primary.TaskRole, primary.Branch, primary.Protocol)
+	}
+	for _, key := range []string{"taskRole", "branch"} {
+		if _, ok := raw[key]; ok {
+			t.Errorf("a primary resolve must omit %s: %s", key, f.rawKeys(raw))
+		}
+	}
+}
+
+// rawKeys lists a decoded JSON object's keys for a failure message.
+func (f *bridgeFixture) rawKeys(raw map[string]json.RawMessage) string {
+	keys := make([]string, 0, len(raw))
+	for key := range raw {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+	return strings.Join(keys, ",")
 }
 
 func TestBridgeResolveClearsPrimaryAttentionAfterVerifiedRestore(t *testing.T) {
@@ -4464,22 +4573,29 @@ func TestCleanupInspectsAmbiguousRemovalResultWithoutRetrying(t *testing.T) {
 func bridgeRepoWithWorktree(t *testing.T, branch string) (root, checkout string) {
 	t.Helper()
 	root = t.TempDir()
+	bridgeCommittedRepo(t, root)
+	checkout = filepath.Join(t.TempDir(), "checkout")
+	bridgeGit(t, root, "worktree", "add", "-b", branch, checkout, "HEAD")
+	return root, checkout
+}
+
+// bridgeCommittedRepo makes dir a repository with one commit, so it has the
+// committed HEAD a dispatch, or a ticket's planner, is based on.
+func bridgeCommittedRepo(t *testing.T, dir string) {
+	t.Helper()
 	for _, args := range [][]string{
 		{"init", "-b", "main"},
 		{"config", "user.email", "orchestrator@example.invalid"},
 		{"config", "user.name", "Orchestrator Test"},
 		{"config", "core.autocrlf", "false"},
 	} {
-		bridgeGit(t, root, args...)
+		bridgeGit(t, dir, args...)
 	}
-	if err := os.WriteFile(filepath.Join(root, "README.md"), []byte("first\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("first\n"), 0o644); err != nil {
 		t.Fatalf("write README: %v", err)
 	}
-	bridgeGit(t, root, "add", "-A")
-	bridgeGit(t, root, "commit", "-m", "first commit")
-	checkout = filepath.Join(t.TempDir(), "checkout")
-	bridgeGit(t, root, "worktree", "add", "-b", branch, checkout, "HEAD")
-	return root, checkout
+	bridgeGit(t, dir, "add", "-A")
+	bridgeGit(t, dir, "commit", "-m", "first commit")
 }
 
 func bridgeGit(t *testing.T, dir string, args ...string) string {

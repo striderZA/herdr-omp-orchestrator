@@ -1196,6 +1196,9 @@ func (c *Coordinator) reconcileProject(ctx context.Context, project task.Project
 	if err != nil {
 		return errors.Join(append(failures, fmt.Errorf("read the tasks of %q: %w", project.Key, err))...)
 	}
+	if err := c.reconcileMissingTicketPlanners(ctx, project.Key, tasks); err != nil {
+		failures = append(failures, err)
+	}
 	for _, st := range tasks {
 		if st.Cleanup == nil || st.Cleanup.Refused {
 			continue
@@ -1250,6 +1253,67 @@ func (c *Coordinator) reconcileProject(ctx context.Context, project task.Project
 		failures = append(failures, err)
 	}
 	return errors.Join(failures...)
+}
+
+// reconcileMissingTicketPlanners records attention for legacy todo tickets that
+// predate the planner task. It never starts a process: new moves persist their
+// planner intent atomically, while an old todo ticket needs an explicit decision.
+func (c *Coordinator) reconcileMissingTicketPlanners(ctx context.Context, projectKey string, tasks []task.Task) error {
+	tickets, err := c.store.Tickets(ctx, projectKey)
+	if err != nil {
+		return fmt.Errorf("read tickets while reconciling planners for %q: %w", projectKey, err)
+	}
+	var latestTasks []task.Task
+	latestTasksRead := false
+	for _, ticket := range tickets {
+		if ticket.Column != task.ColumnTodo || ticket.Decided() {
+			continue
+		}
+		hasPlanner := false
+		for _, linked := range tasks {
+			if linked.TicketID == ticket.ID && linked.Role == task.TaskRolePlan {
+				hasPlanner = true
+				break
+			}
+		}
+		if !hasPlanner {
+			// The caller's task list predates this ticket read. A confirmed move
+			// writes the todo column and planner intent atomically, so re-read tasks
+			// after observing todo before classifying it as a legacy ticket.
+			if !latestTasksRead {
+				latestTasks, err = c.store.Tasks(ctx, projectKey)
+				if err != nil {
+					return fmt.Errorf("re-read tasks while reconciling planners for %q: %w", projectKey, err)
+				}
+				latestTasksRead = true
+			}
+			for _, linked := range latestTasks {
+				if linked.TicketID == ticket.ID && linked.Role == task.TaskRolePlan {
+					hasPlanner = true
+					break
+				}
+			}
+		}
+		if hasPlanner {
+			continue
+		}
+		note := ticketPlannerMissingNote(ticket)
+		if _, err := c.store.AddInbox(ctx, note); err != nil {
+			return fmt.Errorf("record missing planner attention for ticket %s: %w", ticket.ID, err)
+		}
+	}
+	return nil
+}
+
+func ticketPlannerMissingNote(ticket task.Ticket) task.Inbox {
+	sum := sha256.Sum256([]byte("ticket-planner-missing\x00" + ticket.ProjectKey + "\x00" + ticket.ID))
+	return task.Inbox{
+		ID:         "ticket-planner-missing:" + hex.EncodeToString(sum[:]),
+		ProjectKey: ticket.ProjectKey,
+		Kind:       noteKindAttention,
+		Summary:    fmt.Sprintf("Ticket %s is already in todo without a planner; a planner was not started automatically. Review it and decide explicitly how to proceed.", ticket.ID),
+		Delivery:   "ticket planner missing",
+	}
 }
 
 // reconcileCleanup settles only a pending cleanup whose exact checkout is

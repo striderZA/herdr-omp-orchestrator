@@ -95,7 +95,7 @@ func TicketStageOf(t Ticket, linked []Task) TicketStage {
 			if x.Disposition != "" {
 				continue
 			}
-			if StageOf(x) == ReadyForReview {
+			if x.Report != nil && x.Report.Kind == "result" {
 				planReady = true
 			} else {
 				planning = true

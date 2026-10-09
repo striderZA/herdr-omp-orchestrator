@@ -241,7 +241,10 @@ func TestProjectTicketsOmitsTicketsPastTodo(t *testing.T) {
 			t.Fatalf("CreateTicket %s: %v", id, err)
 		}
 	}
-	f.seed(t,
+	f.seed(
+		t,
+		acceptedPlanner("orch_plan_c", "tkt_c_progress"),
+		acceptedPlanner("orch_plan_d", "tkt_d_done"),
 		sampleTask("orch_open", func(x *task.Task) { x.TicketID = "tkt_c_progress" }),
 		sampleTask("orch_closed", func(x *task.Task) {
 			x.TicketID = "tkt_d_done"
@@ -275,8 +278,8 @@ func TestProjectTicketsOmitsTicketsPastTodo(t *testing.T) {
 	for _, card := range tasks {
 		refs[card.ID()] = card.Ticket
 	}
-	if len(tasks) != 2 {
-		t.Fatalf("both tasks must still be cards: %+v", tasks)
+	if len(tasks) != 4 {
+		t.Fatalf("every task, the accepted planners included, must still be a card: %+v", tasks)
 	}
 	if got := refs["orch_open"]; got.ID != "tkt_c_progress" || got.Stage != task.TicketInProgress || got.Title != "title tkt_c_progress" {
 		t.Errorf("the open task's ticket reference = %+v, want tkt_c_progress in progress", got)
@@ -318,6 +321,17 @@ func (f *boardFixture) addTicket(t *testing.T, id string, column task.Column) {
 	if err := f.store.CreateTicket(context.Background(), ticket); err != nil {
 		t.Fatalf("CreateTicket %s: %v", id, err)
 	}
+}
+
+// acceptedPlanner is a ticket's planner whose plan the user accepted. Linked
+// implementation work needs one (spec §5), and it is closed, so it never keeps
+// its ticket open.
+func acceptedPlanner(id, ticketID string) task.Task {
+	return sampleTask(id, func(x *task.Task) {
+		x.TicketID, x.Role = ticketID, task.TaskRolePlan
+		x.Outcome, x.Disposition = task.OutcomeIntegrated, "accepted the plan"
+		x.Report = &task.Report{Kind: "result", Summary: "the plan"}
+	})
 }
 
 func TestTabWalksTicketColumnsThenTaskColumns(t *testing.T) {
@@ -444,10 +458,17 @@ func TestASelectedTicketThatStartsWorkFallsBackToAnotherCard(t *testing.T) {
 	if got := m.SelectedID(); got != "tkt_a_backlog" {
 		t.Fatalf("selected %q, want the backlog ticket", got)
 	}
-	// A task is dispatched for the selected ticket: it is no longer a card.
-	linked := sampleTask("orch_l1", func(x *task.Task) { x.ProjectKey = f.project; x.TicketID = "tkt_a_backlog" })
-	if err := f.store.CreateTask(ctx, linked); err != nil {
-		t.Fatalf("CreateTask: %v", err)
+	// The selected ticket moves to todo and records its planner, the way a
+	// confirmed move does: it is planning now, so it is no longer a card.
+	backlog, err := f.store.Ticket(ctx, "tkt_a_backlog")
+	if err != nil {
+		t.Fatalf("read the selected ticket: %v", err)
+	}
+	planner := sampleTask("orch_l1", func(x *task.Task) {
+		x.ProjectKey, x.TicketID, x.Role, x.Phase = f.project, backlog.ID, task.TaskRolePlan, task.Intent
+	})
+	if _, _, err := f.store.MoveTicketToTodoWithPlannerTask(ctx, backlog.ID, backlog.Revision, planner); err != nil {
+		t.Fatalf("move the ticket and record its planner: %v", err)
 	}
 	press(t, m, keyPress("r"))
 	got := m.SelectedID()
@@ -482,8 +503,10 @@ func TestFocusOnATicketRefusesBeforeHerdr(t *testing.T) {
 
 func TestEnterOpensATicketPageThatScrolls(t *testing.T) {
 	f := newBoardFixture(t, fixturePlan{})
-	ticket := task.Ticket{ID: "tkt_long", ProjectKey: f.project, Title: "long one", Column: task.ColumnBacklog,
-		Body: strings.Repeat("word ", 400)}
+	ticket := task.Ticket{
+		ID: "tkt_long", ProjectKey: f.project, Title: "long one", Column: task.ColumnBacklog,
+		Body: strings.Repeat("word ", 400),
+	}
 	if err := f.store.CreateTicket(context.Background(), ticket); err != nil {
 		t.Fatalf("CreateTicket: %v", err)
 	}
@@ -718,6 +741,17 @@ func TestMoveKeyActsOnlyOnASelectedBacklogTicket(t *testing.T) {
 	if len(ops.moves) != 1 || ops.moves[0] != want {
 		t.Fatalf("moves = %+v, want exactly %+v (the displayed card's digest)", ops.moves, want)
 	}
+	if !strings.Contains(strings.ToLower(m.notice), "planner") {
+		t.Fatalf("successful move notice must say that a planner task was recorded: %q", m.notice)
+	}
+}
+
+func TestTicketMoveHelpStatesItStartsPlanning(t *testing.T) {
+	card := ticketCardOf("tkt_a", "move me", task.TicketBacklog)
+	help := ticketHelpLine(card, Detail{TicketWrites: true})
+	if !strings.Contains(help, "m move to todo + start planner") {
+		t.Fatalf("ticket move help must state its consequence, got %q", help)
+	}
 }
 
 func TestMoveRefusalBecomesANoticeAndRefreshes(t *testing.T) {
@@ -754,6 +788,47 @@ func TestMoveRefusalBecomesANoticeAndRefreshes(t *testing.T) {
 	}
 	if len(m.board.TicketColumn(task.TicketTodo)) != 1 || len(m.board.TicketColumn(task.TicketBacklog)) != 0 {
 		t.Fatal("a refusal must be followed by a refresh that re-reads the ticket")
+	}
+}
+
+// A move the coordinator recorded is never reported as a failed move, even when
+// its planner did not start: the notice says the ticket moved and why its planner
+// has not started, and the board re-reads where the ticket now is.
+func TestAMoveWhosePlannerDidNotStartStillSaysItMoved(t *testing.T) {
+	ctx := context.Background()
+	f := newBoardFixture(t, fixturePlan{})
+	f.addTicket(t, "tkt_a_backlog", task.ColumnBacklog)
+	f.seed(t)
+	ops := &fakeTicketOps{moveErr: &MovedTicketError{Err: errors.New("create the worktree: herdr: not_git_worktree")}}
+	ops.onMove = func() {
+		// The coordinator recorded the move before its planner failed to start.
+		ticket, err := f.store.Ticket(ctx, "tkt_a_backlog")
+		if err != nil {
+			t.Errorf("read the ticket: %v", err)
+			return
+		}
+		if _, err := f.store.UpdateTicket(ctx, ticket.ID, ticket.Revision, func(next *task.Ticket) error {
+			next.Column = task.ColumnTodo
+			return nil
+		}); err != nil {
+			t.Errorf("record the move: %v", err)
+		}
+	}
+	m := f.model(t, Options{Tickets: ops})
+	cmd := typeText(t, m, "m")
+	if cmd == nil {
+		t.Fatal("m on a backlog ticket must start the write")
+	}
+	press(t, m, cmd())
+	if !strings.HasPrefix(m.notice, "Moved tkt_a_backlog to todo") || strings.Contains(m.notice, "Cannot move") ||
+		!strings.Contains(m.notice, "planner did not start") || !strings.Contains(m.notice, "not_git_worktree") {
+		t.Fatalf("a recorded move must say it moved and why its planner did not start: %q", m.notice)
+	}
+	if !m.noticeErr {
+		t.Fatalf("a planner that did not start must still stand out: %q", m.notice)
+	}
+	if len(m.board.TicketColumn(task.TicketTodo)) != 1 || len(m.board.TicketColumn(task.TicketBacklog)) != 0 {
+		t.Fatal("the board must re-read the moved ticket")
 	}
 }
 

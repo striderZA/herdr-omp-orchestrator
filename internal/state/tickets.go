@@ -242,7 +242,9 @@ func (s *Store) DecideTicket(ctx context.Context, id string, expectedRevision in
 
 // checkTicketUsable is the ticket half of the dispatch gate. CreateTask and
 // ClaimTask call it inside their own transaction when a task names a ticket: the
-// ticket must exist, belong to the task's project and be undecided. The column
+// ticket must exist, belong to the task's project and be undecided, and linked
+// work other than the planner itself needs an accepted plan - at least one
+// planner linked to the ticket, each with an accepting disposition. The column
 // is deliberately not looked at. A task without a ticket id passes untouched.
 func checkTicketUsable(ctx context.Context, tx *tx, t task.Task) error {
 	if t.TicketID == "" {
@@ -267,11 +269,19 @@ func checkTicketUsable(ctx context.Context, tx *tx, t task.Task) error {
 	if err != nil {
 		return fmt.Errorf("read the planner tasks of ticket %q: %w", t.TicketID, err)
 	}
+	planned := false
 	for _, existing := range linked {
-		if existing.TicketID == t.TicketID && existing.Role == task.TaskRolePlan && !existing.Accepted() {
+		if existing.TicketID != t.TicketID || existing.Role != task.TaskRolePlan {
+			continue
+		}
+		if !existing.Accepted() {
 			return fmt.Errorf("%w: planner task %s for ticket %s has no accepting disposition",
 				ErrTicketUnavailable, existing.ID, t.TicketID)
 		}
+		planned = true
+	}
+	if !planned {
+		return fmt.Errorf("%w: ticket %s has no planner, so no plan for it was accepted", ErrTicketUnavailable, t.TicketID)
 	}
 	return nil
 }

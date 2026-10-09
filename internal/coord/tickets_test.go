@@ -2,14 +2,17 @@ package coord
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"herdr-omp-orchestrator/internal/herdr"
 	"herdr-omp-orchestrator/internal/task"
 )
 
@@ -59,6 +62,21 @@ func (f *coordFixture) linkedTask(project, ticketID, id string) {
 	}
 }
 
+// acceptedPlanner records a ticket's planner whose report the user accepted: a
+// closed plan-role task, which is what lets linked implementation work start.
+func (f *coordFixture) acceptedPlanner(project, ticketID string) task.Task {
+	f.t.Helper()
+	x := task.Task{
+		ID: "orch_plan_" + ticketID, ProjectKey: project, TicketID: ticketID, Role: task.TaskRolePlan,
+		Title: "Plan: " + ticketID, Phase: task.PromptSubmitted,
+		Outcome: task.OutcomeIntegrated, Disposition: "accepted the plan",
+	}
+	if err := f.store.CreateTask(context.Background(), x); err != nil {
+		f.t.Fatalf("seed the accepted planner of %s: %v", ticketID, err)
+	}
+	return x
+}
+
 func (f *coordFixture) closeTask(id string) {
 	f.t.Helper()
 	current, err := f.store.Task(context.Background(), id)
@@ -101,8 +119,9 @@ func TestCreateTicketRecordsABacklogTicket(t *testing.T) {
 	if _, err := f.coord.CreateTicketFor(ctx, key, TicketCreateParams{Title: strings.Repeat("t", maxTitleLength)}); err != nil {
 		t.Fatalf("a title of exactly %d characters and no body: %v", maxTitleLength, err)
 	}
-	if _, err := f.coord.CreateTicketFor(ctx, key, TicketCreateParams{Title: "big", Body: strings.Repeat("b", maxBriefLength)}); err != nil {
-		t.Fatalf("a body of exactly %d characters: %v", maxBriefLength, err)
+	safeBody := strings.Repeat("b", 10_000)
+	if _, err := f.coord.CreateTicketFor(ctx, key, TicketCreateParams{Title: "big", Body: safeBody}); err != nil {
+		t.Fatalf("a body that fits the bounded planner brief: %v", err)
 	}
 	for name, params := range map[string]TicketCreateParams{
 		"blank title":   {Title: "  \t"},
@@ -122,6 +141,48 @@ func TestCreateTicketRecordsABacklogTicket(t *testing.T) {
 	}
 }
 
+func TestCreateTicketRejectsPlannerBriefThatExceedsWindowsArgumentBudget(t *testing.T) {
+	ctx := context.Background()
+	f, key := ticketFixture(t)
+	body := strings.Repeat(`"`, 12_000)
+	if len(body) > maxBriefLength {
+		t.Fatalf("test body has %d bytes, beyond the ticket body limit", len(body))
+	}
+	if _, err := f.coord.CreateTicketFor(ctx, key, TicketCreateParams{Title: "quoted context", Body: body}); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("CreateTicketFor with an argv-expanding body = %v, want ErrInvalidRequest", err)
+	}
+	if tickets, err := f.store.Tickets(ctx, key); err != nil || len(tickets) != 0 {
+		t.Fatalf("an oversized planner context must not be persisted: %+v, %v", tickets, err)
+	}
+	if calls := f.calls(); len(calls) != 0 {
+		t.Fatalf("rejecting an oversized planner context must not reach Herdr: %+v", calls)
+	}
+	legacy := task.Ticket{
+		ID: "tkt_legacyoversize", ProjectKey: key, Title: "legacy quoted context",
+		Body: body, Column: task.ColumnBacklog,
+	}
+	if err := f.store.CreateTicket(ctx, legacy); err != nil {
+		t.Fatalf("seed an oversized pre-existing ticket: %v", err)
+	}
+	storedLegacy, err := f.store.Ticket(ctx, legacy.ID)
+	if err != nil {
+		t.Fatalf("read the oversized pre-existing ticket: %v", err)
+	}
+	if _, err := f.coord.MoveTicketFor(ctx, key, storedLegacy.ID, storedLegacy.Digest()); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("MoveTicketFor with an argv-expanding legacy ticket = %v, want ErrInvalidRequest", err)
+	}
+	after, err := f.store.Ticket(ctx, legacy.ID)
+	if err != nil || after.Column != task.ColumnBacklog || after.Revision != 1 {
+		t.Fatalf("a refused move must leave the legacy ticket in backlog: %+v, %v", after, err)
+	}
+	if tasks, err := f.store.Tasks(ctx, key); err != nil || len(tasks) != 0 {
+		t.Fatalf("a refused legacy move must not record a planner: %+v, %v", tasks, err)
+	}
+	if calls := f.calls(); len(calls) != 0 {
+		t.Fatalf("refusing the legacy move must not reach Herdr: %+v", calls)
+	}
+}
+
 func TestListTicketsForShowsOnlyThisProjectsTicketsWithDerivedStage(t *testing.T) {
 	ctx := context.Background()
 	f, key := ticketFixture(t)
@@ -129,6 +190,8 @@ func TestListTicketsForShowsOnlyThisProjectsTicketsWithDerivedStage(t *testing.T
 	time.Sleep(3 * time.Millisecond)
 	second := f.newTicket(key, "second")
 	f.foreignTicket("tkt_foreign")
+	planner := f.acceptedPlanner(key, first.ID)
+	time.Sleep(3 * time.Millisecond)
 	f.linkedTask(key, first.ID, "orch_one")
 	f.linkedTask(key, first.ID, "orch_two")
 
@@ -139,8 +202,8 @@ func TestListTicketsForShowsOnlyThisProjectsTicketsWithDerivedStage(t *testing.T
 	if len(list.Tickets) != 2 || list.Tickets[0].TicketID != first.ID || list.Tickets[1].TicketID != second.ID {
 		t.Fatalf("want this project's two tickets, oldest first: %+v", list.Tickets)
 	}
-	if got := list.Tickets[0]; got.Stage != task.TicketInProgress || !reflect.DeepEqual(got.TaskIDs, []string{"orch_one", "orch_two"}) {
-		t.Fatalf("a ticket with open linked tasks is in progress and lists them oldest first: %+v", got)
+	if got := list.Tickets[0]; got.Stage != task.TicketInProgress || !reflect.DeepEqual(got.TaskIDs, []string{planner.ID, "orch_one", "orch_two"}) {
+		t.Fatalf("a ticket with an accepted plan and open linked tasks is in progress and lists them oldest first: %+v", got)
 	}
 	if got := list.Tickets[1]; got.Stage != task.TicketBacklog || len(got.TaskIDs) != 0 {
 		t.Fatalf("an untouched ticket is backlog with no tasks: %+v", got)
@@ -157,7 +220,7 @@ func TestListTicketsForShowsOnlyThisProjectsTicketsWithDerivedStage(t *testing.T
 	}
 }
 
-func TestMoveTicketRecordsTodoAndStartsNothing(t *testing.T) {
+func TestMoveTicketRecordsTodoAndStartsOnePlanner(t *testing.T) {
 	ctx := context.Background()
 	f, key := ticketFixture(t)
 	ticket := f.newTicket(key, "move me")
@@ -169,14 +232,93 @@ func TestMoveTicketRecordsTodoAndStartsNothing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MoveTicketFor: %v", err)
 	}
-	if moved.Column != task.ColumnTodo || moved.Stage != task.TicketTodo || moved.Revision != 2 || moved.Digest == preview.Digest {
-		t.Fatalf("a move records todo at revision 2 with a new digest: %+v", moved)
+	if moved.Column != task.ColumnTodo || moved.Stage != task.TicketPlanning || moved.Revision != 2 || moved.Digest == preview.Digest {
+		t.Fatalf("a move records todo and starts planning at revision 2: %+v", moved)
 	}
-	if tasks, err := f.store.Tasks(ctx, key); err != nil || len(tasks) != 0 {
-		t.Fatalf("a move must not start any task: %+v, %v", tasks, err)
+	tasks, err := f.store.Tasks(ctx, key)
+	if err != nil || len(tasks) != 1 {
+		t.Fatalf("a move must record one planner task: %+v, %v", tasks, err)
+	}
+	planner := tasks[0]
+	if planner.Role != task.TaskRolePlan || planner.TicketID != ticket.ID || planner.Title != "Plan: move me" {
+		t.Fatalf("planner facts = %+v, want a plan task linked to the moved ticket", planner)
+	}
+	if planner.Phase != task.PromptSubmitted || len(planner.ReservedPaths) != 0 ||
+		!strings.Contains(planner.Brief, ticket.Title) || !strings.Contains(planner.Brief, ticket.Body) ||
+		!strings.Contains(strings.ToLower(planner.Brief), "do not edit") {
+		t.Fatalf("planner must be briefed without reservations and told to plan only: %+v", planner)
+	}
+	if !reflect.DeepEqual(moved.TaskIDs, []string{planner.ID}) {
+		t.Fatalf("moved ticket task ids = %v, want its planner %s", moved.TaskIDs, planner.ID)
+	}
+	if starts := f.countCalls("agent start"); starts != 1 {
+		t.Fatalf("planner agent starts = %d, want one: %v", starts, f.calls())
+	}
+}
+
+// The move and its planner intent commit together, and starting the planner is a
+// later step. When that step fails the ticket has still moved, so the answer is
+// the moved ticket with ErrPlannerNotStarted naming the planner - never a failed
+// move, which a retry of the confirmed digest could only meet as ticket_changed.
+// The planner stays a retryable intent for a later drain.
+func TestMoveTicketReportsAMoveWhosePlannerDidNotStartAsMoved(t *testing.T) {
+	ctx := context.Background()
+	f, key := ticketFixture(t)
+	ticket := f.newTicket(key, "planner cannot start")
+	f.updatePlan(func(p *fixturePlan) { p.WorktreeCreateError = "not_git_worktree" })
+	moved, err := f.coord.MoveTicketFor(ctx, key, ticket.ID, ticket.Digest())
+	if !errors.Is(err, ErrPlannerNotStarted) || !errors.Is(err, herdr.ErrCLI) {
+		t.Fatalf("a move whose planner could not start = %v, want ErrPlannerNotStarted wrapping the Herdr failure", err)
+	}
+	tasks, readErr := f.store.Tasks(ctx, key)
+	if readErr != nil || len(tasks) != 1 || tasks[0].Role != task.TaskRolePlan || tasks[0].TicketID != ticket.ID {
+		t.Fatalf("the move must keep its one planner task: %+v, %v", tasks, readErr)
+	}
+	planner := tasks[0]
+	var notStarted *PlannerNotStartedError
+	if !errors.As(err, &notStarted) || notStarted.TicketID != ticket.ID || notStarted.TaskID != planner.ID {
+		t.Fatalf("the error must name the moved ticket and its planner %s: %#v", planner.ID, err)
+	}
+	if moved.TicketID != ticket.ID || moved.Column != task.ColumnTodo || moved.Stage != task.TicketPlanning ||
+		moved.Revision != 2 || !reflect.DeepEqual(moved.TaskIDs, []string{planner.ID}) {
+		t.Fatalf("the answer must be the moved ticket with its planner: %+v", moved)
+	}
+	if stored, _ := f.store.Ticket(ctx, ticket.ID); stored.Column != task.ColumnTodo || stored.Revision != 2 {
+		t.Fatalf("the move must stay recorded: %+v", stored)
+	}
+	if planner.Phase != task.Intent || planner.Blocker != "" {
+		t.Fatalf("the planner must stay a retryable intent for a later drain: %+v", planner)
+	}
+}
+
+func TestMoveTicketAndPlannerIntentRollBackTogether(t *testing.T) {
+	ctx := context.Background()
+	f, key := ticketFixture(t)
+	ticket := f.newTicket(key, "atomic move")
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(f.stateDir, "orchestrator.sqlite")))
+	if err != nil {
+		t.Fatalf("open state database: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if _, err := db.ExecContext(ctx, `CREATE TRIGGER refuse_planner_intent
+		BEFORE INSERT ON tasks
+		WHEN json_extract(NEW.data, '$.Role') = 'plan'
+		BEGIN SELECT RAISE(ABORT, 'planner intent is not writable'); END`); err != nil {
+		t.Fatalf("install planner-intent trigger: %v", err)
+	}
+	_, err = f.coord.MoveTicketFor(ctx, key, ticket.ID, ticket.Digest())
+	if err == nil {
+		t.Fatal("the move succeeded although its planner intent could not be recorded")
+	}
+	if after, readErr := f.store.Ticket(ctx, ticket.ID); readErr != nil ||
+		after.Column != task.ColumnBacklog || after.Revision != 1 {
+		t.Fatalf("a refused planner intent must leave the ticket in backlog: %+v, %v", after, readErr)
+	}
+	if tasks, readErr := f.store.Tasks(ctx, key); readErr != nil || len(tasks) != 0 {
+		t.Fatalf("a refused move must leave no planner task: %+v, %v", tasks, readErr)
 	}
 	if calls := f.calls(); len(calls) != 0 {
-		t.Fatalf("a move must not call Herdr at all: %+v", calls)
+		t.Fatalf("a failed atomic move must reach no Herdr operation: %+v", calls)
 	}
 }
 
@@ -259,11 +401,11 @@ func TestMoveTicketConcurrentHasOneWinner(t *testing.T) {
 			t.Errorf("unexpected move error: %v", err)
 		}
 	}
-	if winners != 1 || changed != 1 {
-		t.Fatalf("concurrent move = %d winners, %d ErrTicketChanged; want 1, 1", winners, changed)
-	}
 	if final, err := f.store.Ticket(ctx, ticket.ID); err != nil || final.Revision != 2 || final.Column != task.ColumnTodo {
 		t.Fatalf("final ticket = %+v, %v; want todo at revision 2", final, err)
+	}
+	if tasks, err := f.store.Tasks(ctx, key); err != nil || len(tasks) != 1 || tasks[0].Role != task.TaskRolePlan {
+		t.Fatalf("one winning move must leave exactly one planner intent: %+v, %v", tasks, err)
 	}
 }
 
@@ -317,6 +459,7 @@ func TestReviewTicket(t *testing.T) {
 
 	t.Run("an open linked task refuses the decision", func(t *testing.T) {
 		ticket := f.newTicket(key, "busy")
+		f.acceptedPlanner(key, ticket.ID)
 		f.linkedTask(key, ticket.ID, "orch_busy")
 		params := TicketReviewParams{TicketID: ticket.ID, Digest: ticket.Digest(), Outcome: task.OutcomeIntegrated, Disposition: "all merged"}
 		if _, err := f.coord.ReviewTicketFor(ctx, key, params); !errors.Is(err, ErrTicketOpen) {
@@ -438,47 +581,80 @@ func (f *coordFixture) ticketDispatch(key, ticketID, title string) (DispatchResu
 	})
 }
 
-func TestDispatchLinksATaskToATicket(t *testing.T) {
+func TestDispatchLinksATaskToATicketAfterItsPlanIsAccepted(t *testing.T) {
 	ctx := context.Background()
 	f, key := ticketFixture(t)
 	ticket := f.newTicket(key, "linked work")
-	if _, err := f.coord.MoveTicketFor(ctx, key, ticket.ID, ticket.Digest()); err != nil {
+	moved, err := f.coord.MoveTicketFor(ctx, key, ticket.ID, ticket.Digest())
+	if err != nil {
 		t.Fatalf("move to todo: %v", err)
 	}
+	if len(moved.TaskIDs) != 1 {
+		t.Fatalf("the moved ticket must name its planner: %+v", moved)
+	}
+	planner, err := f.store.Task(ctx, moved.TaskIDs[0])
+	if err != nil {
+		t.Fatalf("read planner: %v", err)
+	}
+	beforeCalls := len(f.calls())
+	if _, err := f.ticketDispatch(key, ticket.ID, "worker one"); err == nil ||
+		!strings.Contains(strings.ToLower(err.Error()), "plan") {
+		t.Fatalf("implementation dispatch before plan approval = %v, want a plan refusal", err)
+	}
+	if tasks, readErr := f.store.Tasks(ctx, key); readErr != nil || len(tasks) != 1 {
+		t.Fatalf("a refused implementation dispatch must create nothing: %+v, %v", tasks, readErr)
+	}
+	if calls := f.calls(); len(calls) != beforeCalls {
+		t.Fatalf("a refused implementation dispatch must reach no Herdr operation: %+v", calls[beforeCalls:])
+	}
+	f.closeTask(planner.ID)
 	result, err := f.ticketDispatch(key, ticket.ID, "worker one")
 	if err != nil {
-		t.Fatalf("DispatchFor with a todo ticket: %v", err)
+		t.Fatalf("DispatchFor with an accepted plan: %v", err)
 	}
 	if result.TicketID != ticket.ID {
 		t.Fatalf("DispatchResult.TicketID = %q, want %q", result.TicketID, ticket.ID)
 	}
 	stored, err := f.store.Task(ctx, result.TaskID)
 	if err != nil || stored.TicketID != ticket.ID {
-		t.Fatalf("the stored task must carry the ticket id: %+v, %v", stored, err)
+		t.Fatalf("the implementation task must carry the ticket id: %+v, %v", stored, err)
 	}
 	list, err := f.coord.ListTicketsFor(ctx, key)
 	if err != nil || len(list.Tickets) != 1 {
 		t.Fatalf("ListTicketsFor = %+v, %v", list, err)
 	}
-	if got := list.Tickets[0]; got.Stage != task.TicketInProgress || !reflect.DeepEqual(got.TaskIDs, []string{result.TaskID}) {
-		t.Fatalf("the ticket must be in progress with its task listed: %+v", got)
+	if got := list.Tickets[0]; got.Stage != task.TicketInProgress ||
+		!reflect.DeepEqual(got.TaskIDs, []string{planner.ID, result.TaskID}) {
+		t.Fatalf("ticket must show its plan and implementation task in progress: %+v", got)
 	}
 }
 
-func TestDispatchAcceptsABacklogTicketAsTheSpecAllows(t *testing.T) {
+// A ticket's linked work starts only after its planner's report was accepted
+// (spec §5): a backlog ticket has no planner yet, and a todo ticket recorded
+// before planners existed never had one, so both are refused before anything is
+// recorded or reaches Herdr.
+func TestDispatchRefusesATicketWithoutAnAcceptedPlan(t *testing.T) {
 	ctx := context.Background()
 	f, key := ticketFixture(t)
-	ticket := f.newTicket(key, "still in the backlog")
-	result, err := f.ticketDispatch(key, ticket.ID, "early worker")
-	if err != nil {
-		t.Fatalf("DispatchFor with a backlog ticket: %v", err)
+	backlog := f.newTicket(key, "still in the backlog")
+	legacy := f.newTicket(key, "todo before planners")
+	if _, err := f.store.UpdateTicket(ctx, legacy.ID, legacy.Revision, func(next *task.Ticket) error {
+		next.Column = task.ColumnTodo
+		return nil
+	}); err != nil {
+		t.Fatalf("seed a todo ticket without a planner: %v", err)
 	}
-	if result.TicketID != ticket.ID {
-		t.Fatalf("DispatchResult.TicketID = %q, want %q", result.TicketID, ticket.ID)
+	for name, ticketID := range map[string]string{"a backlog ticket": backlog.ID, "a todo ticket without a planner": legacy.ID} {
+		_, err := f.ticketDispatch(key, ticketID, "early worker for "+name)
+		if !errors.Is(err, ErrTicketPlanNotAccepted) || !strings.Contains(err.Error(), ticketID) {
+			t.Errorf("%s: DispatchFor = %v, want ErrTicketPlanNotAccepted naming %s", name, err, ticketID)
+		}
 	}
-	list, err := f.coord.ListTicketsFor(ctx, key)
-	if err != nil || len(list.Tickets) != 1 || list.Tickets[0].Stage != task.TicketInProgress || list.Tickets[0].Column != task.ColumnBacklog {
-		t.Fatalf("a backlog ticket with an open task reads in_progress and stays in the backlog column: %+v, %v", list, err)
+	if tasks, err := f.store.Tasks(ctx, key); err != nil || len(tasks) != 0 {
+		t.Fatalf("a refused dispatch must create no task: %+v, %v", tasks, err)
+	}
+	if calls := f.calls(); len(calls) != 0 {
+		t.Fatalf("a refused dispatch must not reach Herdr: %+v", calls)
 	}
 }
 
@@ -588,5 +764,50 @@ func TestDispatchRefusesABlankTicketIdAndCreatesNothing(t *testing.T) {
 	}
 	if calls := f.calls(); len(calls) != 0 {
 		t.Fatalf("a refused dispatch must not reach Herdr: %+v", calls)
+	}
+}
+
+func TestQueuedTicketPlannerDrainsWithoutChecks(t *testing.T) {
+	ctx := context.Background()
+	f, key := ticketFixture(t)
+	workers := make([]task.Task, 0, 3)
+	for _, title := range []string{"slot owner a", "slot owner b", "slot owner c"} {
+		workers = append(workers, f.mustDispatch(title, "working"))
+	}
+	ticket := f.newTicket(key, "queued planner")
+	moved, err := f.coord.MoveTicketFor(ctx, key, ticket.ID, ticket.Digest())
+	if err != nil {
+		t.Fatalf("MoveTicketFor with a full concurrency budget: %v", err)
+	}
+	if moved.Stage != task.TicketPlanning {
+		t.Fatalf("queued ticket stage = %q, want planning", moved.Stage)
+	}
+	tasks, err := f.store.Tasks(ctx, key)
+	if err != nil {
+		t.Fatalf("Tasks after move: %v", err)
+	}
+	var planner task.Task
+	for _, st := range tasks {
+		if st.Role == task.TaskRolePlan {
+			planner = st
+		}
+	}
+	if planner.ID == "" || planner.Phase != task.Intent || len(planner.Checks) != 0 || len(tasks) != 4 {
+		t.Fatalf("full capacity must leave one queued planner intent without worker checks: %+v", tasks)
+	}
+	if starts := f.countCalls("agent start"); starts != 3 {
+		t.Fatalf("planner must wait for capacity; agent starts = %d, want 3", starts)
+	}
+
+	f.closeTask(workers[0].ID)
+	drained, err := f.coord.DrainQueued(ctx, key)
+	if err != nil {
+		t.Fatalf("DrainQueued after a slot opens: %v", err)
+	}
+	if len(drained) != 1 || drained[0].ID != planner.ID || drained[0].Phase != task.PromptSubmitted {
+		t.Fatalf("drained tasks = %+v, want planner %s to be submitted", drained, planner.ID)
+	}
+	if starts := f.countCalls("agent start"); starts != 4 {
+		t.Fatalf("planner starts after a slot opens = %d, want 4", starts)
 	}
 }

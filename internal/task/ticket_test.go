@@ -42,6 +42,8 @@ func TestTicketStageOf(t *testing.T) {
 	acceptedPlanner := taskWithRole(t, closedTask("p2", "tkt_a"), "plan")
 	rejectedPlanner := acceptedPlanner
 	rejectedPlanner.Outcome, rejectedPlanner.Disposition = OutcomeRejected, OutcomeRejected
+	planWithAttention := planReady
+	planWithAttention.Attention = "primary needs attention"
 	for _, tc := range []struct {
 		name   string
 		ticket Ticket
@@ -55,6 +57,7 @@ func TestTicketStageOf(t *testing.T) {
 		{"todo with every implementation task closed", todo, []Task{closedTask("c1", "tkt_a"), closedTask("c2", "tkt_a")}, TicketReadyForReview},
 		{"todo with an active planner", todo, []Task{planner}, TicketStage("planning")},
 		{"todo with a planner report awaiting review", todo, []Task{planReady}, TicketStage("plan_ready")},
+		{"todo with planner report and retained attention", todo, []Task{planWithAttention}, TicketStage("plan_ready")},
 		{"accepted plan with no implementation tasks", todo, []Task{acceptedPlanner}, TicketTodo},
 		{"accepted plan and open implementation task", todo, []Task{acceptedPlanner, openTask("o1", "tkt_a")}, TicketInProgress},
 		{"plan report takes precedence while implementation is open", todo, []Task{planReady, openTask("o1", "tkt_a")}, TicketStage("plan_ready")},

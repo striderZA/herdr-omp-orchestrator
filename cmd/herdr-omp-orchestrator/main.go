@@ -295,6 +295,18 @@ func (w ticketWriter) CreateTicket(ctx context.Context, projectKey, title string
 
 func (w ticketWriter) MoveTicketToTodo(ctx context.Context, projectKey, ticketID, digest string) error {
 	_, err := w.coordinator.MoveTicketFor(ctx, projectKey, ticketID, digest)
+	return boardMoveError(err)
+}
+
+// boardMoveError is the board's view of a move's error: a move the coordinator
+// recorded but whose planner did not start becomes a board.MovedTicketError
+// carrying why, so the board reports the ticket as moved; any other error is the
+// move's refusal and passes through unchanged.
+func boardMoveError(err error) error {
+	var notStarted *coord.PlannerNotStartedError
+	if errors.As(err, &notStarted) {
+		return &board.MovedTicketError{Err: notStarted.Err}
+	}
 	return err
 }
 

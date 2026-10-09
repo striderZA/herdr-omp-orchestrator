@@ -25,7 +25,8 @@ type DispatchParams struct {
 	ReservedPaths []string `json:"reservedPaths"`
 	BaseRevision  string   `json:"baseRevision"`
 	// TicketID optionally names the ticket this work is for. It is refused unless
-	// the ticket exists in the caller's project and is not decided.
+	// the ticket exists in the caller's project, is not decided, and has at least
+	// one planner, every one of them with an accepting disposition.
 	TicketID string `json:"ticketId"`
 }
 
@@ -175,43 +176,47 @@ func (c *Coordinator) dispatch(
 	if err != nil || duplicate {
 		return st, duplicate, err
 	}
-	if _, err := c.drainQueued(ctx, project.Key, st.ID); err != nil {
-		return st, false, fmt.Errorf("drain queued work before dispatching task %s: %w", st.ID, err)
-	}
+	provisioned, err := c.advanceRecordedIntent(ctx, project.Key, st)
+	return provisioned, false, err
+}
 
+// advanceRecordedIntent gives older queued tasks first use of capacity, then
+// claims and provisions one recorded intent. Both ordinary dispatch and ticket
+// planning use this path after they durably record the task.
+func (c *Coordinator) advanceRecordedIntent(ctx context.Context, projectKey string, st task.Task) (task.Task, error) {
+	if _, err := c.drainQueued(ctx, projectKey, st.ID); err != nil {
+		return st, fmt.Errorf("drain queued work before dispatching task %s: %w", st.ID, err)
+	}
 	claimed, token, err := c.store.ClaimProvisioningSlot(ctx, st.ID, c.opts.Concurrency)
 	switch {
 	case errors.Is(err, state.ErrBudgetExhausted):
-		return st, false, nil
+		return st, nil
 	case err != nil:
-		return st, false, fmt.Errorf("claim the provisioning slot for task %s: %w", st.ID, err)
+		return st, fmt.Errorf("claim the provisioning slot for task %s: %w", st.ID, err)
 	case !claimed:
 		current, readErr := c.store.Task(ctx, st.ID)
 		if readErr != nil {
-			return st, false, fmt.Errorf("read task %s after another caller claimed it: %w", st.ID, readErr)
+			return st, fmt.Errorf("read task %s after another caller claimed it: %w", st.ID, readErr)
 		}
-		return current, false, nil
+		return current, nil
 	}
-
-	// Re-read dependencies after the queue drain: a primary disposition may have
-	// landed since validation, and a stale snapshot would leave this task queued
-	// after the Review drain already ran.
-	current, err := c.projectTasks(ctx, project.Key)
+	current, err := c.projectTasks(ctx, projectKey)
 	if err != nil {
 		if _, releaseErr := c.releaseSlot(ctx, st, token); releaseErr != nil {
-			return st, false, fmt.Errorf("recheck dependencies for task %s: %w; release its slot: %w",
+			return st, fmt.Errorf("recheck dependencies for task %s: %w; release its slot: %w",
 				st.ID, err, releaseErr)
 		}
-		return st, false, fmt.Errorf("recheck dependencies for task %s: %w", st.ID, err)
+		return st, fmt.Errorf("recheck dependencies for task %s: %w", st.ID, err)
 	}
+	// Rechecking dependencies after the drain prevents stale admission when a
+	// primary disposition races the queue walk.
 	if ok, _ := c.dispatchable(current, st); !ok {
 		if _, err := c.releaseSlot(ctx, st, token); err != nil {
-			return st, false, fmt.Errorf("release provisioning slot for dependency-gated task %s: %w", st.ID, err)
+			return st, fmt.Errorf("release provisioning slot for dependency-gated task %s: %w", st.ID, err)
 		}
-		return st, false, nil
+		return st, nil
 	}
-	provisioned, err := c.provision(ctx, st, slotClaim{token: token})
-	return provisioned, false, err
+	return c.provision(ctx, st, slotClaim{token: token})
 }
 
 // ResumeDispatch advances a recorded task from its persisted phase. It is
@@ -584,7 +589,7 @@ func (c *Coordinator) drainQueued(ctx context.Context, projectKey, excluded stri
 	var drained []task.Task
 	for _, cand := range queued {
 		if cand.ID == excluded || cand.Phase != task.Intent || cand.Blocker != "" ||
-			cand.Disposition != "" || len(cand.Checks) == 0 {
+			cand.Disposition != "" || (cand.Role != task.TaskRolePlan && len(cand.Checks) == 0) {
 			continue
 		}
 		if ok, _ := c.dispatchable(queued, cand); !ok {
@@ -605,15 +610,29 @@ func (c *Coordinator) drainQueued(ctx context.Context, projectKey, excluded stri
 			// has not admitted anything and the caller has to know.
 			return drained, fmt.Errorf("claim the provisioning slot of task %s while draining %s: %w", cand.ID, projectKey, err)
 		}
+		claim := slotClaim{token: token}
 		if !took {
-			// Somebody already holds this task's claim: it is being provisioned right
-			// now, or it is waiting for a deliberate resume. A drain must never
-			// provision a task another caller owns — that would race the same branch,
-			// the same pane and the same brief — and it must not renew that caller's
-			// claim either: the renewal belongs to the caller that decided to use it.
-			continue
+			// Somebody already holds this task's claim. While the claim is in use
+			// (fresh, or under a live step) its caller is provisioning the task, and a
+			// drain must never provision a task another caller owns - that would race
+			// the same branch, the same pane and the same brief - nor renew that
+			// caller's claim. A claim nobody has used for a whole step lease is
+			// different: its caller stopped between claiming the slot and recording
+			// the task's first resource (a crash, or a bridge killed on its timeout),
+			// and nothing else would ever continue the task, since startup leaves
+			// intents to the drain. So the drain continues it the way a deliberate
+			// resume does: provision takes the step claim first and only then renews
+			// the slot, so a caller that is alive after all keeps its step.
+			abandoned, err := c.store.SlotClaimAbandoned(ctx, cand.ID, c.opts.StepLease)
+			if err != nil {
+				return drained, fmt.Errorf("read the slot claim of task %s while draining %s: %w", cand.ID, projectKey, err)
+			}
+			if !abandoned {
+				continue
+			}
+			claim = slotClaim{renew: true}
 		}
-		provisioned, err := c.provision(ctx, cand, slotClaim{token: token})
+		provisioned, err := c.provision(ctx, cand, claim)
 		if err != nil {
 			// The claim this candidate took is given back by provision when it turns
 			// out not to own the step (only that token, never another caller's), so the

@@ -1168,6 +1168,71 @@ func TestDrainNeverProvisionsATaskAnotherCallerClaimed(t *testing.T) {
 	}
 }
 
+// A claim no step has used for a whole lease was left by a caller that stopped
+// between claiming the task's slot and recording its first resource (a crash, or
+// a bridge killed on its timeout). Nothing else continues such a task - startup
+// leaves intents to the drain, and the drain left every held claim alone - so a
+// moved ticket stayed in planning with a slot spent. The drain continues it the
+// way a deliberate resume does, exactly once; a fresh claim stays its caller's.
+func TestDrainContinuesAnIntentWhoseSlotClaimOutlivedItsCaller(t *testing.T) {
+	for _, kind := range []string{"planner", "ordinary"} {
+		t.Run(kind, func(t *testing.T) {
+			ctx := context.Background()
+			f := newCoordFixture(t, fixturePlan{})
+			key := f.projectKey()
+			var intent task.Task
+			if kind == "planner" {
+				ticket := f.newTicket(key, "plan after a crash")
+				id, branch, err := f.coord.newIdentity()
+				if err != nil {
+					t.Fatalf("newIdentity: %v", err)
+				}
+				_, intent, err = f.store.MoveTicketToTodoWithPlannerTask(ctx, ticket.ID, ticket.Revision, task.Task{
+					ID: id, ProjectKey: key, Title: "Plan: " + ticket.Title, Brief: "Plan only.", BaseRevision: f.base,
+					Branch: branch, Phase: task.Intent, TicketID: ticket.ID, Role: task.TaskRolePlan,
+				})
+				if err != nil {
+					t.Fatalf("record the move and its planner intent: %v", err)
+				}
+			} else {
+				request, err := newDispatchRequest("after a crash", "Do the work.", []string{"go test ./... ok"}, nil, nil)
+				if err != nil {
+					t.Fatalf("newDispatchRequest: %v", err)
+				}
+				if intent, _, err = f.coord.recordTaskIntent(ctx, key, request, f.base); err != nil {
+					t.Fatalf("record the task intent: %v", err)
+				}
+			}
+			// The caller that claimed the slot stopped before its first step.
+			if took, _, err := f.store.ClaimProvisioningSlot(ctx, intent.ID, 3); err != nil || !took {
+				t.Fatalf("the stopped caller's claim = (%v, %v), want it taken", took, err)
+			}
+			// While the claim is fresh it is its caller's, and a drain leaves it alone.
+			if _, err := f.coord.DrainQueued(ctx, key); err != nil {
+				t.Fatalf("DrainQueued (fresh claim): %v", err)
+			}
+			if got := f.taskByID(t, intent.ID); got.Phase != task.Intent || f.countCalls("worktree create") != 0 {
+				t.Fatalf("the drain provisioned a fresh claim another caller holds: %+v", got)
+			}
+			// A whole lease later nobody is using it, so the drain continues it.
+			short := f.shortLeaseCoordinator(t)
+			time.Sleep(100 * time.Millisecond)
+			drained, err := short.DrainQueued(ctx, key)
+			if err != nil {
+				t.Fatalf("DrainQueued (abandoned claim): %v", err)
+			}
+			if len(drained) != 1 || drained[0].ID != intent.ID {
+				t.Fatalf("the drain must continue the abandoned intent %s: %+v", intent.ID, drained)
+			}
+			assertStepCompleted(t, f, intent.ID, 1, 1)
+			if _, err := short.DrainQueued(ctx, key); err != nil {
+				t.Fatalf("DrainQueued (again): %v", err)
+			}
+			assertStepCompleted(t, f, intent.ID, 1, 1)
+		})
+	}
+}
+
 // ---------------------------------------------------------------------------
 // ownership rechecks
 // ---------------------------------------------------------------------------
