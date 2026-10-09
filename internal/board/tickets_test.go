@@ -962,11 +962,10 @@ func TestControlCharactersInStoredTextNeverReachTheScreen(t *testing.T) {
 
 // NewBoard now delegates to NewBoardWithTickets, so comparing the two renders (as
 // TestBoardWithoutTicketsRendersExactlyAsBefore does) cannot catch a change in the
-// no-ticket output. These are the SHA-256 digests of what the board package at
-// commit 10794e3 (before ticket support; master's 86ff721 has the same board
-// package) rendered for the same cards, widths and selections, so an extra blank
-// line, a moved rule or a changed help line fails here.
-func TestBoardWithoutTicketsMatchesTheRenderRecordedBeforeTickets(t *testing.T) {
+// no-ticket output. These SHA-256 digests record the board after f653bb6 added the
+// search footer (the current base's no-ticket render) for these cards, widths, and
+// selections. Ticket rendering must not change that baseline.
+func TestBoardWithoutTicketsMatchesTheSearchBaseline(t *testing.T) {
 	cards := []Card{
 		{Task: sampleTask("orch_a", nil), Stage: task.Running},
 		{Task: sampleTask("orch_b", func(x *task.Task) { x.Disposition = "integrated" }), Stage: task.Done},
@@ -977,12 +976,12 @@ func TestBoardWithoutTicketsMatchesTheRenderRecordedBeforeTickets(t *testing.T) 
 		"expanded": {SelectedID: "orch_a", Expanded: true},
 	}
 	want := map[string]string{
-		"100/none":     "7982b6688cad0403de40772e476d02f18060dc40b0eeb4bfdba427d4f34ed5cc",
-		"100/selected": "a9f1e6bc6476de12444e37c94625bf9d391e88b24fb92bf006404d37f5dc5b81",
-		"100/expanded": "f3cd59451cf5fe44a48cc6287759e3ac756b19011c2effb272e38764850b6431",
-		"80/none":      "99b71a94b5cb0e11ecb753f65a274954bd5de700ac8a9b29ebab9da78284cfc3",
-		"80/selected":  "9b02898442e3b63e664cf54943d82536c3574689b77d84227177666ef9274a55",
-		"80/expanded":  "9a456d9462349f84412e46159669c30c9a685285a8ae806641815110fdbbcfd2",
+		"100/none":     "263c7331e70d55a87fd3ef4dd9a1385daa921577a6d31a026c3c7e15e94fb393",
+		"100/selected": "3fc1d5f6585ec75ff3eb6d7f8af5d6d07b661e533d2f3e7b9a0b90588cfb064b",
+		"100/expanded": "06eca67407fa95564743ee794a29f05ec46d547ba6c102942a88a63118bb02bd",
+		"80/none":      "0f53761920731b01c96057d061a9021e10c8099ac63861075d1acd81a99c1c2b",
+		"80/selected":  "3b7da3cd845c34e5515cf2ae5f17924baf9f846d69af161a613b03d198e0b10c",
+		"80/expanded":  "8d5f702422c13760abd1e9a3c1caa88d4c845abbda0c68a0288550f860bad8ef",
 	}
 	digest := func(out string) string {
 		sum := sha256.Sum256([]byte(out))
@@ -997,7 +996,7 @@ func TestBoardWithoutTicketsMatchesTheRenderRecordedBeforeTickets(t *testing.T) 
 			}
 		}
 	}
-	const emptyWant = "b4c9f352f166d3725b0287fb44e6726c5917b751590fab2137316fa22bfd3db2"
+	const emptyWant = "2038e9b8bae0808a5a7020218b37603113c9f002ea5622ec3dffbc4d000bb054"
 	if out := Render(NewBoard(nil), Detail{}, 80, ticketTheme); digest(out) != emptyWant {
 		t.Errorf("the empty no-ticket board changed:\n%s", out)
 	}
