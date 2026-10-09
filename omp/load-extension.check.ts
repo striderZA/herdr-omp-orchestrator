@@ -1967,6 +1967,7 @@ async function checkRoleToolAccess(): Promise<void> {
     bound: true,
     role: "worker",
     taskRole: "plan",
+    taskRoleKnown: true,
     branch: "orch/abc123def456",
     reason: "",
     attention: "",
@@ -1975,6 +1976,7 @@ async function checkRoleToolAccess(): Promise<void> {
   };
   const workerResolve = {
     bound: true,
+    taskRoleKnown: true,
     role: "worker",
     branch: "orch/0123456789ab",
     reason: "",
@@ -2094,6 +2096,39 @@ async function checkRoleToolAccess(): Promise<void> {
     workerPrompt.startsWith("Work only in this assigned worktree."),
     `the implementation worker prompt changed: ${workerPrompt.slice(0, 80)}`,
   );
+  for (const [label, invalidResolve] of [
+    [
+      "missing",
+      {
+        bound: true,
+        role: "worker",
+        branch: "orch/0123456789ab",
+        reason: "",
+        attention: "",
+        taskId: "orch_0123456789ab",
+        projectKey: "C:/repo",
+      },
+    ],
+    ["unknown", { ...workerResolve, taskRole: "operator" }],
+  ] as const) {
+    const uncertainWorker = session(launchTools);
+    await uncertainWorker.start(invalidResolve);
+    check(
+      sameTools(uncertainWorker.activeTools, readOnly),
+      `a bound worker with ${label} taskRole metadata was not restricted to read-only tools: ${listed(uncertainWorker.activeTools)}`,
+    );
+    for (const name of ["write", "edit", "bash", "orch_report"]) {
+      check(
+        blocked(await uncertainWorker.call(name), name),
+        `a bound worker with ${label} taskRole metadata could call ${name}`,
+      );
+    }
+    await uncertainWorker.start(workerResolve);
+    check(
+      sameTools(uncertainWorker.activeTools, readOnly) && blocked(await uncertainWorker.call("orch_report"), "orch_report"),
+      `a later resolve lifted the ${label} taskRole restriction`,
+    );
+  }
 
   const noGlob = session(launchTools.filter((name) => name !== "glob"));
   await noGlob.start(primaryResolve);

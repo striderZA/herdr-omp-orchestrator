@@ -1208,13 +1208,19 @@ func TestBridgeResolveReportsTheWorkerTaskRoleAndBranch(t *testing.T) {
 	if _, ok := raw["taskRole"]; ok {
 		t.Errorf("an implementation worker's resolve must omit taskRole: %s", f.rawKeys(raw))
 	}
+	if value, ok := raw["taskRoleKnown"]; !ok || string(value) != "true" {
+		t.Errorf("a bound worker must explicitly confirm its task role, got %s", f.rawKeys(raw))
+	}
 
-	planner, _ := resolve(plannerPane, plannerSession)
+	planner, raw := resolve(plannerPane, plannerSession)
 	if !planner.Bound || planner.Role != string(state.RoleWorker) || planner.TaskID != "p1" {
 		t.Fatalf("planner resolve = %+v, want the bound worker p1", planner)
 	}
 	if planner.TaskRole != string(task.TaskRolePlan) || planner.Branch != "orch/p1" {
 		t.Errorf("planner resolve role/branch = %q/%q, want plan/orch/p1", planner.TaskRole, planner.Branch)
+	}
+	if value, ok := raw["taskRoleKnown"]; !ok || string(value) != "true" {
+		t.Errorf("a bound planner must explicitly confirm its task role, got %s", f.rawKeys(raw))
 	}
 
 	primary, raw := resolve(primaryPane, primarySession)
@@ -1224,7 +1230,7 @@ func TestBridgeResolveReportsTheWorkerTaskRoleAndBranch(t *testing.T) {
 	if primary.TaskRole != "" || primary.Branch != "" || primary.Protocol != 1 {
 		t.Errorf("primary resolve role/branch/protocol = %q/%q/%d, want \"\"/\"\"/1", primary.TaskRole, primary.Branch, primary.Protocol)
 	}
-	for _, key := range []string{"taskRole", "branch"} {
+	for _, key := range []string{"taskRole", "taskRoleKnown", "branch"} {
 		if _, ok := raw[key]; ok {
 			t.Errorf("a primary resolve must omit %s: %s", key, f.rawKeys(raw))
 		}

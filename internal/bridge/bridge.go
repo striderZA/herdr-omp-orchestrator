@@ -854,24 +854,26 @@ func (h *handler) prepare() error {
 // ResolveResult is what resolve returns: either a bound role with its recorded
 // identities, or an explicit reason it could not be proven. It is an exported
 // wire contract because the generated extension and the tests read these names.
-// TaskRole and Branch are additive worker facts (protocol 1 is unchanged): the
-// extension reads the persisted role to give a planner its read-only tools, and
-// a planner without a shell learns the branch its final report must name.
+// TaskRole and TaskRoleKnown distinguish a confirmed empty implementation role
+// from a bridge that does not know the worker's role; Branch carries the planner's
+// own branch because a read-only planner cannot ask Git for it. These fields are
+// additive (protocol 1 is unchanged).
 type ResolveResult struct {
-	Bound        bool   `json:"bound"`
-	Reason       string `json:"reason,omitempty"`
-	Attention    string `json:"attention,omitempty"`
-	Role         string `json:"role,omitempty"`
-	ProjectKey   string `json:"projectKey,omitempty"`
-	TaskID       string `json:"taskId,omitempty"`
-	TaskRole     string `json:"taskRole,omitempty"`
-	Branch       string `json:"branch,omitempty"`
-	LaunchPaneID string `json:"launchPaneId,omitempty"`
-	PublicPaneID string `json:"publicPaneId,omitempty"`
-	TerminalID   string `json:"terminalId,omitempty"`
-	WorktreeID   string `json:"worktreeId,omitempty"`
-	Rebound      bool   `json:"rebound"`
-	Protocol     int    `json:"protocol"`
+	Bound         bool   `json:"bound"`
+	Reason        string `json:"reason,omitempty"`
+	Attention     string `json:"attention,omitempty"`
+	Role          string `json:"role,omitempty"`
+	ProjectKey    string `json:"projectKey,omitempty"`
+	TaskID        string `json:"taskId,omitempty"`
+	TaskRole      string `json:"taskRole,omitempty"`
+	TaskRoleKnown bool   `json:"taskRoleKnown,omitempty"`
+	Branch        string `json:"branch,omitempty"`
+	LaunchPaneID  string `json:"launchPaneId,omitempty"`
+	PublicPaneID  string `json:"publicPaneId,omitempty"`
+	TerminalID    string `json:"terminalId,omitempty"`
+	WorktreeID    string `json:"worktreeId,omitempty"`
+	Rebound       bool   `json:"rebound"`
+	Protocol      int    `json:"protocol"`
 }
 
 // ReadyResult is the answer to `ready`: the handshake was recorded, still
@@ -1470,6 +1472,7 @@ func boundResult(b state.Binding, rebound bool) ResolveResult {
 	result.ProjectKey = b.Task.ProjectKey
 	result.TaskID = b.Task.ID
 	result.TaskRole = string(b.Task.Role)
+	result.TaskRoleKnown = true
 	result.Branch = b.Task.Branch
 	result.TerminalID = b.Task.TerminalID
 	result.WorktreeID = b.Task.WorktreeWorkspaceID

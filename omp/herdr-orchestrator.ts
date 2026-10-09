@@ -43,6 +43,7 @@ interface ResolveBinding {
   // A worker's persisted task role ("plan" for a ticket's planner, "" for
   // implementation work) and its own branch; both empty for a primary.
   taskRole: string;
+  taskRoleKnown: boolean;
   branch: string;
 }
 
@@ -79,6 +80,9 @@ function readResolveBinding(value: unknown): ResolveBinding {
   const record: Record<string, unknown> =
     typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
   const role = record.role;
+  const taskRoleValue = record.taskRole;
+  const taskRoleKnown = record.taskRoleKnown === true &&
+    (taskRoleValue === undefined || typeof taskRoleValue === "string");
   const text = (key: string): string => (typeof record[key] === "string" ? String(record[key]) : "");
   return {
     bound: record.bound === true,
@@ -88,6 +92,7 @@ function readResolveBinding(value: unknown): ResolveBinding {
     taskId: text("taskId"),
     projectKey: text("projectKey"),
     taskRole: text("taskRole"),
+    taskRoleKnown,
     branch: text("branch"),
   };
 }
@@ -1066,6 +1071,9 @@ export default function (pi: ExtensionAPI, options: ExtensionOptions = {}) {
   // The verified planner's branch for its role prompt; null for every other role.
   let plannerBranch: string | null = null;
   const warnedBindingAttention = new Set<string>();
+  // A malformed or older resolve answer for a bound worker cannot distinguish a
+  // planner from implementation work. Keep the process read-only for its lifetime.
+  let roleMetadataRejected = false;
 
   // activate asks the bridge to prove this process's binding, then activates
   // exactly the verified role's tools; nothing is written when the active set
@@ -1076,6 +1084,28 @@ export default function (pi: ExtensionAPI, options: ExtensionOptions = {}) {
   // else OMP may enable later. A later resolve never lifts that restriction.
   async function activate(identity: SessionIdentity, notify: (message: string) => void): Promise<Role | null> {
     const binding = readResolveBinding(await activationBridge("resolve", identity));
+    const invalidBoundRole = binding.bound && (
+      binding.role === null ||
+      (binding.role === "worker" &&
+        (!binding.taskRoleKnown || (binding.taskRole !== "" && binding.taskRole !== "plan")))
+    );
+    if (invalidBoundRole && !roleMetadataRejected) {
+      notify(
+        `Orchestrator role metadata for bound worker task ${binding.taskId || "(unknown)"} is missing or unsupported; ` +
+          "the session is restricted to read-only tools until its bridge and extension are updated together.",
+      );
+    }
+    roleMetadataRejected ||= invalidBoundRole;
+    if (roleMetadataRejected) {
+      readOnly = true;
+      role = null;
+      plannerBranch = null;
+      allowedTools = new Set(READ_ONLY_TOOL_NAMES);
+      const current = pi.getActiveTools();
+      const desired = current.filter((name: string) => READ_ONLY_TOOL_NAMES.includes(name));
+      if (desired.join("\0") !== current.join("\0")) await pi.setActiveTools(desired);
+      return null;
+    }
     const nextRole = binding.bound ? binding.role : null;
     const planner = nextRole === "worker" && binding.taskRole === "plan";
     if (nextRole === "primary" || planner) readOnly = true;
