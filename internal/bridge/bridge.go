@@ -411,11 +411,11 @@ func CoordinatorOps(c *coord.Coordinator) Ops {
 			return result, coordError(err)
 		},
 		TicketList: func(ctx context.Context, p Principal, params json.RawMessage) (any, error) {
-			var request struct{}
+			var request coord.TicketListParams
 			if err := decodeParams(params, &request); err != nil {
 				return nil, err
 			}
-			result, err := c.ListTicketsFor(ctx, p.ProjectKey)
+			result, err := c.ListTicketsFor(ctx, p.ProjectKey, request)
 			return result, coordError(err)
 		},
 		TicketMovePreview: func(ctx context.Context, p Principal, params json.RawMessage) (any, error) {

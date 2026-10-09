@@ -140,12 +140,16 @@ func TestBridgeTicketPreflightAndReviewRoundTrip(t *testing.T) {
 	if created.Column != task.ColumnBacklog || created.Stage != task.TicketBacklog || !strings.HasPrefix(created.TicketID, "tkt_") {
 		t.Fatalf("created = %+v, want a backlog ticket", created)
 	}
+	second := f.ticketView(ops, MethodTicketCreate, `{"title":"Add logging"}`)
 
 	var listed coord.TicketListResult
-	f.ticketCall(ops, MethodTicketList, `{}`).decodeResult(t, &listed)
-	if len(listed.Tickets) != 1 || listed.Tickets[0].TicketID != created.TicketID || listed.Tickets[0].Stage != task.TicketBacklog {
-		t.Fatalf("list = %+v, want the one backlog ticket", listed)
+	f.ticketCall(ops, MethodTicketList, `{"limit":1}`).decodeResult(t, &listed)
+	if len(listed.Tickets) != 1 || listed.Total != 2 || !listed.Truncated ||
+		(listed.Tickets[0].TicketID != created.TicketID && listed.Tickets[0].TicketID != second.TicketID) ||
+		listed.Tickets[0].Stage != task.TicketBacklog {
+		t.Fatalf("list = %+v, want one bounded backlog ticket from total two", listed)
 	}
+	wantError(t, f.ticketCall(ops, MethodTicketList, `{"limit":-1}`), "bad_request")
 
 	preview := f.ticketView(ops, MethodTicketMovePreview, ticketBody(t, map[string]any{"ticketId": created.TicketID}))
 	if preview.Digest == "" || preview.Digest != created.Digest {

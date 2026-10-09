@@ -536,10 +536,9 @@ const toolCalls: { name: string; params: Record<string, unknown>; bad: Record<st
   },
   { name: "orch_cleanup", params: { taskId: "orch_abc" }, bad: {} },
   // The ticket tools: creating and listing are inert facts, moving and closing a
-  // ticket are user decisions. `orch_ticket_list` takes no arguments, so it has
-  // no empty call to refuse.
+  // ticket are user decisions. Ticket listing accepts only an optional row limit.
   { name: "orch_ticket_create", params: { title: "Add search" }, bad: { title: "" } },
-  { name: "orch_ticket_list", params: {}, bad: null },
+  { name: "orch_ticket_list", params: { limit: 20 }, bad: { limit: 0 } },
   { name: "orch_ticket_move", params: { ticketId: "tkt_abc" }, bad: { ticketId: "" } },
   {
     name: "orch_ticket_review",

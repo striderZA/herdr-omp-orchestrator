@@ -1404,10 +1404,12 @@ export default function (pi: ExtensionAPI, options: ExtensionOptions = {}) {
     label: "List tickets",
     defaultInactive: true,
     description:
-      "List this project's tickets, oldest first, with each ticket's column, derived stage and linked task ids. A ticket's stage comes from its tasks and the user's decision, never from terminal activity.",
-    parameters: z.object({}),
-    async execute(_callId, _params, signal, _update, ctx) {
-      return toolResult(await callBridge("ticket_list", {}, sessionIdentity(ctx.sessionManager), signal));
+      "List this project's tickets, oldest first, with each ticket's column, derived stage and linked task ids. Optionally set a row limit (default 50, maximum 200). total and truncated report cuts to the rows or JSON byte budget; titleTruncated, bodyTruncated, dispositionTruncated and taskIdsTruncated mark shortened fields within a row. A ticket's stage comes from its tasks and the user's decision, never from terminal activity.",
+    parameters: z.object({
+      limit: z.number().int().min(1).max(LIST_LIMIT_MAX).optional(),
+    }),
+    async execute(_callId, params, signal, _update, ctx) {
+      return toolResult(await callBridge("ticket_list", params, sessionIdentity(ctx.sessionManager), signal));
     },
   });
 

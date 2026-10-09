@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -195,7 +196,7 @@ func TestListTicketsForShowsOnlyThisProjectsTicketsWithDerivedStage(t *testing.T
 	f.linkedTask(key, first.ID, "orch_one")
 	f.linkedTask(key, first.ID, "orch_two")
 
-	list, err := f.coord.ListTicketsFor(ctx, key)
+	list, err := f.coord.ListTicketsFor(ctx, key, TicketListParams{})
 	if err != nil {
 		t.Fatalf("ListTicketsFor: %v", err)
 	}
@@ -211,12 +212,143 @@ func TestListTicketsForShowsOnlyThisProjectsTicketsWithDerivedStage(t *testing.T
 
 	f.closeTask("orch_one")
 	f.closeTask("orch_two")
-	list, err = f.coord.ListTicketsFor(ctx, key)
+	list, err = f.coord.ListTicketsFor(ctx, key, TicketListParams{})
 	if err != nil || list.Tickets[0].Stage != task.TicketReadyForReview {
 		t.Fatalf("every linked task closed reads ready for review: %+v, %v", list.Tickets, err)
 	}
-	if _, err := f.coord.ListTicketsFor(ctx, "E:/never/bound"); !errors.Is(err, ErrProjectUnknown) {
+	if _, err := f.coord.ListTicketsFor(ctx, "E:/never/bound", TicketListParams{}); !errors.Is(err, ErrProjectUnknown) {
 		t.Fatalf("an unbound project key = %v, want ErrProjectUnknown", err)
+	}
+}
+
+func TestListTicketsForCannotOverflowBridgeResponse(t *testing.T) {
+	ctx := context.Background()
+	f, key := ticketFixture(t)
+	body := strings.Repeat("<", 1500)
+	for i := range 120 {
+		if _, err := f.coord.CreateTicketFor(ctx, key, TicketCreateParams{Title: "large ticket", Body: body}); err != nil {
+			t.Fatalf("CreateTicketFor large ticket %d: %v", i, err)
+		}
+	}
+	got, err := f.coord.ListTicketsFor(ctx, key, TicketListParams{Limit: InspectMaxLimit})
+	if err != nil {
+		t.Fatalf("ListTicketsFor: %v", err)
+	}
+	encoded, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("encode ticket list: %v", err)
+	}
+	if len(encoded) > 1<<20 {
+		t.Fatalf("ticket list is %d bytes, over bridge's 1 MiB response bound", len(encoded))
+	}
+	var metadata struct {
+		Total     int  `json:"total"`
+		Truncated bool `json:"truncated"`
+	}
+	if err := json.Unmarshal(encoded, &metadata); err != nil {
+		t.Fatalf("decode ticket list metadata: %v", err)
+	}
+	if metadata.Total != 120 || !metadata.Truncated {
+		t.Fatalf("bounded list metadata = total %d, truncated %v; want total 120 and truncated", metadata.Total, metadata.Truncated)
+	}
+}
+
+func TestListTicketsForUsesDefaultRowLimit(t *testing.T) {
+	ctx := context.Background()
+	f, key := ticketFixture(t)
+	for range InspectDefaultLimit + 1 {
+		f.newTicket(key, "ticket")
+	}
+	got, err := f.coord.ListTicketsFor(ctx, key, TicketListParams{})
+	if err != nil {
+		t.Fatalf("ListTicketsFor: %v", err)
+	}
+	if len(got.Tickets) > InspectDefaultLimit {
+		t.Fatalf("default list returned %d tickets, over the %d row limit", len(got.Tickets), InspectDefaultLimit)
+	}
+	encoded, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("encode ticket list metadata: %v", err)
+	}
+	var metadata struct {
+		Total     int  `json:"total"`
+		Truncated bool `json:"truncated"`
+	}
+	if err := json.Unmarshal(encoded, &metadata); err != nil {
+		t.Fatalf("decode ticket list metadata: %v", err)
+	}
+	if metadata.Total != InspectDefaultLimit+1 || !metadata.Truncated {
+		t.Fatalf("default list metadata = total %d, truncated %v; want total %d and truncated",
+			metadata.Total, metadata.Truncated, InspectDefaultLimit+1)
+	}
+}
+
+func TestListTicketsHonorsRequestedRowLimit(t *testing.T) {
+	ctx := context.Background()
+	f, key := ticketFixture(t)
+	for range 3 {
+		f.newTicket(key, "ticket")
+	}
+	got, err := f.coord.ListTicketsFor(ctx, key, TicketListParams{Limit: 2})
+	if err != nil {
+		t.Fatalf("ListTicketsFor: %v", err)
+	}
+	if len(got.Tickets) != 2 || got.Total != 3 || !got.Truncated {
+		t.Fatalf("explicit limit result = %d tickets, total %d, truncated %v; want 2, 3, true",
+			len(got.Tickets), got.Total, got.Truncated)
+	}
+}
+
+func TestListTicketsRefusesInvalidLimits(t *testing.T) {
+	f, key := ticketFixture(t)
+	for name, limit := range map[string]int{
+		"negative":  -1,
+		"too large": InspectMaxLimit + 1,
+	} {
+		if _, err := f.coord.ListTicketsFor(context.Background(), key, TicketListParams{Limit: limit}); !errors.Is(err, ErrInvalidRequest) {
+			t.Errorf("%s limit: ListTicketsFor = %v, want ErrInvalidRequest", name, err)
+		}
+	}
+}
+
+func TestListTicketsTruncatesBodyAndLinkedTaskIDs(t *testing.T) {
+	ctx := context.Background()
+	f, key := ticketFixture(t)
+	body := strings.Repeat("é", inspectTextLimit+1)
+	created, err := f.coord.CreateTicketFor(ctx, key, TicketCreateParams{Title: "ticket", Body: body})
+	if err != nil {
+		t.Fatalf("CreateTicketFor: %v", err)
+	}
+	f.acceptedPlanner(key, created.TicketID)
+	for i := range InspectMaxLimit + 1 {
+		f.linkedTask(key, created.TicketID, fmt.Sprintf("orch_%03d", i))
+	}
+	got, err := f.coord.ListTicketsFor(ctx, key, TicketListParams{})
+	if err != nil {
+		t.Fatalf("ListTicketsFor: %v", err)
+	}
+	entry := got.Tickets[0]
+	if entry.Body != strings.Repeat("é", inspectTextLimit)+"…" {
+		t.Errorf("listed body has %d runes; want %d and an ellipsis", len([]rune(entry.Body)), inspectTextLimit+1)
+	}
+	if len(entry.TaskIDs) != InspectMaxLimit {
+		t.Errorf("listed task ids = %d, want the bounded %d", len(entry.TaskIDs), InspectMaxLimit)
+	}
+	encoded, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("encode ticket list: %v", err)
+	}
+	var metadata struct {
+		Tickets []struct {
+			BodyTruncated    bool `json:"bodyTruncated"`
+			TaskIDsTruncated bool `json:"taskIdsTruncated"`
+		} `json:"tickets"`
+	}
+	if err := json.Unmarshal(encoded, &metadata); err != nil {
+		t.Fatalf("decode ticket list truncation metadata: %v", err)
+	}
+	if len(metadata.Tickets) != 1 || !metadata.Tickets[0].BodyTruncated || !metadata.Tickets[0].TaskIDsTruncated {
+		t.Fatalf("ticket truncation metadata = %+v, want both fields marked", metadata.Tickets)
 	}
 }
 
@@ -619,7 +751,7 @@ func TestDispatchLinksATaskToATicketAfterItsPlanIsAccepted(t *testing.T) {
 	if err != nil || stored.TicketID != ticket.ID {
 		t.Fatalf("the implementation task must carry the ticket id: %+v, %v", stored, err)
 	}
-	list, err := f.coord.ListTicketsFor(ctx, key)
+	list, err := f.coord.ListTicketsFor(ctx, key, TicketListParams{})
 	if err != nil || len(list.Tickets) != 1 {
 		t.Fatalf("ListTicketsFor = %+v, %v", list, err)
 	}

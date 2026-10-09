@@ -86,8 +86,8 @@ type TicketReviewParams struct {
 	Disposition string `json:"disposition"`
 }
 
-// TicketView is the durable facts of one ticket plus its derived stage and the
-// tasks linked to it. Digest is the confirmation token for the facts shown.
+// TicketView is the full durable ticket fact plus its derived stage and linked
+// tasks. Digest confirms the full persisted facts, even when a list shortens text.
 type TicketView struct {
 	TicketID    string           `json:"ticketId"`
 	Title       string           `json:"title"`
@@ -101,9 +101,28 @@ type TicketView struct {
 	Disposition string           `json:"disposition,omitempty"`
 }
 
-// TicketListResult is the ticket_list answer.
+// TicketListParams is the ticket_list request body.
+type TicketListParams struct {
+	// Limit is the most rows to return; zero means InspectDefaultLimit.
+	Limit int `json:"limit"`
+}
+
+// TicketListEntry is one bounded ticket_list row. Display fields and linked task
+// ids carry markers when the list shortens them; use the ticket preview for full facts.
+type TicketListEntry struct {
+	TicketView
+	TitleTruncated       bool `json:"titleTruncated,omitempty"`
+	BodyTruncated        bool `json:"bodyTruncated,omitempty"`
+	TaskIDsTruncated     bool `json:"taskIdsTruncated,omitempty"`
+	DispositionTruncated bool `json:"dispositionTruncated,omitempty"`
+}
+
+// TicketListResult is the ticket_list answer. Total counts the project's tickets
+// before row or byte bounds are applied.
 type TicketListResult struct {
-	Tickets []TicketView `json:"tickets"`
+	Tickets   []TicketListEntry `json:"tickets"`
+	Total     int               `json:"total"`
+	Truncated bool              `json:"truncated"`
 }
 
 // CreateTicketFor records a new ticket in the backlog of an already authorized
@@ -150,9 +169,14 @@ func (c *Coordinator) CreateTicketFor(ctx context.Context, projectKey string, p 
 	return TicketView{}, fmt.Errorf("record a ticket: %w", lastErr)
 }
 
-// ListTicketsFor lists the tickets of one project, oldest first, each with its
-// derived stage and linked task ids.
-func (c *Coordinator) ListTicketsFor(ctx context.Context, projectKey string) (TicketListResult, error) {
+// ListTicketsFor lists this project's tickets oldest first. It bounds the result
+// to a requested row count and a JSON byte budget, preserving a visible marker when
+// the list or a row's display fields are shortened.
+func (c *Coordinator) ListTicketsFor(ctx context.Context, projectKey string, p TicketListParams) (TicketListResult, error) {
+	limit, err := inspectLimit(p.Limit)
+	if err != nil {
+		return TicketListResult{}, err
+	}
 	project, err := c.project(ctx, projectKey)
 	if err != nil {
 		return TicketListResult{}, err
@@ -165,11 +189,19 @@ func (c *Coordinator) ListTicketsFor(ctx context.Context, projectKey string) (Ti
 	if err != nil {
 		return TicketListResult{}, err
 	}
-	result := TicketListResult{Tickets: make([]TicketView, 0, len(tickets))}
+	entries := make([]TicketListEntry, 0, min(limit, len(tickets)))
 	for _, ticket := range tickets {
-		result.Tickets = append(result.Tickets, viewOfTicket(ticket, tasks))
+		if len(entries) >= limit {
+			break
+		}
+		entries = append(entries, ticketListEntry(viewOfTicket(ticket, tasks)))
 	}
-	return result, nil
+	kept := boundedPrefix(entries, limit)
+	return TicketListResult{
+		Tickets:   entries[:kept],
+		Total:     len(tickets),
+		Truncated: kept < len(tickets),
+	}, nil
 }
 
 // TicketPreviewFor reads one ticket and its confirmation digest. It writes
@@ -413,6 +445,21 @@ func viewOfTicket(ticket task.Ticket, tasks []task.Task) TicketView {
 		Outcome:     ticket.Outcome,
 		Disposition: ticket.Disposition,
 	}
+}
+
+func ticketListEntry(view TicketView) TicketListEntry {
+	entry := TicketListEntry{TicketView: view}
+	entry.TitleTruncated = truncateRunes(view.Title, inspectTextLimit) != view.Title
+	entry.BodyTruncated = truncateRunes(view.Body, inspectTextLimit) != view.Body
+	entry.DispositionTruncated = truncateRunes(view.Disposition, inspectTextLimit) != view.Disposition
+	entry.Title = truncateRunes(view.Title, inspectTextLimit)
+	entry.Body = truncateRunes(view.Body, inspectTextLimit)
+	entry.Disposition = truncateRunes(view.Disposition, inspectTextLimit)
+	if len(entry.TaskIDs) > InspectMaxLimit {
+		entry.TaskIDs = entry.TaskIDs[:InspectMaxLimit]
+		entry.TaskIDsTruncated = true
+	}
+	return entry
 }
 
 func sameTicketDecision(ticket task.Ticket, kind, note string) bool {
