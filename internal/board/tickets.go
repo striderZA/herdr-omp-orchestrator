@@ -343,6 +343,9 @@ func ticketPageLines(card TicketCard, width int, th Theme) []string {
 	add("Revision", strconv.FormatInt(card.Ticket.Revision, 10))
 	if card.Ticket.Decided() {
 		add("Decision", card.Ticket.Outcome+": "+card.Ticket.Disposition)
+		if card.Ticket.Successor != "" {
+			add("Successor", card.Ticket.Successor)
+		}
 	}
 	section("Body")
 	out = append(out, wrap(orNone(strings.TrimSpace(card.Ticket.Body), "none"), width)...)

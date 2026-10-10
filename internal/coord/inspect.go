@@ -52,6 +52,7 @@ type TaskEntry struct {
 	Attention   string     `json:"attention,omitempty"`
 	Outcome     string     `json:"outcome,omitempty"`
 	Disposition string     `json:"disposition,omitempty"`
+	Successor   string     `json:"successor,omitempty"`
 	TicketID    string     `json:"ticketId,omitempty"`
 }
 
@@ -230,6 +231,7 @@ func taskEntry(x task.Task) TaskEntry {
 		Attention:   truncateRunes(strings.TrimSpace(x.Attention), inspectTextLimit),
 		Outcome:     x.Outcome,
 		Disposition: truncateRunes(x.Disposition, inspectTextLimit),
+		Successor:   x.Successor,
 		TicketID:    x.TicketID,
 	}
 }

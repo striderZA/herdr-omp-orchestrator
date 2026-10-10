@@ -474,7 +474,7 @@ func TestMoveTicketRefusals(t *testing.T) {
 	}
 
 	decided := f.newTicket(key, "decided")
-	if _, err := f.store.DecideTicket(ctx, decided.ID, decided.Revision, task.OutcomeAbandoned, "no"); err != nil {
+	if _, err := f.store.DecideTicket(ctx, decided.ID, decided.Revision, task.OutcomeAbandoned, "no", ""); err != nil {
 		t.Fatalf("decide: %v", err)
 	}
 	fresh, _ := f.store.Ticket(ctx, decided.ID)
@@ -795,7 +795,7 @@ func TestDispatchRefusesAnUnusableTicketAndCreatesNothing(t *testing.T) {
 	f, key := ticketFixture(t)
 	foreign := f.foreignTicket("tkt_foreign")
 	decided := f.newTicket(key, "already decided")
-	if _, err := f.store.DecideTicket(ctx, decided.ID, decided.Revision, task.OutcomeAbandoned, "no"); err != nil {
+	if _, err := f.store.DecideTicket(ctx, decided.ID, decided.Revision, task.OutcomeAbandoned, "no", ""); err != nil {
 		t.Fatalf("decide: %v", err)
 	}
 	for name, c := range map[string]struct {
@@ -841,7 +841,7 @@ func TestDispatchRefusesATicketDecidedAfterThePreCheck(t *testing.T) {
 		t.Fatalf("newDispatchRequest: %v", err)
 	}
 	request.ticketID = ticket.ID
-	if _, err := f.store.DecideTicket(ctx, ticket.ID, ticket.Revision, task.OutcomeAbandoned, "dropped"); err != nil {
+	if _, err := f.store.DecideTicket(ctx, ticket.ID, ticket.Revision, task.OutcomeAbandoned, "dropped", ""); err != nil {
 		t.Fatalf("decide: %v", err)
 	}
 	if _, _, err := f.coord.recordTaskIntent(ctx, key, request, f.base); !errors.Is(err, ErrAlreadyDecided) {

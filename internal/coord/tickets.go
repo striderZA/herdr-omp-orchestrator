@@ -84,6 +84,9 @@ type TicketReviewParams struct {
 	Digest      string `json:"digest"`
 	Outcome     string `json:"outcome"`
 	Disposition string `json:"disposition"`
+	// Successor names the ticket that replaces this one. Only a superseded
+	// decision may name one; it is a reference, not a dependency (issue #61).
+	Successor string `json:"successor"`
 }
 
 // TicketView is the full durable ticket fact plus its derived stage and linked
@@ -99,6 +102,7 @@ type TicketView struct {
 	TaskIDs     []string         `json:"taskIds"`
 	Outcome     string           `json:"outcome,omitempty"`
 	Disposition string           `json:"disposition,omitempty"`
+	Successor   string           `json:"successor,omitempty"`
 }
 
 // TicketListParams is the ticket_list request body.
@@ -346,6 +350,9 @@ func ticketPlannerBrief(ticket task.Ticket) (string, error) {
 // has moved on), any other decision for a decided ticket is ErrAlreadyDecided,
 // and an undecided ticket needs the digest of the facts the user saw.
 //
+// A superseded decision names a successor ticket, which is checked before the
+// write; a repeat matches only when its successor matches too (issue #61).
+//
 // Whether a linked task is still open is decided by the store, inside the
 // transaction that writes the decision, never by a read here: a dispatch landing
 // between a read and the write would otherwise slip through.
@@ -362,8 +369,12 @@ func (c *Coordinator) ReviewTicketFor(ctx context.Context, projectKey string, p 
 	if err != nil {
 		return TicketView{}, err
 	}
+	successor, err := normalizeSuccessor(p.Successor)
+	if err != nil {
+		return TicketView{}, err
+	}
 	if ticket.Decided() {
-		if sameTicketDecision(ticket, kind, note) {
+		if sameTicketDecision(ticket, kind, note, successor) {
 			return c.ticketView(ctx, ticket)
 		}
 		return TicketView{}, ticketAlreadyDecided(ticket)
@@ -375,17 +386,23 @@ func (c *Coordinator) ReviewTicketFor(ctx context.Context, projectKey string, p 
 	case digest != ticket.Digest():
 		return TicketView{}, fmt.Errorf("%w: ticket %s", ErrTicketChanged, ticket.ID)
 	}
-	decided, err := c.store.DecideTicket(ctx, ticket.ID, ticket.Revision, kind, note)
+	successor, err = c.checkSuccessor(ctx, decisionSubject{projectKey: project.Key, id: ticket.ID, ticket: true}, kind, successor)
+	if err != nil {
+		return TicketView{}, err
+	}
+	decided, err := c.store.DecideTicket(ctx, ticket.ID, ticket.Revision, kind, note, successor)
 	switch {
 	case errors.Is(err, state.ErrTicketHasOpenTasks):
 		return TicketView{}, fmt.Errorf("%w: ticket %s", ErrTicketOpen, ticket.ID)
+	case errors.Is(err, state.ErrSuccessorUnavailable):
+		return TicketView{}, fmt.Errorf("%w: %w", ErrTicketUnknown, err)
 	case errors.Is(err, state.ErrConflict):
 		// Another writer landed first. If it recorded this same decision the
 		// request has succeeded; a different one stands; anything else changed
 		// the ticket under the digest.
 		current, readErr := c.store.Ticket(ctx, ticket.ID)
 		if readErr == nil && current.Decided() {
-			if sameTicketDecision(current, kind, note) {
+			if sameTicketDecision(current, kind, note, successor) {
 				return c.ticketView(ctx, current)
 			}
 			return TicketView{}, ticketAlreadyDecided(current)
@@ -444,6 +461,7 @@ func viewOfTicket(ticket task.Ticket, tasks []task.Task) TicketView {
 		TaskIDs:     ids,
 		Outcome:     ticket.Outcome,
 		Disposition: ticket.Disposition,
+		Successor:   ticket.Successor,
 	}
 }
 
@@ -462,8 +480,8 @@ func ticketListEntry(view TicketView) TicketListEntry {
 	return entry
 }
 
-func sameTicketDecision(ticket task.Ticket, kind, note string) bool {
-	return ticket.Outcome == kind && ticket.Disposition == note
+func sameTicketDecision(ticket task.Ticket, kind, note, successor string) bool {
+	return ticket.Outcome == kind && ticket.Disposition == note && ticket.Successor == successor
 }
 
 // ticketDecidedError is ErrAlreadyDecided for a ticket. It matches the sentinel,

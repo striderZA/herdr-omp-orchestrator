@@ -3446,7 +3446,7 @@ func TestAFinalReportAloneDoesNotUnlockADependent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read the bound project: %v", err)
 	}
-	result, err := f.coord.Review(ctx, project.LaunchPaneID, prereq.ID, "integrated", "accepted: the user kept the branch")
+	result, err := f.coord.Review(ctx, project.LaunchPaneID, prereq.ID, "integrated", "accepted: the user kept the branch", "")
 	if err != nil {
 		t.Fatalf("Review: %v", err)
 	}

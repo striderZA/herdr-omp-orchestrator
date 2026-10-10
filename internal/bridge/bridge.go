@@ -79,7 +79,12 @@ const (
 	MethodApproveDialog = "approve_dialog"
 	MethodReportPreview = "report_preview"
 	MethodReview        = "review"
-	MethodSettleInput   = "settle_input"
+	// MethodRepointPreview and MethodRepoint re-point queued dependents of a
+	// superseded task to its successor. The preview is read-only; the write takes
+	// the exact preview the user confirmed (issue #61).
+	MethodRepointPreview = "repoint_preview"
+	MethodRepoint        = "repoint"
+	MethodSettleInput    = "settle_input"
 	// MethodBriefInspection reads the evidence a user decides an ambiguous brief
 	// submission on. The op itself mutates nothing, but it is authorized like any
 	// other primary call: a session that has not confirmed its handshake may not
@@ -233,6 +238,8 @@ type Ops struct {
 	ApproveDialog  func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
 	ReportPreview  func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
 	Review         func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
+	RepointPreview func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
+	Repoint        func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
 	SettleInput    func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
 	CleanupPreview func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
 	Cleanup        func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
@@ -375,7 +382,23 @@ func CoordinatorOps(c *coord.Coordinator) Ops {
 			if err := decodeParams(params, &request); err != nil {
 				return nil, err
 			}
-			result, err := c.ReviewAtRevision(ctx, p.LaunchPaneID, request.TaskID, request.ExpectedRevision, request.Outcome, request.Disposition)
+			result, err := c.ReviewAtRevision(ctx, p.LaunchPaneID, request.TaskID, request.ExpectedRevision, request.Outcome, request.Disposition, request.Successor)
+			return result, coordError(err)
+		},
+		RepointPreview: func(ctx context.Context, p Principal, params json.RawMessage) (any, error) {
+			var request coord.RepointPreviewParams
+			if err := decodeParams(params, &request); err != nil {
+				return nil, err
+			}
+			result, err := c.RepointPreview(ctx, p.LaunchPaneID, request)
+			return result, coordError(err)
+		},
+		Repoint: func(ctx context.Context, p Principal, params json.RawMessage) (any, error) {
+			var request coord.RepointParams
+			if err := decodeParams(params, &request); err != nil {
+				return nil, err
+			}
+			result, err := c.Repoint(ctx, p.LaunchPaneID, request)
 			return result, coordError(err)
 		},
 		CleanupPreview: func(ctx context.Context, p Principal, params json.RawMessage) (any, error) {
@@ -483,6 +506,8 @@ func UnavailableOps(cause error) Ops {
 		BriefInspection:   unavailable,
 		AdjudicateBrief:   unavailable,
 		Review:            unavailable,
+		RepointPreview:    unavailable,
+		Repoint:           unavailable,
 		ReportPreview:     unavailable,
 		CleanupPreview:    unavailable,
 		SettleInput:       unavailable,
@@ -586,6 +611,20 @@ func coordErrorCode(err error) string {
 		return "ticket_open"
 	case errors.Is(err, coord.ErrTicketPlanNotAccepted):
 		return "ticket_plan_not_accepted"
+	case errors.Is(err, coord.ErrSuccessorRequired):
+		return "successor_required"
+	case errors.Is(err, coord.ErrSuccessorNotAllowed):
+		return "successor_not_allowed"
+	case errors.Is(err, coord.ErrSuccessorUnknown):
+		return "successor_unknown"
+	case errors.Is(err, coord.ErrSuccessorSelf):
+		return "successor_self"
+	case errors.Is(err, coord.ErrRepointRefused):
+		return "repoint_refused"
+	case errors.Is(err, coord.ErrRepointChanged):
+		return "repoint_changed"
+	case errors.Is(err, coord.ErrRepointCycle):
+		return "repoint_cycle"
 	case errors.Is(err, coord.ErrProjectUnknown):
 		return "project_unknown"
 	case errors.Is(err, coord.ErrPrimaryNotLive):
@@ -715,6 +754,10 @@ func run(ctx context.Context, env map[string]string, input io.Reader, opts Optio
 		return h.mutate(req, state.RolePrimary, announced, h.ops.ReportPreview)
 	case MethodReview:
 		return h.mutate(req, state.RolePrimary, announced, h.ops.Review)
+	case MethodRepointPreview:
+		return h.mutate(req, state.RolePrimary, announced, h.ops.RepointPreview)
+	case MethodRepoint:
+		return h.mutate(req, state.RolePrimary, announced, h.ops.Repoint)
 	case MethodCleanupPreview:
 		return h.mutate(req, state.RolePrimary, announced, h.ops.CleanupPreview)
 	case MethodBriefInspection:

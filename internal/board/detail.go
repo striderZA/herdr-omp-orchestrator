@@ -65,7 +65,7 @@ func pageLines(card Card, width int, th Theme) []string {
 		}
 	}
 
-	if len(t.Checks) > 0 || len(t.Dependencies) > 0 || len(t.ReservedPaths) > 0 || strings.TrimSpace(t.Disposition) != "" || strings.TrimSpace(t.Outcome) != "" {
+	if len(t.Checks) > 0 || len(t.Dependencies) > 0 || len(t.ReservedPaths) > 0 || strings.TrimSpace(t.Disposition) != "" || strings.TrimSpace(t.Outcome) != "" || strings.TrimSpace(t.Successor) != "" {
 		section("Plan")
 		for _, item := range t.Checks {
 			out = append(out, wrap("Required check: "+singleLine(item), width)...)
@@ -83,6 +83,9 @@ func pageLines(card Card, width int, th Theme) []string {
 		}
 		if d := singleLine(t.Disposition); d != "" {
 			add("Disposition", d)
+		}
+		if s := singleLine(t.Successor); s != "" {
+			add("Successor", s)
 		}
 	}
 	return out

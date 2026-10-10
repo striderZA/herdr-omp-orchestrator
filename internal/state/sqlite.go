@@ -483,6 +483,9 @@ func updateTask(ctx context.Context, tx *tx, id string, expectedRevision int64, 
 	if next.Role != current.Role {
 		return task.Task{}, fmt.Errorf("%w: task %q role is immutable", ErrInvalid, id)
 	}
+	if err := checkSuccessorTx(ctx, tx, current, next); err != nil {
+		return task.Task{}, err
+	}
 	if next.LaunchPaneID != current.LaunchPaneID {
 		if err := checkPaneFree(ctx, tx, next.LaunchPaneID, id); err != nil {
 			return task.Task{}, err

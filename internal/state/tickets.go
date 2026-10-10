@@ -199,7 +199,10 @@ func (s *Store) MoveTicketToTodoWithPlannerTask(
 //
 // The first decision stands: deciding a decided ticket is ErrConflict, even at
 // its current revision. The column is neither read nor changed.
-func (s *Store) DecideTicket(ctx context.Context, id string, expectedRevision int64, outcome, disposition string) (task.Ticket, error) {
+//
+// A superseded decision names its successor ticket, which the same transaction
+// checks (issue #61): it must exist, belong to this project and not be the ticket.
+func (s *Store) DecideTicket(ctx context.Context, id string, expectedRevision int64, outcome, disposition, successor string) (task.Ticket, error) {
 	tx, err := s.begin(ctx, "decide ticket "+id)
 	if err != nil {
 		return task.Ticket{}, err
@@ -227,9 +230,12 @@ func (s *Store) DecideTicket(ctx context.Context, id string, expectedRevision in
 	if open > 0 {
 		return task.Ticket{}, fmt.Errorf("%w: ticket %q has %d open task(s)", ErrTicketHasOpenTasks, id, open)
 	}
+	if err := checkTicketSuccessorTx(ctx, tx, current, outcome, successor); err != nil {
+		return task.Ticket{}, err
+	}
 
 	next := current
-	next.Outcome, next.Disposition = outcome, disposition
+	next.Outcome, next.Disposition, next.Successor = outcome, disposition, successor
 	next, err = writeTicket(ctx, tx, current, next)
 	if err != nil {
 		return task.Ticket{}, err
