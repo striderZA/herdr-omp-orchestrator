@@ -77,7 +77,11 @@ type Task struct {
 	Blocker, Attention, Disposition                     string
 	// Outcome is the structured kind of the user's decision; Disposition carries
 	// its free-text note. A closed task with an empty Outcome is a legacy row.
-	Outcome                                        string
+	Outcome string
+	// Successor names the task that replaces this one when Outcome is
+	// superseded (issue #61). It is set once, with that decision, and stays
+	// empty for every other outcome and for a legacy row.
+	Successor                                      string `json:",omitempty"`
 	Activity                                       string
 	Revision, CreatedAt, UpdatedAt, ActivitySeenAt int64
 	// TicketID names the ticket this task was dispatched for. It is set when the
