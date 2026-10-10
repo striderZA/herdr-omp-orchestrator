@@ -208,3 +208,28 @@ func TestStoreNewStepClaimClearsPriorRouteCompletion(t *testing.T) {
 		t.Fatalf("ClaimStep after the second lease expired = (%v, %v), want the live process to retain its claim", took, err)
 	}
 }
+
+func TestStoreNewSlotClaimClearsPriorRouteCompletion(t *testing.T) {
+	ctx := context.Background()
+	s := open(t, t.TempDir())
+	claimed, stored, token, err := s.ClaimTask(ctx, gateTask(t, "t-reclaimed-slot", "repo-a", nil), 1)
+	if err != nil || !claimed {
+		t.Fatalf("ClaimTask = (%v, %v), want a slot", claimed, err)
+	}
+	identity, err := state.CurrentProcessIdentity()
+	if err != nil {
+		t.Fatalf("CurrentProcessIdentity: %v", err)
+	}
+	s.MarkTaskComplete(identity, stored.ID)
+	if err := s.ReleaseProvisioningSlot(ctx, stored.ID, token); err != nil {
+		t.Fatalf("ReleaseProvisioningSlot: %v", err)
+	}
+	if claimed, _, err := s.ClaimProvisioningSlot(ctx, stored.ID, 1); err != nil || !claimed {
+		t.Fatalf("ClaimProvisioningSlot after route completion = (%v, %v), want a fresh slot", claimed, err)
+	}
+	const lease = 20 * time.Millisecond
+	time.Sleep(2 * lease)
+	if abandoned, err := s.SlotClaimAbandoned(ctx, stored.ID, lease); err != nil || abandoned {
+		t.Fatalf("fresh slot after the lease while its process is live = (%v, %v), want it retained", abandoned, err)
+	}
+}
