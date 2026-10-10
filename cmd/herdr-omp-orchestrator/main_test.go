@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -873,6 +874,125 @@ func TestDetachedRecoveryChildSurvivesTheForegroundRoute(t *testing.T) {
 	t.Fatal("recovery child did not survive the foreground process exit")
 }
 
+func TestDetachedRecoveryWorkerDoesNotPinTheCallersDirectory(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("the recovery child uses Windows breakaway process flags")
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("resolve the test binary: %v", err)
+	}
+	dir := t.TempDir()
+	caller := filepath.Join(dir, "caller")
+	if err := os.Mkdir(caller, 0o700); err != nil {
+		t.Fatalf("create the caller directory: %v", err)
+	}
+	marker := filepath.Join(dir, "route.signal")
+	ready := filepath.Join(dir, "worker.ready")
+	recovered := filepath.Join(dir, "worker.recovered")
+	if err := os.WriteFile(marker, []byte("pending"), 0o600); err != nil {
+		t.Fatalf("create the pending marker: %v", err)
+	}
+	childEnv := replaceTestEnv(os.Environ(), recoveryProcessTestEnv, "worker")
+	childEnv = replaceTestEnv(childEnv, recoveryProcessMarkerEnv, marker)
+	childEnv = replaceTestEnv(childEnv, recoveryProcessReadyEnv, ready)
+	childEnv = replaceTestEnv(childEnv, recoveryProcessRecoveredEnv, recovered)
+
+	// os.Chdir, not t.Chdir: testing keeps a handle on the directory it leaves, which would
+	// pin the caller's checkout inside this process and hide what the worker does.
+	previous, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("read the working directory: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(previous); err != nil {
+			t.Errorf("restore the working directory: %v", err)
+		}
+	})
+	// The route arms its worker while it still runs from the caller's checkout, then returns.
+	if err := os.Chdir(caller); err != nil {
+		t.Fatalf("enter the caller's checkout: %v", err)
+	}
+	completed, err := launchRecoveryChild(exe, []string{"-test.run=^TestDetachedRecoveryWorkerDoesNotPinTheCallersDirectory$"},
+		childEnv, marker, ready)
+	if chdirErr := os.Chdir(previous); chdirErr != nil {
+		t.Fatalf("leave the caller's checkout: %v", chdirErr)
+	}
+	if err != nil {
+		t.Fatalf("arm the recovery worker: %v", err)
+	}
+	released := false
+	release := func() error {
+		if released {
+			return nil
+		}
+		released = true
+		if err := completed(true); err != nil {
+			return err
+		}
+		return waitForWorkerExit(recovered, 10*time.Second)
+	}
+	// However the test ends, the worker has exited before the temp directory is removed:
+	// a live worker keeps its working directory, and this test binary, in use on Windows.
+	t.Cleanup(func() {
+		if err := release(); err != nil {
+			t.Errorf("release the recovery worker: %v", err)
+		}
+	})
+
+	// Once the route has returned, the checkout must be removable while the armed worker
+	// still waits for its completion signal.
+	if err := os.RemoveAll(caller); err != nil {
+		t.Fatalf("the armed recovery worker keeps the caller's directory open: %v", err)
+	}
+	if err := release(); err != nil {
+		t.Fatalf("release the recovery worker: %v", err)
+	}
+	if _, err := os.Stat(recovered); err != nil {
+		t.Fatalf("the released recovery worker did not finish: %v", err)
+	}
+}
+
+// waitForWorkerExit waits for the recovery worker that records its process id in
+// pidFile to exit. The worker writes that file last, just before it returns.
+func waitForWorkerExit(pidFile string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		data, err := os.ReadFile(pidFile)
+		if err == nil && len(data) > 0 {
+			pid, convErr := strconv.Atoi(string(data))
+			if convErr != nil {
+				return fmt.Errorf("the worker recorded %q, not a process id", data)
+			}
+			return waitForProcessExit(pid, timeout)
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("the worker did not record its process id within %s", timeout)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func waitForProcessExit(pid int, timeout time.Duration) error {
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		// Windows cannot open a process once it has been fully reaped, so it has exited.
+		return nil
+	}
+	defer proc.Release()
+	exited := make(chan error, 1)
+	go func() {
+		_, err := proc.Wait()
+		exited <- err
+	}()
+	select {
+	case err := <-exited:
+		return err
+	case <-time.After(timeout):
+		return fmt.Errorf("process %d did not exit within %s", pid, timeout)
+	}
+}
+
 func recoveryProcessParentMain() int {
 	marker := os.Getenv(recoveryProcessMarkerEnv)
 	ready := os.Getenv(recoveryProcessReadyEnv)
@@ -903,7 +1023,7 @@ func recoveryProcessWorkerMain() int {
 	for {
 		complete, err := recoverySignalExists(recoverySignalPath(marker, recoverySignalDone))
 		if err == nil && complete {
-			if err := os.WriteFile(recovered, []byte("recovered"), 0o600); err != nil {
+			if err := os.WriteFile(recovered, []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
 				return 43
 			}
 			return 0

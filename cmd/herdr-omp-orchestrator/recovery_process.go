@@ -131,11 +131,21 @@ func startRecoveryWorker(scope recoveryScope, ticketID string) (func(bool) error
 	return signal, nil
 }
 
+// recoveryWorkerDir is where a detached recovery worker starts. The worker outlives
+// the route that armed it and needs no directory of its own. It must not inherit the
+// caller's working directory: on Windows a process keeps its working directory open,
+// so a checkout or worktree the route ran from could not be removed until the worker
+// exited.
+func recoveryWorkerDir() string {
+	return os.TempDir()
+}
+
 // launchRecoveryChild starts the hidden recovery route with detached stdio and
 // waits for its readiness file before allowing the foreground route to proceed.
 func launchRecoveryChild(executable string, args, environ []string, markerPath, readyPath string) (func(bool) error, error) {
 	cmd := exec.Command(executable, args...)
 	cmd.Env = append([]string(nil), environ...)
+	cmd.Dir = recoveryWorkerDir()
 	cmd.Stdin = nil
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
