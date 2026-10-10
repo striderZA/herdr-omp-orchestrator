@@ -1297,6 +1297,35 @@ Check 'worker reports: a missing transcript proves no report' (Test-Safely {
     $missing = Get-AcceptedResultReportCount -Path $missingTranscript
     -not $missing.Readable -and $missing.Distinct -eq 0 }) 'missing'
 
+# --- an unfinished primary dispatch: cleanup must keep the workspace it is still provisioning in ---
+$answeredDispatchTranscript = Join-Path $script:HarnessRoot 'dispatch-answered.jsonl'
+Set-Content -LiteralPath $answeredDispatchTranscript -Encoding UTF8 -Value @(
+    '{"type":"message","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_d1","name":"orch_dispatch","arguments":{"title":"ACCEPT D: answered"}}]}}',
+    '{"type":"message","message":{"role":"toolResult","toolCallId":"call_d1","toolName":"orch_dispatch","content":[],"isError":false}}'
+)
+Check 'unfinished dispatch: a call whose result is recorded is finished' (Test-Safely { -not (Test-OmpToolCallUnfinished -Path $answeredDispatchTranscript -Name 'orch_dispatch') }) 'answered'
+Check 'unfinished dispatch: a call with no recorded result is still running' (Test-Safely { Test-OmpToolCallUnfinished -Path $toolCallTranscript -Name 'orch_dispatch' }) 'pending'
+Check 'unfinished dispatch: a call without an id cannot be shown finished' (Test-Safely { Test-OmpToolCallUnfinished -Path $idlessTranscript -Name 'orch_dispatch' }) 'no id'
+Check 'unfinished dispatch: a transcript that does not exist holds no dispatch' (Test-Safely { -not (Test-OmpToolCallUnfinished -Path $missingTranscript -Name 'orch_dispatch') }) 'missing'
+Check 'unfinished dispatch: a transcript that cannot be read is treated as unfinished' (Test-Safely {
+    $lock = [System.IO.File]::Open($answeredDispatchTranscript, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::None)
+    try { Test-OmpToolCallUnfinished -Path $answeredDispatchTranscript -Name 'orch_dispatch' } finally { $lock.Dispose() }
+}) 'locked'
+$savedGuardReadySession = (Get-Command Get-ReadySession).ScriptBlock
+$savedGuardProject = Get-Variable -Name Project -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+$script:GuardTranscriptForTest = $toolCallTranscript
+Set-Item -Path Function:\Get-ReadySession -Value { param([string]$LaunchPaneId) [pscustomobject]@{ omp_session_file = $script:GuardTranscriptForTest } }
+$script:Project = $null
+Check 'cleanup guard: no bound project means no dispatch to wait for' (Test-Safely { -not (Test-PrimaryDispatchUnfinished) }) 'no project'
+$script:Project = [pscustomobject]@{ LaunchPaneID = 'w1:p1' }
+Check 'cleanup guard: a primary with a dispatch that has no recorded result is kept' (Test-Safely { Test-PrimaryDispatchUnfinished }) 'unanswered'
+$script:GuardTranscriptForTest = $answeredDispatchTranscript
+Check 'cleanup guard: a primary whose dispatches all have results is not kept' (Test-Safely { -not (Test-PrimaryDispatchUnfinished) }) 'answered'
+Set-Item -Path Function:\Get-ReadySession -Value { param([string]$LaunchPaneId) throw 'the state cannot be read' }
+Check 'cleanup guard: a state that cannot be read to name the transcript is kept' (Test-Safely { Test-PrimaryDispatchUnfinished }) 'unreadable'
+Set-Item -Path Function:\Get-ReadySession -Value $savedGuardReadySession
+$script:Project = $savedGuardProject
+
 $primaryAskScreen = @'
 Earlier conversation contained a completed task-A review:
 Ask 1 questions
