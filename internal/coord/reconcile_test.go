@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"herdr-omp-orchestrator/internal/herdr"
+	"herdr-omp-orchestrator/internal/state"
 	"herdr-omp-orchestrator/internal/task"
 )
 
@@ -3207,6 +3208,68 @@ func TestReconcileStartsTheAgentOfAnInterruptedStepInItsOwnEmptyPane(t *testing.
 		t.Fatalf("Reconcile: %v", err)
 	}
 	assertStepCompleted(t, f, worker.ID, 1, 2)
+}
+
+// TestRecoveryContinuesALaterProvisioningPhaseAfterLease proves that the
+// autonomous recovery pass continues the persisted step without repeating the
+// worktree already recorded by the original caller.
+func TestRecoveryContinuesALaterProvisioningPhaseAfterLease(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	f := newCoordFixture(t, fixturePlan{AgentStartError: "agent_start_failed"})
+	interrupted, err := f.coord.Dispatch(ctx, f.projectKey(), "interrupted", "brief interrupted",
+		[]string{"go test ./... ok"}, nil, nil, f.base)
+	if err == nil {
+		t.Fatal("dispatch succeeded, want the refused agent start to stop the step")
+	}
+	before := f.taskByID(t, interrupted.ID)
+	if before.Phase != task.WorktreeCreated || before.WorktreePath == "" {
+		t.Fatalf("interrupted task = phase %q worktree %q, want a recorded worktree step",
+			before.Phase, before.WorktreePath)
+	}
+	worktrees := f.countCalls("worktree create")
+	starts := f.countCalls("agent start")
+
+	if took, err := f.store.ClaimStep(ctx, interrupted.ID, task.WorktreeCreated, "stopped-owner", 750*time.Millisecond); err != nil || !took {
+		t.Fatalf("the stopped caller's step claim = (%v, %v), want it taken", took, err)
+	}
+	f.updatePlan(func(plan *fixturePlan) { plan.AgentStartError = "" })
+	recovery, err := New(f.store, f.client, Options{StepLease: 750 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("New (recovery): %v", err)
+	}
+	owner, err := state.CurrentProcessIdentity()
+	if err != nil {
+		t.Fatalf("CurrentProcessIdentity: %v", err)
+	}
+	f.store.MarkTaskComplete(owner, interrupted.ID)
+	done := make(chan error, 1)
+	go func() { done <- recovery.RecoverUntilIdle(ctx) }()
+
+	select {
+	case err := <-done:
+		t.Fatalf("recovery returned before the step lease expired: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if got := f.countCalls("agent start"); got != starts {
+		t.Fatalf("agent start calls before lease expiry = %d, want %d", got, starts)
+	}
+	if got := f.countCalls("worktree create"); got != worktrees {
+		t.Fatalf("worktree create calls before lease expiry = %d, want %d", got, worktrees)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("RecoverUntilIdle: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("recovery did not continue the recorded step after the lease expired")
+	}
+	assertStepCompleted(t, f, interrupted.ID, 1, starts+1)
+	if got := f.countCalls("worktree create"); got != worktrees {
+		t.Errorf("worktree create calls = %d, want %d: recovery repeated a recorded step", got, worktrees)
+	}
 }
 
 func TestReconcileAttentionNamesTheTaskAndKeepsAnExistingBlocker(t *testing.T) {

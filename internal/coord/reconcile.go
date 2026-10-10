@@ -1154,6 +1154,12 @@ func (c *Coordinator) probePrimary(ctx context.Context, project task.Project) (p
 // exits nonzero and Herdr records it in the plugin log. The durable facts are
 // written before the error is returned.
 func (c *Coordinator) Reconcile(ctx context.Context) error {
+	return c.reconcile(ctx, true)
+}
+
+// reconcile re-derives identities and resumes recorded work. Background claim
+// recovery omits inbox delivery: it must not inject a note into a primary pane.
+func (c *Coordinator) reconcile(ctx context.Context, flushInbox bool) error {
 	snapshot, err := c.snapshotView(ctx)
 	if err != nil {
 		return err
@@ -1173,12 +1179,14 @@ func (c *Coordinator) Reconcile(ctx context.Context) error {
 			failures = append(failures, err)
 		}
 	}
-	// Identities are repaired; a verified idle primary can now take what is
-	// queued. FlushInbox itself re-verifies, so a project with nothing pending
-	// submits no prompt.
-	for _, project := range projects {
-		if err := c.FlushInbox(ctx, project.Key); err != nil && !errors.Is(err, errInboxDeferred) {
-			failures = append(failures, err)
+	if flushInbox {
+		// Identities are repaired; a verified idle primary can now take what is
+		// queued. FlushInbox itself re-verifies, so a project with nothing pending
+		// submits no prompt.
+		for _, project := range projects {
+			if err := c.FlushInbox(ctx, project.Key); err != nil && !errors.Is(err, errInboxDeferred) {
+				failures = append(failures, err)
+			}
 		}
 	}
 	return errors.Join(failures...)

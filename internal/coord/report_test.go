@@ -1207,6 +1207,11 @@ func TestDrainContinuesAnIntentWhoseSlotClaimOutlivedItsCaller(t *testing.T) {
 			if took, _, err := f.store.ClaimProvisioningSlot(ctx, intent.ID, 3); err != nil || !took {
 				t.Fatalf("the stopped caller's claim = (%v, %v), want it taken", took, err)
 			}
+			owner, err := state.CurrentProcessIdentity()
+			if err != nil {
+				t.Fatalf("CurrentProcessIdentity: %v", err)
+			}
+			f.store.MarkTaskComplete(owner, intent.ID)
 			// While the claim is fresh it is its caller's, and a drain leaves it alone.
 			if _, err := f.coord.DrainQueued(ctx, key); err != nil {
 				t.Fatalf("DrainQueued (fresh claim): %v", err)
@@ -1227,6 +1232,78 @@ func TestDrainContinuesAnIntentWhoseSlotClaimOutlivedItsCaller(t *testing.T) {
 			assertStepCompleted(t, f, intent.ID, 1, 1)
 			if _, err := short.DrainQueued(ctx, key); err != nil {
 				t.Fatalf("DrainQueued (again): %v", err)
+			}
+			assertStepCompleted(t, f, intent.ID, 1, 1)
+		})
+	}
+}
+
+func TestRecoveryContinuesQueuedIntentsAfterLeaseWithoutAnotherOperation(t *testing.T) {
+	for _, kind := range []string{"planner", "ordinary"} {
+		t.Run(kind, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			f := newCoordFixture(t, fixturePlan{})
+			key := f.projectKey()
+			var intent task.Task
+			var err error
+			if kind == "planner" {
+				ticket := f.newTicket(key, "recover a planner")
+				id, branch, err := f.coord.newIdentity()
+				if err != nil {
+					t.Fatalf("newIdentity: %v", err)
+				}
+				_, intent, err = f.store.MoveTicketToTodoWithPlannerTask(ctx, ticket.ID, ticket.Revision, task.Task{
+					ID: id, ProjectKey: key, Title: "Plan: " + ticket.Title, Brief: "Plan only.", BaseRevision: f.base,
+					Branch: branch, Phase: task.Intent, TicketID: ticket.ID, Role: task.TaskRolePlan,
+				})
+				if err != nil {
+					t.Fatalf("record the move and its planner intent: %v", err)
+				}
+			} else {
+				request, err := newDispatchRequest("recover ordinary work", "Do the work.", []string{"go test ./... ok"}, nil, nil)
+				if err != nil {
+					t.Fatalf("newDispatchRequest: %v", err)
+				}
+				if intent, _, err = f.coord.recordTaskIntent(ctx, key, request, f.base); err != nil {
+					t.Fatalf("record the task intent: %v", err)
+				}
+			}
+			if took, _, err := f.store.ClaimProvisioningSlot(ctx, intent.ID, 3); err != nil || !took {
+				t.Fatalf("the stopped caller's claim = (%v, %v), want it taken", took, err)
+			}
+
+			recovery, err := New(f.store, f.client, Options{StepLease: 750 * time.Millisecond})
+			if err != nil {
+				t.Fatalf("New (recovery): %v", err)
+			}
+			owner, err := state.CurrentProcessIdentity()
+			if err != nil {
+				t.Fatalf("CurrentProcessIdentity: %v", err)
+			}
+			f.store.MarkTaskComplete(owner, intent.ID)
+			done := make(chan error, 1)
+			go func() { done <- recovery.RecoverUntilIdle(ctx) }()
+
+			select {
+			case err := <-done:
+				t.Fatalf("recovery returned before the lease expired: %v", err)
+			case <-time.After(100 * time.Millisecond):
+			}
+			if got := f.taskByID(t, intent.ID); got.Phase != task.Intent {
+				t.Fatalf("the recovery worker took a fresh slot claim: phase %q, want %q", got.Phase, task.Intent)
+			}
+			if got := f.countCalls("worktree create"); got != 0 {
+				t.Fatalf("worktree create calls before lease expiry = %d, want 0", got)
+			}
+
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("RecoverUntilIdle: %v", err)
+				}
+			case <-ctx.Done():
+				t.Fatal("recovery did not continue the task after the lease expired")
 			}
 			assertStepCompleted(t, f, intent.ID, 1, 1)
 		})
@@ -2046,4 +2123,16 @@ func TestDrainQueuedSurfacesStorageFailures(t *testing.T) {
 			t.Errorf("the retryable attention vanished although its write failed: %+v", still)
 		}
 	})
+}
+
+func TestRecoveryUntilIdleDoesNotReconcileWhenNoClaimsArePending(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	f.updatePlan(func(plan *fixturePlan) { plan.SnapshotProtocol = 23 })
+	recovery, err := New(f.store, f.client, Options{StepLease: time.Second})
+	if err != nil {
+		t.Fatalf("New (recovery): %v", err)
+	}
+	if err := recovery.RecoverUntilIdle(context.Background()); err != nil {
+		t.Fatalf("RecoverUntilIdle without claims: %v", err)
+	}
 }

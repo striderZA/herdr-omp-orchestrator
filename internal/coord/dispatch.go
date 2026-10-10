@@ -223,6 +223,10 @@ func (c *Coordinator) advanceRecordedIntent(ctx context.Context, projectKey stri
 // idempotent: a task that was already dispatched, reviewed or closed is
 // returned untouched, and no step whose side effect is recorded is repeated.
 func (c *Coordinator) ResumeDispatch(ctx context.Context, taskID string) (task.Task, error) {
+	return c.resumeDispatch(ctx, taskID, true)
+}
+
+func (c *Coordinator) resumeDispatch(ctx context.Context, taskID string, drainAfter bool) (task.Task, error) {
 	st, err := c.store.Task(ctx, taskID)
 	if err != nil {
 		return task.Task{}, err
@@ -263,8 +267,10 @@ func (c *Coordinator) ResumeDispatch(ctx context.Context, taskID string) (task.T
 	// The task was provisioned, so a drain that could not run is reported without
 	// pretending the step itself failed: a resume is idempotent from the recorded
 	// phase, and the queued work it could not admit must not stay silent.
-	if _, err := c.drainQueued(ctx, st.ProjectKey, st.ID); err != nil {
-		return provisioned, fmt.Errorf("task %s was dispatched, but %w", st.ID, err)
+	if drainAfter {
+		if _, err := c.drainQueued(ctx, st.ProjectKey, st.ID); err != nil {
+			return provisioned, fmt.Errorf("task %s was dispatched, but %w", st.ID, err)
+		}
 	}
 	return provisioned, nil
 }
@@ -579,6 +585,14 @@ func (c *Coordinator) DrainQueued(ctx context.Context, projectKey string) ([]tas
 // bookkeeping: a write it had to make about a candidate's retry (retiring a
 // retryable reason) that could not be stored.
 func (c *Coordinator) drainQueued(ctx context.Context, projectKey, excluded string) ([]task.Task, error) {
+	return c.drainQueuedFiltered(ctx, projectKey, excluded, "")
+}
+
+func (c *Coordinator) drainQueuedTask(ctx context.Context, projectKey, taskID string) ([]task.Task, error) {
+	return c.drainQueuedFiltered(ctx, projectKey, "", taskID)
+}
+
+func (c *Coordinator) drainQueuedFiltered(ctx context.Context, projectKey, excluded, onlyTaskID string) ([]task.Task, error) {
 	if strings.TrimSpace(projectKey) == "" {
 		return nil, fmt.Errorf("%w: project key is required", ErrInvalidRequest)
 	}
@@ -588,6 +602,9 @@ func (c *Coordinator) drainQueued(ctx context.Context, projectKey, excluded stri
 	}
 	var drained []task.Task
 	for _, cand := range queued {
+		if onlyTaskID != "" && cand.ID != onlyTaskID {
+			continue
+		}
 		if cand.ID == excluded || cand.Phase != task.Intent || cand.Blocker != "" ||
 			cand.Disposition != "" || (cand.Role != task.TaskRolePlan && len(cand.Checks) == 0) {
 			continue
