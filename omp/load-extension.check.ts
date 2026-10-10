@@ -29,13 +29,17 @@ import extension, {
   dispatchWithConsent,
   refreshIdentity,
   readReportPreview,
+  readRepointPreview,
   readTicketPreview,
   recordReviewWithConsent,
   recordTicketMoveWithConsent,
   recordTicketReviewWithConsent,
   quoteForDialog,
   refreshReady,
+  repointConfirmRequest,
+  repointRequestMatches,
   sendAnswerWithConsent,
+  successorRefusal,
   settleConfirmRequest,
   uiGate,
   warnOnce,
@@ -183,6 +187,7 @@ const wantNames = [
   "orch_cleanup",
   "orch_dispatch",
   "orch_inbox_list",
+  "orch_repoint",
   "orch_report",
   "orch_review",
   "orch_settle_input",
@@ -535,6 +540,21 @@ const toolCalls: { name: string; params: Record<string, unknown>; bad: Record<st
     bad: { taskId: "orch_abc", decision: "maybe" },
   },
   { name: "orch_cleanup", params: { taskId: "orch_abc" }, bad: {} },
+  {
+    name: "orch_repoint",
+    params: { supersededTaskId: "orch_abc", dependentIds: ["orch_dep"] },
+    bad: { supersededTaskId: "orch_abc", dependentIds: [] },
+  },
+  {
+    name: "orch_review",
+    params: { taskId: "orch_abc", outcome: "superseded", disposition: "replaced", successor: "orch_next" },
+    bad: { taskId: "orch_abc", outcome: "superseded", successor: "n".repeat(65) },
+  },
+  {
+    name: "orch_ticket_review",
+    params: { ticketId: "tkt_abc", outcome: "superseded", disposition: "replaced", successor: "tkt_next" },
+    bad: { ticketId: "tkt_abc", outcome: "superseded", successor: "n".repeat(65) },
+  },
   // The ticket tools: creating and listing are inert facts, moving and closing a
   // ticket are user decisions. Ticket listing accepts only an optional row limit.
   { name: "orch_ticket_create", params: { title: "Add search" }, bad: { title: "" } },
@@ -818,6 +838,251 @@ async function checkReviewConsent(): Promise<void> {
 
 await checkReviewConsent();
 
+// A superseded decision names where the work went and releases nothing, and a
+// successor that does not fit its outcome is refused before any dialog (issue #61).
+async function checkSuccessorConsent(): Promise<void> {
+  check(successorRefusal("superseded", "", "task") !== null, "a superseded task decision without a successor was accepted");
+  check(successorRefusal("superseded", "  ", "ticket") !== null, "a superseded ticket decision with a blank successor was accepted");
+  check(successorRefusal("superseded", "orch_next", "task") === null, "a superseded task decision naming a successor was refused");
+  check(successorRefusal("rejected", "orch_next", "task") !== null, "a rejected decision naming a successor was accepted");
+  check(successorRefusal("integrated", "", "ticket") === null, "an integrated ticket decision without a successor was refused");
+  const identity = {
+    getSessionId: () => "sess-1",
+    getSessionFile: () => "C:/session.jsonl",
+    isSessionOnDisk: () => true,
+  };
+  const review = tools.find((tool) => tool.name === "orch_review") as
+    | (RegisteredTool & {
+        execute: (
+          callId: string,
+          params: { taskId: string; outcome: string; disposition: string; successor: string },
+          signal: AbortSignal,
+          update: undefined,
+          ctx: unknown,
+        ) => Promise<{ isError?: boolean; content: Array<{ text: string }> }>;
+      })
+    | undefined;
+  if (!review) {
+    failures.push("orch_review was not registered");
+    return;
+  }
+  let prompts = 0;
+  const refused = await review.execute(
+    "review-superseded-unnamed",
+    { taskId: "orch_abc", outcome: "superseded", disposition: "replaced", successor: "" },
+    new AbortController().signal,
+    undefined,
+    { hasUI: true, ui: { confirm: async () => { prompts++; return true; } }, sessionManager: identity },
+  );
+  check(refused.isError === true && prompts === 0, "orch_review accepted a superseded decision without a successor before asking the user");
+  const report = readReportPreview({
+    taskId: "orch_abc",
+    revision: 7,
+    stage: "ready_for_review",
+    summary: "Added subtract to a.js",
+    branch: "orch/abc",
+    evidence: ["commit 0123456789abcdef"],
+    checks: ["go test ./internal/coord ok"],
+    risk: "No known risk",
+  });
+  check(report !== null, "a valid stored report preview was refused");
+  if (!report) return;
+  const sent: Array<{ successor: string }> = [];
+  const send = async (confirmed: { successor: string }) => {
+    sent.push(confirmed);
+    return { stage: "Done" };
+  };
+  let asked = "";
+  const superseded = await recordReviewWithConsent(
+    { hasUI: true, confirm: async (_title, message) => { asked = message; return true; } },
+    report,
+    "superseded",
+    "replaced by the new worker",
+    send,
+    "orch_next",
+  );
+  check(superseded.ok && sent[0]?.successor === "orch_next", "a confirmed superseded review did not send the successor it showed");
+  check(asked.includes('Successor: "orch_next"'), `the superseded review dialog does not name its successor:\n${asked}`);
+  check(asked.includes("Superseded does not release dependents"), "the superseded review dialog does not say that superseded releases nothing");
+  sent.length = 0;
+  asked = "";
+  await recordReviewWithConsent(
+    { hasUI: true, confirm: async (_title, message) => { asked = message; return true; } },
+    report,
+    "integrated",
+    "accepted the result",
+    send,
+  );
+  check(!asked.includes("Successor"), "a non-superseded review dialog names a successor");
+  check(sent[0]?.successor === "", "a non-superseded review sent a successor");
+  const ticket = readTicketPreview({
+    ticketId: "tkt_abc",
+    title: "Ship the search",
+    body: "Index the notes.",
+    column: "todo",
+    stage: "todo",
+    revision: 4,
+    digest: "d4",
+    taskIds: [],
+  });
+  check(ticket !== null, "a valid ticket preview was refused");
+  if (!ticket) return;
+  const ticketSent: Array<{ successor: string }> = [];
+  let ticketAsked = "";
+  const decided = await recordTicketReviewWithConsent(
+    { hasUI: true, confirm: async (_title, message) => { ticketAsked = message; return true; } },
+    ticket,
+    "superseded",
+    "replaced by the new ticket",
+    async (confirmed) => {
+      ticketSent.push(confirmed);
+      return { stage: "done" };
+    },
+    "tkt_next",
+  );
+  check(decided.ok && ticketSent[0]?.successor === "tkt_next", "a confirmed superseded ticket decision did not send the successor it showed");
+  check(ticketAsked.includes('Successor ticket: "tkt_next"'), `the superseded ticket dialog does not name its successor:\n${ticketAsked}`);
+  check(ticketAsked.includes("reference only"), "the superseded ticket dialog does not say the successor is a reference only");
+}
+
+// A superseded decision that names no successor is refused by the tool itself,
+// before any dialog opens and before the bridge is asked for anything (issue #61).
+async function checkSuccessorToolRefusal(): Promise<void> {
+  const identity = {
+    getSessionId: () => "sess-1",
+    getSessionFile: () => "C:/session.jsonl",
+    isSessionOnDisk: () => true,
+  };
+  type Refusing = RegisteredTool & {
+    execute: (
+      callId: string,
+      params: Record<string, unknown>,
+      signal: AbortSignal,
+      update: undefined,
+      ctx: unknown,
+    ) => Promise<{ isError?: boolean; content: Array<{ text: string }> }>;
+  };
+  const cases = [
+    { name: "orch_review", params: { taskId: "orch_s", outcome: "superseded", disposition: "replaced", successor: "" } },
+    { name: "orch_ticket_review", params: { ticketId: "tkt_abc", outcome: "superseded", disposition: "replaced", successor: "" } },
+  ];
+  for (const { name, params } of cases) {
+    const tool = tools.find((candidate) => candidate.name === name) as Refusing | undefined;
+    if (!tool) {
+      failures.push(`${name} was not registered`);
+      continue;
+    }
+    let prompts = 0;
+    const ctx = { hasUI: true, ui: { confirm: async () => { prompts++; return true; } }, sessionManager: identity };
+    try {
+      const result = await tool.execute(`refuse-${name}`, params, new AbortController().signal, undefined, ctx);
+      check(
+        result.isError === true && result.content.some((part) => part.text.includes("must name")),
+        `${name} did not refuse a superseded decision with no successor: ${JSON.stringify(result)}`,
+      );
+    } catch (error) {
+      failures.push(`${name} threw on a superseded decision with no successor: ${String(error)}`);
+    }
+    check(prompts === 0, `${name} asked for confirmation before refusing a superseded decision with no successor`);
+  }
+}
+
+// A re-point changes what queued work waits on, so the user confirms the exact
+// dependents and revisions the preview showed. A declined confirmation sends
+// nothing, and a session with no UI never reaches the bridge (issue #61).
+async function checkRepointConsent(): Promise<void> {
+  const repoint = tools.find((tool) => tool.name === "orch_repoint") as
+    | (RegisteredTool & {
+        execute: (
+          callId: string,
+          params: { supersededTaskId: string; dependentIds: string[] },
+          signal: AbortSignal,
+          update: undefined,
+          ctx: unknown,
+        ) => Promise<{ isError?: boolean; content: Array<{ text: string }> }>;
+      })
+    | undefined;
+  if (!repoint) {
+    failures.push("orch_repoint was not registered");
+    return;
+  }
+  const identity = {
+    getSessionId: () => "sess-1",
+    getSessionFile: () => "C:/session.jsonl",
+    isSessionOnDisk: () => true,
+  };
+  let prompts = 0;
+  try {
+    const noUI = await repoint.execute(
+      "repoint-no-ui",
+      { supersededTaskId: "orch_s", dependentIds: ["orch_d"] },
+      new AbortController().signal,
+      undefined,
+      { hasUI: false, ui: { confirm: async () => { prompts++; return true; } }, sessionManager: identity },
+    );
+    check(noUI.isError === true, "orch_repoint proceeded without an interactive UI");
+    check(prompts === 0, "orch_repoint asked for confirmation without an interactive UI");
+  } catch (error) {
+    failures.push(`orch_repoint reached the bridge without a UI: ${String(error)}`);
+  }
+  const raw = {
+    supersededTaskId: "orch_s",
+    successorTaskId: "orch_n",
+    successorStage: "running",
+    successorOutcome: "",
+    accepting: false,
+    dependents: [{ taskId: "orch_d", title: "write the docs", stage: "queued", revision: 3, dependencies: ["orch_s"] }],
+  };
+  const preview = readRepointPreview(raw);
+  check(preview?.dependents[0]?.revision === 3, "a valid re-point preview was refused");
+  check(readRepointPreview({ ...raw, dependents: "orch_d" }) === null, "a re-point preview with a malformed dependent list was trusted");
+  check(readRepointPreview({ ...raw, dependents: [] }) === null, "a re-point preview with no dependents was trusted");
+  check(readRepointPreview({ ...raw, successorTaskId: "" }) === null, "a re-point preview with no successor was trusted");
+  check(readRepointPreview({ ...raw, accepting: "yes" }) === null, "a re-point preview whose accepting flag is not a boolean was trusted");
+  check(readRepointPreview(Object.fromEntries(Object.entries(raw).filter(([key]) => key !== "accepting"))) === null, "a re-point preview with no accepting flag was trusted");
+  check(readRepointPreview({ ...raw, successorStage: "" }) === null, "a re-point preview with no successor stage was trusted");
+  check(readRepointPreview({ ...raw, accepting: true, successorOutcome: "" }) === null, "an accepting re-point preview with no successor outcome was trusted");
+  check(readRepointPreview({ ...raw, dependents: [{ ...raw.dependents[0], title: "" }] }) === null, "a re-point dependent with no title was trusted");
+  check(readRepointPreview({ ...raw, dependents: [{ ...raw.dependents[0], stage: "" }] }) === null, "a re-point dependent with no stage was trusted");
+  check(readRepointPreview({ ...raw, dependents: [{ ...raw.dependents[0], revision: 0 }] }) === null, "a re-point dependent with no revision was trusted");
+  check(readRepointPreview({ ...raw, dependents: [{ ...raw.dependents[0], revision: 1.5 }] }) === null, "a re-point dependent with a fractional revision was trusted");
+  if (!preview) return;
+  check(repointRequestMatches(["orch_d"], preview), "a re-point preview naming exactly the requested dependent was refused");
+  check(repointRequestMatches([" orch_d "], preview), "a requested dependent with surrounding spaces was not matched to its preview");
+  check(!repointRequestMatches(["orch_d", "orch_x"], preview), "a re-point preview with an extra requested dependent matched");
+  check(!repointRequestMatches(["orch_x"], preview), "a re-point preview naming a different dependent matched");
+  check(!repointRequestMatches([], preview), "a re-point preview matched an empty request");
+  const plan = repointConfirmRequest(preview);
+  check(plan.ok, "a re-point of a queued dependent was refused before the user was asked");
+  if (plan.ok) {
+    check(plan.request.message.includes("stay queued until it accepts"), "the re-point dialog does not say the dependents wait on a non-accepting successor");
+    check(plan.request.message.includes('Dependent "orch_d"') && plan.request.message.includes("revision 3"), "the re-point dialog does not show the dependent and its confirmed revision");
+    const sentRepoint: string[] = [];
+    const declined = await confirmThen({ hasUI: true, confirm: async () => false }, plan.request, async () => {
+      sentRepoint.push("repoint");
+      return {};
+    });
+    check(!declined.ok && sentRepoint.length === 0, "a declined re-point reached the bridge");
+    const approved = await confirmThen({ hasUI: true, confirm: async () => true }, plan.request, async () => {
+      sentRepoint.push("repoint");
+      return {};
+    });
+    check(approved.ok && sentRepoint.length === 1, "an approved re-point did not reach the bridge exactly once");
+  }
+  const started = repointConfirmRequest({ ...preview, dependents: [{ ...preview.dependents[0], stage: "running" }] });
+  check(!started.ok, "a re-point of a started dependent was accepted");
+  const unrevised = repointConfirmRequest({ ...preview, dependents: [{ ...preview.dependents[0], revision: 0 }] });
+  check(!unrevised.ok, "a re-point without a confirmed revision was accepted");
+  const unnamed = repointConfirmRequest({ ...preview, dependents: [] });
+  check(!unnamed.ok, "a re-point with no dependents was accepted");
+  const released = repointConfirmRequest({ ...preview, accepting: true, successorStage: "done", successorOutcome: "integrated" });
+  check(released.ok && released.request.message.includes("released when this is recorded"), "a re-point onto an accepting successor does not say its dependents are released");
+}
+
+await checkSuccessorConsent();
+await checkRepointConsent();
+await checkSuccessorToolRefusal();
+
 // Moving or closing a ticket is a user decision. The helper requires an interactive UI,
 // refuses if the user declines, shows the ticket context and plan-start consequence,
 // and sends the digest of precisely the ticket that was previewed.
@@ -931,6 +1196,7 @@ async function checkTicketConsent(): Promise<void> {
     "superseded",
     note,
     sendReview,
+    "tkt_def456",
   );
   check(!declinedReview.ok && reviews.length === 0, "a declined ticket review reached the bridge mutation");
   for (const fact of [preview.ticketId, preview.title, "superseded", note, "revision 4", "orch_a1", "cannot be closed while"]) {
@@ -942,8 +1208,9 @@ async function checkTicketConsent(): Promise<void> {
       `Confirm closing ticket ${preview.ticketId} with this outcome: superseded`,
       `Title: ${JSON.stringify(preview.title)}`,
       'Note: "Superseded by tkt_def456."',
+      'Successor ticket: "tkt_def456"',
       `Ticket: revision ${preview.revision}, stage ${preview.stage}; linked tasks: ${preview.taskIds.join(", ")}`,
-      "This records your decision on the ticket only: it changes no task and merges nothing. A ticket cannot be closed while any of its linked tasks is still open.",
+      "This records your decision on the ticket only: it changes no task and merges nothing. A ticket cannot be closed while any of its linked tasks is still open. The successor ticket is a reference only: no linked task moves to it and no dependency is created.",
     ].join("\n"),
     `the ticket decision dialog changed shape:\n${request.message}`,
   );
@@ -980,6 +1247,7 @@ async function checkTicketConsent(): Promise<void> {
     "superseded",
     HOSTILE_NOTE,
     async (confirmed) => { hostileSent.push(confirmed.disposition); return { stage: "done" }; },
+    "tkt_def456",
   );
   check(hostile.ok && hostileSent.length === 1, "an approved ticket decision with a multi-line note was not sent once");
   checkNoteQuoted("the ticket decision dialog", hostileRequest.message, hostileSent[0]);
@@ -2055,6 +2323,7 @@ async function checkRoleToolAccess(): Promise<void> {
     sameTools(primary.activeTools, [...readOnly, ...primary.primaryNames]),
     `a primary kept tools beyond read-only plus primary tools: ${listed(primary.activeTools)}`,
   );
+  check(primary.activeTools.has("orch_repoint"), "the primary lost orch_repoint, which only the primary may use");
   check(primaryPrompt.includes("read-only coordinator"), "the primary role prompt does not say it is a read-only coordinator");
   for (const name of ["bash", "write"]) {
     const result = await primary.call(name);
@@ -2079,6 +2348,7 @@ async function checkRoleToolAccess(): Promise<void> {
     sameTools(planner.activeTools, [...readOnly, "orch_report"]),
     `a planner kept tools beyond read-only plus orch_report: ${listed(planner.activeTools)}`,
   );
+  check(!planner.activeTools.has("orch_repoint"), "a planner kept orch_repoint, which only the primary may use");
   check(plannerPrompt.includes('branch = "orch/abc123def456"'), `the planner role prompt does not name its branch: ${plannerPrompt}`);
   for (const name of ["edit", "orch_dispatch"]) {
     check(blocked(await planner.call(name), name), `a planner's ${name} call was not blocked`);
@@ -2091,6 +2361,7 @@ async function checkRoleToolAccess(): Promise<void> {
     sameTools(worker.activeTools, [...launchTools, "orch_report"]),
     `an implementation worker lost launch tools: ${listed(worker.activeTools)}`,
   );
+  check(!worker.activeTools.has("orch_repoint"), "an implementation worker kept orch_repoint, which only the primary may use");
   check((await worker.call("bash"))?.block !== true, "an implementation worker's bash call was blocked");
   check(
     workerPrompt.startsWith("Work only in this assigned worktree."),

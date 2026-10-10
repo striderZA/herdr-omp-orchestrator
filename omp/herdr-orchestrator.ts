@@ -341,6 +341,74 @@ function readCleanupPreview(value: unknown): CleanupPreview {
   };
 }
 
+export interface RepointDependentPreview {
+  taskId: string;
+  title: string;
+  stage: string;
+  revision: number;
+  dependencies: string[];
+}
+
+export interface RepointPreview {
+  supersededTaskId: string;
+  successorTaskId: string;
+  successorStage: string;
+  successorOutcome: string;
+  accepting: boolean;
+  dependents: RepointDependentPreview[];
+}
+
+// readRepointPreview trusts a bridge answer only when the superseded task, its
+// successor and every named dependent are present and well formed. Anything the
+// dialog would show that is missing or of the wrong type refuses the whole preview,
+// because the dialog and the write both act on exactly these facts.
+export function readRepointPreview(value: unknown): RepointPreview | null {
+  if (typeof value !== "object" || value === null || !("dependents" in value) || !Array.isArray(value.dependents)) {
+    return null;
+  }
+  const dependents: RepointDependentPreview[] = [];
+  for (const item of value.dependents) {
+    if (typeof item !== "object" || item === null) return null;
+    const dependencies = "dependencies" in item ? item.dependencies : null;
+    if (!Array.isArray(dependencies) || !dependencies.every((entry) => typeof entry === "string")) return null;
+    const dependent: RepointDependentPreview = {
+      taskId: previewText(item, "taskId"),
+      title: previewText(item, "title"),
+      stage: previewText(item, "stage"),
+      revision: previewNumber(item, "revision"),
+      dependencies,
+    };
+    if (dependent.taskId === "" || dependent.title === "" || dependent.stage === "" ||
+      !Number.isSafeInteger(dependent.revision) || dependent.revision <= 0) {
+      return null;
+    }
+    dependents.push(dependent);
+  }
+  const accepting = "accepting" in value ? value.accepting : undefined;
+  if (typeof accepting !== "boolean") return null;
+  const preview: RepointPreview = {
+    supersededTaskId: previewText(value, "supersededTaskId"),
+    successorTaskId: previewText(value, "successorTaskId"),
+    successorStage: previewText(value, "successorStage"),
+    successorOutcome: previewText(value, "successorOutcome"),
+    accepting,
+    dependents,
+  };
+  if (!preview.supersededTaskId || !preview.successorTaskId || !preview.successorStage ||
+    (accepting && !preview.successorOutcome) || dependents.length === 0) {
+    return null;
+  }
+  return preview;
+}
+
+// repointRequestMatches reports whether a preview names exactly the dependents the
+// user asked for, in the order they were named. The coordinator answers in that
+// order, so any other set is refused before the user is asked.
+export function repointRequestMatches(requested: readonly string[], preview: RepointPreview): boolean {
+  if (requested.length !== preview.dependents.length) return false;
+  return requested.every((id, index) => id.trim() === preview.dependents[index]?.taskId);
+}
+
 export function readReportPreview(value: unknown): ReportPreview | null {
   if (typeof value !== "object" || value === null) return null;
   const taskId = previewText(value, "taskId");
@@ -472,6 +540,60 @@ export function cleanupConfirmRequest(preview: CleanupPreview): ConfirmPlan {
       message:
         `Task ${preview.taskId}: remove ${preview.path} on branch ${preview.branch} (${where}). ` +
         `The branch is kept and the removal is never forced.`,
+    },
+  };
+}
+
+// successorRefusal refuses a decision whose successor does not fit its outcome
+// before the user is asked: a superseded decision must name one, and no other
+// outcome may. The coordinator enforces the same rule and the store repeats it.
+export function successorRefusal(outcome: ReviewOutcome, successor: string, subject: "task" | "ticket"): string | null {
+  const named = successor.trim() !== "";
+  if (outcome === "superseded" && !named) {
+    return `a superseded ${subject} decision must name the ${subject} that replaces the work, so nothing was done`;
+  }
+  if (outcome !== "superseded" && named) {
+    return `only a superseded ${subject} decision may name a successor, so nothing was done`;
+  }
+  return null;
+}
+
+// repointConfirmRequest is the confirmation a re-point needs: the superseded task,
+// its successor and each dependent at the revision the user is deciding on. It
+// refuses before the user is asked when a named dependent is not queued.
+export function repointConfirmRequest(preview: RepointPreview): ConfirmPlan {
+  if (preview.dependents.length === 0) {
+    return {
+      ok: false,
+      reason: `task ${quoteForDialog(preview.supersededTaskId)} has no queued dependents to re-point, so nothing was done`,
+    };
+  }
+  for (const dependent of preview.dependents) {
+    if (dependent.stage !== "queued") {
+      return {
+        ok: false,
+        reason: `dependent ${quoteForDialog(dependent.taskId)} is ${dependent.stage}, not queued, so it cannot be re-pointed and nothing was done`,
+      };
+    }
+    if (!Number.isSafeInteger(dependent.revision) || dependent.revision <= 0) {
+      return { ok: false, reason: `dependent ${quoteForDialog(dependent.taskId)} has no confirmed revision, so nothing was done` };
+    }
+  }
+  const release = preview.accepting
+    ? `Successor ${quoteForDialog(preview.successorTaskId)} has already accepted (${preview.successorOutcome}), so these dependents are released when this is recorded.`
+    : `Successor ${quoteForDialog(preview.successorTaskId)} is ${preview.successorStage} and not accepting, so these dependents stay queued until it accepts.`;
+  return {
+    ok: true,
+    request: {
+      title: "Re-point queued dependents",
+      message: [
+        `Confirm making these queued dependents of ${quoteForDialog(preview.supersededTaskId)} wait on its successor ${quoteForDialog(preview.successorTaskId)} instead.`,
+        ...preview.dependents.map(
+          (dependent) => `Dependent ${quoteForDialog(dependent.taskId)} (${quoteForDialog(dependent.title)}), revision ${dependent.revision}`,
+        ),
+        release,
+        "Nothing else changes: each dependent keeps its other dependencies, and a dependent that has started is never re-pointed.",
+      ].join("\n"),
     },
   };
 }
@@ -611,23 +733,39 @@ export function recordReviewWithConsent<T>(
   preview: ReportPreview,
   outcome: ReviewOutcome,
   disposition: string,
-  send: (params: { taskId: string; outcome: ReviewOutcome; disposition: string; expectedRevision: number }) => Promise<T>,
+  send: (params: {
+    taskId: string;
+    outcome: ReviewOutcome;
+    disposition: string;
+    expectedRevision: number;
+    successor: string;
+  }) => Promise<T>,
+  successor = "",
 ): Promise<GateOutcome<T>> {
   const releases = RELEASING_OUTCOMES.includes(outcome);
+  const withSuccessor = outcome === "superseded" && successor.trim() !== "";
   const request = {
     title: "Record review disposition",
     message:
       `Confirm that you reviewed the worker's final report for task ${preview.taskId} and chose this outcome: ${outcome}\n` +
-      `Note: ${quoteForDialog(disposition)}\nStored report (revision ${preview.revision}):\n` +
+      `Note: ${quoteForDialog(disposition)}\n` +
+      (withSuccessor ? `Successor: ${quoteForDialog(successor)}\n` : "") +
+      `Stored report (revision ${preview.revision}):\n` +
       `Summary: ${quoteForDialog(preview.summary)}\nBranch: ${quoteForDialog(preview.branch)}\n` +
       `Evidence: ${quoteForDialog(preview.evidence)}\nChecks: ${quoteForDialog(preview.checks)}\n` +
       `Risk: ${quoteForDialog(preview.risk)}\n` +
       (releases
         ? "This closes the task and may start queued dependent work. Decline if you have not reviewed the report."
-        : "This closes the task and frees its slot and paths, but tasks that depend on it stay queued. Decline if you have not reviewed the report."),
+        : withSuccessor
+          ? "This closes the task and frees its slot and paths. Superseded does not release dependents: tasks that depend on it stay queued until you re-point them to the successor. Decline if you have not reviewed the report."
+          : "This closes the task and frees its slot and paths, but tasks that depend on it stay queued. Decline if you have not reviewed the report."),
   };
   return confirmThen(gate, request, () => send({
-    taskId: preview.taskId, outcome, disposition, expectedRevision: preview.revision,
+    taskId: preview.taskId,
+    outcome,
+    disposition,
+    expectedRevision: preview.revision,
+    successor: withSuccessor ? successor : "",
   }));
 }
 
@@ -705,23 +843,37 @@ export async function recordTicketReviewWithConsent<T>(
   preview: TicketPreview,
   outcome: ReviewOutcome,
   disposition: string,
-  send: (params: { ticketId: string; digest: string; outcome: ReviewOutcome; disposition: string }) => Promise<T>,
+  send: (params: {
+    ticketId: string;
+    digest: string;
+    outcome: ReviewOutcome;
+    disposition: string;
+    successor: string;
+  }) => Promise<T>,
+  successor = "",
 ): Promise<GateOutcome<T>> {
+  const withSuccessor = outcome === "superseded" && successor.trim() !== "";
   const request = {
     title: "Record ticket decision",
     message:
       `Confirm closing ticket ${preview.ticketId} with this outcome: ${outcome}\n` +
       `Title: ${quoteForDialog(preview.title)}\n` +
       `Note: ${quoteForDialog(disposition)}\n` +
+      (withSuccessor ? `Successor ticket: ${quoteForDialog(successor)}\n` : "") +
       `Ticket: revision ${preview.revision}, stage ${preview.stage}; linked tasks: ${preview.taskIds.length > 0 ? preview.taskIds.join(", ") : "none"}\n` +
       (preview.stage === "done"
         ? "This ticket is already decided: repeating the same decision changes nothing, and a different one is refused. "
         : "") +
       "This records your decision on the ticket only: it changes no task and merges nothing. " +
-      "A ticket cannot be closed while any of its linked tasks is still open.",
+      "A ticket cannot be closed while any of its linked tasks is still open." +
+      (withSuccessor ? " The successor ticket is a reference only: no linked task moves to it and no dependency is created." : ""),
   };
   return confirmThen(gate, request, () => send({
-    ticketId: preview.ticketId, digest: preview.digest, outcome, disposition,
+    ticketId: preview.ticketId,
+    digest: preview.digest,
+    outcome,
+    disposition,
+    successor: withSuccessor ? successor : "",
   }));
 }
 
@@ -1052,6 +1204,7 @@ export default function (pi: ExtensionAPI, options: ExtensionOptions = {}) {
     "orch_settle_input",
     "orch_adjudicate_dispatch",
     "orch_cleanup",
+    "orch_repoint",
     "orch_ticket_create",
     "orch_ticket_list",
     "orch_ticket_move",
@@ -1354,15 +1507,23 @@ export default function (pi: ExtensionAPI, options: ExtensionOptions = {}) {
       taskId: z.string().min(1),
       outcome: z.enum(REVIEW_OUTCOMES),
       disposition: z.string().max(200).default(""),
+      successor: z.string().max(64).default(""),
     }),
     async execute(_callId, params, signal, _update, ctx) {
       const gate = uiGate(ctx, pi.events);
       if (!gate.hasUI) return toolRefusal("this session has no interactive UI, so the user could not confirm and nothing was done");
+      const refusal = successorRefusal(params.outcome, params.successor, "task");
+      if (refusal) return toolRefusal(refusal);
       const identity = sessionIdentity(ctx.sessionManager);
       const preview = readReportPreview(await callBridge("report_preview", { taskId: params.taskId }, identity, signal));
       if (!preview || preview.taskId !== params.taskId) return toolRefusal("the persisted report could not be verified for this task");
-      const gated = await recordReviewWithConsent(gate, preview, params.outcome, params.disposition, (confirmed) =>
-        callBridge("review", confirmed, identity, signal),
+      const gated = await recordReviewWithConsent(
+        gate,
+        preview,
+        params.outcome,
+        params.disposition,
+        (confirmed) => callBridge("review", confirmed, identity, signal),
+        params.successor,
       );
       if (!gated.ok) return toolRefusal(gated.reason);
       return toolResult(gated.value);
@@ -1476,15 +1637,23 @@ export default function (pi: ExtensionAPI, options: ExtensionOptions = {}) {
       ticketId: z.string().min(1),
       outcome: z.enum(REVIEW_OUTCOMES),
       disposition: z.string().max(200).default(""),
+      successor: z.string().max(64).default(""),
     }),
     async execute(_callId, params, signal, _update, ctx) {
       const gate = uiGate(ctx, pi.events);
       if (!gate.hasUI) return toolRefusal("this session has no interactive UI, so the user could not confirm and nothing was done");
+      const refusal = successorRefusal(params.outcome, params.successor, "ticket");
+      if (refusal) return toolRefusal(refusal);
       const identity = sessionIdentity(ctx.sessionManager);
       const preview = readTicketPreview(await callBridge("ticket_move_preview", { ticketId: params.ticketId }, identity, signal));
       if (!preview || preview.ticketId !== params.ticketId) return toolRefusal("the persisted ticket could not be verified");
-      const gated = await recordTicketReviewWithConsent(gate, preview, params.outcome, params.disposition, (confirmed) =>
-        callBridge("ticket_review", confirmed, identity, signal),
+      const gated = await recordTicketReviewWithConsent(
+        gate,
+        preview,
+        params.outcome,
+        params.disposition,
+        (confirmed) => callBridge("ticket_review", confirmed, identity, signal),
+        params.successor,
       );
       if (!gated.ok) return toolRefusal(gated.reason);
       return toolResult(gated.value);
@@ -1569,6 +1738,44 @@ export default function (pi: ExtensionAPI, options: ExtensionOptions = {}) {
           revision: preview.revision,
           alreadyRemoved: preview.alreadyRemoved,
           workspaceId: preview.workspaceId,
+        }, identity, signal),
+      );
+      if (!gated.ok) return toolRefusal(gated.reason);
+      return toolResult(gated.value);
+    },
+  });
+
+  // A re-point changes what queued work waits on, so the user confirms the exact
+  // dependents and their revisions before the bridge records it (issue #61). A
+  // declined or unavailable confirmation sends nothing.
+  pi.registerTool({
+    name: "orch_repoint",
+    label: "Re-point dependents",
+    defaultInactive: true,
+    description:
+      "Make queued dependents wait on a superseded task's successor instead of the superseded task. Only queued dependents can be named, the user confirms the exact list before anything changes, and a re-pointed dependent is released only when its successor has an accepting outcome.",
+    parameters: z.object({
+      supersededTaskId: z.string().min(1).max(64),
+      dependentIds: z.array(z.string().min(1).max(64)).min(1).max(32),
+    }),
+    async execute(_callId, params, signal, _update, ctx) {
+      const gate = uiGate(ctx, pi.events);
+      if (!gate.hasUI) return toolRefusal("this session has no interactive UI, so the user could not confirm and nothing was done");
+      const identity = sessionIdentity(ctx.sessionManager);
+      const preview = readRepointPreview(await callBridge("repoint_preview", params, identity, signal));
+      if (!preview || preview.supersededTaskId !== params.supersededTaskId) {
+        return toolRefusal("the re-point could not be verified against the persisted tasks");
+      }
+      if (!repointRequestMatches(params.dependentIds, preview)) {
+        return toolRefusal("the re-point preview does not name exactly the dependents you asked for, so nothing was done");
+      }
+      const plan = repointConfirmRequest(preview);
+      if (!plan.ok) return toolRefusal(plan.reason);
+      const gated = await confirmThen(gate, plan.request, () =>
+        callBridge("repoint", {
+          supersededTaskId: preview.supersededTaskId,
+          successorTaskId: preview.successorTaskId,
+          dependents: preview.dependents.map((dependent) => ({ taskId: dependent.taskId, expectedRevision: dependent.revision })),
         }, identity, signal),
       );
       if (!gated.ok) return toolRefusal(gated.reason);
