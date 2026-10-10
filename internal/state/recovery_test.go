@@ -9,7 +9,7 @@ import (
 	"herdr-omp-orchestrator/internal/task"
 )
 
-func TestNextRecoveryDelayPollsLiveTaskOwnerAtBoundedInterval(t *testing.T) {
+func TestRecoveryClaimsReportALiveOwnerUntilItIsFenced(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 	s := open(t, dir)
@@ -27,33 +27,26 @@ func TestNextRecoveryDelayPollsLiveTaskOwnerAtBoundedInterval(t *testing.T) {
 		t.Fatalf("expire test slot claim: %v", err)
 	}
 
-	delay, pending, err := s.NextRecoveryDelay(ctx, lease)
-	if err != nil || !pending {
-		t.Fatalf("NextRecoveryDelay with a live owner = (%v, %v, %v), want pending", delay, pending, err)
+	claims, err := s.RecoveryClaims(ctx, lease, stored.ID)
+	if err != nil || len(claims) != 1 || !claims[0].Live {
+		t.Fatalf("RecoveryClaims with a live owner = (%+v, %v), want one live claim", claims, err)
 	}
-	if delay <= 0 || delay > time.Second {
-		t.Fatalf("NextRecoveryDelay with a live owner = %v, want a bounded poll no longer than 1s", delay)
-	}
-
 	s.MarkTaskComplete(identity, stored.ID)
-	delay, pending, err = s.NextRecoveryDelay(ctx, lease)
-	if err != nil || !pending {
-		t.Fatalf("NextRecoveryDelay after owner completion = (%v, %v, %v), want pending", delay, pending, err)
-	}
-	if delay != 0 {
-		t.Fatalf("NextRecoveryDelay after owner completion = %v, want immediate recovery after expired lease", delay)
+	claims, err = s.RecoveryClaims(ctx, lease, stored.ID)
+	if err != nil || len(claims) != 1 || claims[0].Live || !claims[0].Due.Before(time.Now()) {
+		t.Fatalf("RecoveryClaims after owner completion = (%+v, %v), want one expired claim with no live owner", claims, err)
 	}
 }
 
-func TestNextRecoveryDelayDoesNotScheduleBindIntents(t *testing.T) {
+func TestRecoveryClaimsIgnoreBindIntents(t *testing.T) {
 	ctx := context.Background()
 	s := open(t, t.TempDir())
 	if _, acquired, created, err := s.ClaimBindIntent(ctx, "repo-a", "owner", time.Hour, nil, nil); err != nil || !acquired || !created {
 		t.Fatalf("ClaimBindIntent = (acquired %v, created %v, err %v), want new intent", acquired, created, err)
 	}
 
-	if delay, pending, err := s.NextRecoveryDelay(ctx, time.Minute); err != nil || pending || delay != 0 {
-		t.Fatalf("NextRecoveryDelay with only a bind intent = (%v, %v, %v), want no task recovery", delay, pending, err)
+	if claims, err := s.RecoveryClaims(ctx, time.Minute); err != nil || len(claims) != 0 {
+		t.Fatalf("RecoveryClaims with only a bind intent = (%+v, %v), want no task claims", claims, err)
 	}
 	owner, err := state.CurrentProcessIdentity()
 	if err != nil {
@@ -181,7 +174,7 @@ func TestRecoverableTaskIDsExcludeCompletedPromptSubmission(t *testing.T) {
 	}
 }
 
-func TestNextRecoveryDelaySchedulesResourceTaskBetweenSteps(t *testing.T) {
+func TestRecoveryClaimsScheduleAResourceTaskBetweenSteps(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 	s := open(t, dir)
@@ -206,9 +199,9 @@ func TestNextRecoveryDelaySchedulesResourceTaskBetweenSteps(t *testing.T) {
 	}
 	s.MarkTaskComplete(owner, stored.ID)
 
-	delay, pending, err := s.NextRecoveryDelay(ctx, lease)
-	if err != nil || !pending || delay != 0 {
-		t.Fatalf("NextRecoveryDelay between steps = (%v, %v, %v), want immediate recovery", delay, pending, err)
+	claims, err := s.RecoveryClaims(ctx, lease)
+	if err != nil || len(claims) != 1 || claims[0].Live || claims[0].Due.After(time.Now()) {
+		t.Fatalf("RecoveryClaims between steps = (%+v, %v), want one claim due now with no live owner", claims, err)
 	}
 }
 

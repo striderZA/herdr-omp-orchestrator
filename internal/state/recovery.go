@@ -9,27 +9,26 @@ import (
 	"herdr-omp-orchestrator/internal/task"
 )
 
-const recoveryOwnerPollInterval = time.Second
+// RecoveryClaim is one task's provisioning claims as recovery reads them.
+type RecoveryClaim struct {
+	ID string
+	// Due is when the claims may be retried: the later of their lease ends. It is the
+	// zero time when no claim applies to the task's phase.
+	Due time.Time
+	// Live reports that a live or unverifiable owner holds one of the claims, and then
+	// they are never taken over. A claim with no owner identity (a legacy row) is not
+	// live: it is due when its lease ends, like a dead owner's claim.
+	Live bool
+}
 
-// NextRecoveryDelay reports how long until the earliest recoverable task claim
-// may be retried. Live task owners are polled at a bounded interval so route
-// completion or process exit can make their claims recoverable without waiting
-// for a stale lease. Bind intents use their separate explicit proof path.
-func (s *Store) NextRecoveryDelay(ctx context.Context, stepLease time.Duration, taskIDs ...string) (time.Duration, bool, error) {
+// RecoveryClaims classifies the task claims in scope, limited to taskIDs when given.
+// Recovery schedules and judges claims from this one classification, so the rules
+// for a live owner, a dead owner and a legacy row live in a single place.
+// Bind intents use their separate explicit proof path and are not reported.
+func (s *Store) RecoveryClaims(ctx context.Context, stepLease time.Duration, taskIDs ...string) ([]RecoveryClaim, error) {
 	if stepLease <= 0 {
-		return 0, false, fmt.Errorf("%w: a positive step lease is required", ErrInvalid)
+		return nil, fmt.Errorf("%w: a positive step lease is required", ErrInvalid)
 	}
-	now := time.Now().UnixMilli()
-	var earliest int64
-	consider := func(due int64) {
-		if due > 0 && (earliest == 0 || due < earliest) {
-			earliest = due
-		}
-	}
-	pollLiveOwner := func() {
-		consider(now + recoveryOwnerPollInterval.Milliseconds())
-	}
-
 	query := `SELECT id, COALESCE(json_extract(data, '$.Phase'), ''),
 		        COALESCE(json_extract(data, '$.Blocker'), ''),
 		        COALESCE(json_extract(data, '$.Disposition'), ''),
@@ -45,10 +44,12 @@ func (s *Store) NextRecoveryDelay(ctx context.Context, stepLease time.Duration, 
 		}
 		query += ` AND id IN (` + strings.Join(placeholders, ",") + `)`
 	}
+	query += ` ORDER BY id`
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return 0, false, fmt.Errorf("read task claims for recovery: %w", err)
+		return nil, fmt.Errorf("read task claims for recovery: %w", err)
 	}
+	var claims []RecoveryClaim
 	for rows.Next() {
 		var id, phase, blocker, disposition, owner, stepPhase string
 		var claimedAt, slotOwnerPID, slotOwnerStart, stepUntil, stepOwnerPID, stepOwnerStart int64
@@ -58,7 +59,7 @@ func (s *Store) NextRecoveryDelay(ctx context.Context, stepLease time.Duration, 
 			&owner, &stepPhase, &stepUntil, &stepOwnerPID, &stepOwnerStart,
 		); err != nil {
 			_ = rows.Close()
-			return 0, false, fmt.Errorf("read task claim for recovery: %w", err)
+			return nil, fmt.Errorf("read task claim for recovery: %w", err)
 		}
 		if strings.TrimSpace(blocker) != "" || strings.TrimSpace(disposition) != "" {
 			continue
@@ -69,22 +70,18 @@ func (s *Store) NextRecoveryDelay(ctx context.Context, stepLease time.Duration, 
 				continue
 			}
 			due := claimedAt + stepLease.Milliseconds()
-			ownerAlive := s.taskOwnerAlive(slotOwnerPID, slotOwnerStart, id)
-			// SlotClaimAbandoned also excludes any live step claim on an intent,
-			// regardless of its phase. A dead step owner still retains the
-			// existing lease fence; a live or unknown owner is polled instead.
+			live := s.taskOwnerAlive(slotOwnerPID, slotOwnerStart, id)
+			// SlotClaimAbandoned also excludes any live step claim on an intent, whatever
+			// its phase: a live step owner keeps the intent's claim live, and a dead one
+			// leaves the claim to its lease.
 			if strings.TrimSpace(owner) != "" {
 				if s.taskOwnerAlive(stepOwnerPID, stepOwnerStart, id) {
-					ownerAlive = true
+					live = true
 				} else if stepUntil > due {
 					due = stepUntil
 				}
 			}
-			if ownerAlive {
-				pollLiveOwner()
-			} else {
-				consider(due)
-			}
+			claims = append(claims, RecoveryClaim{ID: id, Due: millisTime(due), Live: live})
 		case task.WorktreeCreated, task.AgentStarted:
 			if claimedAt <= 0 && strings.TrimSpace(owner) == "" {
 				continue
@@ -96,29 +93,27 @@ func (s *Store) NextRecoveryDelay(ctx context.Context, stepLease time.Duration, 
 			if stepUntil > due {
 				due = stepUntil
 			}
-			if s.taskOwnerAlive(slotOwnerPID, slotOwnerStart, id) ||
-				s.taskOwnerAlive(stepOwnerPID, stepOwnerStart, id) {
-				pollLiveOwner()
-			} else {
-				consider(due)
-			}
+			live := s.taskOwnerAlive(slotOwnerPID, slotOwnerStart, id) ||
+				s.taskOwnerAlive(stepOwnerPID, stepOwnerStart, id)
+			claims = append(claims, RecoveryClaim{ID: id, Due: millisTime(due), Live: live})
 		}
 	}
 	if err := rows.Err(); err != nil {
 		_ = rows.Close()
-		return 0, false, fmt.Errorf("read task claim for recovery: %w", err)
+		return nil, fmt.Errorf("read task claim for recovery: %w", err)
 	}
 	if err := rows.Close(); err != nil {
-		return 0, false, fmt.Errorf("close task claims for recovery: %w", err)
+		return nil, fmt.Errorf("close task claims for recovery: %w", err)
 	}
+	return claims, nil
+}
 
-	if earliest == 0 {
-		return 0, false, nil
+// millisTime converts a stored Unix-millisecond instant; zero means none.
+func millisTime(ms int64) time.Time {
+	if ms <= 0 {
+		return time.Time{}
 	}
-	if earliest <= now {
-		return 0, true, nil
-	}
-	return time.Duration(earliest-now) * time.Millisecond, true, nil
+	return time.UnixMilli(ms)
 }
 
 // RecoverableTaskIDs reports task claims owned by owner that task recovery may
