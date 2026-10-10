@@ -125,6 +125,9 @@ type Card struct {
 	// title and derived stage, so the task's detail can say where the ticket
 	// stands even once the ticket is no longer a card.
 	Ticket TicketRef
+	// Review is the card's wait in ready_for_review, read from its task's history.
+	// Every other card leaves it zero (see review.go).
+	Review ReviewWait
 }
 
 // ID is the card's identity. The board selects, focuses and drills down by this
@@ -171,6 +174,12 @@ func (c Card) Observation() string {
 // projection: the store's durable facts are never touched, and the order is the
 // store's stable oldest-first order.
 func ProjectCards(ctx context.Context, store *state.Store, projectKey string) ([]Card, error) {
+	return projectCardsAt(ctx, store, projectKey, time.Now())
+}
+
+// projectCardsAt is ProjectCards with the instant the waits are measured to, so
+// a test can fix it.
+func projectCardsAt(ctx context.Context, store *state.Store, projectKey string, asOf time.Time) ([]Card, error) {
 	if store == nil {
 		return nil, fmt.Errorf("board: no store")
 	}
@@ -185,12 +194,21 @@ func ProjectCards(ctx context.Context, store *state.Store, projectKey string) ([
 	}
 	cards := make([]Card, 0, len(tasks))
 	for _, fact := range tasks {
-		cards = append(cards, Card{
+		stage := task.StageOf(fact)
+		card := Card{
 			Task:             fact,
-			Stage:            task.StageOf(fact),
+			Stage:            stage,
 			DependencyBlocks: dependencyBlocks(tasks, fact),
 			Ticket:           refs[fact.TicketID],
-		})
+		}
+		if stage == task.ReadyForReview {
+			wait, err := readReviewWait(ctx, store, fact.ID, stage, asOf)
+			if err != nil {
+				return nil, err
+			}
+			card.Review = wait
+		}
+		cards = append(cards, card)
 	}
 	return cards, nil
 }
@@ -578,6 +596,7 @@ func detailLines(b *Board, d Detail, width int, th Theme) []string {
 	if line := ticketLine(card); line != "" {
 		out = append(out, wrap(line, width)...)
 	}
+	out = append(out, reviewWaitLines(card, width)...)
 
 	if d.Expanded {
 		out = append(out, wrap("Brief: "+orNone(singleLine(card.Task.Brief), "none"), width)...)

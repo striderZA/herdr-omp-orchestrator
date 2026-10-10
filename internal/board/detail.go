@@ -28,6 +28,7 @@ func pageLines(card Card, width int, th Theme) []string {
 	if line := ticketLine(card); line != "" {
 		out = append(out, wrap(line, width)...)
 	}
+	out = append(out, reviewWaitLines(card, width)...)
 	if observed := card.Observation(); observed != "" {
 		add("Last observation", observed)
 	}
