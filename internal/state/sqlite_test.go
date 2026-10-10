@@ -575,11 +575,33 @@ func TestOpenMigratesSlotTokenForAnExistingProvisioningClaim(t *testing.T) {
 	if err != nil || token == 0 {
 		t.Fatalf("RenewProvisioningSlot on the legacy claim = (%d, %v), want a fresh token", token, err)
 	}
+	identity, err := state.CurrentProcessIdentity()
+	if err != nil {
+		t.Fatalf("CurrentProcessIdentity: %v", err)
+	}
+	migrated := rawState(t, dir)
+	var slotPID, slotStart, stepPID, stepStart int64
+	if err := migrated.QueryRow(`SELECT slot_owner_pid, slot_owner_start, step_claim_pid, step_claim_start
+		FROM tasks WHERE id = 't1'`).Scan(&slotPID, &slotStart, &stepPID, &stepStart); err != nil {
+		t.Fatalf("read migrated claim owners: %v", err)
+	}
+	if slotPID != int64(identity.PID) || slotStart != identity.StartTime ||
+		stepPID != int64(identity.PID) || stepStart != identity.StartTime {
+		t.Fatalf("recorded slot/step identities = (%d/%d, %d/%d), want current owner %s",
+			slotPID, slotStart, stepPID, stepStart, identity)
+	}
 	if err := s.ReleaseStep(ctx, "t1", "legacy-resume"); err != nil {
 		t.Fatalf("ReleaseStep on the migrated task: %v", err)
 	}
 	if err := s.ReleaseProvisioningSlot(ctx, "t1", token); err != nil {
 		t.Fatalf("release the migrated legacy claim: %v", err)
+	}
+	if err := migrated.QueryRow(`SELECT slot_owner_pid, slot_owner_start, step_claim_pid, step_claim_start
+		FROM tasks WHERE id = 't1'`).Scan(&slotPID, &slotStart, &stepPID, &stepStart); err != nil {
+		t.Fatalf("read cleared claim owners: %v", err)
+	}
+	if slotPID != 0 || slotStart != 0 || stepPID != 0 || stepStart != 0 {
+		t.Fatalf("cleared slot/step identities = (%d/%d, %d/%d), want all zero", slotPID, slotStart, stepPID, stepStart)
 	}
 	if slots, err := s.ProvisioningSlots(ctx, "repo-a"); err != nil || slots != 0 {
 		t.Fatalf("ProvisioningSlots after migrated release = (%d, %v), want 0", slots, err)

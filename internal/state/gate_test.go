@@ -47,6 +47,12 @@ func TestStoreSlotClaimAbandonedOnlyAfterTheLeaseWithNoLiveStep(t *testing.T) {
 	if abandoned, err := s.SlotClaimAbandoned(ctx, stored.ID, lease); err != nil || abandoned {
 		t.Fatalf("a fresh claim = (%v, %v), want its caller's", abandoned, err)
 	}
+	identity, err := state.CurrentProcessIdentity()
+	if err != nil {
+		t.Fatalf("CurrentProcessIdentity: %v", err)
+	}
+	// This test represents a caller that exited after leaving its claim.
+	s.MarkTaskComplete(identity, stored.ID)
 	time.Sleep(2 * lease)
 	if abandoned, err := s.SlotClaimAbandoned(ctx, stored.ID, lease); err != nil || !abandoned {
 		t.Fatalf("a claim older than the lease with no step = (%v, %v), want abandoned", abandoned, err)
@@ -61,6 +67,8 @@ func TestStoreSlotClaimAbandonedOnlyAfterTheLeaseWithNoLiveStep(t *testing.T) {
 	if err := s.ReleaseStep(ctx, stored.ID, "owner-a"); err != nil {
 		t.Fatalf("ReleaseStep: %v", err)
 	}
+	// This simulated route has now finished too; the process itself remains live.
+	s.MarkTaskComplete(identity, stored.ID)
 	if abandoned, err := s.SlotClaimAbandoned(ctx, stored.ID, lease); err != nil || !abandoned {
 		t.Fatalf("a claim whose step was given back = (%v, %v), want abandoned again", abandoned, err)
 	}
@@ -73,6 +81,91 @@ func TestStoreSlotClaimAbandonedOnlyAfterTheLeaseWithNoLiveStep(t *testing.T) {
 	}
 	if _, err := s.SlotClaimAbandoned(ctx, "missing", lease); !errors.Is(err, state.ErrNotFound) {
 		t.Fatalf("an unknown task = %v, want ErrNotFound", err)
+	}
+}
+
+func TestStoreDoesNotTakeOverAnExpiredClaimWhileItsProcessIsAlive(t *testing.T) {
+	ctx := context.Background()
+	s := open(t, t.TempDir())
+	const lease = 30 * time.Millisecond
+	claimed, stored, _, err := s.ClaimTask(ctx, gateTask(t, "t-live", "repo-a", nil), 3)
+	if err != nil || !claimed {
+		t.Fatalf("ClaimTask = (%v, %v), want a slot", claimed, err)
+	}
+	if took, err := s.ClaimStep(ctx, stored.ID, task.Intent, "owner-a", lease); err != nil || !took {
+		t.Fatalf("ClaimStep(owner-a) = (%v, %v), want the step", took, err)
+	}
+	time.Sleep(3 * lease)
+
+	if abandoned, err := s.SlotClaimAbandoned(ctx, stored.ID, lease); err != nil || abandoned {
+		t.Fatalf("an expired claim held by this live process = (%v, %v), want not abandoned", abandoned, err)
+	}
+	if took, err := s.ClaimStep(ctx, stored.ID, task.Intent, "owner-b", lease); err != nil || took {
+		t.Fatalf("ClaimStep(owner-b) = (%v, %v), want the live process's step kept", took, err)
+	}
+}
+
+func TestStoreDoesNotAbandonAnExpiredSlotWhileItsProcessIsAlive(t *testing.T) {
+	ctx := context.Background()
+	s := open(t, t.TempDir())
+	const lease = 30 * time.Millisecond
+	claimed, stored, _, err := s.ClaimTask(ctx, gateTask(t, "t-live-slot", "repo-a", nil), 3)
+	if err != nil || !claimed {
+		t.Fatalf("ClaimTask = (%v, %v), want a slot", claimed, err)
+	}
+	time.Sleep(3 * lease)
+	if abandoned, err := s.SlotClaimAbandoned(ctx, stored.ID, lease); err != nil || abandoned {
+		t.Fatalf("an expired slot claim held by this live process = (%v, %v), want not abandoned", abandoned, err)
+	}
+}
+
+func TestStoreAllowsTakeoverAfterClaimOwnerCompletes(t *testing.T) {
+	ctx := context.Background()
+	s := open(t, t.TempDir())
+	const lease = 30 * time.Millisecond
+	claimed, stored, _, err := s.ClaimTask(ctx, gateTask(t, "t-completed-owner", "repo-a", nil), 3)
+	if err != nil || !claimed {
+		t.Fatalf("ClaimTask = (%v, %v), want a slot", claimed, err)
+	}
+	identity, err := state.CurrentProcessIdentity()
+	if err != nil {
+		t.Fatalf("CurrentProcessIdentity: %v", err)
+	}
+	s.MarkTaskComplete(identity, stored.ID)
+	time.Sleep(3 * lease)
+
+	if abandoned, err := s.SlotClaimAbandoned(ctx, stored.ID, lease); err != nil || !abandoned {
+		t.Fatalf("an expired claim with a completed owner = (%v, %v), want abandoned", abandoned, err)
+	}
+	if took, err := s.ClaimStep(ctx, stored.ID, task.Intent, "owner-b", lease); err != nil || !took {
+		t.Fatalf("ClaimStep(owner-b) = (%v, %v), want completed owner's step taken over", took, err)
+	}
+}
+
+func TestStoreCompletionFenceDoesNotCompleteLaterClaimsFromTheSameProcess(t *testing.T) {
+	ctx := context.Background()
+	s := open(t, t.TempDir())
+	const lease = 30 * time.Millisecond
+	owner, err := state.CurrentProcessIdentity()
+	if err != nil {
+		t.Fatalf("CurrentProcessIdentity: %v", err)
+	}
+	claimed, earlier, _, err := s.ClaimTask(ctx, gateTask(t, "t-earlier", "repo-a", nil), 3)
+	if err != nil || !claimed {
+		t.Fatalf("ClaimTask(earlier) = (%v, %v), want a slot", claimed, err)
+	}
+	s.MarkTaskComplete(owner, earlier.ID)
+	time.Sleep(2 * lease)
+	claimed, later, _, err := s.ClaimTask(ctx, gateTask(t, "t-later", "repo-a", nil), 3)
+	if err != nil || !claimed {
+		t.Fatalf("ClaimTask(later) = (%v, %v), want a slot", claimed, err)
+	}
+	if abandoned, err := s.SlotClaimAbandoned(ctx, earlier.ID, lease); err != nil || !abandoned {
+		t.Fatalf("the completed earlier claim = (%v, %v), want abandoned", abandoned, err)
+	}
+	time.Sleep(2 * lease)
+	if abandoned, err := s.SlotClaimAbandoned(ctx, later.ID, lease); err != nil || abandoned {
+		t.Fatalf("a later claim from the still-live process = (%v, %v), want its caller's", abandoned, err)
 	}
 }
 
@@ -311,8 +404,16 @@ func TestStoreClaimStepIsExclusivePerPhase(t *testing.T) {
 		t.Fatalf("ClaimStep(dead) = (%v, %v), want the claim", took, err)
 	}
 	time.Sleep(40 * time.Millisecond)
+	if took, err := first.ClaimStep(ctx, "t1", task.WorktreeCreated, "still-live-owner", time.Minute); err != nil || took {
+		t.Fatalf("ClaimStep while the process is still live = (%v, %v), want it refused", took, err)
+	}
+	identity, err := state.CurrentProcessIdentity()
+	if err != nil {
+		t.Fatalf("CurrentProcessIdentity: %v", err)
+	}
+	first.MarkTaskComplete(identity, "t1")
 	if took, err := first.ClaimStep(ctx, "t1", task.WorktreeCreated, "owner-live", time.Minute); err != nil || !took {
-		t.Fatalf("ClaimStep after the lease expired = (%v, %v), want the claim", took, err)
+		t.Fatalf("ClaimStep after route completion = (%v, %v), want the claim", took, err)
 	}
 	// Releasing someone else's claim is refused, never silent.
 	if err := first.ReleaseStep(ctx, "t1", "owner-dead"); !errors.Is(err, state.ErrConflict) {
@@ -645,6 +746,11 @@ func TestStoreRecordStepFailureKeepsAnUndecidedOutcomeWithoutALiveOwner(t *testi
 	}
 	// The step can still be taken over at once, so a definite failure never leaves the
 	// task behind a lease.
+	identity, err := state.CurrentProcessIdentity()
+	if err != nil {
+		t.Fatalf("CurrentProcessIdentity: %v", err)
+	}
+	s.MarkTaskComplete(identity, "t1")
 	if took, err := s.ClaimStep(ctx, "t1", task.Intent, "owner-b", time.Minute); err != nil || !took {
 		t.Fatalf("ClaimStep after the expired failure = (%v, %v), want the takeover", took, err)
 	}

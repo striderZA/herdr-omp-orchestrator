@@ -10,12 +10,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 
+	"herdr-omp-orchestrator/internal/bridge"
 	"herdr-omp-orchestrator/internal/coord"
 	"herdr-omp-orchestrator/internal/herdr"
 	"herdr-omp-orchestrator/internal/setup"
@@ -36,6 +40,12 @@ const (
 func TestMain(m *testing.M) {
 	if os.Getenv(routeFixtureEnv) == "1" {
 		os.Exit(routeFixtureMain())
+	}
+	switch os.Getenv(recoveryProcessTestEnv) {
+	case "parent":
+		os.Exit(recoveryProcessParentMain())
+	case "worker":
+		os.Exit(recoveryProcessWorkerMain())
 	}
 	os.Exit(m.Run())
 }
@@ -362,6 +372,7 @@ func readRouteCalls(t *testing.T, path string) [][]string {
 	}
 	return calls
 }
+
 func TestCoordCodePreservesAmbiguousOperation(t *testing.T) {
 	if got := coordCode(herdr.ErrAmbiguous); got != "ambiguous_operation" {
 		t.Fatalf("coordCode(herdr.ErrAmbiguous) = %q, want ambiguous_operation", got)
@@ -565,4 +576,349 @@ func TestCoordCodeNamesAnUnmetBindPrerequisite(t *testing.T) {
 	if got := coordCode(fmt.Errorf("%w: boom", coord.ErrNotReady)); got != "not_ready" {
 		t.Errorf("coordCode(not ready) = %q, want not_ready", got)
 	}
+}
+
+func TestRecoverableRouteArmsBeforeRunningAndSignalsCompletionAfterward(t *testing.T) {
+	var order []string
+	status := runRecoverableRoute(
+		func() (func(bool) error, error) {
+			order = append(order, "armed")
+			return func(recover bool) error {
+				if recover {
+					order = append(order, "complete")
+				} else {
+					order = append(order, "abort")
+				}
+				return nil
+			}, nil
+		},
+		func() (int, bool) {
+			order = append(order, "route")
+			return 7, true
+		},
+		func(err error) int {
+			t.Fatalf("runRecoverableRoute failure: %v", err)
+			return 2
+		},
+		func(err error) { t.Fatalf("signal failure: %v", err) },
+	)
+	if status != 7 {
+		t.Fatalf("status = %d, want the route's status 7", status)
+	}
+	if got := strings.Join(order, ","); got != "armed,route,complete" {
+		t.Fatalf("operation order = %q, want armed before the route and completion after it", got)
+	}
+}
+
+func TestRecoverableRouteRefusesBeforeRunningWhenWorkerCannotArm(t *testing.T) {
+	routeCalls := 0
+	status := runRecoverableRoute(
+		func() (func(bool) error, error) {
+			return nil, fmt.Errorf("recovery worker could not start")
+		},
+		func() (int, bool) {
+			routeCalls++
+			return 0, true
+		},
+		func(err error) int {
+			if !strings.Contains(err.Error(), "recovery worker could not start") {
+				t.Fatalf("failure = %v, want the arming error", err)
+			}
+			return 2
+		},
+		func(err error) { t.Fatalf("unexpected post-route signal failure: %v", err) },
+	)
+	if status != 2 || routeCalls != 0 {
+		t.Fatalf("status = %d routeCalls = %d, want refusal before route execution", status, routeCalls)
+	}
+}
+
+func TestRecoverableRouteAbortsWorkerForAnIdempotentNoOp(t *testing.T) {
+	var recover bool
+	status := runRecoverableRoute(
+		func() (func(bool) error, error) {
+			return func(shouldRecover bool) error {
+				recover = shouldRecover
+				return nil
+			}, nil
+		},
+		func() (int, bool) { return 0, false },
+		func(err error) int {
+			t.Fatalf("runRecoverableRoute failure: %v", err)
+			return 2
+		},
+		func(err error) { t.Fatalf("signal failure: %v", err) },
+	)
+	if status != 0 || recover {
+		t.Fatalf("status = %d recover = %v, want a no-op to abort the worker", status, recover)
+	}
+}
+
+func TestRecoverableRouteKeepsRouteResultWhenCompletionSignalFails(t *testing.T) {
+	var signalFailure string
+	status := runRecoverableRoute(
+		func() (func(bool) error, error) {
+			return func(bool) error { return fmt.Errorf("marker write failed") }, nil
+		},
+		func() (int, bool) { return 7, true },
+		func(err error) int {
+			t.Fatalf("route unexpectedly failed before running: %v", err)
+			return 2
+		},
+		func(err error) { signalFailure = err.Error() },
+	)
+	if status != 7 || !strings.Contains(signalFailure, "marker write failed") {
+		t.Fatalf("status = %d, signal failure = %q; want route status 7 and a reported signal failure",
+			status, signalFailure)
+	}
+}
+
+func TestBridgeResponseNeedsRecoveryDistinguishesMutationsFromNoOps(t *testing.T) {
+	tests := []struct {
+		name    string
+		method  string
+		payload string
+		want    bool
+	}{
+		{"dispatch created", bridge.MethodDispatch, `{"ok":true,"result":{"duplicate":false}}`, true},
+		{"dispatch duplicate", bridge.MethodDispatch, `{"ok":true,"result":{"duplicate":true}}`, false},
+		{"dispatch refusal", bridge.MethodDispatch, `{"ok":false,"error":{"code":"invalid_request"}}`, true},
+		{"ticket moved", bridge.MethodTicketMove, `{"ok":true,"result":{}}`, true},
+		{"ticket move refusal", bridge.MethodTicketMove, `{"ok":false,"error":{"code":"ticket_changed"}}`, false},
+		{"review result", bridge.MethodReview, `{"ok":true,"result":{}}`, true},
+		{"review error", bridge.MethodReview, `{"ok":false,"error":{"code":"report_changed"}}`, true},
+		{"brief adjudication resumes", bridge.MethodAdjudicateBrief, `{"ok":true,"result":{"decision":"not_delivered"}}`, true},
+		{"brief adjudication delivered", bridge.MethodAdjudicateBrief, `{"ok":true,"result":{"decision":"delivered"}}`, false},
+		{"brief adjudication error", bridge.MethodAdjudicateBrief, `{"ok":false,"error":{"code":"step_failed"}}`, true},
+		{"read only", bridge.MethodTaskList, `{"ok":true,"result":{}}`, false},
+		{"malformed answer", bridge.MethodDispatch, `{`, true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := bridgeResponseNeedsRecovery(test.method, []byte(test.payload)); got != test.want {
+				t.Fatalf("bridgeResponseNeedsRecovery(%q, %s) = %v, want %v", test.method, test.payload, got, test.want)
+			}
+		})
+	}
+}
+
+func TestBridgeRecoveryScopeCoversOnlyTaskProgressOperations(t *testing.T) {
+	tests := []struct {
+		method string
+		scope  recoveryScope
+		want   bool
+	}{
+		{method: bridge.MethodDispatch, scope: recoveryScopeOwner, want: true},
+		{method: bridge.MethodTicketMove, scope: recoveryScopeOwner, want: true},
+		{method: bridge.MethodReview, scope: recoveryScopeOwner, want: true},
+		{method: bridge.MethodAdjudicateBrief, scope: recoveryScopeOwner, want: true},
+		{method: bridge.MethodTaskList, want: false},
+		{want: false},
+	}
+	for _, test := range tests {
+		scope, got := bridgeRecoveryScope([]string{test.method})
+		if got != test.want || scope != test.scope {
+			t.Errorf("bridgeRecoveryScope(%q) = (%q, %v), want (%q, %v)",
+				test.method, scope, got, test.scope, test.want)
+		}
+	}
+}
+
+func TestRecoveryWaitsForRouteCompletionOrParentExit(t *testing.T) {
+	parent := state.ProcessIdentity{PID: 42, StartTime: 99}
+	t.Run("route is still active", func(t *testing.T) {
+		marker := filepath.Join(t.TempDir(), "route.signal")
+		if err := os.WriteFile(marker, []byte("pending"), 0o600); err != nil {
+			t.Fatalf("create the pending marker: %v", err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		done := make(chan error, 1)
+		go func() {
+			done <- waitForRecoveryTrigger(ctx, marker, parent,
+				func(got state.ProcessIdentity) (bool, error) { return got == parent, nil },
+				5*time.Millisecond)
+		}()
+		select {
+		case err := <-done:
+			t.Fatalf("worker armed recovery before the route completed: %v", err)
+		case <-time.After(50 * time.Millisecond):
+		}
+		if err := writeRecoverySignal(marker, recoverySignalDone); err != nil {
+			t.Fatalf("complete the route marker: %v", err)
+		}
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("waitForRecoveryTrigger after completion: %v", err)
+			}
+		case <-ctx.Done():
+			t.Fatal("worker did not observe the completed route")
+		}
+	})
+	t.Run("parent exited before completion", func(t *testing.T) {
+		marker := filepath.Join(t.TempDir(), "route.signal")
+		if err := os.WriteFile(marker, []byte("pending"), 0o600); err != nil {
+			t.Fatalf("create the pending marker: %v", err)
+		}
+		err := waitForRecoveryTrigger(context.Background(), marker, parent,
+			func(state.ProcessIdentity) (bool, error) { return false, nil },
+			time.Millisecond)
+		if err != nil {
+			t.Fatalf("waitForRecoveryTrigger after owner exit: %v", err)
+		}
+	})
+}
+
+func TestRecoveryWorkerRemovesMarkerWhenRouteAborts(t *testing.T) {
+	parent, err := state.CurrentProcessIdentity()
+	if err != nil {
+		t.Fatalf("CurrentProcessIdentity: %v", err)
+	}
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "route.signal")
+	ready := filepath.Join(dir, "worker.ready")
+	if err := os.WriteFile(marker, []byte(recoverySignalPending), 0o600); err != nil {
+		t.Fatalf("create the pending marker: %v", err)
+	}
+	stderr := &bytes.Buffer{}
+	done := make(chan int, 1)
+	env := map[string]string{envStateDir: dir, envHerdrBinary: "herdr"}
+	args := []string{
+		string(recoveryScopeOwner),
+		fmt.Sprint(parent.PID),
+		fmt.Sprint(parent.StartTime),
+		marker,
+		ready,
+		"",
+	}
+	go func() { done <- runRecovery(env, stderr, args) }()
+	readyDeadline := time.NewTimer(recoveryArmTimeout)
+	defer readyDeadline.Stop()
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if data, err := os.ReadFile(ready); err == nil && string(data) == "ready" {
+			break
+		}
+		select {
+		case status := <-done:
+			t.Fatalf("runRecovery exited before readiness: status %d, stderr %q", status, stderr.String())
+		case <-readyDeadline.C:
+			if err := writeRecoverySignal(marker, recoverySignalAbort); err != nil {
+				t.Fatalf("abort the recovery worker after readiness timeout: %v", err)
+			}
+			select {
+			case status := <-done:
+				t.Fatalf("recovery worker did not become ready before deadline: status %d, stderr %q", status, stderr.String())
+			case <-time.After(recoveryArmTimeout):
+				t.Fatal("recovery worker did not exit after aborting during startup")
+			}
+		case <-ticker.C:
+		}
+	}
+	if err := writeRecoverySignal(marker, recoverySignalAbort); err != nil {
+		t.Fatalf("abort the recovery worker: %v", err)
+	}
+	select {
+	case status := <-done:
+		if status != 0 {
+			t.Fatalf("runRecovery status = %d, want successful abort (stderr %q)", status, stderr.String())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("recovery worker did not exit after the route abort")
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("abort marker remains: %v", err)
+	}
+}
+
+const (
+	recoveryProcessTestEnv      = "ORCH_RECOVERY_PROCESS_TEST"
+	recoveryProcessMarkerEnv    = "ORCH_RECOVERY_PROCESS_MARKER"
+	recoveryProcessReadyEnv     = "ORCH_RECOVERY_PROCESS_READY"
+	recoveryProcessRecoveredEnv = "ORCH_RECOVERY_PROCESS_RECOVERED"
+)
+
+func TestDetachedRecoveryChildSurvivesTheForegroundRoute(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("the recovery child uses Windows breakaway process flags")
+	}
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "route.signal")
+	ready := filepath.Join(dir, "worker.ready")
+	recovered := filepath.Join(dir, "worker.recovered")
+	if err := os.WriteFile(marker, []byte("pending"), 0o600); err != nil {
+		t.Fatalf("create the pending marker: %v", err)
+	}
+	env := os.Environ()
+	env = replaceTestEnv(env, recoveryProcessTestEnv, "parent")
+	env = replaceTestEnv(env, recoveryProcessMarkerEnv, marker)
+	env = replaceTestEnv(env, recoveryProcessReadyEnv, ready)
+	env = replaceTestEnv(env, recoveryProcessRecoveredEnv, recovered)
+	parent := exec.Command(os.Args[0], "-test.run=^TestDetachedRecoveryChildSurvivesTheForegroundRoute$")
+	parent.Env = env
+	parent.Stdout = io.Discard
+	parent.Stderr = io.Discard
+	if err := parent.Run(); err != nil {
+		t.Fatalf("foreground test process: %v", err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(recovered); err == nil {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("recovery child did not survive the foreground process exit")
+}
+
+func recoveryProcessParentMain() int {
+	marker := os.Getenv(recoveryProcessMarkerEnv)
+	ready := os.Getenv(recoveryProcessReadyEnv)
+	childEnv := replaceTestEnv(os.Environ(), recoveryProcessTestEnv, "worker")
+	completed, err := launchRecoveryChild(os.Args[0], []string{"-test.run=^TestDetachedRecoveryChildSurvivesTheForegroundRoute$"},
+		childEnv, marker, ready)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 31
+	}
+	if err := completed(true); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 32
+	}
+	return 0
+}
+
+func recoveryProcessWorkerMain() int {
+	ready := os.Getenv(recoveryProcessReadyEnv)
+	marker := os.Getenv(recoveryProcessMarkerEnv)
+	recovered := os.Getenv(recoveryProcessRecoveredEnv)
+	if ready == "" || marker == "" || recovered == "" {
+		return 41
+	}
+	if err := os.WriteFile(ready, []byte("ready"), 0o600); err != nil {
+		return 42
+	}
+	for {
+		complete, err := recoverySignalExists(recoverySignalPath(marker, recoverySignalDone))
+		if err == nil && complete {
+			if err := os.WriteFile(recovered, []byte("recovered"), 0o600); err != nil {
+				return 43
+			}
+			return 0
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func replaceTestEnv(env []string, key, value string) []string {
+	prefix := strings.ToUpper(key) + "="
+	result := make([]string, 0, len(env)+1)
+	for _, entry := range env {
+		if !strings.HasPrefix(strings.ToUpper(entry), prefix) {
+			result = append(result, entry)
+		}
+	}
+	return append(result, key+"="+value)
 }

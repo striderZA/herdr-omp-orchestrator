@@ -186,6 +186,8 @@ type Coordinator struct {
 	// owner identifies this coordinator in the durable step claim, so the claim it
 	// takes can be released by it and by nobody else.
 	owner string
+	// pace bounds how long a recovery worker retries a due claim that no pass can advance.
+	pace recoveryPace
 }
 
 // New returns a coordinator over an open store and a Herdr client.
@@ -227,6 +229,7 @@ func New(store *state.Store, client *herdr.Client, opts Options) (*Coordinator, 
 		opts:   opts,
 		random: fillRandom,
 		owner:  hex.EncodeToString(owner),
+		pace:   defaultRecoveryPace,
 	}, nil
 }
 

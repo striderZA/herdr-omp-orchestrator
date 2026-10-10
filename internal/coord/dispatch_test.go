@@ -4743,9 +4743,14 @@ func TestStepClaimLeaseKeepsCrashRecovery(t *testing.T) {
 		t.Fatalf("ClaimStep(dead) = (%v, %v), want the claim", took, err)
 	}
 	time.Sleep(40 * time.Millisecond)
+	identity, err := state.CurrentProcessIdentity()
+	if err != nil {
+		t.Fatalf("CurrentProcessIdentity: %v", err)
+	}
+	f.store.MarkTaskComplete(identity, atBrief.ID)
 	resumed, err := f.resume(atBrief.ID)
 	if err != nil {
-		t.Fatalf("resume after the lease expired: %v", err)
+		t.Fatalf("resume after the lease expired and owner completed: %v", err)
 	}
 	if resumed.Phase != task.PromptSubmitted {
 		t.Errorf("phase = %q, want %q", resumed.Phase, task.PromptSubmitted)
