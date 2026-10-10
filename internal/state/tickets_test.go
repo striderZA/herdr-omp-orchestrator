@@ -266,24 +266,103 @@ func TestClaimTaskAndCreateTaskRefuseAnUnavailableTicket(t *testing.T) {
 	}
 }
 
-func TestClaimTaskAcceptsABacklogTicket(t *testing.T) {
+// Linked implementation work needs the ticket's planner report accepted: a
+// ticket with no planner refuses it in CreateTask and ClaimTask and stores
+// nothing, and the same work is admitted once an accepted planner is recorded.
+func TestClaimTaskRefusesLinkedWorkWithoutAnAcceptedPlanner(t *testing.T) {
 	ctx := context.Background()
 	s := open(t, t.TempDir())
-	mustCreateTicket(t, s, seedTicket("tkt_a", "repo-a")) // still in the backlog
-	if err := s.CreateTask(ctx, ticketTask("t1", "tkt_a", 1)); err != nil {
-		t.Fatalf("CreateTask for a backlog ticket: %v", err)
+	mustCreateTicket(t, s, seedTicket("tkt_a", "repo-a")) // still in the backlog, no planner
+	work := ticketTask("t1", "tkt_a", 1)
+	if err := s.CreateTask(ctx, work); !errors.Is(err, state.ErrTicketUnavailable) {
+		t.Fatalf("CreateTask without a planner = %v, want ErrTicketUnavailable", err)
 	}
-	// Identical work would be answered as a repeat of t1 (issue #4); this test is
-	// about the ticket, so the second task is a different piece of work.
-	second := ticketTask("t2", "tkt_a", 2)
-	second.Title = "a second piece of work for the ticket"
-	if _, linked, _, err := s.ClaimTask(ctx, second, 3); err != nil || linked.TicketID != "tkt_a" {
-		t.Fatalf("ClaimTask for a backlog ticket = %+v, %v", linked, err)
+	if _, _, _, err := s.ClaimTask(ctx, work, 3); !errors.Is(err, state.ErrTicketUnavailable) {
+		t.Fatalf("ClaimTask without a planner = %v, want ErrTicketUnavailable", err)
 	}
-	for _, id := range []string{"t1", "t2"} {
-		if got, err := s.Task(ctx, id); err != nil || got.TicketID != "tkt_a" {
-			t.Fatalf("task %s must be stored linked: %+v, %v", id, got, err)
-		}
+	if _, err := s.Task(ctx, "t1"); !errors.Is(err, state.ErrNotFound) {
+		t.Fatalf("refused linked work must not be stored: %v", err)
+	}
+	if err := s.CreateTask(ctx, acceptedPlannerTask("plan_a", "tkt_a", 2)); err != nil {
+		t.Fatalf("seed the accepted planner: %v", err)
+	}
+	if _, linked, _, err := s.ClaimTask(ctx, work, 3); err != nil || linked.TicketID != "tkt_a" {
+		t.Fatalf("ClaimTask after the plan was accepted = %+v, %v", linked, err)
+	}
+}
+
+// acceptedPlannerTask is a ticket's planner whose report the user accepted: a
+// closed plan-role task with an integrated outcome, which releases linked work.
+func acceptedPlannerTask(id, ticketID string, n int) task.Task {
+	x := ticketTask(id, ticketID, n)
+	x.Role = task.TaskRolePlan
+	x.Outcome, x.Disposition = task.OutcomeIntegrated, "accepted the plan"
+	return x
+}
+
+func TestTicketPlannerGateAndRoleAreImmutable(t *testing.T) {
+	ctx := context.Background()
+	s := open(t, t.TempDir())
+	mustCreateTicket(t, s, seedTicket("tkt_a", "repo-a"))
+
+	planner := ticketTask("plan_a", "tkt_a", 1)
+	planner.Role = task.TaskRolePlan
+	if err := s.CreateTask(ctx, planner); err != nil {
+		t.Fatalf("CreateTask for the planner: %v", err)
+	}
+	implementation := ticketTask("impl_open_plan", "tkt_a", 2)
+	if err := s.CreateTask(ctx, implementation); !errors.Is(err, state.ErrTicketUnavailable) {
+		t.Fatalf("CreateTask before plan approval = %v, want ErrTicketUnavailable", err)
+	}
+	if _, err := s.Task(ctx, implementation.ID); !errors.Is(err, state.ErrNotFound) {
+		t.Fatalf("a task before plan approval was stored: %v", err)
+	}
+	implementation.ID = "claim_open_plan"
+	if _, _, _, err := s.ClaimTask(ctx, implementation, 3); !errors.Is(err, state.ErrTicketUnavailable) {
+		t.Fatalf("ClaimTask before plan approval = %v, want ErrTicketUnavailable", err)
+	}
+	if _, err := s.Task(ctx, implementation.ID); !errors.Is(err, state.ErrNotFound) {
+		t.Fatalf("a claimed task before plan approval was stored: %v", err)
+	}
+
+	if _, err := s.UpdateTask(ctx, planner.ID, 1, func(next *task.Task) error {
+		next.Role = ""
+		return nil
+	}); !errors.Is(err, state.ErrInvalid) {
+		t.Fatalf("changing the planner role = %v, want ErrInvalid", err)
+	}
+	if _, err := s.UpdateTask(ctx, planner.ID, 1, func(next *task.Task) error {
+		next.Outcome, next.Disposition = task.OutcomeIntegrated, task.OutcomeIntegrated
+		return nil
+	}); err != nil {
+		t.Fatalf("accept planner: %v", err)
+	}
+	implementation.ID = "impl_after_accepted_plan"
+	if err := s.CreateTask(ctx, implementation); err != nil {
+		t.Fatalf("CreateTask after accepting the plan: %v", err)
+	}
+
+	mustCreateTicket(t, s, seedTicket("tkt_b", "repo-a"))
+	rejected := ticketTask("plan_b", "tkt_b", 3)
+	rejected.Role = task.TaskRolePlan
+	if err := s.CreateTask(ctx, rejected); err != nil {
+		t.Fatalf("CreateTask for the second planner: %v", err)
+	}
+	if _, err := s.UpdateTask(ctx, rejected.ID, 1, func(next *task.Task) error {
+		next.Outcome, next.Disposition = task.OutcomeRejected, task.OutcomeRejected
+		return nil
+	}); err != nil {
+		t.Fatalf("reject planner: %v", err)
+	}
+	implementation = ticketTask("impl_rejected_plan", "tkt_b", 4)
+	if err := s.CreateTask(ctx, implementation); !errors.Is(err, state.ErrTicketUnavailable) {
+		t.Fatalf("CreateTask after rejecting the plan = %v, want ErrTicketUnavailable", err)
+	}
+
+	invalidRole := ticketTask("bad_role", "", 5)
+	invalidRole.Role = task.TaskRole("worker")
+	if err := s.CreateTask(ctx, invalidRole); !errors.Is(err, state.ErrInvalid) {
+		t.Fatalf("CreateTask with unknown role = %v, want ErrInvalid", err)
 	}
 }
 
@@ -292,6 +371,13 @@ func TestDecideTicketRefusesWhileALinkedTaskIsOpen(t *testing.T) {
 	s := open(t, t.TempDir())
 	mustCreateTicket(t, s, seedTicket("tkt_a", "repo-a"))
 	mustCreateTicket(t, s, seedTicket("tkt_b", "repo-a"))
+	// Linked work needs each ticket's plan accepted; a closed planner never
+	// blocks the ticket's decision.
+	for i, ticketID := range []string{"tkt_a", "tkt_b"} {
+		if err := s.CreateTask(ctx, acceptedPlannerTask("plan_"+ticketID, ticketID, 11+i)); err != nil {
+			t.Fatalf("seed the accepted planner of %s: %v", ticketID, err)
+		}
+	}
 	if _, _, _, err := s.ClaimTask(ctx, ticketTask("t1", "tkt_a", 1), 3); err != nil {
 		t.Fatalf("ClaimTask: %v", err)
 	}
@@ -391,6 +477,10 @@ func TestTicketDecisionAndTaskClaimNeverBothSucceed(t *testing.T) {
 		ticketID := fmt.Sprintf("tkt_%02d", round)
 		taskID := fmt.Sprintf("task_%02d", round)
 		mustCreateTicket(t, decider, seedTicket(ticketID, "repo-a"))
+		// The plan is accepted first, so the claim races the decision only.
+		if err := decider.CreateTask(ctx, acceptedPlannerTask(fmt.Sprintf("plan_%02d", round), ticketID, 100+round)); err != nil {
+			t.Fatalf("round %d: seed the accepted planner: %v", round, err)
+		}
 		linked := ticketTask(taskID, ticketID, round)
 
 		start := make(chan struct{})
@@ -436,6 +526,9 @@ func TestUpdateTaskRefusesToChangeTicketID(t *testing.T) {
 	s := open(t, t.TempDir())
 	mustCreateTicket(t, s, seedTicket("tkt_a", "repo-a"))
 	mustCreateTicket(t, s, seedTicket("tkt_b", "repo-a"))
+	if err := s.CreateTask(ctx, acceptedPlannerTask("plan_a", "tkt_a", 3)); err != nil {
+		t.Fatalf("seed the accepted planner: %v", err)
+	}
 	if err := s.CreateTask(ctx, ticketTask("t1", "tkt_a", 1)); err != nil {
 		t.Fatalf("CreateTask: %v", err)
 	}

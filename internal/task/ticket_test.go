@@ -20,10 +20,30 @@ func closedTask(id, ticketID string) Task {
 	return x
 }
 
+func taskWithRole(t *testing.T, x Task, role string) Task {
+	t.Helper()
+	encoded, err := json.Marshal(map[string]string{"Role": role})
+	if err != nil {
+		t.Fatalf("encode task role: %v", err)
+	}
+	if err := json.Unmarshal(encoded, &x); err != nil {
+		t.Fatalf("decode task role: %v", err)
+	}
+	return x
+}
+
 func TestTicketStageOf(t *testing.T) {
 	backlog := Ticket{ID: "tkt_a", Column: ColumnBacklog}
 	todo := Ticket{ID: "tkt_a", Column: ColumnTodo}
 	decidedBacklog := Ticket{ID: "tkt_a", Column: ColumnBacklog, Outcome: OutcomeAbandoned, Disposition: OutcomeAbandoned}
+	planner := taskWithRole(t, openTask("p1", "tkt_a"), "plan")
+	planReady := planner
+	planReady.Report = &Report{Kind: "result", Summary: "implementation plan"}
+	acceptedPlanner := taskWithRole(t, closedTask("p2", "tkt_a"), "plan")
+	rejectedPlanner := acceptedPlanner
+	rejectedPlanner.Outcome, rejectedPlanner.Disposition = OutcomeRejected, OutcomeRejected
+	planWithAttention := planReady
+	planWithAttention.Attention = "primary needs attention"
 	for _, tc := range []struct {
 		name   string
 		ticket Ticket
@@ -34,7 +54,14 @@ func TestTicketStageOf(t *testing.T) {
 		{"todo without tasks", todo, nil, TicketTodo},
 		{"todo with one open task", todo, []Task{openTask("o1", "tkt_a")}, TicketInProgress},
 		{"todo with a closed and an open task", todo, []Task{closedTask("c1", "tkt_a"), openTask("o1", "tkt_a")}, TicketInProgress},
-		{"todo with every task closed", todo, []Task{closedTask("c1", "tkt_a"), closedTask("c2", "tkt_a")}, TicketReadyForReview},
+		{"todo with every implementation task closed", todo, []Task{closedTask("c1", "tkt_a"), closedTask("c2", "tkt_a")}, TicketReadyForReview},
+		{"todo with an active planner", todo, []Task{planner}, TicketStage("planning")},
+		{"todo with a planner report awaiting review", todo, []Task{planReady}, TicketStage("plan_ready")},
+		{"todo with planner report and retained attention", todo, []Task{planWithAttention}, TicketStage("plan_ready")},
+		{"accepted plan with no implementation tasks", todo, []Task{acceptedPlanner}, TicketTodo},
+		{"accepted plan and open implementation task", todo, []Task{acceptedPlanner, openTask("o1", "tkt_a")}, TicketInProgress},
+		{"plan report takes precedence while implementation is open", todo, []Task{planReady, openTask("o1", "tkt_a")}, TicketStage("plan_ready")},
+		{"rejected plan with no implementation tasks", todo, []Task{rejectedPlanner}, TicketTodo},
 		{"decided backlog ticket with an open task", decidedBacklog, []Task{openTask("o1", "tkt_a")}, TicketDone},
 		{"backlog ticket with an open task", backlog, []Task{openTask("o1", "tkt_a")}, TicketInProgress},
 	} {

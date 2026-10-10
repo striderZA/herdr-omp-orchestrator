@@ -306,6 +306,9 @@ func (s *Store) CreateTask(ctx context.Context, t task.Task) error {
 	if t.ID == "" || t.ProjectKey == "" {
 		return fmt.Errorf("%w: task id and project key are required", ErrInvalid)
 	}
+	if err := checkTaskRole(t); err != nil {
+		return err
+	}
 	now := time.Now().UnixMilli()
 	t.Revision = 1
 	t.CreatedAt, t.UpdatedAt = now, now
@@ -459,6 +462,9 @@ func updateTask(ctx context.Context, tx *tx, id string, expectedRevision int64, 
 	}
 	if next.TicketID != current.TicketID {
 		return task.Task{}, fmt.Errorf("%w: task %q ticket id is immutable", ErrInvalid, id)
+	}
+	if next.Role != current.Role {
+		return task.Task{}, fmt.Errorf("%w: task %q role is immutable", ErrInvalid, id)
 	}
 	if next.LaunchPaneID != current.LaunchPaneID {
 		if err := checkPaneFree(ctx, tx, next.LaunchPaneID, id); err != nil {
@@ -1142,8 +1148,36 @@ func (s *Store) ClaimTask(ctx context.Context, t task.Task, budget int) (bool, t
 }
 
 func (s *Store) claimTask(ctx context.Context, t task.Task, budget int, claimSlot bool) (bool, task.Task, int64, error) {
+	action := "record task intent"
+	operation := action + " " + t.ID
+	if claimSlot {
+		action = "claim task"
+		operation = action + " " + t.ID
+	}
+	tx, err := s.begin(ctx, operation)
+	if err != nil {
+		return false, task.Task{}, 0, err
+	}
+	defer tx.rollback()
+
+	claimed, recorded, token, err := s.claimTaskTx(ctx, tx, t, budget, claimSlot)
+	if err != nil {
+		return false, task.Task{}, 0, err
+	}
+	if err := tx.commit(operation); err != nil {
+		return false, task.Task{}, 0, err
+	}
+	return claimed, recorded, token, nil
+}
+
+// claimTaskTx records one task intent through the durable ticket, duplicate,
+// pane, reservation and optional capacity gates. Its caller owns the transaction.
+func (s *Store) claimTaskTx(ctx context.Context, tx *tx, t task.Task, budget int, claimSlot bool) (bool, task.Task, int64, error) {
 	if t.ID == "" || t.ProjectKey == "" {
 		return false, task.Task{}, 0, fmt.Errorf("%w: task id and project key are required", ErrInvalid)
+	}
+	if err := checkTaskRole(t); err != nil {
+		return false, task.Task{}, 0, err
 	}
 	if claimSlot && budget < 1 {
 		return false, task.Task{}, 0, fmt.Errorf("%w: a provisioning budget of at least one is required", ErrInvalid)
@@ -1157,17 +1191,9 @@ func (s *Store) claimTask(ctx context.Context, t task.Task, budget int, claimSlo
 	}
 
 	action := "record task intent"
-	operation := action + " " + t.ID
 	if claimSlot {
 		action = "claim task"
-		operation = action + " " + t.ID
 	}
-	tx, err := s.begin(ctx, operation)
-	if err != nil {
-		return false, task.Task{}, 0, err
-	}
-	defer tx.rollback()
-
 	if taken, err := rowExists(ctx, tx, `SELECT 1 FROM tasks WHERE id = ?`, t.ID); err != nil {
 		return false, task.Task{}, 0, err
 	} else if taken {
@@ -1218,9 +1244,6 @@ func (s *Store) claimTask(ctx context.Context, t task.Task, budget int, claimSlo
 		return false, task.Task{}, 0, fmt.Errorf("%s %q: %w", action, t.ID, err)
 	}
 	if err := recordCreated(ctx, tx, t); err != nil {
-		return false, task.Task{}, 0, err
-	}
-	if err := tx.commit(operation); err != nil {
 		return false, task.Task{}, 0, err
 	}
 	return claimed, t, token, nil
@@ -1372,6 +1395,44 @@ func (s *Store) RenewProvisioningSlot(ctx context.Context, id, owner string) (in
 		return 0, err
 	}
 	return token, nil
+}
+
+// SlotClaimAbandoned reports whether a queued (intent) task holds a provisioning
+// slot claim that no caller is using: the claim is older than lease and no step
+// claim is live. A caller takes the step claim moments after it claims the slot
+// and holds it while the step runs, so such a claim was left by a caller that
+// stopped in between (a crash, or a bridge killed on its timeout), and nothing
+// else would ever continue the task. A drain may continue it the way a deliberate
+// resume does: the step claim first, then the renewal (RenewProvisioningSlot). A
+// fresh claim, a live step, a released claim, a task past intent and a decided
+// task are never abandoned; an unknown task is ErrNotFound.
+func (s *Store) SlotClaimAbandoned(ctx context.Context, id string, lease time.Duration) (bool, error) {
+	if strings.TrimSpace(id) == "" {
+		return false, fmt.Errorf("%w: task id is required", ErrInvalid)
+	}
+	if lease <= 0 {
+		return false, fmt.Errorf("%w: a positive step lease is required", ErrInvalid)
+	}
+	var phase, disposition, owner string
+	var claimedAt, until int64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COALESCE(json_extract(data, '$.Phase'), ''), COALESCE(json_extract(data, '$.Disposition'), ''),
+		        slot_claimed_at, step_claim_owner, step_claim_until
+		 FROM tasks WHERE id = ?`, id).Scan(&phase, &disposition, &claimedAt, &owner, &until)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, fmt.Errorf("%w: task %s", ErrNotFound, id)
+	}
+	if err != nil {
+		return false, fmt.Errorf("read the slot claim of task %s: %w", id, err)
+	}
+	now := time.Now().UnixMilli()
+	switch {
+	case phase != string(task.Intent), strings.TrimSpace(disposition) != "", claimedAt <= 0:
+		return false, nil
+	case owner != "" && until > now:
+		return false, nil
+	}
+	return claimedAt <= now-lease.Milliseconds(), nil
 }
 
 // ReleaseProvisioningSlot gives a claimed slot back, for a task whose

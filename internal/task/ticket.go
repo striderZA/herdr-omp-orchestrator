@@ -15,8 +15,8 @@ type Column string
 const (
 	// ColumnBacklog holds a ticket that has been written down but not started.
 	ColumnBacklog Column = "backlog"
-	// ColumnTodo holds a ticket a human has marked ready for work. In this
-	// version the move only records that fact; it starts nothing.
+	// ColumnTodo holds a ticket a human marked ready for work; moving it starts or
+	// queues the ticket's planner task.
 	ColumnTodo Column = "todo"
 )
 
@@ -40,6 +40,8 @@ type TicketStage string
 const (
 	TicketBacklog        TicketStage = "backlog"
 	TicketTodo           TicketStage = "todo"
+	TicketPlanning       TicketStage = "planning"
+	TicketPlanReady      TicketStage = "plan_ready"
 	TicketInProgress     TicketStage = "in_progress"
 	TicketReadyForReview TicketStage = "ready_for_review"
 	TicketDone           TicketStage = "done"
@@ -79,31 +81,40 @@ func LinkedTasks(all []Task, ticketID string) []Task {
 	return linked
 }
 
-// TicketStageOf projects a ticket and its linked tasks onto a stage. The first
-// matching rule wins, so the function is total:
-//
-//  1. a decided ticket is done;
-//  2. at least one linked task and every one of them closed is ready for review;
-//  3. at least one linked task still open is in progress, even when the ticket
-//     is still in the backlog (dispatch accepts any undecided ticket);
-//  4. a ticket in the todo column is todo;
-//  5. anything else is backlog.
-//
-// A task is open until it records a disposition, exactly as StageOf reads it.
+// TicketStageOf projects a ticket and its linked tasks onto a stage. A decision
+// wins; otherwise an active planner task wins, then implementation tasks, then
+// the ticket's stored column. Planner tasks never count as implementation tasks.
 func TicketStageOf(t Ticket, linked []Task) TicketStage {
 	if t.Decided() {
 		return TicketDone
 	}
-	open := 0
+	implementationTasks, openImplementations := 0, 0
+	planning, planReady := false, false
 	for _, x := range linked {
+		if x.Role == TaskRolePlan {
+			if x.Disposition != "" {
+				continue
+			}
+			if x.Report != nil && x.Report.Kind == "result" {
+				planReady = true
+			} else {
+				planning = true
+			}
+			continue
+		}
+		implementationTasks++
 		if x.Disposition == "" {
-			open++
+			openImplementations++
 		}
 	}
 	switch {
-	case len(linked) > 0 && open == 0:
+	case planning:
+		return TicketPlanning
+	case planReady:
+		return TicketPlanReady
+	case implementationTasks > 0 && openImplementations == 0:
 		return TicketReadyForReview
-	case open > 0:
+	case openImplementations > 0:
 		return TicketInProgress
 	case t.Column == ColumnTodo:
 		return TicketTodo

@@ -416,6 +416,8 @@ func TestDifferentTicketIsDifferentWork(t *testing.T) {
 		if err != nil {
 			t.Fatalf("create ticket %q: %v", title, err)
 		}
+		// Linked work needs the ticket's plan accepted.
+		f.acceptedPlanner(projectKey, view.TicketID)
 		tickets = append(tickets, view.TicketID)
 	}
 	dispatch := func(ticketID string) DispatchResult {

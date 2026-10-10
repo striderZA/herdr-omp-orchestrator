@@ -3,10 +3,11 @@ package board
 import (
 	"context"
 	"fmt"
-	"herdr-omp-orchestrator/internal/state"
-	"herdr-omp-orchestrator/internal/task"
 	"strconv"
 	"strings"
+
+	"herdr-omp-orchestrator/internal/state"
+	"herdr-omp-orchestrator/internal/task"
 )
 
 // TicketColumns are the two columns a ticket rests in before any task exists for
@@ -23,6 +24,8 @@ var TicketColumns = []task.TicketStage{
 var ticketStageLabels = map[task.TicketStage]string{
 	task.TicketBacklog:        "Backlog",
 	task.TicketTodo:           "Todo",
+	task.TicketPlanning:       "Planning",
+	task.TicketPlanReady:      "Plan ready",
 	task.TicketInProgress:     "In progress",
 	task.TicketReadyForReview: "Ready for review",
 	task.TicketDone:           "Done",
@@ -273,16 +276,16 @@ func linkedTasks(card TicketCard) string {
 	return strings.Join(parts, ", ")
 }
 
-// ticketWriteKeys are the write keys worth offering for a selected ticket: m only
-// for a backlog ticket (the only one that can move), n whenever writes are
-// enabled. A read-only board offers neither.
+// ticketWriteKeys are the write keys worth offering for a selected ticket: m
+// moves a backlog ticket to todo and starts planning, n creates a ticket. A
+// read-only board offers neither.
 func ticketWriteKeys(card TicketCard, d Detail) []string {
 	if !d.TicketWrites {
 		return nil
 	}
 	var keys []string
 	if card.Stage == task.TicketBacklog {
-		keys = append(keys, "m move to todo")
+		keys = append(keys, "m move to todo + start planner")
 	}
 	return append(keys, "n new ticket")
 }
@@ -368,12 +371,24 @@ func pageLinesOf(b *Board, id string, width int, th Theme) ([]string, bool) {
 	return nil, false
 }
 
-// TicketOps is the only write the board may make: create a ticket, and move a
-// backlog ticket to todo. The human's keypress is the confirmation, so the move
-// carries the digest of the ticket exactly as the board showed it and the
-// implementation refuses if the ticket changed since. Neither call touches a
-// task, a worktree or Herdr. A nil TicketOps keeps the board fully read-only.
+// TicketOps is the board's only write path: create a ticket and move a backlog
+// ticket to todo. The human's keypress confirms the move and planner start; the
+// coordinator checks the displayed digest, records the task and starts or queues
+// it. The board itself never writes a task or calls Herdr. A nil TicketOps keeps
+// the board fully read-only.
 type TicketOps interface {
 	CreateTicket(ctx context.Context, projectKey, title string) error
 	MoveTicketToTodo(ctx context.Context, projectKey, ticketID, digest string) error
 }
+
+// MovedTicketError is what a TicketOps move returns when it recorded the move but
+// starting the ticket's planner afterwards failed. The ticket did move, so the
+// board says so and shows why the planner has not started instead of reporting a
+// failed move. Err is that cause.
+type MovedTicketError struct{ Err error }
+
+func (e *MovedTicketError) Error() string {
+	return "the ticket moved, but its planner did not start: " + e.Err.Error()
+}
+
+func (e *MovedTicketError) Unwrap() error { return e.Err }

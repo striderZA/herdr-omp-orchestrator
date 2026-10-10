@@ -3499,3 +3499,70 @@ func TestReconcileDoesNotSettleCleanupWithoutRetainedBranch(t *testing.T) {
 		t.Fatalf("cleanup notes = %d, want none without branch evidence", len(notes))
 	}
 }
+
+func TestReconcileReportsLegacyTodoTicketWithoutStartingPlanner(t *testing.T) {
+	ctx := context.Background()
+	f, key := ticketFixture(t)
+	ticket := f.newTicket(key, "legacy todo")
+	if _, err := f.store.UpdateTicket(ctx, ticket.ID, ticket.Revision, func(next *task.Ticket) error {
+		next.Column = task.ColumnTodo
+		return nil
+	}); err != nil {
+		t.Fatalf("seed a Phase 1 todo ticket: %v", err)
+	}
+
+	for pass := range 2 {
+		if err := f.coord.Reconcile(ctx); err != nil {
+			t.Fatalf("Reconcile pass %d: %v", pass+1, err)
+		}
+	}
+	notes, err := f.store.ProjectInbox(ctx, key)
+	if err != nil {
+		t.Fatalf("ProjectInbox: %v", err)
+	}
+	var matching []task.Inbox
+	for _, note := range notes {
+		if note.Kind == "attention" && strings.Contains(note.Summary, ticket.ID) {
+			matching = append(matching, note)
+		}
+	}
+	if len(matching) != 1 || matching[0].TaskID != "" ||
+		!strings.Contains(strings.ToLower(matching[0].Summary), "not started") {
+		t.Fatalf("a legacy todo ticket needs one project-level no-restart attention note: %+v", matching)
+	}
+	if tasks, err := f.store.Tasks(ctx, key); err != nil || len(tasks) != 0 {
+		t.Fatalf("reconciliation must not silently start its planner: %+v, %v", tasks, err)
+	}
+	if starts := f.countCalls("agent start"); starts != 0 {
+		t.Fatalf("reconciliation started %d agents for a legacy todo ticket: %v", starts, f.calls())
+	}
+}
+
+func TestReconcileMissingPlannerRechecksTasksAfterTodoTicketRead(t *testing.T) {
+	ctx := context.Background()
+	f, key := ticketFixture(t)
+	ticket := f.newTicket(key, "atomic move race")
+	staleTasks, err := f.store.Tasks(ctx, key)
+	if err != nil {
+		t.Fatalf("read tasks before the move: %v", err)
+	}
+	if len(staleTasks) != 0 {
+		t.Fatalf("tasks before the move = %+v, want none", staleTasks)
+	}
+	if _, err := f.coord.MoveTicketFor(ctx, key, ticket.ID, ticket.Digest()); err != nil {
+		t.Fatalf("MoveTicketFor: %v", err)
+	}
+
+	if err := f.coord.reconcileMissingTicketPlanners(ctx, key, staleTasks); err != nil {
+		t.Fatalf("reconcile the earlier task snapshot: %v", err)
+	}
+	notes, err := f.store.ProjectInbox(ctx, key)
+	if err != nil {
+		t.Fatalf("ProjectInbox: %v", err)
+	}
+	for _, note := range notes {
+		if note.Kind == "attention" && strings.Contains(note.Summary, ticket.ID) {
+			t.Fatalf("an atomic move with a recorded planner was misreported as legacy: %+v", note)
+		}
+	}
+}

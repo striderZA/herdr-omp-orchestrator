@@ -2,16 +2,18 @@ package board
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"herdr-omp-orchestrator/internal/herdr"
-	"herdr-omp-orchestrator/internal/state"
-	"herdr-omp-orchestrator/internal/task"
 	"io"
 	"slices"
 	"strings"
 	"time"
 	"unicode"
 	"unicode/utf8"
+
+	"herdr-omp-orchestrator/internal/herdr"
+	"herdr-omp-orchestrator/internal/state"
+	"herdr-omp-orchestrator/internal/task"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/muesli/termenv"
@@ -75,6 +77,9 @@ type focusMsg struct {
 type ticketWriteMsg struct {
 	success string
 	failure string
+	// partial is the notice for a move that was recorded although its planner did
+	// not start (a MovedTicketError); it is empty for a create.
+	partial string
 	err     error
 	// moved is the ticket a move write is for; it is empty for a create.
 	moved string
@@ -218,10 +223,17 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if typed.moved != "" {
 			delete(m.moving, typed.moved)
 		}
-		if typed.err != nil {
+		var recorded *MovedTicketError
+		switch {
+		case typed.partial != "" && errors.As(typed.err, &recorded):
+			// The move is recorded and only its planner's start failed: say the
+			// ticket moved, and why its planner has not started.
+			m.notice = typed.partial + ": " + shortError(recorded.Err)
+			m.noticeErr = true
+		case typed.err != nil:
 			m.notice = typed.failure + ": " + shortError(typed.err)
 			m.noticeErr = true
-		} else {
+		default:
 			m.notice = typed.success
 			m.noticeErr = false
 		}
@@ -232,8 +244,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 // key applies one keystroke. Outside this model only two things can change: "f"
-// focuses a pane FocusVerified proved, and "n" and "m" create or move a ticket
-// through Options.Tickets, which is the human's own keypress and nothing else.
+// focuses a pane FocusVerified proved, and "n" and "m" write tickets through
+// TicketOps; "m" is the human's confirmation to start the ticket planner.
 func (m *Model) key(key tea.KeyMsg) tea.Cmd {
 	if m.promptOpen {
 		return m.promptKey(key)
@@ -867,9 +879,9 @@ func (m *Model) submitPrompt() tea.Cmd {
 }
 
 // moveTicket moves the selected backlog ticket to todo, sending the digest of the
-// card exactly as the board displays it: if the ticket changed since the board
-// last read it, the coordinator refuses and the board says so. Anything other
-// than a backlog ticket is refused here, before a write is attempted.
+// card exactly as the board displays it. The coordinator atomically records the
+// planner task and starts or queues it; if the ticket changed since the board last
+// read it, the coordinator refuses and the board says so.
 func (m *Model) moveTicket() tea.Cmd {
 	if m.opts.Tickets == nil {
 		m.notice = ticketWritesUnavailable
@@ -893,8 +905,9 @@ func (m *Model) moveTicket() tea.Cmd {
 	m.moving[id] = true
 	return func() tea.Msg {
 		return ticketWriteMsg{
-			success: "Moved " + id + " to todo",
+			success: "Moved " + id + " to todo; planner task recorded",
 			failure: "Cannot move " + id,
+			partial: "Moved " + id + " to todo; its planner did not start",
 			moved:   id,
 			err:     ops.MoveTicketToTodo(ctx, project, id, digest),
 		}

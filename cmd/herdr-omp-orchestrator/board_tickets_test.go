@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"testing"
 
@@ -13,7 +14,7 @@ import (
 	"herdr-omp-orchestrator/internal/task"
 )
 
-func TestBoardOptionsWireTicketWritesThroughTheCoordinator(t *testing.T) {
+func TestBoardOptionsRouteTicketMovesThroughCoordinatorPreflight(t *testing.T) {
 	ctx := context.Background()
 	store, err := state.Open(t.TempDir())
 	if err != nil {
@@ -36,7 +37,8 @@ func TestBoardOptionsWireTicketWritesThroughTheCoordinator(t *testing.T) {
 	if err != nil {
 		t.Fatalf("os.Executable: %v", err)
 	}
-	// Ticket writes never call Herdr, so any executable path is a valid client.
+	// A move now starts a planner, so this test uses a nonexistent checkout and
+	// proves coordinator preflight refuses before any Herdr operation.
 	client, err := herdr.NewClient(exe)
 	if err != nil {
 		t.Fatalf("herdr.NewClient: %v", err)
@@ -62,19 +64,38 @@ func TestBoardOptionsWireTicketWritesThroughTheCoordinator(t *testing.T) {
 	if after, _ := store.Ticket(ctx, tickets[0].ID); after.Column != task.ColumnBacklog || after.Revision != 1 {
 		t.Fatalf("a refused move must write nothing: %+v", after)
 	}
-	if err := ops.MoveTicketToTodo(ctx, project.Key, tickets[0].ID, tickets[0].Digest()); err != nil {
-		t.Fatalf("MoveTicketToTodo with the displayed digest: %v", err)
+	if err := ops.MoveTicketToTodo(ctx, project.Key, tickets[0].ID, tickets[0].Digest()); !errors.Is(err, coord.ErrBaseRevision) {
+		t.Fatalf("a move without a committed project HEAD = %v, want coord.ErrBaseRevision", err)
 	}
-	if after, _ := store.Ticket(ctx, tickets[0].ID); after.Column != task.ColumnTodo {
-		t.Fatalf("the move must record todo: %+v", after)
+	if after, _ := store.Ticket(ctx, tickets[0].ID); after.Column != task.ColumnBacklog || after.Revision != 1 {
+		t.Fatalf("a move without a committed project HEAD must leave the ticket unchanged: %+v", after)
 	}
 	if tasks, _ := store.Tasks(ctx, project.Key); len(tasks) != 0 {
-		t.Fatalf("a move starts no task: %+v", tasks)
+		t.Fatalf("a refused move must leave no planner task: %+v", tasks)
 	}
 
 	// The project is the caller's resolved one: another key is not a project.
 	if err := ops.CreateTicket(ctx, `C:\elsewhere`, "x"); !errors.Is(err, coord.ErrProjectUnknown) {
 		t.Fatalf("an unbound project = %v, want coord.ErrProjectUnknown", err)
+	}
+}
+
+// The executable is where the coordinator's answer becomes the board's: a move
+// the coordinator recorded but whose planner did not start reaches the board as a
+// recorded move with its cause, while every other error stays a refusal.
+func TestBoardMoveErrorKeepsARecordedMoveRecorded(t *testing.T) {
+	cause := errors.New("create the worktree: herdr: not_git_worktree")
+	var recorded *board.MovedTicketError
+	got := boardMoveError(fmt.Errorf("move: %w", &coord.PlannerNotStartedError{TicketID: "tkt_a", TaskID: "orch_p", Err: cause}))
+	if !errors.As(got, &recorded) || recorded.Err != cause {
+		t.Fatalf("a recorded move whose planner did not start = %#v, want a board.MovedTicketError carrying its cause", got)
+	}
+	refusal := fmt.Errorf("%w: ticket tkt_a", coord.ErrTicketChanged)
+	if got := boardMoveError(refusal); got != refusal {
+		t.Fatalf("a refused move = %#v, want the coordinator's refusal unchanged", got)
+	}
+	if got := boardMoveError(nil); got != nil {
+		t.Fatalf("a move that started its planner = %v, want no error", got)
 	}
 }
 
