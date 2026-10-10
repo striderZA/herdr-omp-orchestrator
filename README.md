@@ -8,6 +8,7 @@ A Windows-only Herdr plugin that connects Oh My Pi (OMP) primary and worker agen
 - [Repository and development rules](AGENTS.md) — architecture, conventions, and commands.
 - [Herdr compatibility facts](docs/herdr-facts.md) — the external Herdr behavior this plugin depends on and how it was verified.
 - [Disposition contract (ADR 0001)](docs/adr/0001-disposition-contract.md) — how task decisions close tasks and release dependents.
+- [Successors and re-points (ADR 0005)](docs/adr/0005-successors-and-repoint.md) — how a superseded decision names its successor and how queued dependents are re-pointed to it.
 
 ## Development
 

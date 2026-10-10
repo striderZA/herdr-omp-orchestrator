@@ -22,3 +22,4 @@ Status: Accepted (issue #5). The maintainer decided the contract before the code
 
 - `Review`/`ReviewAtRevision` take `(outcome, note)`; the bridge `review` params gain `outcome`; `orch_review` requires `outcome`.
 - No way yet to unblock dependents of a rejected task other than re-dispatching; revisit if needed.
+- Superseded decisions name a successor, and queued dependents of a superseded task can be re-pointed to it (ADR 0005). Rejected tasks name no successor, so their dependents still need re-dispatching.
