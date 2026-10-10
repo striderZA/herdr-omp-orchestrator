@@ -9,6 +9,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -77,7 +78,7 @@ const (
 	envPluginEventJSON = "HERDR_PLUGIN_EVENT_JSON"
 )
 
-const usage = "usage: herdr-omp-orchestrator <setup|bind|startup|event|board|open-board|reattach|open-reattach|bridge <method>>"
+const usage = "usage: herdr-omp-orchestrator <setup|bind|startup|event|board|open-board|reattach|open-reattach|bridge <method>|recover>"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -85,13 +86,24 @@ func main() {
 		os.Exit(2)
 	}
 	env := environMap(os.Environ())
+	recoveryFailure := func(err error) int {
+		return emit(os.Stdout, os.Stderr, failureBody("recovery_unavailable", err.Error()))
+	}
+	recoverySignalFailure := func(err error) {
+		fmt.Fprintf(os.Stderr, "herdr-omp-orchestrator: %v\n", err)
+	}
 	switch os.Args[1] {
 	case "setup":
 		os.Exit(runSetup(env, os.Stdout, os.Stderr))
 	case "bind":
 		os.Exit(runBind(env, os.Stdout, os.Stderr))
 	case "startup":
-		os.Exit(runStartup(env, os.Stdout, os.Stderr))
+		os.Exit(runRecoverableRoute(
+			func() (func(bool) error, error) { return startRecoveryWorker(recoveryScopeAll, "") },
+			func() (int, bool) { return runStartup(env, os.Stdout, os.Stderr), true },
+			recoveryFailure,
+			recoverySignalFailure,
+		))
 	case "event":
 		os.Exit(runEvent(env, os.Stdout, os.Stderr))
 	case "board":
@@ -103,7 +115,20 @@ func main() {
 	case "open-reattach":
 		os.Exit(runOpenReattach(env, os.Stdout, os.Stderr))
 	case "bridge":
-		os.Exit(runBridge(env, os.Stdin, os.Stdout, os.Stderr, os.Args[2:]))
+		args := os.Args[2:]
+		if scope, recoverable := bridgeRecoveryScope(args); recoverable {
+			os.Exit(runRecoverableRoute(
+				func() (func(bool) error, error) { return startRecoveryWorker(scope, "") },
+				func() (int, bool) {
+					return runBridgeRecoverable(env, os.Stdin, os.Stdout, os.Stderr, args)
+				},
+				recoveryFailure,
+				recoverySignalFailure,
+			))
+		}
+		os.Exit(runBridge(env, os.Stdin, os.Stdout, os.Stderr, args))
+	case "recover":
+		os.Exit(runRecovery(env, os.Stderr, os.Args[2:]))
 	default:
 		fmt.Fprintf(os.Stderr, "herdr-omp-orchestrator: unknown command %q\n%s\n", os.Args[1], usage)
 		os.Exit(2)
@@ -262,7 +287,10 @@ func runBoard(env map[string]string, stdout, stderr io.Writer) int {
 	}
 	// The board owns the terminal until it is closed; no timeout applies, and
 	// Bubble Tea is left with the process's own stdio.
-	if err := board.Run(context.Background(), store, client, project.Key, boardOptions(store, client)); err != nil {
+	if err := board.Run(context.Background(), store, client, project.Key,
+		boardOptions(store, client, func(ticketID string) (func(bool) error, error) {
+			return startRecoveryWorker(recoveryScopeOwner, ticketID)
+		})); err != nil {
 		return emit(stdout, stderr, failureBody("internal", err.Error()))
 	}
 	return 0
@@ -276,17 +304,28 @@ func runBoard(env map[string]string, stdout, stderr io.Writer) int {
 //
 // A coordinator that cannot be built does not stop the board from opening: it is
 // returned read-only, and says so when a ticket key is pressed.
-func boardOptions(store *state.Store, client *herdr.Client) board.Options {
+func boardOptions(
+	store *state.Store,
+	client *herdr.Client,
+	launchRecovery ...func(string) (func(bool) error, error),
+) board.Options {
 	coordinator, err := coord.New(store, client, coord.Options{})
 	if err != nil {
 		return board.Options{}
 	}
-	return board.Options{Tickets: ticketWriter{coordinator: coordinator}}
+	var launch func(string) (func(bool) error, error)
+	if len(launchRecovery) > 0 {
+		launch = launchRecovery[0]
+	}
+	return board.Options{Tickets: ticketWriter{coordinator: coordinator, launchRecovery: launch}}
 }
 
 // ticketWriter is board.TicketOps over the coordinator's project-keyed ticket
 // operations. The board package imports nothing from coord; this is the seam.
-type ticketWriter struct{ coordinator *coord.Coordinator }
+type ticketWriter struct {
+	coordinator    *coord.Coordinator
+	launchRecovery func(string) (func(bool) error, error)
+}
 
 func (w ticketWriter) CreateTicket(ctx context.Context, projectKey, title string) error {
 	_, err := w.coordinator.CreateTicketFor(ctx, projectKey, coord.TicketCreateParams{Title: title})
@@ -294,8 +333,23 @@ func (w ticketWriter) CreateTicket(ctx context.Context, projectKey, title string
 }
 
 func (w ticketWriter) MoveTicketToTodo(ctx context.Context, projectKey, ticketID, digest string) error {
-	_, err := w.coordinator.MoveTicketFor(ctx, projectKey, ticketID, digest)
-	return boardMoveError(err)
+	var complete func(bool) error
+	if w.launchRecovery != nil {
+		var err error
+		complete, err = w.launchRecovery(ticketID)
+		if err != nil {
+			return fmt.Errorf("start the recovery worker before moving the ticket: %w", err)
+		}
+	}
+	_, moveErr := w.coordinator.MoveTicketFor(ctx, projectKey, ticketID, digest)
+	if complete != nil {
+		var notStarted *coord.PlannerNotStartedError
+		moved := moveErr == nil || errors.As(moveErr, &notStarted)
+		if err := complete(moved); err != nil {
+			return errors.Join(boardMoveError(moveErr), fmt.Errorf("signal ticket-move recovery: %w", err))
+		}
+	}
+	return boardMoveError(moveErr)
 }
 
 // boardMoveError is the board's view of a move's error: a move the coordinator
@@ -417,6 +471,60 @@ func runBridge(env map[string]string, stdin io.Reader, stdout, stderr io.Writer,
 		return 2
 	}
 	return 0
+}
+
+func runBridgeRecoverable(env map[string]string, stdin io.Reader, stdout, stderr io.Writer, args []string) (int, bool) {
+	var output bytes.Buffer
+	status := runBridge(env, stdin, &output, stderr, args)
+	if _, err := stdout.Write(output.Bytes()); err != nil {
+		fmt.Fprintf(stderr, "herdr-omp-orchestrator: bridge: %v\n", err)
+		return 2, true
+	}
+	method := ""
+	if len(args) > 0 {
+		method = strings.TrimSpace(args[0])
+	}
+	return status, bridgeResponseNeedsRecovery(method, output.Bytes())
+}
+
+func bridgeResponseNeedsRecovery(method string, payload []byte) bool {
+	var response struct {
+		OK     bool            `json:"ok"`
+		Result json.RawMessage `json:"result"`
+	}
+	if err := json.Unmarshal(payload, &response); err != nil {
+		return true
+	}
+	switch method {
+	case bridge.MethodDispatch:
+		var result struct {
+			Duplicate bool `json:"duplicate"`
+		}
+		err := json.Unmarshal(response.Result, &result)
+		if response.OK && err == nil && result.Duplicate {
+			return false
+		}
+		return true
+	case bridge.MethodTicketMove:
+		return response.OK
+	case bridge.MethodReview:
+		// Review always runs the idempotent queue drain after an accepting or
+		// repeated decision, so the recovery worker is relevant to this route.
+		return true
+	case bridge.MethodAdjudicateBrief:
+		if !response.OK {
+			return true
+		}
+		var result struct {
+			Decision string `json:"decision"`
+		}
+		if err := json.Unmarshal(response.Result, &result); err != nil {
+			return true
+		}
+		return result.Decision == "not_delivered"
+	default:
+		return false
+	}
 }
 
 // openCoordinator opens the coordinator over the plugin's own state directory
