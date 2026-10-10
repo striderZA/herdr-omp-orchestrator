@@ -9,8 +9,6 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-const processStillActive = 259
-
 // CurrentProcessIdentity returns this process's PID and Windows creation time.
 func CurrentProcessIdentity() (ProcessIdentity, error) {
 	handle, err := windows.GetCurrentProcess()
@@ -38,7 +36,7 @@ func ProcessAlive(identity ProcessIdentity) (bool, error) {
 	if !identity.valid() {
 		return false, fmt.Errorf("invalid process identity %s", identity)
 	}
-	handle, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, identity.PID)
+	handle, err := windows.OpenProcess(windows.SYNCHRONIZE|windows.PROCESS_QUERY_LIMITED_INFORMATION, false, identity.PID)
 	if errors.Is(err, windows.ERROR_INVALID_PARAMETER) {
 		return false, nil
 	}
@@ -55,9 +53,20 @@ func ProcessAlive(identity ProcessIdentity) (bool, error) {
 	if start != identity.StartTime {
 		return false, nil
 	}
-	var exitCode uint32
-	if err := windows.GetExitCodeProcess(handle, &exitCode); err != nil {
-		return false, fmt.Errorf("read process %s exit status: %w", identity, err)
+	// GetExitCodeProcess reports STILL_ACTIVE (259) for a process that exited with
+	// that code too, so an exit code cannot tell a running process from a finished
+	// one. The process handle is signaled once the process has terminated: a zero
+	// timeout wait asks exactly that.
+	event, err := windows.WaitForSingleObject(handle, 0)
+	if err != nil {
+		return false, fmt.Errorf("read process %s state: %w", identity, err)
 	}
-	return exitCode == processStillActive, nil
+	switch event {
+	case uint32(windows.WAIT_OBJECT_0):
+		return false, nil
+	case uint32(windows.WAIT_TIMEOUT):
+		return true, nil
+	default:
+		return false, fmt.Errorf("read process %s state: unexpected wait result %#x", identity, event)
+	}
 }
