@@ -7717,12 +7717,26 @@ function Invoke-Cleanup {
     }
 
     if (-not $KeepResources) {
+        # A process that was still exiting when cleanup began can hold the root for a moment:
+        # a workspace closed mid-dispatch leaves its bridge and any detached recovery worker
+        # running. Retry for a bounded time; the final state is still asserted below.
         $removeError = ''
-        if (Test-Path -LiteralPath $script:WorkRoot) {
-            try { Remove-Item -LiteralPath $script:WorkRoot -Recurse -Force -ErrorAction Stop } catch {
+        $removeAttempts = 0
+        $removeDeadline = (Get-Date).AddSeconds(60)
+        while (Test-Path -LiteralPath $script:WorkRoot) {
+            $removeAttempts++
+            try {
+                Remove-Item -LiteralPath $script:WorkRoot -Recurse -Force -ErrorAction Stop
+            } catch {
                 $removeError = $_.Exception.Message
-                Add-Assertion -Id 'Z7.ERR' -What 'working temp root removal' -Status 'FAIL' -Evidence (Protect-Text $removeError 500)
             }
+            if (-not (Test-Path -LiteralPath $script:WorkRoot)) { $removeError = ''; break }
+            if ((Get-Date) -ge $removeDeadline) { break }
+            Start-Sleep -Seconds 2
+        }
+        if ($removeError -ne '') {
+            Add-Assertion -Id 'Z7.ERR' -What 'working temp root removal' -Status 'FAIL' `
+                -Evidence (Protect-Text ("after $removeAttempts attempt(s): " + $removeError) 500)
         }
         Assert-True -Id 'Z7.1' -What 'the temporary working root is gone after cleanup' `
             -Condition (-not (Test-Path -LiteralPath $script:WorkRoot)) -Evidence (Protect-Text $removeError 300)
