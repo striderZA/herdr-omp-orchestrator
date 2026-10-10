@@ -207,7 +207,11 @@ func dependencyBlocks(all []task.Task, fact task.Task) []string {
 	for _, id := range fact.Dependencies {
 		for _, dep := range all {
 			if dep.ID == id && dep.Disposition != "" && !dep.Accepted() {
-				out = append(out, fmt.Sprintf("dependency %s was closed as %s; the primary must re-plan and re-dispatch this task without that dependency", dep.ID, dep.Outcome))
+				if dep.Outcome == task.OutcomeSuperseded && dep.Successor != "" {
+					out = append(out, fmt.Sprintf("dependency %s was closed as superseded; the primary can re-point this task to its successor %s, or re-plan and re-dispatch it without that dependency", dep.ID, dep.Successor))
+				} else {
+					out = append(out, fmt.Sprintf("dependency %s was closed as %s; the primary must re-plan and re-dispatch this task without that dependency", dep.ID, dep.Outcome))
+				}
 			}
 		}
 	}

@@ -515,7 +515,7 @@ $script:ReadOnlyToolNames = @('read', 'grep', 'find', 'glob')
 $script:PrimaryToolNames = @(
     'orch_dispatch', 'orch_answer', 'orch_approve_dialog', 'orch_review', 'orch_settle_input',
     'orch_adjudicate_dispatch', 'orch_cleanup', 'orch_ticket_create', 'orch_ticket_list',
-    'orch_ticket_move', 'orch_ticket_review', 'orch_task_list', 'orch_inbox_list'
+    'orch_ticket_move', 'orch_ticket_review', 'orch_task_list', 'orch_inbox_list', 'orch_repoint'
 )
 $script:WorkerToolNames = @('orch_report')
 $script:Assertions = New-Object System.Collections.ArrayList
@@ -4779,7 +4779,8 @@ function Get-ExtensionConsentDialogTitles {
         'Move ticket to todo',
         'Dispatch work without a ticket',
         'Record ticket decision',
-        'Send answer to worker'
+        'Send answer to worker',
+        'Re-point queued dependents'
     )
 }
 

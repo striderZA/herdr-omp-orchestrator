@@ -815,7 +815,7 @@ func TestLegacyStoredReportPreviewsUnchangedAndSurvivesARewrite(t *testing.T) {
 	}
 
 	// Decide the task: this rewrites the task row for a reason unrelated to the checks.
-	if _, err := f.coord.ReviewAtRevision(ctx, project.LaunchPaneID, worker.ID, preview.Revision, "integrated", "accepted"); err != nil {
+	if _, err := f.coord.ReviewAtRevision(ctx, project.LaunchPaneID, worker.ID, preview.Revision, "integrated", "accepted", ""); err != nil {
 		t.Fatalf("review of a legacy report: %v", err)
 	}
 	var checks string
@@ -904,7 +904,7 @@ func TestReportOnlyAPrimaryDispositionMovesATaskToDone(t *testing.T) {
 
 	// A disposition before the report is reviewed is refused: there is nothing
 	// to decide yet.
-	if _, err := f.coord.Review(ctx, project.LaunchPaneID, worker.ID, "integrated", "accepted"); !errors.Is(err, ErrNotReviewed) {
+	if _, err := f.coord.Review(ctx, project.LaunchPaneID, worker.ID, "integrated", "accepted", ""); !errors.Is(err, ErrNotReviewed) {
 		t.Fatalf("Review without a report err = %v, want ErrNotReviewed", err)
 	}
 	if after := f.reload(worker.ID); after.Disposition != "" || task.StageOf(after) == task.Done {
@@ -919,7 +919,7 @@ func TestReportOnlyAPrimaryDispositionMovesATaskToDone(t *testing.T) {
 	}
 
 	// An empty outcome is not a decision.
-	if _, err := f.coord.Review(ctx, project.LaunchPaneID, worker.ID, "   ", "accepted"); !errors.Is(err, ErrInvalidRequest) {
+	if _, err := f.coord.Review(ctx, project.LaunchPaneID, worker.ID, "   ", "accepted", ""); !errors.Is(err, ErrInvalidRequest) {
 		t.Fatalf("Review(empty outcome) err = %v, want ErrInvalidRequest", err)
 	}
 	if after := f.reload(worker.ID); after.Disposition != "" {
@@ -927,7 +927,7 @@ func TestReportOnlyAPrimaryDispositionMovesATaskToDone(t *testing.T) {
 	}
 
 	disposition := "accepted: the user kept the branch and merged it by hand"
-	result, err := f.coord.Review(ctx, project.LaunchPaneID, worker.ID, "integrated", disposition)
+	result, err := f.coord.Review(ctx, project.LaunchPaneID, worker.ID, "integrated", disposition, "")
 	if err != nil {
 		t.Fatalf("Review: %v", err)
 	}
@@ -972,7 +972,7 @@ func TestReviewPreviewShowsDurableReportAndRefusesStaleDecision(t *testing.T) {
 	if _, err := f.coord.FinalReport(ctx, worker.LaunchPaneID, changed); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.coord.ReviewAtRevision(ctx, project.LaunchPaneID, worker.ID, preview.Revision, "integrated", "accepted"); !errors.Is(err, ErrReportChanged) {
+	if _, err := f.coord.ReviewAtRevision(ctx, project.LaunchPaneID, worker.ID, preview.Revision, "integrated", "accepted", ""); !errors.Is(err, ErrReportChanged) {
 		t.Fatalf("decision after report replacement = %v, want ErrReportChanged", err)
 	}
 	if actual := f.reload(worker.ID); actual.Disposition != "" {
@@ -985,7 +985,7 @@ func TestReviewPreviewShowsDurableReportAndRefusesStaleDecision(t *testing.T) {
 	if current.Summary != changed.Summary || current.Revision == preview.Revision {
 		t.Fatalf("replacement was not visible in new preview: %+v", current)
 	}
-	if _, err := f.coord.ReviewAtRevision(ctx, project.LaunchPaneID, worker.ID, current.Revision, "integrated", "accepted"); err != nil {
+	if _, err := f.coord.ReviewAtRevision(ctx, project.LaunchPaneID, worker.ID, current.Revision, "integrated", "accepted", ""); err != nil {
 		t.Fatalf("decision on the previewed revision: %v", err)
 	}
 }
@@ -1001,24 +1001,24 @@ func TestReviewRefusesToRewriteARecordedDecision(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.coord.ReviewAtRevision(ctx, project.LaunchPaneID, worker.ID, preview.Revision, "integrated", "accepted"); err != nil {
+	if _, err := f.coord.ReviewAtRevision(ctx, project.LaunchPaneID, worker.ID, preview.Revision, "integrated", "accepted", ""); err != nil {
 		t.Fatalf("first decision: %v", err)
 	}
 	closed := f.reload(worker.ID)
-	if retry, err := f.coord.ReviewAtRevision(ctx, project.LaunchPaneID, worker.ID, preview.Revision, "integrated", "accepted"); err != nil || retry.Stage != task.Done {
+	if retry, err := f.coord.ReviewAtRevision(ctx, project.LaunchPaneID, worker.ID, preview.Revision, "integrated", "accepted", ""); err != nil || retry.Stage != task.Done {
 		t.Fatalf("retry after a recorded decision = (%+v, %v), want unchanged done task", retry, err)
 	}
-	if retry, err := f.coord.Review(ctx, project.LaunchPaneID, worker.ID, "integrated", "accepted"); err != nil || retry.Stage != task.Done {
+	if retry, err := f.coord.Review(ctx, project.LaunchPaneID, worker.ID, "integrated", "accepted", ""); err != nil || retry.Stage != task.Done {
 		t.Fatalf("legacy retry of the same decision = (%+v, %v)", retry, err)
 	}
-	if _, err := f.coord.Review(ctx, project.LaunchPaneID, worker.ID, "rejected", "rejected"); !errors.Is(err, ErrAlreadyDecided) {
+	if _, err := f.coord.Review(ctx, project.LaunchPaneID, worker.ID, "rejected", "rejected", ""); !errors.Is(err, ErrAlreadyDecided) {
 		t.Fatalf("legacy repeat review = %v, want ErrAlreadyDecided", err)
 	}
 	latest, err := f.coord.ReportPreview(ctx, project.LaunchPaneID, worker.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.coord.ReviewAtRevision(ctx, project.LaunchPaneID, worker.ID, latest.Revision, "rejected", "rejected"); !errors.Is(err, ErrAlreadyDecided) {
+	if _, err := f.coord.ReviewAtRevision(ctx, project.LaunchPaneID, worker.ID, latest.Revision, "rejected", "rejected", ""); !errors.Is(err, ErrAlreadyDecided) {
 		t.Fatalf("freshly previewed repeat review = %v, want ErrAlreadyDecided", err)
 	}
 	if after := f.reload(worker.ID); after.Disposition != "accepted" || after.Revision != closed.Revision {
@@ -1054,7 +1054,7 @@ func TestReviewDrainsTheTasksItsDispositionUnblocks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read the bound project: %v", err)
 	}
-	result, err := f.coord.Review(ctx, project.LaunchPaneID, first.ID, "integrated", "accepted")
+	result, err := f.coord.Review(ctx, project.LaunchPaneID, first.ID, "integrated", "accepted", "")
 	if err != nil {
 		t.Fatalf("Review: %v", err)
 	}
@@ -1092,7 +1092,12 @@ func TestRejectedReviewClosesButDoesNotReleaseDependents(t *testing.T) {
 			if err != nil {
 				t.Fatalf("read the bound project: %v", err)
 			}
-			result, err := f.coord.Review(ctx, project.LaunchPaneID, first.ID, outcome, "")
+			successor := ""
+			if outcome == task.OutcomeSuperseded {
+				successor = f.mustDispatch("successor", "The replacement brief.").ID
+			}
+			starts := f.countCalls("worktree create")
+			result, err := f.coord.Review(ctx, project.LaunchPaneID, first.ID, outcome, "", successor)
 			if err != nil {
 				t.Fatalf("Review: %v", err)
 			}
@@ -1106,7 +1111,7 @@ func TestRejectedReviewClosesButDoesNotReleaseDependents(t *testing.T) {
 			if after.Phase != task.Intent || task.StageOf(after) != task.Queued {
 				t.Errorf("the dependent of a %s task = %q/%q, want it still queued", outcome, after.Phase, task.StageOf(after))
 			}
-			if f.countCalls("worktree create") != 1 {
+			if f.countCalls("worktree create") != starts {
 				t.Errorf("a worker started for a dependent of a %s task: %v", outcome, f.calls())
 			}
 			tasks, err := f.store.Tasks(ctx, f.projectKey())
@@ -1333,7 +1338,7 @@ func TestAnswerRelayRequiresABoundPrimaryAndItsOwnTask(t *testing.T) {
 	if _, err := f.coord.Answer(ctx, project.LaunchPaneID, foreign.ID, "keep the old API"); !errors.Is(err, ErrOwnership) {
 		t.Errorf("Answer for another project's task err = %v, want ErrOwnership", err)
 	}
-	if _, err := f.coord.Review(ctx, project.LaunchPaneID, foreign.ID, "integrated", "accepted"); !errors.Is(err, ErrOwnership) {
+	if _, err := f.coord.Review(ctx, project.LaunchPaneID, foreign.ID, "integrated", "accepted", ""); !errors.Is(err, ErrOwnership) {
 		t.Errorf("Review of another project's task err = %v, want ErrOwnership", err)
 	}
 	if _, err := f.coord.Cleanup(ctx, project.LaunchPaneID, foreign.ID); !errors.Is(err, ErrOwnership) {
@@ -1585,7 +1590,7 @@ func TestCleanupRefusesAnythingButAReviewedDoneTask(t *testing.T) {
 		t.Fatalf("a refused cleanup cleared the recorded resources: %+v", after)
 	}
 	// Reviewed Done, but the task records no checkout to remove.
-	if _, err := f.coord.Review(ctx, project.LaunchPaneID, worker.ID, "integrated", "accepted"); err != nil {
+	if _, err := f.coord.Review(ctx, project.LaunchPaneID, worker.ID, "integrated", "accepted", ""); err != nil {
 		t.Fatalf("Review: %v", err)
 	}
 	f.update(f.reload(worker.ID), func(next *task.Task) error {
@@ -1824,7 +1829,7 @@ func TestProgressQuestionAndReportAreRefusedAfterTheDisposition(t *testing.T) {
 		t.Fatalf("FinalReport: %v", err)
 	}
 	reviewed := f.reload(worker.ID)
-	if _, err := f.coord.Review(ctx, project.LaunchPaneID, worker.ID, "integrated", "accepted: merged by hand"); err != nil {
+	if _, err := f.coord.Review(ctx, project.LaunchPaneID, worker.ID, "integrated", "accepted: merged by hand", ""); err != nil {
 		t.Fatalf("Review: %v", err)
 	}
 	closed := f.reload(worker.ID)
@@ -1901,7 +1906,7 @@ func TestStaleWorkerPreflightCannotCommitAfterADisposition(t *testing.T) {
 		t.Fatalf("FinalReport: %v", err)
 	}
 	staleDuplicateReport := f.reload(worker.ID)
-	if _, err := f.coord.Review(ctx, project.LaunchPaneID, worker.ID, "integrated", "accepted: merged by hand"); err != nil {
+	if _, err := f.coord.Review(ctx, project.LaunchPaneID, worker.ID, "integrated", "accepted: merged by hand", ""); err != nil {
 		t.Fatalf("Review: %v", err)
 	}
 	closed := f.reload(worker.ID)

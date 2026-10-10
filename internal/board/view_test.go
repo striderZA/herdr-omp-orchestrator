@@ -481,6 +481,43 @@ func TestDependentOfANonAcceptingOutcomeIsShownBlocked(t *testing.T) {
 	}
 }
 
+// A dependent of a superseded task names the successor and the re-point path, and
+// the superseded task's own page names the successor its decision recorded (issue #61).
+func TestSupersededDecisionNamesItsSuccessorOnThePageAndTheDependent(t *testing.T) {
+	f := newBoardFixture(t, fixturePlan{})
+	superseded := sampleTask("orch_p1", func(x *task.Task) {
+		x.Outcome, x.Disposition, x.Successor = task.OutcomeSuperseded, "replaced", "orch_p2"
+	})
+	successor := sampleTask("orch_p2", nil)
+	stuck := sampleTask("orch_p3", func(x *task.Task) { x.Phase = task.Intent; x.Dependencies = []string{superseded.ID} })
+	f.seed(t, superseded, successor, stuck)
+
+	cards, err := ProjectCards(context.Background(), f.store, f.project)
+	if err != nil {
+		t.Fatalf("ProjectCards: %v", err)
+	}
+	th := Theme{Profile: termenv.Ascii}
+	blocked := strings.Join(strings.Fields(strings.Join(pageLines(cardByID(t, cards, stuck.ID), 200, th), " ")), " ")
+	want := "Blocked: dependency orch_p1 was closed as superseded; the primary can re-point this task to its successor orch_p2"
+	if !strings.Contains(blocked, want) {
+		t.Errorf("the blocked dependent does not name the re-point path %q:\n%s", want, blocked)
+	}
+	page := strings.Join(pageLines(cardByID(t, cards, superseded.ID), 100, th), "\n")
+	if !strings.Contains(page, "Successor: orch_p2") {
+		t.Errorf("the superseded task's page does not name its successor:\n%s", page)
+	}
+}
+
+// A successor is a fact of the Plan section on its own: the page never hides the
+// successor a decision recorded, even when no other planning fact exists (issue #61).
+func TestSuccessorAloneKeepsThePlanSection(t *testing.T) {
+	card := Card{Task: task.Task{ID: "orch_s1", Title: "old plan", Successor: "orch_s2"}, Stage: task.Done}
+	page := strings.Join(pageLines(card, 100, Theme{Profile: termenv.Ascii}), "\n")
+	if !strings.Contains(page, "Successor: orch_s2") {
+		t.Errorf("a successor alone is not shown on the task page:\n%s", page)
+	}
+}
+
 func cardByID(t *testing.T, cards []Card, id string) Card {
 	t.Helper()
 	for _, c := range cards {

@@ -249,7 +249,7 @@ func TestClaimTaskAndCreateTaskRefuseAnUnavailableTicket(t *testing.T) {
 	s := open(t, t.TempDir())
 	mustCreateTicket(t, s, seedTicket("tkt_other", "repo-b"))
 	mustCreateTicket(t, s, seedTicket("tkt_done", "repo-a"))
-	if _, err := s.DecideTicket(ctx, "tkt_done", 1, task.OutcomeAbandoned, "not needed"); err != nil {
+	if _, err := s.DecideTicket(ctx, "tkt_done", 1, task.OutcomeAbandoned, "not needed", ""); err != nil {
 		t.Fatalf("DecideTicket: %v", err)
 	}
 	for _, ticketID := range []string{"tkt_other", "tkt_missing", "tkt_done"} {
@@ -386,7 +386,7 @@ func TestDecideTicketRefusesWhileALinkedTaskIsOpen(t *testing.T) {
 		t.Fatalf("ClaimTask: %v", err)
 	}
 
-	if _, err := s.DecideTicket(ctx, "tkt_a", 1, task.OutcomeIntegrated, "merged"); !errors.Is(err, state.ErrTicketHasOpenTasks) {
+	if _, err := s.DecideTicket(ctx, "tkt_a", 1, task.OutcomeIntegrated, "merged", ""); !errors.Is(err, state.ErrTicketHasOpenTasks) {
 		t.Fatalf("DecideTicket with an open linked task = %v, want ErrTicketHasOpenTasks", err)
 	}
 	if got, _ := s.Ticket(ctx, "tkt_a"); got.Revision != 1 || got.Decided() {
@@ -399,7 +399,7 @@ func TestDecideTicketRefusesWhileALinkedTaskIsOpen(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("close the linked task: %v", err)
 	}
-	decided, err := s.DecideTicket(ctx, "tkt_a", 1, task.OutcomeIntegrated, "merged")
+	decided, err := s.DecideTicket(ctx, "tkt_a", 1, task.OutcomeIntegrated, "merged", "")
 	if err != nil || !decided.Decided() || decided.Outcome != task.OutcomeIntegrated || decided.Disposition != "merged" || decided.Revision != 2 {
 		t.Fatalf("DecideTicket after the task closed = %+v, %v", decided, err)
 	}
@@ -416,7 +416,7 @@ func TestDecideTicketWithNoLinkedTasksIsAllowed(t *testing.T) {
 	if err := s.CreateTask(ctx, seedTask("t1")); err != nil {
 		t.Fatalf("CreateTask: %v", err)
 	}
-	if got, err := s.DecideTicket(ctx, "tkt_a", 1, task.OutcomeAbandoned, "not needed"); err != nil || !got.Decided() {
+	if got, err := s.DecideTicket(ctx, "tkt_a", 1, task.OutcomeAbandoned, "not needed", ""); err != nil || !got.Decided() {
 		t.Fatalf("DecideTicket with zero linked tasks = %+v, %v", got, err)
 	}
 }
@@ -425,22 +425,22 @@ func TestDecideTicketValidatesAndKeepsTheFirstDecision(t *testing.T) {
 	ctx := context.Background()
 	s := open(t, t.TempDir())
 	mustCreateTicket(t, s, seedTicket("tkt_a", "repo-a"))
-	if _, err := s.DecideTicket(ctx, "tkt_missing", 1, task.OutcomeKept, "x"); !errors.Is(err, state.ErrNotFound) {
+	if _, err := s.DecideTicket(ctx, "tkt_missing", 1, task.OutcomeKept, "x", ""); !errors.Is(err, state.ErrNotFound) {
 		t.Errorf("an unknown ticket = %v, want ErrNotFound", err)
 	}
-	if _, err := s.DecideTicket(ctx, "tkt_a", 7, task.OutcomeKept, "x"); !errors.Is(err, state.ErrConflict) {
+	if _, err := s.DecideTicket(ctx, "tkt_a", 7, task.OutcomeKept, "x", ""); !errors.Is(err, state.ErrConflict) {
 		t.Errorf("a stale revision = %v, want ErrConflict", err)
 	}
 	for name, args := range map[string][2]string{"blank outcome": {" ", "x"}, "blank disposition": {task.OutcomeKept, "  "}} {
-		if _, err := s.DecideTicket(ctx, "tkt_a", 1, args[0], args[1]); !errors.Is(err, state.ErrInvalid) {
+		if _, err := s.DecideTicket(ctx, "tkt_a", 1, args[0], args[1], ""); !errors.Is(err, state.ErrInvalid) {
 			t.Errorf("%s = %v, want ErrInvalid", name, err)
 		}
 	}
-	if _, err := s.DecideTicket(ctx, "tkt_a", 1, task.OutcomeKept, "first"); err != nil {
+	if _, err := s.DecideTicket(ctx, "tkt_a", 1, task.OutcomeKept, "first", ""); err != nil {
 		t.Fatalf("first decision: %v", err)
 	}
 	// Even at the current revision a second decision must not overwrite the first.
-	if _, err := s.DecideTicket(ctx, "tkt_a", 2, task.OutcomeRejected, "second"); !errors.Is(err, state.ErrConflict) {
+	if _, err := s.DecideTicket(ctx, "tkt_a", 2, task.OutcomeRejected, "second", ""); !errors.Is(err, state.ErrConflict) {
 		t.Errorf("a second decision = %v, want ErrConflict", err)
 	}
 	if got, _ := s.Ticket(ctx, "tkt_a"); got.Outcome != task.OutcomeKept || got.Disposition != "first" || got.Revision != 2 {
@@ -452,7 +452,8 @@ func TestClaimTaskAfterADecisionIsRefused(t *testing.T) {
 	ctx := context.Background()
 	s := open(t, t.TempDir())
 	mustCreateTicket(t, s, seedTicket("tkt_a", "repo-a"))
-	if _, err := s.DecideTicket(ctx, "tkt_a", 1, task.OutcomeSuperseded, "replaced"); err != nil {
+	mustCreateTicket(t, s, seedTicket("tkt_next", "repo-a"))
+	if _, err := s.DecideTicket(ctx, "tkt_a", 1, task.OutcomeSuperseded, "replaced", "tkt_next"); err != nil {
 		t.Fatalf("DecideTicket: %v", err)
 	}
 	if _, _, _, err := s.ClaimTask(ctx, ticketTask("t1", "tkt_a", 1), 3); !errors.Is(err, state.ErrTicketUnavailable) {
@@ -490,7 +491,7 @@ func TestTicketDecisionAndTaskClaimNeverBothSucceed(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			_, decideErr = decider.DecideTicket(ctx, ticketID, 1, task.OutcomeAbandoned, "not needed")
+			_, decideErr = decider.DecideTicket(ctx, ticketID, 1, task.OutcomeAbandoned, "not needed", "")
 		}()
 		go func() {
 			defer wg.Done()

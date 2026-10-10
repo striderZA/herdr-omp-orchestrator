@@ -26,9 +26,13 @@ const (
 // Outcome and Disposition are the user's decision about the ticket, with the
 // same meaning as on a Task (ADR 0001): a non-empty Disposition closes it.
 type Ticket struct {
-	ID, ProjectKey, Title, Body    string
-	Column                         Column
-	Outcome, Disposition           string
+	ID, ProjectKey, Title, Body string
+	Column                      Column
+	Outcome, Disposition        string
+	// Successor names the ticket that replaces this one when the decision is
+	// superseded (issue #61). It is a reference, not a dependency: no linked task
+	// moves to it. It stays empty for every other decision and for a legacy row.
+	Successor                      string `json:",omitempty"`
 	Revision, CreatedAt, UpdatedAt int64
 }
 

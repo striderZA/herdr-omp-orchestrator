@@ -327,8 +327,11 @@ type SettleInputParams struct {
 type ReviewParams struct {
 	TaskID string `json:"taskId"`
 	// Outcome is one of task.Outcomes(); Disposition is the free-text note.
-	Outcome          string `json:"outcome"`
-	Disposition      string `json:"disposition"`
+	Outcome     string `json:"outcome"`
+	Disposition string `json:"disposition"`
+	// Successor names the task that replaces this one. Only a superseded decision
+	// may name one, and it must name a task of the same project (issue #61).
+	Successor        string `json:"successor"`
 	ExpectedRevision int64  `json:"expectedRevision"`
 }
 
@@ -434,6 +437,7 @@ type ReviewResult struct {
 	TaskID      string     `json:"taskId"`
 	Outcome     string     `json:"outcome"`
 	Disposition string     `json:"disposition"`
+	Successor   string     `json:"successor,omitempty"`
 	Stage       task.Stage `json:"stage"`
 }
 
@@ -1037,17 +1041,17 @@ func (c *Coordinator) ReportPreview(ctx context.Context, primaryLaunchPaneID, ta
 
 // ReviewAtRevision records only the report revision the primary just showed to
 // the user. An unrelated task update also invalidates the preview conservatively.
-func (c *Coordinator) ReviewAtRevision(ctx context.Context, primaryLaunchPaneID, taskID string, expectedRevision int64, outcome, note string) (ReviewResult, error) {
+func (c *Coordinator) ReviewAtRevision(ctx context.Context, primaryLaunchPaneID, taskID string, expectedRevision int64, outcome, note, successor string) (ReviewResult, error) {
 	if expectedRevision <= 0 {
 		return ReviewResult{}, fmt.Errorf("%w: a positive report revision is required", ErrInvalidRequest)
 	}
-	return c.review(ctx, primaryLaunchPaneID, taskID, outcome, note, expectedRevision)
+	return c.review(ctx, primaryLaunchPaneID, taskID, outcome, note, successor, expectedRevision)
 }
 
 // Review records the user's decision for a worker's reviewed result. This is
 // the only thing that moves a task to Done.
-func (c *Coordinator) Review(ctx context.Context, primaryLaunchPaneID, taskID, outcome, note string) (ReviewResult, error) {
-	return c.review(ctx, primaryLaunchPaneID, taskID, outcome, note, 0)
+func (c *Coordinator) Review(ctx context.Context, primaryLaunchPaneID, taskID, outcome, note, successor string) (ReviewResult, error) {
+	return c.review(ctx, primaryLaunchPaneID, taskID, outcome, note, successor, 0)
 }
 
 // decisionOf is the single validation point of the disposition contract: a
@@ -1069,15 +1073,15 @@ func decisionOf(outcome, note string) (string, string, error) {
 	return kind, text, nil
 }
 
-func sameDecision(st task.Task, kind, text string) bool {
-	return st.Disposition == text && st.Outcome == kind
+func sameDecision(st task.Task, kind, text, successor string) bool {
+	return st.Disposition == text && st.Outcome == kind && st.Successor == successor
 }
 
 func alreadyDecided(st task.Task) error {
 	return fmt.Errorf("%w: task %s already records %q (%s)", ErrAlreadyDecided, st.ID, st.Disposition, st.Outcome)
 }
 
-func (c *Coordinator) review(ctx context.Context, primaryLaunchPaneID, taskID, outcome, note string, expectedRevision int64) (ReviewResult, error) {
+func (c *Coordinator) review(ctx context.Context, primaryLaunchPaneID, taskID, outcome, note, successor string, expectedRevision int64) (ReviewResult, error) {
 	project, err := c.primaryProject(ctx, primaryLaunchPaneID)
 	if err != nil {
 		return ReviewResult{}, err
@@ -1090,14 +1094,24 @@ func (c *Coordinator) review(ctx context.Context, primaryLaunchPaneID, taskID, o
 	if err != nil {
 		return ReviewResult{}, err
 	}
+	successorID, err := normalizeSuccessor(successor)
+	if err != nil {
+		return ReviewResult{}, err
+	}
 	if !isReviewed(st) {
 		return ReviewResult{}, fmt.Errorf("%w: task %s has no final result to decide on, so it cannot be closed", ErrNotReviewed, st.ID)
 	}
 	if st.Disposition != "" {
-		if sameDecision(st, kind, decision) {
+		if sameDecision(st, kind, decision, successorID) {
 			return c.finishReview(ctx, project.Key, st)
 		}
 		return ReviewResult{}, alreadyDecided(st)
+	}
+	// A new decision's successor is checked once, here, before anything is written
+	// (issue #61). A repeat of the recorded decision has already matched above.
+	successorID, err = c.checkSuccessor(ctx, decisionSubject{projectKey: project.Key, id: st.ID}, kind, successorID)
+	if err != nil {
+		return ReviewResult{}, err
 	}
 	mutate := func(next *task.Task) error {
 		if !isReviewed(*next) {
@@ -1108,6 +1122,7 @@ func (c *Coordinator) review(ctx context.Context, primaryLaunchPaneID, taskID, o
 		}
 		next.Outcome = kind
 		next.Disposition = decision
+		next.Successor = successorID
 		return nil
 	}
 	var updated task.Task
@@ -1120,7 +1135,7 @@ func (c *Coordinator) review(ctx context.Context, primaryLaunchPaneID, taskID, o
 		if errors.Is(err, state.ErrConflict) || errors.Is(err, ErrAlreadyDecided) {
 			current, readErr := c.store.Task(ctx, st.ID)
 			if readErr == nil && current.Disposition != "" {
-				if sameDecision(current, kind, decision) {
+				if sameDecision(current, kind, decision, successorID) {
 					return c.finishReview(ctx, project.Key, current)
 				}
 				return ReviewResult{}, alreadyDecided(current)
@@ -1128,6 +1143,9 @@ func (c *Coordinator) review(ctx context.Context, primaryLaunchPaneID, taskID, o
 			if errors.Is(err, state.ErrConflict) && expectedRevision > 0 {
 				return ReviewResult{}, fmt.Errorf("%w: task %s is no longer at revision %d", ErrReportChanged, st.ID, expectedRevision)
 			}
+		}
+		if errors.Is(err, state.ErrSuccessorUnavailable) {
+			return ReviewResult{}, fmt.Errorf("%w: %w", ErrSuccessorUnknown, err)
 		}
 		return ReviewResult{}, err
 	}
@@ -1137,7 +1155,7 @@ func (c *Coordinator) review(ctx context.Context, primaryLaunchPaneID, taskID, o
 // finishReview retries only the idempotent queue drain on an identical repeat
 // decision; the stored disposition and task revision are never rewritten.
 func (c *Coordinator) finishReview(ctx context.Context, projectKey string, updated task.Task) (ReviewResult, error) {
-	result := ReviewResult{TaskID: updated.ID, Outcome: updated.Outcome, Disposition: updated.Disposition, Stage: task.StageOf(updated)}
+	result := ReviewResult{TaskID: updated.ID, Outcome: updated.Outcome, Disposition: updated.Disposition, Stage: task.StageOf(updated), Successor: updated.Successor}
 	if _, err := c.DrainQueued(ctx, projectKey); err != nil {
 		return result, fmt.Errorf("the disposition was recorded, but the queued tasks of %s could not be drained: %w", projectKey, err)
 	}

@@ -256,7 +256,7 @@ func TestProjectTicketsOmitsTicketsPastTodo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read the ticket: %v", err)
 	}
-	if _, err := f.store.DecideTicket(ctx, done.ID, done.Revision, task.OutcomeIntegrated, "shipped"); err != nil {
+	if _, err := f.store.DecideTicket(ctx, done.ID, done.Revision, task.OutcomeIntegrated, "shipped", ""); err != nil {
 		t.Fatalf("decide: %v", err)
 	}
 
@@ -1175,5 +1175,15 @@ func TestALongNoticeNeverMakesALineWiderThanTheTerminal(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// A superseded ticket names its successor ticket on its detail page (issue #61).
+func TestTicketDetailNamesItsSuccessorTicket(t *testing.T) {
+	card := ticketCardOf("tkt_s1", "old plan", task.TicketDone)
+	card.Ticket.Outcome, card.Ticket.Disposition, card.Ticket.Successor = task.OutcomeSuperseded, "replaced", "tkt_s2"
+	page := strings.Join(ticketPageLines(card, 100, ticketTheme), "\n")
+	if !strings.Contains(page, "Successor: tkt_s2") {
+		t.Errorf("the superseded ticket's page does not name its successor:\n%s", page)
 	}
 }

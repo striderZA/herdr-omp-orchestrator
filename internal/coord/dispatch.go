@@ -411,7 +411,7 @@ func normalizeReservedPath(path string) (string, error) {
 // satisfied dependency never becomes unsatisfied (a recorded decision is final),
 // so a stale read can only queue a task that could have run, never the other way
 // around. A dependency closed with a non-accepting outcome never becomes
-// satisfied: its dependents stay queued for good unless the primary re-plans.
+// satisfied: its dependents stay queued for good unless the primary re-plans or re-points them to a superseded task's successor (issue #61).
 func (c *Coordinator) dispatchable(existing []task.Task, st task.Task) (bool, string) {
 	if reason := unsatisfiedDependency(existing, st); reason != "" {
 		return false, reason
@@ -439,6 +439,9 @@ func unsatisfiedDependency(existing []task.Task, st task.Task) string {
 			return fmt.Sprintf("dependency %s is %s, not closed by a disposition yet", dependency, stage)
 		}
 		if !dep.Accepted() {
+			if dep.Outcome == task.OutcomeSuperseded && dep.Successor != "" {
+				return fmt.Sprintf("dependency %s was closed as superseded, which does not release its dependents; the primary can re-point this task to its successor %s, or re-plan and re-dispatch it without that dependency", dependency, dep.Successor)
+			}
 			return fmt.Sprintf("dependency %s was closed as %s, which does not release its dependents; the primary must re-plan and re-dispatch this task without that dependency", dependency, dep.Outcome)
 		}
 	}
