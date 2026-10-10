@@ -263,6 +263,15 @@ Check 'StageOf result is ready' ((Get-TaskStage -Fact ([pscustomobject]@{ Phase 
 Check 'StageOf attention is needs_input' ((Get-TaskStage -Fact ([pscustomobject]@{ Phase = 'prompt_submitted'; Attention = 'x' })) -eq 'needs_input') 'attention'
 Check 'StageOf disposition is done' ((Get-TaskStage -Fact ([pscustomobject]@{ Phase = 'prompt_submitted'; Disposition = 'kept'; Report = [pscustomobject]@{ Kind = 'result' } })) -eq 'done') 'done'
 
+# --- provisioning state (the wait before a dispatched task is checked) -------
+Check 'provisioning: an intent row is pending, not checkable' ((Get-TaskProvisioningState -Fact ([pscustomobject]@{ Phase = 'intent'; Branch = 'orch/abc123'; WorktreePath = ''; PublicPaneID = '' })) -eq 'pending') 'intent'
+Check 'provisioning: a worktree without a submitted brief is pending' ((Get-TaskProvisioningState -Fact ([pscustomobject]@{ Phase = 'worktree_created'; WorktreePath = 'C:\w'; PublicPaneID = 'w1:p2' })) -eq 'pending') 'worktree_created'
+Check 'provisioning: a started agent without a submitted brief is pending' ((Get-TaskProvisioningState -Fact ([pscustomobject]@{ Phase = 'agent_started'; WorktreePath = 'C:\w'; PublicPaneID = 'w1:p2' })) -eq 'pending') 'agent_started'
+Check 'provisioning: a submitted brief means provisioning finished' ((Get-TaskProvisioningState -Fact ([pscustomobject]@{ Phase = 'prompt_submitted'; WorktreePath = 'C:\w'; PublicPaneID = 'w1:p2' })) -eq 'submitted') 'prompt_submitted'
+Check 'provisioning: a recorded blocker stops the wait' ((Get-TaskProvisioningState -Fact ([pscustomobject]@{ Phase = 'intent'; Blocker = 'cannot create the worktree'; Attention = '' })) -eq 'stopped') 'blocker'
+Check 'provisioning: recorded attention stops the wait' ((Get-TaskProvisioningState -Fact ([pscustomobject]@{ Phase = 'worktree_created'; Blocker = ''; Attention = 'could not start the worker' })) -eq 'stopped') 'attention'
+Check 'provisioning: a missing fact is pending' ((Get-TaskProvisioningState -Fact $null) -eq 'pending') 'null'
+
 # --- Get-Field under StrictMode ---------------------------------------------
 Check 'Get-Field missing property' ((Get-Field ([pscustomobject]@{ A = 1 }) 'B' 'def') -eq 'def') 'missing'
 Check 'Get-Field null object' ((Get-Field $null 'A' 'def') -eq 'def') 'null'
@@ -3631,6 +3640,49 @@ Check 'availability: both present fails' ((Test-ResumeHintAvailability -Hint ([p
 Check 'availability: neither present fails' ((Test-ResumeHintAvailability -Hint ([pscustomobject]@{ resume = ''; resumeUnavailable = '' })) -eq $false) 'neither'
 Check 'N6 rule: a string onDisk cannot pass even with a resume offered' ((Test-ResumeHintImplication -Hint ([pscustomobject]@{ onDisk = 'true'; resume = 'omp --resume=x'; resumeUnavailable = '' })) -eq $false) 'string flag + resume'
 Check 'N6 rule: a missing onDisk cannot pass even with a resume offered' ((Test-ResumeHintImplication -Hint ([pscustomobject]@{ resume = 'omp --resume=x'; resumeUnavailable = '' })) -eq $false) 'absent flag + resume'
+
+# --- Wait-ForProvisionedTasks: read a dispatched task only once it has settled ---
+# The coordinator records a task at intent, then its worktree and pane, then its brief.
+# The wait returns on the submitted row, keeps waiting while the task is still being
+# provisioned, and returns early on a stopped task so its reason is reported.
+$savedProjectTasks = (Get-Command Get-ProjectTasks).ScriptBlock
+$savedWaitUntil = (Get-Command Wait-Until).ScriptBlock
+$script:Project = [pscustomobject]@{ Key = 'proj-helper' }
+$script:ProvisionSnapshotsForTest = @()
+$script:ProvisionReadsForTest = 0
+function Get-ProjectTasks {
+    param([string]$Key)
+    $index = [math]::Min($script:ProvisionReadsForTest, $script:ProvisionSnapshotsForTest.Count - 1)
+    $script:ProvisionReadsForTest++
+    return @([pscustomobject]@{ id = 'orch_helper'; fact = $script:ProvisionSnapshotsForTest[$index] })
+}
+function Wait-Until {
+    param([double]$TimeoutSeconds, [double]$IntervalSeconds, [string]$What, [scriptblock]$Probe)
+    for ($attempt = 0; $attempt -lt 5; $attempt++) {
+        $value = & $Probe
+        if ($null -ne $value) { return [pscustomobject]@{ Ok = $true; Value = $value; Elapsed = 0.0 } }
+    }
+    return [pscustomobject]@{ Ok = $false; Value = $null; Elapsed = 0.0 }
+}
+$script:ProvisionSnapshotsForTest = @(
+    [pscustomobject]@{ Phase = 'intent'; Branch = 'orch/abc123' },
+    [pscustomobject]@{ Phase = 'worktree_created'; WorktreePath = 'C:\w'; PublicPaneID = 'w1:p2' },
+    [pscustomobject]@{ Phase = 'prompt_submitted'; WorktreePath = 'C:\w'; PublicPaneID = 'w1:p2' }
+)
+$script:ProvisionReadsForTest = 0
+$settled = Wait-ForProvisionedTasks -Count 1 -TimeoutSeconds 1
+Check 'provisioned wait returns only on the submitted row' ($settled.Ok -and (Get-TaskProvisioningState -Fact (Get-Field (@($settled.Value)[0]) 'fact')) -eq 'submitted' -and $script:ProvisionReadsForTest -eq 3) "reads=$($script:ProvisionReadsForTest) ok=$($settled.Ok)"
+$script:ProvisionSnapshotsForTest = @([pscustomobject]@{ Phase = 'intent'; Blocker = 'cannot create the worktree'; Attention = '' })
+$script:ProvisionReadsForTest = 0
+$stopped = Wait-ForProvisionedTasks -Count 1 -TimeoutSeconds 1
+Check 'provisioned wait ends at once on a stopped task, so its reason is reported' ($stopped.Ok -and $script:ProvisionReadsForTest -eq 1 -and (Get-TaskProvisioningState -Fact (Get-Field (@($stopped.Value)[0]) 'fact')) -eq 'stopped') "reads=$($script:ProvisionReadsForTest)"
+$script:ProvisionSnapshotsForTest = @([pscustomobject]@{ Phase = 'intent'; Branch = 'orch/abc123' })
+$script:ProvisionReadsForTest = 0
+$never = Wait-ForProvisionedTasks -Count 1 -TimeoutSeconds 1
+Check 'provisioned wait gives up when a task never finishes provisioning' ((-not $never.Ok) -and $script:ProvisionReadsForTest -eq 5) "reads=$($script:ProvisionReadsForTest)"
+Set-Item -Path Function:\Get-ProjectTasks -Value $savedProjectTasks
+Set-Item -Path Function:\Wait-Until -Value $savedWaitUntil
+
 $exitCode = $fails + $projectionFails
 Write-Host ''
 Write-Host "helper check failures: $exitCode of $checks checks"

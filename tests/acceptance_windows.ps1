@@ -4056,6 +4056,44 @@ function Wait-ForTasks {
     }
 }
 
+function Get-TaskProvisioningState {
+    <#
+        Where a task's provisioning stands, judged from its recorded fact alone.
+        'submitted' once its brief has been submitted, the last provisioning step: by
+        then its worktree, pane, agent and session are recorded. 'stopped' when it
+        recorded a blocker or attention that provisioning does not pass by itself.
+        'pending' otherwise. The coordinator records a task at intent, before any
+        worktree or pane exists, so the row alone proves nothing about the checkout or
+        the worker.
+    #>
+    param($Fact)
+    if ($null -eq $Fact) { return 'pending' }
+    if ((Get-Field $Fact 'Phase') -eq 'prompt_submitted') { return 'submitted' }
+    if ((Get-Field $Fact 'Blocker') -ne '' -or (Get-Field $Fact 'Attention') -ne '') { return 'stopped' }
+    return 'pending'
+}
+
+function Wait-ForProvisionedTasks {
+    <#
+        Waits until Count tasks of this project have submitted their briefs. A task
+        that stops with a blocker or attention ends the wait at once, so the caller
+        reports the recorded reason rather than a timeout. Returns the same rows as
+        Wait-ForTasks; callers re-read the facts they assert on.
+    #>
+    param(
+        [Parameter(Mandatory)][int]$Count,
+        [double]$TimeoutSeconds = 600
+    )
+    return Wait-Until -TimeoutSeconds $TimeoutSeconds -IntervalSeconds 3 -What 'provisioned worker tasks' -Probe {
+        $tasks = @(Get-ProjectTasks -Key (Get-Field $script:Project 'Key'))
+        if ($tasks.Count -lt $Count) { return $null }
+        $states = @($tasks | ForEach-Object { Get-TaskProvisioningState -Fact (Get-Field $_ 'fact') })
+        if (@($states | Where-Object { $_ -eq 'submitted' }).Count -eq $Count) { return $tasks }
+        if (@($states | Where-Object { $_ -eq 'stopped' }).Count -gt 0) { return $tasks }
+        return $null
+    }
+}
+
 function Invoke-Dispatch {
     Write-Step 'Phase 9: two independent worker changes'
     New-TaskBriefs
@@ -4100,7 +4138,7 @@ function Invoke-Dispatch {
         return
     }
 
-    $wait = Wait-ForTasks -Count 2 -TimeoutSeconds 600
+    $wait = Wait-ForProvisionedTasks -Count 2 -TimeoutSeconds 600
     Assert-True -Id 'D1.2' -What 'two worker tasks exist for this project' -Condition $wait.Ok `
         -Evidence ("after {0:N0}s: {1}" -f $wait.Elapsed, (Protect-Text (Get-Json @($wait.Value | ForEach-Object { Get-Field $_ 'id' })) 300))
     if (-not $wait.Ok) {
@@ -4246,8 +4284,17 @@ BRIEF: $brief
         -Evidence ("after {0:N0}s tasks={1}" -f $wait.Elapsed, $(if ($null -eq $wait.Value) { 0 } else { @($wait.Value).Count }))
     if (-not $wait.Ok -or @($wait.Value).Count -ne 1) { throw 'the single-worker task was not created' }
 
-    $script:Tasks = @($wait.Value)
+    # The row exists from intent, before the worktree and public pane are recorded.
+    # Provisioning records both, starts the agent and submits the brief last, so read
+    # the task only once that has finished or has stopped with a recorded reason.
+    $provisioned = Wait-ForProvisionedTasks -Count 1 -TimeoutSeconds 300
+    $script:Tasks = @(Get-ProjectTasks -Key (Get-Field $script:Project 'Key'))
     $script:TaskA = Get-Field $script:Tasks[0] 'fact'
+    $provisioningState = Get-TaskProvisioningState -Fact $script:TaskA
+    Assert-True -Id 'SW0.2b' -What 'the task finishes provisioning (worktree, pane, agent and brief) before it is checked' `
+        -Condition ($provisioned.Ok -and $provisioningState -eq 'submitted') -TaskId ([string](Get-Field $script:TaskA 'ID')) `
+        -Evidence ("state=$provisioningState phase=[$(Get-Field $script:TaskA 'Phase')] attention=[$(Protect-Text ([string](Get-Field $script:TaskA 'Attention')) 200)] blocker=[$(Protect-Text ([string](Get-Field $script:TaskA 'Blocker')) 200)] waited=" + ('{0:N0}s' -f $provisioned.Elapsed))
+    if ($provisioningState -ne 'submitted') { throw "the single-worker task did not finish provisioning (state $provisioningState)" }
     $id = [string](Get-Field $script:TaskA 'ID')
     Assert-Match -Id 'SW0.3' -What 'the worker task has a generated task id' -Pattern '^orch_[0-9a-f]{12}$' -Actual $id
     Assert-Match -Id 'SW0.4' -What 'the task owns a generated worker branch' -Pattern '^orch/[0-9a-f]{12}$' `
@@ -4258,7 +4305,11 @@ BRIEF: $brief
     Assert-True -Id 'SW0.request' -What 'the task stores exactly the request the user confirmed, and no ticket' `
         -Condition (Test-TaskMatchesDispatchRequest -Fact $script:TaskA -Request $confirmedRequests[0]) -TaskId $id `
         -Evidence ("confirmed=" + (Protect-Text (Get-Json $confirmedRequests[0]) 400) + " stored title=[$(Get-Field $script:TaskA 'Title')] ticket=[$(Get-Field $script:TaskA 'TicketID')]")
-    $live = Get-LiveAgent -Target ([string](Get-Field $script:TaskA 'PublicPaneID'))
+    # A task that finished provisioning always records its pane. Refuse an empty one with
+    # its reason rather than let Get-LiveAgent fail on its parameter binding.
+    $publicPane = [string](Get-Field $script:TaskA 'PublicPaneID')
+    if ($publicPane -eq '') { throw "task $id records no public pane, so its worker cannot be checked" }
+    $live = Get-LiveAgent -Target $publicPane
     $handshake = Get-ReadySession -LaunchPaneId ([string](Get-Field $script:TaskA 'LaunchPaneID'))
     Assert-True -Id 'SW0.6' -What 'Herdr reports a live worker on its recorded pane' `
         -Condition $live.Found -TaskId $id -Evidence (Protect-Text (Get-Json $live.Agent) 400)
