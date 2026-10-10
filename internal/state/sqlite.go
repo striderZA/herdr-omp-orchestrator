@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite" // pure-Go driver, so a CGO_ENABLED=0 build needs no C toolchain
@@ -99,9 +100,13 @@ CREATE TABLE IF NOT EXISTS tasks (
 	revision INTEGER NOT NULL,
 	slot_claimed_at INTEGER NOT NULL DEFAULT 0,
 	slot_token INTEGER NOT NULL DEFAULT 0,
+	slot_owner_pid INTEGER NOT NULL DEFAULT 0,
+	slot_owner_start INTEGER NOT NULL DEFAULT 0,
 	step_claim_owner TEXT NOT NULL DEFAULT '',
 	step_claim_phase TEXT NOT NULL DEFAULT '',
 	step_claim_until INTEGER NOT NULL DEFAULT 0,
+	step_claim_pid INTEGER NOT NULL DEFAULT 0,
+	step_claim_start INTEGER NOT NULL DEFAULT 0,
 	data JSON NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS tasks_launch_pane_id
@@ -168,9 +173,13 @@ const inboxRecoveryDetail = "the plugin stopped while this delivery was in fligh
 var taskColumns = []struct{ name, ddl string }{
 	{"slot_claimed_at", `ALTER TABLE tasks ADD COLUMN slot_claimed_at INTEGER NOT NULL DEFAULT 0`},
 	{"slot_token", `ALTER TABLE tasks ADD COLUMN slot_token INTEGER NOT NULL DEFAULT 0`},
+	{"slot_owner_pid", `ALTER TABLE tasks ADD COLUMN slot_owner_pid INTEGER NOT NULL DEFAULT 0`},
+	{"slot_owner_start", `ALTER TABLE tasks ADD COLUMN slot_owner_start INTEGER NOT NULL DEFAULT 0`},
 	{"step_claim_owner", `ALTER TABLE tasks ADD COLUMN step_claim_owner TEXT NOT NULL DEFAULT ''`},
 	{"step_claim_phase", `ALTER TABLE tasks ADD COLUMN step_claim_phase TEXT NOT NULL DEFAULT ''`},
 	{"step_claim_until", `ALTER TABLE tasks ADD COLUMN step_claim_until INTEGER NOT NULL DEFAULT 0`},
+	{"step_claim_pid", `ALTER TABLE tasks ADD COLUMN step_claim_pid INTEGER NOT NULL DEFAULT 0`},
+	{"step_claim_start", `ALTER TABLE tasks ADD COLUMN step_claim_start INTEGER NOT NULL DEFAULT 0`},
 }
 
 // migratedColumns are the additive columns of every table, in the order they are
@@ -256,7 +265,10 @@ func columnNames(ctx context.Context, tx *sql.Tx, table string) (map[string]bool
 
 // Store owns the orchestrator database.
 type Store struct {
-	db *sql.DB
+	db                  *sql.DB
+	processIdentity     ProcessIdentity
+	ownerMu             sync.RWMutex
+	completedTaskOwners map[completedTaskOwner]struct{}
 }
 
 // Open opens the orchestrator database in dir, creating it if needed.
@@ -290,7 +302,12 @@ func Open(dir string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("index %q: %w", path, err)
 	}
-	return &Store{db: db}, nil
+	identity, _ := CurrentProcessIdentity()
+	return &Store{
+		db:                  db,
+		processIdentity:     identity,
+		completedTaskOwners: make(map[completedTaskOwner]struct{}),
+	}, nil
 }
 
 // Close releases the database handle.
@@ -1224,6 +1241,7 @@ func (s *Store) claimTaskTx(ctx context.Context, tx *tx, t task.Task, budget int
 	}
 	claimed := false
 	var token int64
+	var slotOwnerPID, slotOwnerStart int64
 	if claimSlot {
 		count, err := claimedSlots(ctx, tx, t.ProjectKey, t.ID)
 		if err != nil {
@@ -1231,15 +1249,20 @@ func (s *Store) claimTaskTx(ctx context.Context, tx *tx, t task.Task, budget int
 		}
 		claimed = count < budget
 		if claimed {
+			identity, err := s.currentProcessIdentity()
+			if err != nil {
+				return false, task.Task{}, 0, err
+			}
+			slotOwnerPID, slotOwnerStart = int64(identity.PID), identity.StartTime
 			// A brand-new record has no previous claim, so the token is simply now.
 			token = nextSlotToken(0)
 		}
 	}
 	if _, err := tx.ExecContext(
 		ctx,
-		`INSERT INTO tasks (id, project_key, launch_pane_id, public_pane_id, revision, slot_claimed_at, slot_token, data)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		t.ID, t.ProjectKey, nullablePane(t.LaunchPaneID), t.PublicPaneID, t.Revision, token, token, string(data),
+		`INSERT INTO tasks (id, project_key, launch_pane_id, public_pane_id, revision, slot_claimed_at, slot_token, slot_owner_pid, slot_owner_start, data)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		t.ID, t.ProjectKey, nullablePane(t.LaunchPaneID), t.PublicPaneID, t.Revision, token, token, slotOwnerPID, slotOwnerStart, string(data),
 	); err != nil {
 		return false, task.Task{}, 0, fmt.Errorf("%s %q: %w", action, t.ID, err)
 	}
@@ -1314,9 +1337,13 @@ func (s *Store) ClaimProvisioningSlot(ctx context.Context, id string, budget int
 		return false, 0, fmt.Errorf("read the slot token of %s: %w", id, err)
 	}
 	token := nextSlotToken(previous)
+	identity, err := s.currentProcessIdentity()
+	if err != nil {
+		return false, 0, err
+	}
 	res, err := tx.ExecContext(ctx,
-		`UPDATE tasks SET slot_claimed_at = ?, slot_token = ? WHERE id = ? AND slot_claimed_at = 0`,
-		token, token, id)
+		`UPDATE tasks SET slot_claimed_at = ?, slot_token = ?, slot_owner_pid = ?, slot_owner_start = ? WHERE id = ? AND slot_claimed_at = 0`,
+		token, token, int64(identity.PID), identity.StartTime, id)
 	if err != nil {
 		return false, 0, fmt.Errorf("claim provisioning slot for %s: %w", id, err)
 	}
@@ -1326,6 +1353,7 @@ func (s *Store) ClaimProvisioningSlot(ctx context.Context, id string, budget int
 	if err := tx.commit("claim provisioning slot for " + id); err != nil {
 		return false, 0, err
 	}
+	s.markTaskActive(identity, id)
 	return true, token, nil
 }
 
@@ -1381,10 +1409,14 @@ func (s *Store) RenewProvisioningSlot(ctx context.Context, id, owner string) (in
 	if claimedAt == 0 && !ownsResources(phase) {
 		return 0, fmt.Errorf("%w: task %s holds no provisioning slot to renew", ErrConflict, id)
 	}
+	identity, err := s.currentProcessIdentity()
+	if err != nil {
+		return 0, err
+	}
 	token := nextSlotToken(current)
 	res, err := tx.ExecContext(ctx,
-		`UPDATE tasks SET slot_token = ? WHERE id = ? AND slot_token = ?`,
-		token, id, current)
+		`UPDATE tasks SET slot_token = ?, slot_owner_pid = ?, slot_owner_start = ? WHERE id = ? AND slot_token = ?`,
+		token, int64(identity.PID), identity.StartTime, id, current)
 	if err != nil {
 		return 0, fmt.Errorf("renew the provisioning slot of %s: %w", id, err)
 	}
@@ -1394,18 +1426,19 @@ func (s *Store) RenewProvisioningSlot(ctx context.Context, id, owner string) (in
 	if err := tx.commit("renew the provisioning slot of " + id); err != nil {
 		return 0, err
 	}
+	s.markTaskActive(identity, id)
 	return token, nil
 }
 
 // SlotClaimAbandoned reports whether a queued (intent) task holds a provisioning
-// slot claim that no caller is using: the claim is older than lease and no step
-// claim is live. A caller takes the step claim moments after it claims the slot
-// and holds it while the step runs, so such a claim was left by a caller that
-// stopped in between (a crash, or a bridge killed on its timeout), and nothing
-// else would ever continue the task. A drain may continue it the way a deliberate
-// resume does: the step claim first, then the renewal (RenewProvisioningSlot). A
-// fresh claim, a live step, a released claim, a task past intent and a decided
-// task are never abandoned; an unknown task is ErrNotFound.
+// slot claim that no caller is using: the claim is older than lease and neither
+// recorded owner process is alive. A live step prevents abandonment regardless
+// of its phase; process-query failures are treated as live, while legacy claims
+// without an owner identity retain the lease-only fallback. A drain may continue
+// an abandoned claim the way a deliberate resume does: the step claim first,
+// then the renewal (RenewProvisioningSlot). A fresh claim, a live step, a
+// released claim, a task past intent and a decided task are never abandoned; an
+// unknown task is ErrNotFound.
 func (s *Store) SlotClaimAbandoned(ctx context.Context, id string, lease time.Duration) (bool, error) {
 	if strings.TrimSpace(id) == "" {
 		return false, fmt.Errorf("%w: task id is required", ErrInvalid)
@@ -1414,11 +1447,15 @@ func (s *Store) SlotClaimAbandoned(ctx context.Context, id string, lease time.Du
 		return false, fmt.Errorf("%w: a positive step lease is required", ErrInvalid)
 	}
 	var phase, disposition, owner string
-	var claimedAt, until int64
+	var claimedAt, until, slotOwnerPID, slotOwnerStart, stepOwnerPID, stepOwnerStart int64
 	err := s.db.QueryRowContext(ctx,
 		`SELECT COALESCE(json_extract(data, '$.Phase'), ''), COALESCE(json_extract(data, '$.Disposition'), ''),
-		        slot_claimed_at, step_claim_owner, step_claim_until
-		 FROM tasks WHERE id = ?`, id).Scan(&phase, &disposition, &claimedAt, &owner, &until)
+		        slot_claimed_at, slot_owner_pid, slot_owner_start,
+		        step_claim_owner, step_claim_until, step_claim_pid, step_claim_start
+		 FROM tasks WHERE id = ?`, id).Scan(
+		&phase, &disposition, &claimedAt, &slotOwnerPID, &slotOwnerStart,
+		&owner, &until, &stepOwnerPID, &stepOwnerStart,
+	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, fmt.Errorf("%w: task %s", ErrNotFound, id)
 	}
@@ -1429,7 +1466,9 @@ func (s *Store) SlotClaimAbandoned(ctx context.Context, id string, lease time.Du
 	switch {
 	case phase != string(task.Intent), strings.TrimSpace(disposition) != "", claimedAt <= 0:
 		return false, nil
-	case owner != "" && until > now:
+	case s.taskOwnerAlive(slotOwnerPID, slotOwnerStart, id):
+		return false, nil
+	case owner != "" && (until > now || s.taskOwnerAlive(stepOwnerPID, stepOwnerStart, id)):
 		return false, nil
 	}
 	return claimedAt <= now-lease.Milliseconds(), nil
@@ -1492,7 +1531,7 @@ func (s *Store) ReleaseProvisioningSlot(ctx context.Context, id string, token in
 	// erased by it. The token column stays as it is: it is the identity of the claim
 	// that was given back, and a later claim takes a strictly greater one.
 	res, err := tx.ExecContext(ctx,
-		`UPDATE tasks SET slot_claimed_at = 0
+		`UPDATE tasks SET slot_claimed_at = 0, slot_owner_pid = 0, slot_owner_start = 0
 		  WHERE id = ? AND slot_token = ?
 		    AND COALESCE(json_extract(data, '$.Phase'), '') NOT IN ('worktree_created', 'agent_started', 'prompt_submitted')
 		    AND NOT (step_claim_owner <> '' AND step_claim_until > ?)`,
@@ -1574,10 +1613,11 @@ type rowQueryer interface {
 //
 //   - a claim is keyed by the phase it was taken for, so a step that advanced does
 //     not block the next step;
-//   - a claim that is older than lease can be taken over, which is what keeps a
-//     crash recoverable: the process that died left the claim, and the retry —
-//     minutes later, or from another process — is allowed to continue from the
-//     recorded phase;
+//   - a claim can be taken over only after its lease expired and its recorded
+//     step owner is no longer alive. Between steps, the provisioning-slot owner
+//     also fences another process until that owner exits and the slot lease ends;
+//     process-query failures keep both claims, while legacy claims without owner
+//     identity retain lease-only recovery;
 //   - a live claim for the same phase is never stolen, so only one caller runs the
 //     step and only one side effect (a worktree create, an agent start, a brief) is
 //     ever issued per step.
@@ -1595,10 +1635,7 @@ func (s *Store) ClaimStep(ctx context.Context, taskID string, phase task.Phase, 
 	defer tx.rollback()
 
 	var holder, heldPhase string
-	var heldUntil int64
-	// The step is eligible only while the task still records this phase, so a
-	// caller holding a stale read can never re-run a step the task has moved past
-	// (the loser of a concurrent resume, for example).
+	var heldUntil, heldPID, heldStart, slotClaimedAt, slotOwnerPID, slotOwnerStart int64
 	current, err := scanTask(tx.QueryRowContext(ctx, `SELECT data FROM tasks WHERE id = ?`, taskID), "task "+taskID)
 	if err != nil {
 		return false, err
@@ -1607,26 +1644,41 @@ func (s *Store) ClaimStep(ctx context.Context, taskID string, phase task.Phase, 
 		return false, tx.commit("claim step of " + taskID)
 	}
 	err = tx.QueryRowContext(ctx,
-		`SELECT step_claim_owner, step_claim_phase, step_claim_until FROM tasks WHERE id = ?`, taskID).
-		Scan(&holder, &heldPhase, &heldUntil)
+		`SELECT step_claim_owner, step_claim_phase, step_claim_until, step_claim_pid, step_claim_start,
+		        slot_claimed_at, slot_owner_pid, slot_owner_start FROM tasks WHERE id = ?`, taskID).
+		Scan(&holder, &heldPhase, &heldUntil, &heldPID, &heldStart,
+			&slotClaimedAt, &slotOwnerPID, &slotOwnerStart)
 	if err != nil {
 		return false, fmt.Errorf("read the step claim of %s: %w", taskID, err)
 	}
 	now := time.Now().UnixMilli()
-	live := holder != "" && heldPhase == string(phase) && now < heldUntil
+	live := holder != "" && heldPhase == string(phase) &&
+		(now < heldUntil || s.taskOwnerAlive(heldPID, heldStart, taskID))
 	if live {
 		// Another caller is running this very step. Commit without changing anything
 		// so the read did not hold a write lock longer than it had to.
 		return false, tx.commit("claim step of " + taskID)
 	}
+	identity, err := s.currentProcessIdentity()
+	if err != nil {
+		return false, err
+	}
+	slotOwnerIsThisProcess := int64(identity.PID) == slotOwnerPID && identity.StartTime == slotOwnerStart
+	if !slotOwnerIsThisProcess {
+		if s.taskOwnerAlive(slotOwnerPID, slotOwnerStart, taskID) ||
+			(slotClaimedAt > 0 && now < slotClaimedAt+lease.Milliseconds()) {
+			return false, tx.commit("claim step of " + taskID)
+		}
+	}
 	if _, err := tx.ExecContext(ctx,
-		`UPDATE tasks SET step_claim_owner = ?, step_claim_phase = ?, step_claim_until = ? WHERE id = ?`,
-		owner, string(phase), now+lease.Milliseconds(), taskID); err != nil {
+		`UPDATE tasks SET step_claim_owner = ?, step_claim_phase = ?, step_claim_until = ?, step_claim_pid = ?, step_claim_start = ? WHERE id = ?`,
+		owner, string(phase), now+lease.Milliseconds(), int64(identity.PID), identity.StartTime, taskID); err != nil {
 		return false, fmt.Errorf("claim step of %s: %w", taskID, err)
 	}
 	if err := tx.commit("claim step of " + taskID); err != nil {
 		return false, err
 	}
+	s.markTaskActive(identity, taskID)
 	return true, nil
 }
 
@@ -1782,7 +1834,7 @@ func requireOwnStep(ctx context.Context, tx *tx, id, owner string) error {
 // owner and phase still match is cleared, so a caller can never take a step away
 // from the caller that holds it.
 func clearStepClaim(ctx context.Context, q execer, id, owner string, phase task.Phase) (bool, error) {
-	query := `UPDATE tasks SET step_claim_owner = '', step_claim_phase = '', step_claim_until = 0 WHERE id = ?`
+	query := `UPDATE tasks SET step_claim_owner = '', step_claim_phase = '', step_claim_until = 0, step_claim_pid = 0, step_claim_start = 0 WHERE id = ?`
 	args := []any{id}
 	if owner != "" || phase != "" {
 		query += ` AND step_claim_owner = ? AND step_claim_phase = ? AND step_claim_until > ?`
@@ -1807,7 +1859,7 @@ func (s *Store) ReleaseStep(ctx context.Context, taskID, owner string) error {
 		return fmt.Errorf("%w: task id and owner are required", ErrInvalid)
 	}
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE tasks SET step_claim_owner = '', step_claim_phase = '', step_claim_until = 0
+		`UPDATE tasks SET step_claim_owner = '', step_claim_phase = '', step_claim_until = 0, step_claim_pid = 0, step_claim_start = 0
 		  WHERE id = ? AND step_claim_owner = ?`, taskID, owner)
 	if err != nil {
 		return fmt.Errorf("release the step claim of %s: %w", taskID, err)
