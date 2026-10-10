@@ -2745,17 +2745,19 @@ function Test-RestoredReviewRefusal {
 function Get-OmpTranscriptToolEntries {
     <#
         The tool calls the assistant made in one OMP transcript (its toolCall parts,
-        in transcript order) and the ids of the calls whose tool result is recorded.
+        in transcript order), the ids of the calls whose tool result is recorded, and the
+        ids of the calls whose result is an error.
         Only assistant messages carry calls: a user message or a tool result that
         quotes one is not a call. Half-written lines are skipped. A missing or
         unreadable transcript yields nothing and Readable is false, so a check that
         needs this evidence fails closed.
     #>
     param([string]$Path)
-    $entries = [pscustomobject]@{ Readable = $false; Calls = @(); ResultIds = @() }
+    $entries = [pscustomobject]@{ Readable = $false; Calls = @(); ResultIds = @(); ErrorIds = @() }
     if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $entries }
     $calls = New-Object System.Collections.ArrayList
     $resultIds = New-Object System.Collections.ArrayList
+    $errorIds = New-Object System.Collections.ArrayList
     $stream = $null
     $reader = $null
     try {
@@ -2770,6 +2772,7 @@ function Get-OmpTranscriptToolEntries {
             if ($role -ceq 'toolResult') {
                 $resultId = [string](Get-Field $message 'toolCallId')
                 if ($resultId -ne '') { [void]$resultIds.Add($resultId) }
+                if ($resultId -ne '' -and [bool](Get-Field $message 'isError' $false)) { [void]$errorIds.Add($resultId) }
                 continue
             }
             if ($role -cne 'assistant') { continue }
@@ -2786,6 +2789,7 @@ function Get-OmpTranscriptToolEntries {
     $entries.Readable = $true
     $entries.Calls = @($calls)
     $entries.ResultIds = @($resultIds)
+    $entries.ErrorIds = @($errorIds)
     return $entries
 }
 
@@ -2837,6 +2841,53 @@ function Test-OmpPendingToolCall {
         if ($same) { return $true }
     }
     return $false
+}
+
+function Get-ReportIdentity {
+    <#
+        The content of one final report in a fixed key order: the fields the
+        coordinator's note identity is built from (summary, branch, evidence, checks
+        and risk). The intent label OMP adds and the order the model wrote the keys
+        in are not part of the report.
+    #>
+    param($Report)
+    $checks = @(@(Get-Field $Report 'checks' @()) | ForEach-Object {
+        [ordered]@{
+            name    = [string](Get-Field $_ 'name')
+            outcome = [string](Get-Field $_ 'outcome')
+            detail  = [string](Get-Field $_ 'detail')
+        }
+    })
+    return (Get-Json ([ordered]@{
+        summary  = [string](Get-Field $Report 'summary')
+        branch   = [string](Get-Field $Report 'branch')
+        evidence = @(@(Get-Field $Report 'evidence' @()) | ForEach-Object { [string]$_ })
+        checks   = $checks
+        risk     = [string](Get-Field $Report 'risk')
+    }))
+}
+
+function Get-AcceptedResultReportCount {
+    <#
+        How many distinct final reports one worker transcript shows the coordinator
+        accepted: orch_report calls of kind "result" whose tool result is recorded and
+        is not an error. Reports are compared by Get-ReportIdentity, so an identical
+        resubmission counts once. Readable is false for a missing or unreadable
+        transcript, so a check that needs the count fails closed.
+    #>
+    param([string]$Path)
+    $entries = Get-OmpTranscriptToolEntries -Path $Path
+    if (-not $entries.Readable) { return [pscustomobject]@{ Readable = $false; Distinct = 0 } }
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($call in @($entries.Calls)) {
+        if ([string](Get-Field $call 'name') -cne 'orch_report') { continue }
+        $callId = [string](Get-Field $call 'id')
+        if ($callId -eq '' -or @($entries.ResultIds) -cnotcontains $callId -or @($entries.ErrorIds) -ccontains $callId) { continue }
+        $report = Get-Field $call 'arguments' $null
+        if ([string](Get-Field $report 'kind') -cne 'result') { continue }
+        [void]$seen.Add((Get-ReportIdentity -Report $report))
+    }
+    return [pscustomobject]@{ Readable = $true; Distinct = $seen.Count }
 }
 
 function Select-OmpToolCallNames {
@@ -6199,7 +6250,20 @@ function Invoke-WorkerReports {
         Assert-True -Id "W2.$($pair.Name)-clean-attention" -What 'a final report clears the worker question attention' -Condition ([string]::IsNullOrWhiteSpace([string](Get-Field $reported 'Attention'))) -TaskId $id
         $dump = Get-StateDump
         $note = @($dump.tables.inbox | Where-Object { (Get-Field $_ 'task_id') -eq $id -and (Get-Field $_ 'kind') -eq 'result' })
-        Assert-Equal -Id "W3.$($pair.Name)-note" -What 'exactly one result note was recorded for the primary' -Expected 1 -Actual $note.Count -TaskId $id
+        # The worker may report again. The coordinator records each distinct accepted
+        # report as one note, and an identical resubmission as none, so the worker's
+        # transcript says how many notes are right. Its last tool result can land a
+        # moment after the report is stored, so the transcript count is waited on.
+        $workerTranscript = [string](Get-Field (Get-ReadySession -LaunchPaneId ([string](Get-Field $reported 'LaunchPaneID'))) 'omp_session_file')
+        $settled = Wait-Until -TimeoutSeconds 60 -IntervalSeconds 3 -What "worker $($pair.Name)'s accepted final reports" -Probe {
+            $found = Get-AcceptedResultReportCount -Path $workerTranscript
+            if ($found.Readable -and $found.Distinct -eq $note.Count) { return $found }
+            return $null
+        }
+        $accepted = Get-AcceptedResultReportCount -Path $workerTranscript
+        Assert-True -Id "W3.$($pair.Name)-note" -What 'one result note is recorded for each distinct final report the worker transcript shows accepted' `
+            -Condition ($settled.Ok -and $note.Count -ge 1) -TaskId $id `
+            -Evidence ("notes=$($note.Count) accepted=$($accepted.Distinct) readable=$($accepted.Readable) transcript=[$workerTranscript]")
         Assert-OmpSessionModel -Id "W2.$($pair.Name)-model" -What "worker $($pair.Name) ran on the requested model" `
             -LaunchPaneId ([string](Get-Field $reported 'LaunchPaneID')) -TaskId $id
     }

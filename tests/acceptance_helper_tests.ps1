@@ -1261,6 +1261,42 @@ Check 'tool use within: a call outside the allowed set fails and is named' (Test
 Check 'tool use within: a transcript without tool calls proves nothing' (Test-Safely { -not (Test-OmpToolCallsWithin -Path $textOnlyTranscript -Allowed @('read')).Ok }) 'no calls'
 Check 'tool use within: a missing or empty transcript path proves nothing' (Test-Safely { -not (Test-OmpToolCallsWithin -Path $missingTranscript -Allowed @('read')).Ok -and -not (Test-OmpToolCallsWithin -Path '' -Allowed @('read')).Ok }) 'missing path'
 
+# --- worker final reports the transcript accepted: distinct by content, never by the intent label ---
+$reportCallA = '{"type":"message","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_r1","name":"orch_report","arguments":{"i":"Report completed requested change","kind":"result","summary":"ACCEPT-SINGLE: a.js now exports subtract","branch":"orch/abc","evidence":["commit d486a16"],"checks":[{"name":"git log -1 --format=%H","outcome":"passed","detail":"d486a16"}],"risk":"none"}}]}}'
+$reportCallReordered = '{"type":"message","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_r2","name":"orch_report","arguments":{"risk":"none","checks":[{"outcome":"passed","detail":"d486a16","name":"git log -1 --format=%H"}],"evidence":["commit d486a16"],"branch":"orch/abc","summary":"ACCEPT-SINGLE: a.js now exports subtract","kind":"result","i":"Confirm completed requested change"}}]}}'
+$reportCallDroppedDetail = '{"type":"message","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_r3","name":"orch_report","arguments":{"i":"Confirm completed requested change","kind":"result","summary":"ACCEPT-SINGLE: a.js now exports subtract","branch":"orch/abc","evidence":["commit d486a16"],"checks":[{"name":"git log -1 --format=%H","outcome":"passed"}],"risk":"none"}}]}}'
+$reportCallRejected = '{"type":"message","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_r4","name":"orch_report","arguments":{"kind":"result","summary":"ACCEPT-SINGLE: a rejected shape","branch":"orch/abc","evidence":[],"checks":[],"risk":"none"}}]}}'
+$reportCallPartial = '{"type":"message","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_r5","name":"orch_report","arguments":{"kind":"partial","summary":"ACCEPT-SINGLE: halfway","branch":"orch/abc","evidence":[],"checks":[],"risk":"none"}}]}}'
+$reportCallUnanswered = '{"type":"message","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_r6","name":"orch_report","arguments":{"kind":"result","summary":"ACCEPT-SINGLE: never answered","branch":"orch/abc","evidence":[],"checks":[],"risk":"none"}}]}}'
+$sameReportTranscript = Join-Path $script:HarnessRoot 'worker-same-report.jsonl'
+Set-Content -LiteralPath $sameReportTranscript -Encoding UTF8 -Value @(
+    $reportCallA,
+    '{"type":"message","message":{"role":"toolResult","toolCallId":"call_r1","toolName":"orch_report","content":[],"isError":false}}',
+    $reportCallReordered,
+    '{"type":"message","message":{"role":"toolResult","toolCallId":"call_r2","toolName":"orch_report","content":[],"isError":false}}'
+)
+$reportTranscript = Join-Path $script:HarnessRoot 'worker-reports.jsonl'
+Set-Content -LiteralPath $reportTranscript -Encoding UTF8 -Value @(
+    $reportCallA,
+    '{"type":"message","message":{"role":"toolResult","toolCallId":"call_r1","toolName":"orch_report","content":[],"isError":false}}',
+    $reportCallReordered,
+    '{"type":"message","message":{"role":"toolResult","toolCallId":"call_r2","toolName":"orch_report","content":[],"isError":false}}',
+    $reportCallDroppedDetail,
+    '{"type":"message","message":{"role":"toolResult","toolCallId":"call_r3","toolName":"orch_report","content":[],"isError":false}}',
+    $reportCallRejected,
+    '{"type":"message","message":{"role":"toolResult","toolCallId":"call_r4","toolName":"orch_report","content":[{"type":"text","text":"rejected"}],"isError":true}}',
+    $reportCallPartial,
+    '{"type":"message","message":{"role":"toolResult","toolCallId":"call_r5","toolName":"orch_report","content":[],"isError":false}}',
+    $reportCallUnanswered
+)
+Check 'worker reports: the same report in another key order and intent label is one report' (Test-Safely { (Get-AcceptedResultReportCount -Path $sameReportTranscript).Distinct -eq 1 }) 'identical resubmission'
+Check 'worker reports: only accepted result reports count, and a changed check is a new report' (Test-Safely {
+    $counted = Get-AcceptedResultReportCount -Path $reportTranscript
+    $counted.Readable -and $counted.Distinct -eq 2 }) 'accepted only'
+Check 'worker reports: a missing transcript proves no report' (Test-Safely {
+    $missing = Get-AcceptedResultReportCount -Path $missingTranscript
+    -not $missing.Readable -and $missing.Distinct -eq 0 }) 'missing'
+
 $primaryAskScreen = @'
 Earlier conversation contained a completed task-A review:
 Ask 1 questions
