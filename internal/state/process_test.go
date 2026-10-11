@@ -28,9 +28,16 @@ func TestProcessIdentityHelper(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CurrentProcessIdentity: %v", err)
 	}
-	if err := os.WriteFile(os.Getenv(processIdentityHelperFile),
-		[]byte(fmt.Sprintf("%d %d", identity.PID, identity.StartTime)), 0o600); err != nil {
+	// Publish the identity whole: write a temporary file, then rename it into
+	// place. A reader that finds the identity file reads both fields, never the
+	// empty or half-written file that a truncating write briefly exposes.
+	identityFile := os.Getenv(processIdentityHelperFile)
+	temp := identityFile + ".tmp"
+	if err := os.WriteFile(temp, []byte(fmt.Sprintf("%d %d", identity.PID, identity.StartTime)), 0o600); err != nil {
 		t.Fatalf("write process identity: %v", err)
+	}
+	if err := os.Rename(temp, identityFile); err != nil {
+		t.Fatalf("publish process identity: %v", err)
 	}
 	for {
 		time.Sleep(time.Hour)
