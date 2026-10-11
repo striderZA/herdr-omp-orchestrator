@@ -2890,41 +2890,6 @@ function Get-AcceptedResultReportCount {
     return [pscustomobject]@{ Readable = $true; Distinct = $seen.Count }
 }
 
-function Test-OmpToolCallUnfinished {
-    <#
-        True when the transcript cannot show that every call of this tool has finished:
-        a call with no recorded result, a call with no id to link a result by, or a
-        transcript that exists but cannot be read. A missing transcript holds no calls.
-    #>
-    param([string]$Path, [Parameter(Mandatory)][string]$Name)
-    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
-    $entries = Get-OmpTranscriptToolEntries -Path $Path
-    if (-not $entries.Readable) { return $true }
-    foreach ($call in @($entries.Calls)) {
-        if ([string](Get-Field $call 'name') -cne $Name) { continue }
-        $callId = [string](Get-Field $call 'id')
-        if ($callId -eq '' -or @($entries.ResultIds) -cnotcontains $callId) { return $true }
-    }
-    return $false
-}
-
-function Test-PrimaryDispatchUnfinished {
-    <#
-        True when the primary's orch_dispatch calls cannot all be shown finished, or
-        the run's state cannot be read to name the primary's transcript. Cleanup closes
-        the workspace the primary runs in, so it must not run under a dispatch that is
-        still provisioning there.
-    #>
-    $launch = [string](Get-Field $script:Project 'LaunchPaneID')
-    if ([string]::IsNullOrWhiteSpace($launch)) { return $false }
-    try {
-        $transcript = [string](Get-Field (Get-ReadySession -LaunchPaneId $launch) 'omp_session_file')
-    } catch {
-        return $true
-    }
-    return (Test-OmpToolCallUnfinished -Path $transcript -Name 'orch_dispatch')
-}
-
 function Select-OmpToolCallNames {
     # The distinct names of transcript tool calls, in first-seen order.
     param([object[]]$Calls = @())
@@ -7985,10 +7950,7 @@ try {
     }
 } finally {
     $script:ScenarioDeadline = $null
-    # Cleanup closes the primary's workspace, so a dispatch still provisioning in it keeps the run's resources.
-    if (-not $KeepResources -and (Test-PrimaryDispatchUnfinished)) {
-        Preserve-ResourcesForPendingTool -AssertionId 'RUN.pending-dispatch-preserved' -Reason "the primary's orch_dispatch call has no recorded result, so cleanup would close the workspace it is still provisioning in"
-    } elseif ($script:PendingUserInteraction -and -not $KeepResources) {
+    if ($script:PendingUserInteraction -and -not $KeepResources) {
         Preserve-ResourcesForPendingTool -AssertionId 'RUN.pending-interaction-preserved' -Reason 'the final journal still records an unresolved user interaction'
     }
     try { Invoke-Cleanup } catch {
