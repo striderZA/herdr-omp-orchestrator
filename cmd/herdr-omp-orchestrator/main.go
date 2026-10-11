@@ -78,7 +78,7 @@ const (
 	envPluginEventJSON = "HERDR_PLUGIN_EVENT_JSON"
 )
 
-const usage = "usage: herdr-omp-orchestrator <setup|bind|startup|event|board|open-board|reattach|open-reattach|bridge <method>|recover>"
+const usage = "usage: herdr-omp-orchestrator <setup [--dry-run]|bind|startup|event|board|open-board|reattach|open-reattach|bridge <method>|recover>"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -94,7 +94,7 @@ func main() {
 	}
 	switch os.Args[1] {
 	case "setup":
-		os.Exit(runSetup(env, os.Stdout, os.Stderr))
+		os.Exit(runSetup(env, os.Args[2:], os.Stdout, os.Stderr))
 	case "bind":
 		os.Exit(runBind(env, os.Stdout, os.Stderr))
 	case "startup":
@@ -643,15 +643,27 @@ func coordCode(err error) string {
 	}
 }
 
+// setupDryRunFlag makes setup report what it would do, without writing.
+const setupDryRunFlag = "--dry-run"
+
 // runSetup installs the plugin's OMP extension and reports the outcome. The
 // executable path it embeds is this binary, resolved at runtime, so a moved or
 // reinstalled plugin refreshes the embedded path instead of leaving an
-// extension that points at a stale executable.
-func runSetup(env map[string]string, stdout, stderr io.Writer) int {
+// extension that points at a stale executable. With --dry-run it reports the
+// action an install would take and writes nothing.
+func runSetup(env map[string]string, args []string, stdout, stderr io.Writer) int {
+	dryRun, err := parseSetupArgs(args)
+	if err != nil {
+		emit(stdout, stderr, failureBody("usage", err.Error()))
+		return 2
+	}
 	executable, err := os.Executable()
 	if err != nil {
 		fmt.Fprintf(stderr, "herdr-omp-orchestrator: setup: %v\n", err)
 		return emit(stdout, stderr, failureBody("executable_unavailable", "the plugin executable path could not be resolved"))
+	}
+	if dryRun {
+		return emitSetupPlan(env, executable, stdout, stderr)
 	}
 	if err := setup.Install(env, executable); err != nil {
 		return emit(stdout, stderr, setupFailure(err))
@@ -663,6 +675,39 @@ func runSetup(env map[string]string, stdout, stderr io.Writer) int {
 	return emit(stdout, stderr, map[string]any{
 		"ok":        true,
 		"extension": path,
+		"protocol":  setup.Protocol,
+	})
+}
+
+// parseSetupArgs reads the arguments setup accepts: none, or exactly --dry-run.
+// Anything else is refused before any path is resolved, so a mistyped flag can
+// never fall through to a real install. That refusal is a usage error and exits
+// 2, like the other usage refusals of this executable.
+func parseSetupArgs(args []string) (bool, error) {
+	switch {
+	case len(args) == 0:
+		return false, nil
+	case len(args) == 1 && args[0] == setupDryRunFlag:
+		return true, nil
+	default:
+		return false, fmt.Errorf("setup accepts no arguments or exactly %s; got %q; usage: herdr-omp-orchestrator setup [%s]",
+			setupDryRunFlag, args, setupDryRunFlag)
+	}
+}
+
+// emitSetupPlan answers what setup would do for env and writes nothing. Its
+// refusals are the install's own, so a preview fails and exits the way the real
+// setup would.
+func emitSetupPlan(env map[string]string, executable string, stdout, stderr io.Writer) int {
+	plan, err := setup.PlanInstall(env, executable)
+	if err != nil {
+		return emit(stdout, stderr, setupFailure(err))
+	}
+	return emit(stdout, stderr, map[string]any{
+		"ok":        true,
+		"dryRun":    true,
+		"action":    string(plan.Action),
+		"extension": plan.Extension,
 		"protocol":  setup.Protocol,
 	})
 }
