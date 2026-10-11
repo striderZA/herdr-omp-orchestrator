@@ -2745,19 +2745,21 @@ function Test-RestoredReviewRefusal {
 function Get-OmpTranscriptToolEntries {
     <#
         The tool calls the assistant made in one OMP transcript (its toolCall parts,
-        in transcript order), the ids of the calls whose tool result is recorded, and the
-        ids of the calls whose result is an error.
+        in transcript order), the ids of the calls whose tool result is recorded, the ids
+        of the calls whose result is an error, and each recorded tool result with its tool
+        name, error flag and text.
         Only assistant messages carry calls: a user message or a tool result that
         quotes one is not a call. Half-written lines are skipped. A missing or
         unreadable transcript yields nothing and Readable is false, so a check that
         needs this evidence fails closed.
     #>
     param([string]$Path)
-    $entries = [pscustomobject]@{ Readable = $false; Calls = @(); ResultIds = @(); ErrorIds = @() }
+    $entries = [pscustomobject]@{ Readable = $false; Calls = @(); ResultIds = @(); ErrorIds = @(); Results = @() }
     if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $entries }
     $calls = New-Object System.Collections.ArrayList
     $resultIds = New-Object System.Collections.ArrayList
     $errorIds = New-Object System.Collections.ArrayList
+    $results = New-Object System.Collections.ArrayList
     $stream = $null
     $reader = $null
     try {
@@ -2773,6 +2775,8 @@ function Get-OmpTranscriptToolEntries {
                 $resultId = [string](Get-Field $message 'toolCallId')
                 if ($resultId -ne '') { [void]$resultIds.Add($resultId) }
                 if ($resultId -ne '' -and [bool](Get-Field $message 'isError' $false)) { [void]$errorIds.Add($resultId) }
+                $resultText = (@(Get-Field $message 'content' @()) | ForEach-Object { [string](Get-Field $_ 'text') }) -join ''
+                [void]$results.Add([pscustomobject]@{ Id = $resultId; Name = [string](Get-Field $message 'toolName'); IsError = [bool](Get-Field $message 'isError' $false); Text = $resultText })
                 continue
             }
             if ($role -cne 'assistant') { continue }
@@ -2790,6 +2794,7 @@ function Get-OmpTranscriptToolEntries {
     $entries.Calls = @($calls)
     $entries.ResultIds = @($resultIds)
     $entries.ErrorIds = @($errorIds)
+    $entries.Results = @($results)
     return $entries
 }
 
@@ -2843,15 +2848,15 @@ function Test-OmpPendingToolCall {
     return $false
 }
 
-function Get-ReportIdentity {
+function Get-StoredReportIdentity {
     <#
-        The content of one final report in a fixed key order: the fields the
-        coordinator's note identity is built from (summary, branch, evidence, checks
-        and risk). The intent label OMP adds and the order the model wrote the keys
-        in are not part of the report.
+        The content of one stored final report, in a fixed field order: the fields the
+        coordinator hashes for the report's note (Kind, Summary, Branch, Evidence, Checks
+        and Risk). The worker's arguments, the order it wrote them in and any whitespace
+        the coordinator trims are not part of it.
     #>
     param($Report)
-    $checks = @(@(Get-Field $Report 'checks' @()) | ForEach-Object {
+    $checks = @(@(Get-Field $Report 'Checks' @()) | ForEach-Object {
         [ordered]@{
             name    = [string](Get-Field $_ 'name')
             outcome = [string](Get-Field $_ 'outcome')
@@ -2859,33 +2864,34 @@ function Get-ReportIdentity {
         }
     })
     return (Get-Json ([ordered]@{
-        summary  = [string](Get-Field $Report 'summary')
-        branch   = [string](Get-Field $Report 'branch')
-        evidence = @(@(Get-Field $Report 'evidence' @()) | ForEach-Object { [string]$_ })
-        checks   = $checks
-        risk     = [string](Get-Field $Report 'risk')
+        Kind     = [string](Get-Field $Report 'Kind')
+        Summary  = [string](Get-Field $Report 'Summary')
+        Branch   = [string](Get-Field $Report 'Branch')
+        Evidence = @(@(Get-Field $Report 'Evidence' @()) | ForEach-Object { [string]$_ })
+        Checks   = $checks
+        Risk     = [string](Get-Field $Report 'Risk')
     }))
 }
 
 function Get-AcceptedResultReportCount {
     <#
         How many distinct final reports one worker transcript shows the coordinator
-        accepted: orch_report calls of kind "result" whose tool result is recorded and
-        is not an error. Reports are compared by Get-ReportIdentity, so an identical
-        resubmission counts once. Readable is false for a missing or unreadable
-        transcript, so a check that needs the count fails closed.
+        stored. A successful orch_report result returns the task and the report it
+        stored, the same report the coordinator hashes for the note, so an identical
+        resubmission counts once. A refusal returns no stored report and is not counted,
+        whether OMP marks it as an error or not. Readable is false for a missing or
+        unreadable transcript, so a check that needs the count fails closed.
     #>
     param([string]$Path)
     $entries = Get-OmpTranscriptToolEntries -Path $Path
     if (-not $entries.Readable) { return [pscustomobject]@{ Readable = $false; Distinct = 0 } }
     $seen = New-Object 'System.Collections.Generic.HashSet[string]'
-    foreach ($call in @($entries.Calls)) {
-        if ([string](Get-Field $call 'name') -cne 'orch_report') { continue }
-        $callId = [string](Get-Field $call 'id')
-        if ($callId -eq '' -or @($entries.ResultIds) -cnotcontains $callId -or @($entries.ErrorIds) -ccontains $callId) { continue }
-        $report = Get-Field $call 'arguments' $null
-        if ([string](Get-Field $report 'kind') -cne 'result') { continue }
-        [void]$seen.Add((Get-ReportIdentity -Report $report))
+    foreach ($result in @($entries.Results)) {
+        if ($result.Name -cne 'orch_report' -or $result.IsError -or $result.Text -eq '') { continue }
+        try { $body = ConvertFrom-Json -InputObject $result.Text -ErrorAction Stop } catch { continue }
+        $stored = Get-Field $body 'report' $null
+        if ($null -eq $stored -or [string](Get-Field $body 'taskId') -eq '') { continue }
+        [void]$seen.Add((Get-StoredReportIdentity -Report $stored))
     }
     return [pscustomobject]@{ Readable = $true; Distinct = $seen.Count }
 }

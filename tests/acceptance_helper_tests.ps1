@@ -1261,38 +1261,67 @@ Check 'tool use within: a call outside the allowed set fails and is named' (Test
 Check 'tool use within: a transcript without tool calls proves nothing' (Test-Safely { -not (Test-OmpToolCallsWithin -Path $textOnlyTranscript -Allowed @('read')).Ok }) 'no calls'
 Check 'tool use within: a missing or empty transcript path proves nothing' (Test-Safely { -not (Test-OmpToolCallsWithin -Path $missingTranscript -Allowed @('read')).Ok -and -not (Test-OmpToolCallsWithin -Path '' -Allowed @('read')).Ok }) 'missing path'
 
-# --- worker final reports the transcript accepted: distinct by content, never by the intent label ---
-$reportCallA = '{"type":"message","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_r1","name":"orch_report","arguments":{"i":"Report completed requested change","kind":"result","summary":"ACCEPT-SINGLE: a.js now exports subtract","branch":"orch/abc","evidence":["commit d486a16"],"checks":[{"name":"git log -1 --format=%H","outcome":"passed","detail":"d486a16"}],"risk":"none"}}]}}'
-$reportCallReordered = '{"type":"message","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_r2","name":"orch_report","arguments":{"risk":"none","checks":[{"outcome":"passed","detail":"d486a16","name":"git log -1 --format=%H"}],"evidence":["commit d486a16"],"branch":"orch/abc","summary":"ACCEPT-SINGLE: a.js now exports subtract","kind":"result","i":"Confirm completed requested change"}}]}}'
-$reportCallDroppedDetail = '{"type":"message","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_r3","name":"orch_report","arguments":{"i":"Confirm completed requested change","kind":"result","summary":"ACCEPT-SINGLE: a.js now exports subtract","branch":"orch/abc","evidence":["commit d486a16"],"checks":[{"name":"git log -1 --format=%H","outcome":"passed"}],"risk":"none"}}]}}'
-$reportCallRejected = '{"type":"message","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_r4","name":"orch_report","arguments":{"kind":"result","summary":"ACCEPT-SINGLE: a rejected shape","branch":"orch/abc","evidence":[],"checks":[],"risk":"none"}}]}}'
-$reportCallPartial = '{"type":"message","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_r5","name":"orch_report","arguments":{"kind":"partial","summary":"ACCEPT-SINGLE: halfway","branch":"orch/abc","evidence":[],"checks":[],"risk":"none"}}]}}'
-$reportCallUnanswered = '{"type":"message","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_r6","name":"orch_report","arguments":{"kind":"result","summary":"ACCEPT-SINGLE: never answered","branch":"orch/abc","evidence":[],"checks":[],"risk":"none"}}]}}'
+# --- worker final reports the coordinator stored: distinct by the stored report, never by the arguments ---
+function New-TestReportCall {
+    param([string]$CallId, $Arguments)
+    $message = [ordered]@{ role = 'assistant'; content = @([ordered]@{ type = 'toolCall'; id = $CallId; name = 'orch_report'; arguments = $Arguments }) }
+    return (ConvertTo-Json -InputObject ([ordered]@{ type = 'message'; message = $message }) -Depth 12 -Compress)
+}
+function New-TestReportResult {
+    param([string]$CallId, [string]$Text, [bool]$IsError = $false)
+    $message = [ordered]@{ role = 'toolResult'; toolCallId = $CallId; toolName = 'orch_report'; content = @([ordered]@{ type = 'text'; text = $Text }); isError = $IsError }
+    return (ConvertTo-Json -InputObject ([ordered]@{ type = 'message'; message = $message }) -Depth 12 -Compress)
+}
+function New-TestStoredReportText {
+    # The text of a successful orch_report result: the task and the report the coordinator stored.
+    param($Stored)
+    return (ConvertTo-Json -InputObject ([ordered]@{ taskId = 'orch_abc123def456'; stage = 'ready_for_review'; report = $Stored; duplicate = $false }) -Depth 12 -Compress)
+}
+$storedWithDetail = [ordered]@{ Kind = 'result'; Summary = 'ACCEPT-SINGLE: a.js now exports subtract'; Branch = 'orch/abc'; Evidence = @('commit d486a16'); Checks = @([ordered]@{ name = 'git log -1 --format=%H'; outcome = 'passed'; detail = 'd486a16' }); Risk = 'none' }
+$storedWithoutDetail = [ordered]@{ Kind = 'result'; Summary = 'ACCEPT-SINGLE: a.js now exports subtract'; Branch = 'orch/abc'; Evidence = @('commit d486a16'); Checks = @([ordered]@{ name = 'git log -1 --format=%H'; outcome = 'passed' }); Risk = 'none' }
+$reportArgsA = [ordered]@{ i = 'Report completed requested change'; kind = 'result'; summary = 'ACCEPT-SINGLE: a.js now exports subtract'; branch = 'orch/abc'; evidence = @('commit d486a16'); checks = @([ordered]@{ name = 'git log -1 --format=%H'; outcome = 'passed'; detail = 'd486a16' }); risk = 'none' }
+# The coordinator trims the summary and the branch, so this resubmission is stored as the same report.
+$reportArgsPadded = [ordered]@{ i = 'Confirm completed requested change'; kind = 'result'; summary = 'ACCEPT-SINGLE: a.js now exports subtract  '; branch = ' orch/abc '; evidence = @('commit d486a16'); checks = @([ordered]@{ name = 'git log -1 --format=%H'; outcome = 'passed'; detail = 'd486a16' }); risk = 'none' }
+$reportArgsDropped = [ordered]@{ i = 'Confirm completed requested change'; kind = 'result'; summary = 'ACCEPT-SINGLE: a.js now exports subtract'; branch = 'orch/abc'; evidence = @('commit d486a16'); checks = @([ordered]@{ name = 'git log -1 --format=%H'; outcome = 'passed' }); risk = 'none' }
 $sameReportTranscript = Join-Path $script:HarnessRoot 'worker-same-report.jsonl'
 Set-Content -LiteralPath $sameReportTranscript -Encoding UTF8 -Value @(
-    $reportCallA,
-    '{"type":"message","message":{"role":"toolResult","toolCallId":"call_r1","toolName":"orch_report","content":[],"isError":false}}',
-    $reportCallReordered,
-    '{"type":"message","message":{"role":"toolResult","toolCallId":"call_r2","toolName":"orch_report","content":[],"isError":false}}'
+    (New-TestReportCall -CallId 'call_r1' -Arguments $reportArgsA),
+    (New-TestReportResult -CallId 'call_r1' -Text (New-TestStoredReportText -Stored $storedWithDetail)),
+    (New-TestReportCall -CallId 'call_r2' -Arguments $reportArgsPadded),
+    (New-TestReportResult -CallId 'call_r2' -Text (New-TestStoredReportText -Stored $storedWithDetail))
 )
 $reportTranscript = Join-Path $script:HarnessRoot 'worker-reports.jsonl'
 Set-Content -LiteralPath $reportTranscript -Encoding UTF8 -Value @(
-    $reportCallA,
-    '{"type":"message","message":{"role":"toolResult","toolCallId":"call_r1","toolName":"orch_report","content":[],"isError":false}}',
-    $reportCallReordered,
-    '{"type":"message","message":{"role":"toolResult","toolCallId":"call_r2","toolName":"orch_report","content":[],"isError":false}}',
-    $reportCallDroppedDetail,
-    '{"type":"message","message":{"role":"toolResult","toolCallId":"call_r3","toolName":"orch_report","content":[],"isError":false}}',
-    $reportCallRejected,
-    '{"type":"message","message":{"role":"toolResult","toolCallId":"call_r4","toolName":"orch_report","content":[{"type":"text","text":"rejected"}],"isError":true}}',
-    $reportCallPartial,
-    '{"type":"message","message":{"role":"toolResult","toolCallId":"call_r5","toolName":"orch_report","content":[],"isError":false}}',
-    $reportCallUnanswered
+    (New-TestReportCall -CallId 'call_r1' -Arguments $reportArgsA),
+    (New-TestReportResult -CallId 'call_r1' -Text (New-TestStoredReportText -Stored $storedWithDetail)),
+    (New-TestReportCall -CallId 'call_r2' -Arguments $reportArgsPadded),
+    (New-TestReportResult -CallId 'call_r2' -Text (New-TestStoredReportText -Stored $storedWithDetail)),
+    (New-TestReportCall -CallId 'call_r3' -Arguments $reportArgsDropped),
+    (New-TestReportResult -CallId 'call_r3' -Text (New-TestStoredReportText -Stored $storedWithoutDetail)),
+    (New-TestReportCall -CallId 'call_r4' -Arguments $reportArgsA),
+    (New-TestReportResult -CallId 'call_r4' -Text 'invalid_report: the report summary is empty' -IsError $true),
+    (New-TestReportCall -CallId 'call_r5' -Arguments $reportArgsA),
+    (New-TestReportResult -CallId 'call_r5' -Text '{"ok":false,"error":{"code":"invalid_report","message":"the report names no branch"}}'),
+    (New-TestReportCall -CallId 'call_r6' -Arguments ([ordered]@{ kind = 'progress'; summary = 'halfway' })),
+    (New-TestReportResult -CallId 'call_r6' -Text '{"taskId":"orch_abc123def456","stage":"running"}'),
+    (New-TestReportCall -CallId 'call_r7' -Arguments $reportArgsA)
 )
-Check 'worker reports: the same report in another key order and intent label is one report' (Test-Safely { (Get-AcceptedResultReportCount -Path $sameReportTranscript).Distinct -eq 1 }) 'identical resubmission'
-Check 'worker reports: only accepted result reports count, and a changed check is a new report' (Test-Safely {
+$refusalTranscript = Join-Path $script:HarnessRoot 'worker-refusals.jsonl'
+Set-Content -LiteralPath $refusalTranscript -Encoding UTF8 -Value @(
+    (New-TestReportCall -CallId 'call_x1' -Arguments $reportArgsA),
+    (New-TestReportResult -CallId 'call_x1' -Text 'invalid_report: the report summary is empty' -IsError $true),
+    (New-TestReportCall -CallId 'call_x2' -Arguments $reportArgsA),
+    (New-TestReportResult -CallId 'call_x2' -Text '{"ok":false,"error":{"code":"invalid_report","message":"the report names no branch"}}'),
+    (New-TestReportCall -CallId 'call_x3' -Arguments ([ordered]@{ kind = 'progress'; summary = 'halfway' })),
+    (New-TestReportResult -CallId 'call_x3' -Text '{"taskId":"orch_abc123def456","stage":"running"}')
+)
+Check 'worker reports: a stored report is one report, whatever the worker wrote in its arguments' (Test-Safely { (Get-AcceptedResultReportCount -Path $sameReportTranscript).Distinct -eq 1 }) 'identical resubmission'
+Check 'worker reports: only stored reports count, and a changed check is a new report' (Test-Safely {
     $counted = Get-AcceptedResultReportCount -Path $reportTranscript
-    $counted.Readable -and $counted.Distinct -eq 2 }) 'accepted only'
+    $counted.Readable -and $counted.Distinct -eq 2 }) 'stored only'
+Check 'worker reports: a refusal or a result with no stored report is not a report' (Test-Safely {
+    $refused = Get-AcceptedResultReportCount -Path $refusalTranscript
+    $refused.Readable -and $refused.Distinct -eq 0 }) 'refusals'
 Check 'worker reports: a missing transcript proves no report' (Test-Safely {
     $missing = Get-AcceptedResultReportCount -Path $missingTranscript
     -not $missing.Readable -and $missing.Distinct -eq 0 }) 'missing'
