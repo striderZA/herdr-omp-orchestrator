@@ -174,55 +174,89 @@ func ExtensionPath(env map[string]string) (string, error) {
 // install
 // ---------------------------------------------------------------------------
 
+// Action is what installing the extension would do to its file.
+type Action string
+
+const (
+	// ActionCreate means no extension exists yet, so setup writes one.
+	ActionCreate Action = "create"
+	// ActionRefresh means a managed extension exists with other content, for
+	// example one that embeds a plugin executable that has since moved, so setup
+	// replaces it.
+	ActionRefresh Action = "refresh"
+	// ActionUnchanged means the extension already holds exactly what setup would
+	// write, so setup leaves it alone.
+	ActionUnchanged Action = "unchanged"
+)
+
 // Install creates or refreshes the plugin's OMP extension for env, refusing to
 // change anything when the integration, the plugin state directory, the Herdr
 // CLI or the plugin executable cannot be verified. executable is the absolute
 // path of the plugin executable OMP will spawn for every bridge call (the setup
 // action passes os.Executable).
 func Install(env map[string]string, executable string) error {
-	pluginExecutable, err := checkExecutable(ErrExecutableUnavailable, "plugin executable", executable)
+	target, err := prepareInstall(env, executable)
 	if err != nil {
 		return err
+	}
+	action, err := decideWrite(target.path, target.content)
+	if err != nil {
+		return err
+	}
+	if action == ActionUnchanged {
+		return nil
+	}
+	return replaceExtension(target.path, target.content)
+}
+
+// installTarget is the rendered extension Install would write, and the path it
+// would write it to in OMP's effective extension directory.
+type installTarget struct {
+	path    string
+	content string
+}
+
+// prepareInstall runs every check Install makes before it touches the disk, and
+// renders the extension it would write. It creates nothing.
+func prepareInstall(env map[string]string, executable string) (installTarget, error) {
+	pluginExecutable, err := checkExecutable(ErrExecutableUnavailable, "plugin executable", executable)
+	if err != nil {
+		return installTarget{}, err
 	}
 	stateDir := strings.TrimSpace(env["HERDR_PLUGIN_STATE_DIR"])
 	if stateDir == "" {
-		return fail(ErrStateDirUnavailable, "HERDR_PLUGIN_STATE_DIR is not set, so the extension would have no orchestrator state to talk to")
+		return installTarget{}, fail(ErrStateDirUnavailable, "HERDR_PLUGIN_STATE_DIR is not set, so the extension would have no orchestrator state to talk to")
 	}
 	stateDir, err = filepath.Abs(stateDir)
 	if err != nil {
-		return wrap(ErrStateDirUnavailable, err, "resolve HERDR_PLUGIN_STATE_DIR %q", stateDir)
+		return installTarget{}, wrap(ErrStateDirUnavailable, err, "resolve HERDR_PLUGIN_STATE_DIR %q", stateDir)
 	}
 	herdrBinary := strings.TrimSpace(env["HERDR_BIN_PATH"])
 	if herdrBinary == "" {
-		return fail(ErrHerdrBinaryUnavailable, "HERDR_BIN_PATH is not set, so the extension would have no verified Herdr CLI to embed")
+		return installTarget{}, fail(ErrHerdrBinaryUnavailable, "HERDR_BIN_PATH is not set, so the extension would have no verified Herdr CLI to embed")
 	}
 	herdrBinary, err = checkExecutable(ErrHerdrBinaryUnavailable, "Herdr binary", herdrBinary)
 	if err != nil {
-		return err
+		return installTarget{}, err
 	}
 
 	dir, err := ExtensionDir(env)
 	if err != nil {
-		return err
+		return installTarget{}, err
 	}
 	if err := checkIntegration(context.Background(), env, dir, herdrBinary); err != nil {
-		return err
+		return installTarget{}, err
 	}
 
 	source, err := readSource(env)
 	if err != nil {
-		return err
+		return installTarget{}, err
 	}
 	content, err := render(source, pluginExecutable, stateDir, herdrBinary)
 	if err != nil {
-		return err
+		return installTarget{}, err
 	}
-
-	target := filepath.Join(dir, ExtensionName)
-	if err := writeIfChanged(target, content); err != nil {
-		return err
-	}
-	return nil
+	return installTarget{path: filepath.Join(dir, ExtensionName), content: content}, nil
 }
 
 // Verify proves, without writing anything, that an OMP session started now would
@@ -477,22 +511,36 @@ func jsStringBody(s string) string {
 	return string(encoded[1 : len(encoded)-1])
 }
 
-// writeIfChanged installs content at target atomically: a same-directory
-// temporary file is written, flushed, closed and renamed over the target, so a
-// reader never observes a partial extension. Byte-identical content is left
-// untouched, which keeps a repeated setup action a true no-op.
-func writeIfChanged(target, content string) error {
-	if existing, err := os.ReadFile(target); err == nil {
-		if string(existing) == content {
-			return nil
-		}
-		if !strings.HasPrefix(string(existing), ManagedMarker+"\n") {
-			return fail(ErrExtensionConflict, "%q already exists and was not written by this plugin; move it away or rename it before running setup", target)
-		}
-	} else if !os.IsNotExist(err) {
-		return wrap(ErrWriteFailed, err, "read existing extension %q", target)
+// decideWrite compares content with the extension at target and reports what
+// installing it would do:
+//
+//   - no file: ActionCreate.
+//   - a byte-identical file: ActionUnchanged, and nothing is written.
+//   - a file that starts with the managed marker: ActionRefresh.
+//   - any other file: ErrExtensionConflict, because setup never replaces a file
+//     it did not write.
+func decideWrite(target, content string) (Action, error) {
+	existing, err := os.ReadFile(target)
+	if os.IsNotExist(err) {
+		return ActionCreate, nil
 	}
+	if err != nil {
+		return "", wrap(ErrWriteFailed, err, "read existing extension %q", target)
+	}
+	if string(existing) == content {
+		return ActionUnchanged, nil
+	}
+	if !strings.HasPrefix(string(existing), ManagedMarker+"\n") {
+		return "", fail(ErrExtensionConflict, "%q already exists and was not written by this plugin; move it away or rename it before running setup", target)
+	}
+	return ActionRefresh, nil
+}
 
+// replaceExtension installs content at target atomically: a same-directory
+// temporary file is written, flushed, closed and renamed over the target, so a
+// reader never observes a partial extension. The caller has already decided,
+// with decideWrite, that content must be written.
+func replaceExtension(target, content string) error {
 	dir := filepath.Dir(target)
 	temp, err := os.CreateTemp(dir, "."+ExtensionName+".*.tmp")
 	if err != nil {
