@@ -189,11 +189,21 @@ const (
 	ActionUnchanged Action = "unchanged"
 )
 
+// InstallPlan is what PlanInstall reports: the action Install would take and the
+// file it would take it on. It describes the disk as it was when it was checked;
+// nothing was written to produce it.
+type InstallPlan struct {
+	Action Action
+	// Extension is the absolute path of the plugin's extension file.
+	Extension string
+}
+
 // Install creates or refreshes the plugin's OMP extension for env, refusing to
 // change anything when the integration, the plugin state directory, the Herdr
 // CLI or the plugin executable cannot be verified. executable is the absolute
 // path of the plugin executable OMP will spawn for every bridge call (the setup
-// action passes os.Executable).
+// action passes os.Executable). PlanInstall reports the same decision without
+// writing anything.
 func Install(env map[string]string, executable string) error {
 	target, err := prepareInstall(env, executable)
 	if err != nil {
@@ -207,6 +217,23 @@ func Install(env map[string]string, executable string) error {
 		return nil
 	}
 	return replaceExtension(target.path, target.content)
+}
+
+// PlanInstall reports what Install would do for env and executable, and writes
+// nothing. It runs the checks Install runs, renders the content Install would
+// write and makes the same decision (decideWrite), so a planned action is the
+// action Install takes and a planned refusal is the refusal Install returns. It
+// never creates the extensions directory, the extension or Herdr's integration.
+func PlanInstall(env map[string]string, executable string) (InstallPlan, error) {
+	target, err := prepareInstall(env, executable)
+	if err != nil {
+		return InstallPlan{}, err
+	}
+	action, err := decideWrite(target.path, target.content)
+	if err != nil {
+		return InstallPlan{}, err
+	}
+	return InstallPlan{Action: action, Extension: target.path}, nil
 }
 
 // installTarget is the rendered extension Install would write, and the path it
@@ -512,7 +539,8 @@ func jsStringBody(s string) string {
 }
 
 // decideWrite compares content with the extension at target and reports what
-// installing it would do:
+// installing it would do. Install and PlanInstall both call it, so the plan
+// cannot drift from the write:
 //
 //   - no file: ActionCreate.
 //   - a byte-identical file: ActionUnchanged, and nothing is written.
