@@ -26,11 +26,12 @@ package board
 import (
 	"context"
 	"fmt"
-	"herdr-omp-orchestrator/internal/state"
-	"herdr-omp-orchestrator/internal/task"
 	"strings"
 	"time"
 	"unicode"
+
+	"herdr-omp-orchestrator/internal/state"
+	"herdr-omp-orchestrator/internal/task"
 
 	"github.com/mattn/go-runewidth"
 	"github.com/muesli/termenv"
@@ -538,12 +539,15 @@ func cardColor(card Card, selected string) string {
 	}
 }
 
-// cardText is one card's single line: its ID (the identity), its title, and
-// Herdr's activity as a separate indicator.
+// cardText is one card's single line: its selection marker, a text attention
+// marker for needs-input cards, its ID and title, and Herdr's activity separately.
 func cardText(card Card, selected bool) string {
 	marker := "  "
 	if selected {
 		marker = "> "
+	}
+	if card.Stage == task.NeedsInput {
+		marker += "! "
 	}
 	text := marker + "[" + card.ID() + "] " + singleLine(card.Title())
 	if activity := card.Activity(); activity != "" {

@@ -628,6 +628,56 @@ func TestBoardColorsFollowTheTheme(t *testing.T) {
 	}
 }
 
+func TestNeedsInputMarkerIsVisibleWithoutColorInWideAndNarrowLayouts(t *testing.T) {
+	needs := sampleTask("orch_n3", func(x *task.Task) { x.Blocker = "which error contract?"; x.Title = "x" })
+	running := sampleTask("orch_r2", func(x *task.Task) { x.Activity = "done"; x.Title = "x" })
+	board := NewBoard([]Card{
+		{Task: needs, Stage: task.NeedsInput},
+		{Task: running, Stage: task.Running},
+	})
+	theme := Theme{Profile: termenv.Ascii}
+
+	for _, tc := range []struct {
+		name  string
+		width int
+	}{
+		{name: "narrow", width: 60},
+		{name: "wide", width: 120},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			unselected := Render(board, Detail{SelectedID: running.ID}, tc.width, theme)
+			needsLine := lineContaining(t, strings.Split(unselected, "\n"), "["+needs.ID+"]")
+			if !strings.Contains(needsLine, "! ["+needs.ID+"]") {
+				t.Errorf("unselected needs-input card lacks a plain-text attention marker:\n%s", needsLine)
+			}
+			runningLine := lineContaining(t, strings.Split(unselected, "\n"), "["+running.ID+"]")
+			if strings.Contains(runningLine, "! ["+running.ID+"]") {
+				t.Errorf("running card carries the needs-input marker:\n%s", runningLine)
+			}
+			if !strings.Contains(runningLine, "(done)") {
+				t.Errorf("worker activity is not shown separately from task stage:\n%s", runningLine)
+			}
+
+			selected := Render(board, Detail{SelectedID: needs.ID}, tc.width, theme)
+			selectedNeedsLine := lineContaining(t, strings.Split(selected, "\n"), "["+needs.ID+"]")
+			if !strings.Contains(selectedNeedsLine, "> ! ["+needs.ID+"]") {
+				t.Errorf("selection hides or replaces the needs-input marker:\n%s", selectedNeedsLine)
+			}
+
+			for _, rendered := range []string{unselected, selected} {
+				if strings.Contains(rendered, "\x1b") {
+					t.Errorf("the ASCII layout emitted a color escape:\n%s", rendered)
+				}
+				for _, line := range strings.Split(rendered, "\n") {
+					if got := runeWidth(line); got > tc.width {
+						t.Errorf("line %q is %d columns wide, want at most %d", line, got, tc.width)
+					}
+				}
+			}
+		})
+	}
+}
+
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
