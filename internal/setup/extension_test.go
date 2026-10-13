@@ -985,7 +985,7 @@ func TestCanonicalExtensionSourceIsTheSubstitutionTemplate(t *testing.T) {
 		"pi.setActiveTools(",
 		`pi.on("before_agent_start"`,
 		`pi.on("session_start"`,
-		`spawn(PLUGIN_EXECUTABLE, ["bridge", method]`,
+		`spawnChild(PLUGIN_EXECUTABLE, ["bridge", method]`,
 		`name: "orch_dispatch"`,
 		`name: "orch_report"`,
 		`name: "orch_task_list"`,

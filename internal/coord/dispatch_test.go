@@ -1614,6 +1614,41 @@ func TestBindRejectsANonRepository(t *testing.T) {
 // Dispatch
 // ---------------------------------------------------------------------------
 
+func TestDispatchBoundsAcceptanceCheckCount(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	checks := make([]string, 32)
+	for i := range checks {
+		checks[i] = fmt.Sprintf("check %d", i)
+	}
+	st, err := f.dispatch("32 checks", "brief", checks, nil, nil, f.base)
+	if err != nil {
+		t.Fatalf("dispatch 32 checks: %v", err)
+	}
+	if len(st.Checks) != 32 {
+		t.Errorf("returned checks = %d, want 32", len(st.Checks))
+	}
+	tasks, err := f.store.Tasks(context.Background(), f.project)
+	if err != nil {
+		t.Fatalf("Tasks: %v", err)
+	}
+	if len(tasks) != 1 || len(tasks[0].Checks) != 32 {
+		t.Fatalf("persisted tasks/checks = %d/%d, want 1/32", len(tasks), len(tasks[0].Checks))
+	}
+
+	before := len(tasks)
+	checks = append(checks, "check 32")
+	if _, err := f.dispatch("33 checks", "brief", checks, nil, nil, f.base); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("dispatch 33 checks err = %v, want ErrInvalidRequest", err)
+	}
+	tasks, err = f.store.Tasks(context.Background(), f.project)
+	if err != nil {
+		t.Fatalf("Tasks after refusal: %v", err)
+	}
+	if len(tasks) != before {
+		t.Errorf("persisted task count = %d, want unchanged at %d", len(tasks), before)
+	}
+}
+
 func TestDispatchDoesNotCopyADirtyPrimaryCheckout(t *testing.T) {
 	f := newCoordFixture(t, fixturePlan{})
 	// An uncommitted change in the primary checkout must never reach a worker.
@@ -4847,5 +4882,57 @@ func TestDispatchRequiresARecordedProject(t *testing.T) {
 	f := newCoordFixture(t, fixturePlan{})
 	if _, err := f.coord.Dispatch(context.Background(), "E:/nowhere", "one", "brief", []string{"check"}, nil, nil, f.base); !errors.Is(err, ErrProjectUnknown) {
 		t.Fatalf("dispatch without a project err = %v, want ErrProjectUnknown", err)
+	}
+}
+func TestNewDispatchRequestUsesUTF16CharacterLimits(t *testing.T) {
+	tests := []struct {
+		name  string
+		title string
+		brief string
+		check string
+		valid bool
+	}{
+		{"ASCII title at limit", strings.Repeat("a", 160), "brief", "check", true},
+		{"ASCII title over limit", strings.Repeat("a", 161), "brief", "check", false},
+		{"CJK title within limit", strings.Repeat("界", 54), "brief", "check", true},
+		{"CJK title at limit", strings.Repeat("界", 160), "brief", "check", true},
+		{"CJK title over limit", strings.Repeat("界", 161), "brief", "check", false},
+		{"CJK check at limit", "title", "brief", strings.Repeat("界", 512), true},
+		{"CJK check over limit", "title", "brief", strings.Repeat("界", 513), false},
+		{"astral title at limit", strings.Repeat("😀", 80), "brief", "check", true},
+		{"astral title over limit", strings.Repeat("😀", 81), "brief", "check", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := newDispatchRequest(tt.title, tt.brief, []string{tt.check}, nil, nil)
+			if (err == nil) != tt.valid {
+				t.Fatalf("newDispatchRequest() error = %v, valid = %v", err, tt.valid)
+			}
+		})
+	}
+}
+
+func TestNewDispatchRequestBoundsReservedPathsInUTF16Units(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		ok   bool
+	}{
+		{"ASCII path at limit", strings.Repeat("a", 512), true},
+		{"ASCII path over limit", strings.Repeat("a", 513), false},
+		{"CJK path at limit", strings.Repeat("界", 512), true},
+		{"astral path at limit", strings.Repeat("😀", 256), true},
+		{"astral path over limit", strings.Repeat("😀", 257), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := newDispatchRequest("title", "brief", []string{"check"}, nil, []string{tt.path})
+			if tt.ok && err != nil {
+				t.Fatalf("reserved path refused: %v", err)
+			}
+			if !tt.ok && !errors.Is(err, ErrInvalidRequest) {
+				t.Fatalf("reserved path err = %v, want ErrInvalidRequest", err)
+			}
+		})
 	}
 }

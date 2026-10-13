@@ -395,3 +395,11 @@ func (e *MovedTicketError) Error() string {
 }
 
 func (e *MovedTicketError) Unwrap() error { return e.Err }
+
+type MovedTicketSignalError struct{ Err error }
+
+func (e *MovedTicketSignalError) Error() string {
+	return "the ticket moved, but recovery signalling failed: " + e.Err.Error()
+}
+
+func (e *MovedTicketSignalError) Unwrap() error { return e.Err }

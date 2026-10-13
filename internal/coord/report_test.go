@@ -2131,6 +2131,7 @@ func TestDrainQueuedSurfacesStorageFailures(t *testing.T) {
 }
 
 func TestRecoveryUntilIdleDoesNotReconcileWhenNoClaimsArePending(t *testing.T) {
+
 	f := newCoordFixture(t, fixturePlan{})
 	f.updatePlan(func(plan *fixturePlan) { plan.SnapshotProtocol = 23 })
 	recovery, err := New(f.store, f.client, Options{StepLease: time.Second})
@@ -2139,5 +2140,14 @@ func TestRecoveryUntilIdleDoesNotReconcileWhenNoClaimsArePending(t *testing.T) {
 	}
 	if err := recovery.RecoverUntilIdle(context.Background()); err != nil {
 		t.Fatalf("RecoverUntilIdle without claims: %v", err)
+	}
+}
+
+func TestTextFieldUsesUTF16CharacterUnits(t *testing.T) {
+	if _, err := textField(strings.Repeat("😀", 80), 160, "field"); err != nil {
+		t.Fatalf("80 astral characters should fit 160 UTF-16 units: %v", err)
+	}
+	if _, err := textField(strings.Repeat("😀", 81), 160, "field"); err == nil {
+		t.Fatal("81 astral characters should exceed 160 UTF-16 units")
 	}
 }

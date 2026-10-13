@@ -317,6 +317,8 @@ const (
 	maxPathLength    = 512
 	maxDependencies  = 32
 	maxReservedPaths = 32
+	// maxChecks mirrors the extension's DISPATCH_CHECKS_MAX.
+	maxChecks = 32
 )
 
 func newDispatchRequest(title, brief string, checks, dependencies, reservedPaths []string) (dispatchRequest, error) {
@@ -327,21 +329,23 @@ func newDispatchRequest(title, brief string, checks, dependencies, reservedPaths
 	switch {
 	case request.title == "":
 		return dispatchRequest{}, fmt.Errorf("%w: a title is required", ErrInvalidRequest)
-	case len(request.title) > maxTitleLength:
+	case task.TextLength(request.title) > maxTitleLength:
 		return dispatchRequest{}, fmt.Errorf("%w: the title exceeds %d characters", ErrInvalidRequest, maxTitleLength)
 	case request.brief == "":
 		return dispatchRequest{}, fmt.Errorf("%w: a brief is required", ErrInvalidRequest)
-	case len(request.brief) > maxBriefLength:
+	case task.TextLength(request.brief) > maxBriefLength:
 		return dispatchRequest{}, fmt.Errorf("%w: the brief exceeds %d characters", ErrInvalidRequest, maxBriefLength)
 	case len(checks) == 0:
 		return dispatchRequest{}, fmt.Errorf("%w: at least one acceptance check is required", ErrInvalidRequest)
+	case len(checks) > maxChecks:
+		return dispatchRequest{}, fmt.Errorf("%w: more than %d acceptance checks", ErrInvalidRequest, maxChecks)
 	}
 	for _, check := range checks {
 		trimmed := strings.TrimSpace(check)
 		switch {
 		case trimmed == "":
 			return dispatchRequest{}, fmt.Errorf("%w: an acceptance check is empty", ErrInvalidRequest)
-		case len(trimmed) > maxCheckLength:
+		case task.TextLength(trimmed) > maxCheckLength:
 			return dispatchRequest{}, fmt.Errorf("%w: an acceptance check exceeds %d characters", ErrInvalidRequest, maxCheckLength)
 		}
 		request.checks = append(request.checks, trimmed)
@@ -381,7 +385,7 @@ func normalizeReservedPath(path string) (string, error) {
 	if trimmed == "" {
 		return "", fmt.Errorf("%w: a reserved path is empty", ErrInvalidRequest)
 	}
-	if len(trimmed) > maxPathLength {
+	if task.TextLength(trimmed) > maxPathLength {
 		return "", fmt.Errorf("%w: the reserved path %q exceeds %d characters", ErrInvalidRequest, trimmed, maxPathLength)
 	}
 	slashed := strings.ReplaceAll(trimmed, `\`, "/")

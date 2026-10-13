@@ -831,6 +831,42 @@ func TestAMoveWhosePlannerDidNotStartStillSaysItMoved(t *testing.T) {
 		t.Fatal("the board must re-read the moved ticket")
 	}
 }
+func TestAMoveWhoseRecoverySignalFailedStillSaysItMoved(t *testing.T) {
+	ctx := context.Background()
+	f := newBoardFixture(t, fixturePlan{})
+	f.addTicket(t, "tkt_a_backlog", task.ColumnBacklog)
+	f.seed(t)
+	ops := &fakeTicketOps{moveErr: &MovedTicketSignalError{Err: errors.New("recovery signal unavailable")}}
+	ops.onMove = func() {
+		ticket, err := f.store.Ticket(ctx, "tkt_a_backlog")
+		if err != nil {
+			t.Errorf("read the ticket: %v", err)
+			return
+		}
+		if _, err := f.store.UpdateTicket(ctx, ticket.ID, ticket.Revision, func(next *task.Ticket) error {
+			next.Column = task.ColumnTodo
+			return nil
+		}); err != nil {
+			t.Errorf("record the move: %v", err)
+		}
+	}
+	m := f.model(t, Options{Tickets: ops})
+	cmd := typeText(t, m, "m")
+	if cmd == nil {
+		t.Fatal("m on a backlog ticket must start the write")
+	}
+	press(t, m, cmd())
+	if !strings.HasPrefix(m.notice, "Moved tkt_a_backlog to todo") || strings.Contains(m.notice, "Cannot move") ||
+		!strings.Contains(m.notice, "recovery signal unavailable") {
+		t.Fatalf("a committed move with a failed recovery signal must say it moved and why: %q", m.notice)
+	}
+	if !m.noticeErr {
+		t.Fatalf("a failed recovery signal must stand out: %q", m.notice)
+	}
+	if len(m.board.TicketColumn(task.TicketTodo)) != 1 || len(m.board.TicketColumn(task.TicketBacklog)) != 0 {
+		t.Fatal("the board must re-read the moved ticket")
+	}
+}
 
 func TestBoardWithoutTicketOpsStaysReadOnly(t *testing.T) {
 	ctx := context.Background()
@@ -899,19 +935,19 @@ func TestTicketTitlePromptIsBounded(t *testing.T) {
 	}
 	press(t, m, cmd())
 	if len(ops.creates) != 1 || len(ops.creates[0].title) != 160 {
-		t.Fatalf("the title is bounded at 160 bytes, the coordinator's limit: %+v", ops.creates)
+		t.Fatalf("the title is bounded at 160 UTF-16 units, the coordinator's limit: %+v", ops.creates)
 	}
 
 	typeText(t, m, "n")
-	typeText(t, m, strings.Repeat("日", 100))
+	typeText(t, m, strings.Repeat("😀", 100))
 	cmd = press(t, m, tea.KeyMsg{Type: tea.KeyEnter})
 	if cmd == nil {
-		t.Fatal("a wide title must still submit")
+		t.Fatal("an astral title must still submit")
 	}
 	press(t, m, cmd())
 	title := ops.creates[1].title
-	if !utf8.ValidString(title) || len(title) > 160 || len([]rune(title)) != 53 {
-		t.Fatalf("a multi-byte title must be cut on a rune boundary within 160 bytes, got %d bytes / %d runes", len(title), len([]rune(title)))
+	if !utf8.ValidString(title) || task.TextLength(title) != 160 || len([]rune(title)) != 80 {
+		t.Fatalf("a 160-unit title must be cut on a rune boundary, got %d UTF-16 units / %d runes", task.TextLength(title), len([]rune(title)))
 	}
 
 	// Pasted control characters never reach the title.

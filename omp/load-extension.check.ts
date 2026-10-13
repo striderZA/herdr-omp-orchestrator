@@ -18,10 +18,13 @@
 // Run it with the OMP builder resolvable, e.g.
 //   NODE_PATH=%USERPROFILE%\node_modules bun omp/load-extension.check.ts
 // or point OMP_TYPED_BUILDER straight at the zod module file.
+import { EventEmitter } from "node:events";
+import { PassThrough, Writable } from "node:stream";
 import extension, {
   adjudicateConfirmRequest,
   answerConfirmRequest,
   afterTurnRefresh,
+  callBridge,
   cleanupConfirmRequest,
   confirmThen,
   dialogConfirmRequest,
@@ -382,12 +385,28 @@ if (!dispatch) {
     "orch_dispatch accepted 33 dependencies, which Go refuses",
   );
   check(
+    tryParse(schema, { ...payload, checks: manyDispatchItems(32, "check") }).ok,
+    "orch_dispatch rejected 32 acceptance checks, which Go accepts",
+  );
+  check(
+    !tryParse(schema, { ...payload, checks: manyDispatchItems(33, "check") }).ok,
+    "orch_dispatch accepted 33 acceptance checks, which Go refuses",
+  );
+  check(
     tryParse(schema, { ...payload, reservedPaths: manyDispatchItems(32, "src/file") }).ok,
     "orch_dispatch rejected 32 reserved paths, which Go accepts",
   );
   check(
     !tryParse(schema, { ...payload, reservedPaths: manyDispatchItems(33, "src/file") }).ok,
     "orch_dispatch accepted 33 reserved paths, which Go refuses",
+  );
+  check(
+    tryParse(schema, { ...payload, reservedPaths: ["p".repeat(512)] }).ok,
+    "orch_dispatch rejected a 512-character reserved path, which Go accepts",
+  );
+  check(
+    !tryParse(schema, { ...payload, reservedPaths: ["p".repeat(513)] }).ok,
+    "orch_dispatch accepted a 513-character reserved path, which Go refuses",
   );
 }
 
@@ -514,6 +533,21 @@ if (!report) {
 // call the model is told to make; a missing or too-loose schema is a load
 // failure waiting for the user's machine.
 const toolCalls: { name: string; params: Record<string, unknown>; bad: Record<string, unknown> | null }[] = [
+  {
+    name: "orch_dispatch",
+    params: {
+      title: "Bounded task",
+      brief: "Do the bounded thing.",
+      checks: Array.from({ length: 32 }, (_, i) => `check${i}`),
+      baseRevision: "0123456",
+    },
+    bad: {
+      title: "Bounded task",
+      brief: "Do the bounded thing.",
+      checks: Array.from({ length: 33 }, (_, i) => `check${i}`),
+      baseRevision: "0123456",
+    },
+  },
   // orch_report is the one worker tool; each kind is a call the model is told to
   // make, and the bad case for a kind is that kind with its own field missing.
   { name: "orch_report", params: { kind: "progress", summary: "ported the lexer" }, bad: { kind: "progress", summary: "" } },
@@ -602,6 +636,10 @@ if (ticketCreate) {
   check(tryParse(schema, { title: "t".repeat(160), body: "b".repeat(16000) }).ok, "orch_ticket_create refused the largest valid call");
   check(!tryParse(schema, { title: "t".repeat(161) }).ok, "orch_ticket_create accepted a title over 160 characters");
   check(!tryParse(schema, { title: "x", body: "b".repeat(16001) }).ok, "orch_ticket_create accepted a body over 16000 characters");
+  check(
+    ticketCreate.description.includes("14,000 bytes"),
+    "orch_ticket_create does not say that creation is refused past the 14,000-byte planner budget",
+  );
 }
 const ticketReview = tools.find((tool) => tool.name === "orch_ticket_review");
 if (ticketReview) {
@@ -2409,7 +2447,89 @@ async function checkRoleToolAccess(): Promise<void> {
   );
 }
 
+// --- the bridge's stdout bound ----------------------------------------------
+
+// The Go bridge ends each answer with a newline, and the extension refuses more
+// than MAX_OUTPUT_BYTES (1 MiB) of stdout, counting that newline. The answers
+// below go through callBridge's own child seam, so the byte accounting checked
+// here is the production accounting; no process is spawned.
+function scriptedBridgeChild(stdoutChunks: string[]) {
+  const child = new EventEmitter() as EventEmitter & {
+    stdout: PassThrough;
+    stderr: PassThrough;
+    stdin: Writable;
+    kill(): boolean;
+  };
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.stdin = new Writable({ write: (_chunk, _encoding, done) => done() });
+  child.kill = () => true;
+  child.stdout.on("end", () => child.emit("close", 0));
+  setImmediate(() => {
+    for (const chunk of stdoutChunks) child.stdout.write(chunk);
+    child.stdout.end();
+    child.stderr.end();
+  });
+  return child;
+}
+
+async function checkBridgeOutputBound(): Promise<void> {
+  const BOUND = 1 << 20;
+  const identity = { id: "omp-session", file: "", onDisk: false };
+  type SpawnSeam = Parameters<typeof callBridge>[4];
+  const answer = async (chunks: string[]) => {
+    let spawned: string[] = [];
+    const spawnChild = ((_command: string, args: string[]) => {
+      spawned = args;
+      return scriptedBridgeChild(chunks);
+    }) as unknown as SpawnSeam;
+    try {
+      const result = await callBridge("ticket_list", {}, identity, undefined, spawnChild);
+      return { result, code: undefined as string | undefined, spawned };
+    } catch (error) {
+      const code = (error as { code?: unknown } | null)?.code;
+      return { result: undefined as unknown, code: typeof code === "string" ? code : String(error), spawned };
+    }
+  };
+  const head = '{"ok":true,"result":"';
+  const tail = '"}';
+  const headBytes = Buffer.byteLength(head);
+  const tailBytes = Buffer.byteLength(tail);
+
+  // Exactly the bound with the newline counted, in multibyte text: accepted.
+  const twoByteRuns = (BOUND - 1 - headBytes - tailBytes) / 2;
+  const exact = await answer([head + "\u00e9".repeat(twoByteRuns) + tail, "\n"]);
+  check(
+    exact.result === "\u00e9".repeat(twoByteRuns),
+    `an answer of exactly ${BOUND} bytes, newline included, was ${exact.code ?? "not returned as sent"}`,
+  );
+  check(
+    JSON.stringify(exact.spawned) === JSON.stringify(["bridge", "ticket_list"]),
+    `callBridge spawned ${JSON.stringify(exact.spawned)}, want the bridge with its method`,
+  );
+
+  // The JSON alone fills the bound; the newline takes stdout one byte past it.
+  const jsonAtBound = head + "a".repeat(BOUND - headBytes - tailBytes) + tail;
+  check(
+    Buffer.byteLength(jsonAtBound) === BOUND,
+    `the scripted JSON is ${Buffer.byteLength(jsonAtBound)} bytes, want ${BOUND}`,
+  );
+  const oneOver = await answer([jsonAtBound, "\n"]);
+  check(
+    oneOver.code === "bridge_output_too_large",
+    `stdout of ${BOUND + 1} bytes, newline included, was ${oneOver.code ?? "accepted"}, want bridge_output_too_large`,
+  );
+
+  // Under the bound in UTF-16 units but over it in bytes: refused, so the bound counts bytes.
+  const wide = await answer([head + "\u00e9".repeat(600_000) + tail, "\n"]);
+  check(
+    wide.code === "bridge_output_too_large",
+    `a multibyte answer over ${BOUND} bytes was ${wide.code ?? "accepted"}, want bridge_output_too_large`,
+  );
+}
+
 await checkRoleToolAccess();
+await checkBridgeOutputBound();
 
 if (failures.length > 0) {
   for (const failure of failures) console.error(`load check FAILED: ${failure}`);

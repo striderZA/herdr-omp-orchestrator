@@ -240,7 +240,9 @@ interface CleanupPreview {
 export const CHECK_OUTCOMES = ["passed", "failed", "skipped"] as const;
 const REPORT_CHECKS_MAX = 32;
 const DISPATCH_DEPENDENCIES_MAX = 32;
+const DISPATCH_CHECKS_MAX = 32; // Mirrors the Go maxChecks.
 const DISPATCH_RESERVED_PATHS_MAX = 32;
+const DISPATCH_RESERVED_PATH_MAX = 512; // Mirrors the Go maxPathLength.
 const REPORT_EVIDENCE_MAX = 64;
 
 // Persisted report and revision returned by the primary-only report_preview
@@ -1025,11 +1027,14 @@ function toolRefusal(reason: string) {
 // plugin state directory are handed to every child explicitly: an ordinary
 // Herdr-managed OMP pane is not guaranteed to inherit plugin-command
 // environment, so the extension cannot rely on process.env carrying them.
-async function callBridge(
+// spawnChild exists only so the load check can script a child's stdout; every
+// production caller takes the default.
+export async function callBridge(
   method: string,
   params: unknown,
   identity: SessionIdentity,
   signal?: AbortSignal,
+  spawnChild: typeof spawn = spawn,
 ): Promise<unknown> {
   const request = JSON.stringify({
     version: BRIDGE_PROTOCOL,
@@ -1051,7 +1056,7 @@ async function callBridge(
       settle();
     };
 
-    const child = spawn(PLUGIN_EXECUTABLE, ["bridge", method], {
+    const child = spawnChild(PLUGIN_EXECUTABLE, ["bridge", method], {
       windowsHide: true,
       stdio: ["pipe", "pipe", "pipe"],
       env: {
@@ -1388,9 +1393,9 @@ export default function (pi: ExtensionAPI, options: ExtensionOptions = {}) {
     parameters: z.object({
       title: z.string().min(1).max(160),
       brief: z.string().min(1).max(16000),
-      checks: z.array(z.string().min(1).max(512)).min(1),
+      checks: z.array(z.string().min(1).max(512)).min(1).max(DISPATCH_CHECKS_MAX),
       dependencies: z.array(z.string()).max(DISPATCH_DEPENDENCIES_MAX).default(() => []),
-      reservedPaths: z.array(z.string()).max(DISPATCH_RESERVED_PATHS_MAX).default(() => []),
+      reservedPaths: z.array(z.string().max(DISPATCH_RESERVED_PATH_MAX)).max(DISPATCH_RESERVED_PATHS_MAX).default(() => []),
       baseRevision: z.string().min(7),
       // Strict-mode calls use null for an unlinked task; the coordinator refuses ids
       // that are not this project's ticket, are already decided, or have no accepted plan.
@@ -1580,7 +1585,7 @@ export default function (pi: ExtensionAPI, options: ExtensionOptions = {}) {
     label: "Record ticket",
     defaultInactive: true,
     description:
-      "Record a new ticket in the project's backlog. A ticket is a note of intended work: creating one starts nothing. Give it a short title and, optionally, a body with the details.",
+      "Record a new ticket in the project's backlog. A ticket is a note of intended work: creating one starts nothing. Give it a short title and, optionally, a body with the details. Creation is refused when the body's planner brief would exceed 14,000 bytes once encoded, which can happen well before the 16,000-character limit for long or non-ASCII text.",
     parameters: z.object({
       title: z.string().min(1).max(160),
       body: z.string().max(16000).default(""),

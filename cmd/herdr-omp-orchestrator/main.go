@@ -324,6 +324,7 @@ func boardOptions(
 // operations. The board package imports nothing from coord; this is the seam.
 type ticketWriter struct {
 	coordinator    *coord.Coordinator
+	moveTicket     func(context.Context, string, string, string) (coord.TicketView, error)
 	launchRecovery func(string) (func(bool) error, error)
 }
 
@@ -341,12 +342,24 @@ func (w ticketWriter) MoveTicketToTodo(ctx context.Context, projectKey, ticketID
 			return fmt.Errorf("start the recovery worker before moving the ticket: %w", err)
 		}
 	}
-	_, moveErr := w.coordinator.MoveTicketFor(ctx, projectKey, ticketID, digest)
+	var moveErr error
+	if w.moveTicket != nil {
+		_, moveErr = w.moveTicket(ctx, projectKey, ticketID, digest)
+	} else {
+		_, moveErr = w.coordinator.MoveTicketFor(ctx, projectKey, ticketID, digest)
+	}
 	if complete != nil {
 		var notStarted *coord.PlannerNotStartedError
 		moved := moveErr == nil || errors.As(moveErr, &notStarted)
 		if err := complete(moved); err != nil {
-			return errors.Join(boardMoveError(moveErr), fmt.Errorf("signal ticket-move recovery: %w", err))
+			signalErr := fmt.Errorf("signal ticket-move recovery: %w", err)
+			if moveErr == nil {
+				return &board.MovedTicketSignalError{Err: signalErr}
+			}
+			if moved {
+				return &board.MovedTicketSignalError{Err: errors.Join(boardMoveError(moveErr), signalErr)}
+			}
+			return errors.Join(boardMoveError(moveErr), signalErr)
 		}
 	}
 	return boardMoveError(moveErr)
