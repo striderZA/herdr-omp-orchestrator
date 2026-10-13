@@ -831,6 +831,42 @@ func TestAMoveWhosePlannerDidNotStartStillSaysItMoved(t *testing.T) {
 		t.Fatal("the board must re-read the moved ticket")
 	}
 }
+func TestAMoveWhoseRecoverySignalFailedStillSaysItMoved(t *testing.T) {
+	ctx := context.Background()
+	f := newBoardFixture(t, fixturePlan{})
+	f.addTicket(t, "tkt_a_backlog", task.ColumnBacklog)
+	f.seed(t)
+	ops := &fakeTicketOps{moveErr: &MovedTicketSignalError{Err: errors.New("recovery signal unavailable")}}
+	ops.onMove = func() {
+		ticket, err := f.store.Ticket(ctx, "tkt_a_backlog")
+		if err != nil {
+			t.Errorf("read the ticket: %v", err)
+			return
+		}
+		if _, err := f.store.UpdateTicket(ctx, ticket.ID, ticket.Revision, func(next *task.Ticket) error {
+			next.Column = task.ColumnTodo
+			return nil
+		}); err != nil {
+			t.Errorf("record the move: %v", err)
+		}
+	}
+	m := f.model(t, Options{Tickets: ops})
+	cmd := typeText(t, m, "m")
+	if cmd == nil {
+		t.Fatal("m on a backlog ticket must start the write")
+	}
+	press(t, m, cmd())
+	if !strings.HasPrefix(m.notice, "Moved tkt_a_backlog to todo") || strings.Contains(m.notice, "Cannot move") ||
+		!strings.Contains(m.notice, "recovery signal unavailable") {
+		t.Fatalf("a committed move with a failed recovery signal must say it moved and why: %q", m.notice)
+	}
+	if !m.noticeErr {
+		t.Fatalf("a failed recovery signal must stand out: %q", m.notice)
+	}
+	if len(m.board.TicketColumn(task.TicketTodo)) != 1 || len(m.board.TicketColumn(task.TicketBacklog)) != 0 {
+		t.Fatal("the board must re-read the moved ticket")
+	}
+}
 
 func TestBoardWithoutTicketOpsStaysReadOnly(t *testing.T) {
 	ctx := context.Background()

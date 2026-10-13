@@ -79,8 +79,9 @@ type ticketWriteMsg struct {
 	failure string
 	// partial is the notice for a move that was recorded although its planner did
 	// not start (a MovedTicketError); it is empty for a create.
-	partial string
-	err     error
+	partial       string
+	signalPartial string
+	err           error
 	// moved is the ticket a move write is for; it is empty for a create.
 	moved string
 }
@@ -224,11 +225,15 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			delete(m.moving, typed.moved)
 		}
 		var recorded *MovedTicketError
+		var signalFailed *MovedTicketSignalError
 		switch {
 		case typed.partial != "" && errors.As(typed.err, &recorded):
 			// The move is recorded and only its planner's start failed: say the
 			// ticket moved, and why its planner has not started.
 			m.notice = typed.partial + ": " + shortError(recorded.Err)
+			m.noticeErr = true
+		case typed.signalPartial != "" && errors.As(typed.err, &signalFailed):
+			m.notice = typed.signalPartial + ": " + shortError(signalFailed.Err)
 			m.noticeErr = true
 		case typed.err != nil:
 			m.notice = typed.failure + ": " + shortError(typed.err)
@@ -905,11 +910,12 @@ func (m *Model) moveTicket() tea.Cmd {
 	m.moving[id] = true
 	return func() tea.Msg {
 		return ticketWriteMsg{
-			success: "Moved " + id + " to todo; planner task recorded",
-			failure: "Cannot move " + id,
-			partial: "Moved " + id + " to todo; its planner did not start",
-			moved:   id,
-			err:     ops.MoveTicketToTodo(ctx, project, id, digest),
+			success:       "Moved " + id + " to todo; planner task recorded",
+			failure:       "Cannot move " + id,
+			partial:       "Moved " + id + " to todo; its planner did not start",
+			signalPartial: "Moved " + id + " to todo; recovery signalling failed",
+			moved:         id,
+			err:           ops.MoveTicketToTodo(ctx, project, id, digest),
 		}
 	}
 }

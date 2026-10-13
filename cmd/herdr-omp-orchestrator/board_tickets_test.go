@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 
 	"herdr-omp-orchestrator/internal/board"
@@ -96,6 +97,43 @@ func TestBoardMoveErrorKeepsARecordedMoveRecorded(t *testing.T) {
 	}
 	if got := boardMoveError(nil); got != nil {
 		t.Fatalf("a move that started its planner = %v, want no error", got)
+	}
+}
+
+type ticketMoveFunc func(context.Context, string, string, string) (coord.TicketView, error)
+
+func TestTicketWriterReportsCommittedMoveWhenRecoverySignalFails(t *testing.T) {
+	cause := errors.New("signal transport unavailable")
+	w := ticketWriter{
+		moveTicket: func(context.Context, string, string, string) (coord.TicketView, error) {
+			return coord.TicketView{}, nil
+		},
+		launchRecovery: func(string) (func(bool) error, error) {
+			return func(bool) error { return cause }, nil
+		},
+	}
+	err := w.MoveTicketToTodo(context.Background(), "project", "tkt_a", "digest")
+	var moved *board.MovedTicketSignalError
+	if !errors.As(err, &moved) || !errors.Is(err, cause) || !strings.Contains(err.Error(), cause.Error()) {
+		t.Fatalf("committed move with failed recovery signal = %v, want a MovedTicketSignalError preserving its cause", err)
+	}
+}
+
+func TestTicketWriterKeepsBothCausesWhenPlannerAndRecoverySignalFail(t *testing.T) {
+	planner := errors.New("create the worktree: herdr: not_git_worktree")
+	signal := errors.New("signal transport unavailable")
+	w := ticketWriter{
+		moveTicket: func(context.Context, string, string, string) (coord.TicketView, error) {
+			return coord.TicketView{}, &coord.PlannerNotStartedError{TicketID: "tkt_a", TaskID: "orch_p", Err: planner}
+		},
+		launchRecovery: func(string) (func(bool) error, error) {
+			return func(bool) error { return signal }, nil
+		},
+	}
+	err := w.MoveTicketToTodo(context.Background(), "project", "tkt_a", "digest")
+	var moved *board.MovedTicketSignalError
+	if !errors.As(err, &moved) || !strings.Contains(err.Error(), planner.Error()) || !strings.Contains(err.Error(), signal.Error()) {
+		t.Fatalf("a recorded move whose planner did not start and whose signal failed = %v, want a MovedTicketSignalError naming both causes", err)
 	}
 }
 
