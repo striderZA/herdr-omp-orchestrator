@@ -357,6 +357,62 @@ func (f *bridgeFixture) seedFreshWorker(id, launchPane string) task.Task {
 	}
 	return updated
 }
+func TestAdoptionSucceedsAfterAnUnrelatedRevisionUpdate(t *testing.T) {
+	f := newBridgeFixture(t)
+	worker := f.seedFreshWorker("t1", workerPane)
+	updated, err := f.store.UpdateTask(context.Background(), worker.ID, worker.Revision, func(next *task.Task) error {
+		next.AgentName = "unrelated-agent"
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("advance worker revision: %v", err)
+	}
+	if updated.OMPSessionID != "" {
+		t.Fatalf("updated session = %q, want blank", updated.OMPSessionID)
+	}
+
+	binding, err := (&handler{ctx: context.Background(), store: f.store}).adoptTaskSession(worker, task.Announcement{ID: "omp-adopted"})
+	if err != nil {
+		t.Fatalf("adoptTaskSession: %v", err)
+	}
+	if binding.Role != state.RoleWorker || binding.Task.ID != worker.ID {
+		t.Fatalf("binding = %+v, want worker %q", binding, worker.ID)
+	}
+	stored, err := f.store.Task(context.Background(), worker.ID)
+	if err != nil {
+		t.Fatalf("Task: %v", err)
+	}
+	if stored.OMPSessionID != "omp-adopted" {
+		t.Fatalf("recorded session = %q, want omp-adopted", stored.OMPSessionID)
+	}
+}
+
+func TestAdoptionRefusesADifferentSessionAfterAnUnrelatedRevisionUpdate(t *testing.T) {
+	f := newBridgeFixture(t)
+	worker := f.seedFreshWorker("t1", workerPane)
+	const differentSession = "omp-already-recorded"
+	if _, err := f.store.UpdateTask(context.Background(), worker.ID, worker.Revision, func(next *task.Task) error {
+		next.OMPSessionID = differentSession
+		return nil
+	}); err != nil {
+		t.Fatalf("advance worker revision: %v", err)
+	}
+
+	binding, err := (&handler{ctx: context.Background(), store: f.store}).adoptTaskSession(worker, task.Announcement{ID: "omp-adopted"})
+	if !errors.Is(err, errSessionMismatch) {
+		t.Fatalf("adoptTaskSession error = %v, want errSessionMismatch", err)
+	}
+	if binding.Task.OMPSessionID != differentSession {
+		t.Fatalf("returned binding session = %q, want %q", binding.Task.OMPSessionID, differentSession)
+	}
+	stored, err := f.store.Task(context.Background(), worker.ID)
+	if err != nil {
+		t.Fatalf("Task: %v", err)
+	}
+	if stored.OMPSessionID != differentSession {
+		t.Fatalf("recorded session = %q, want %q untouched", stored.OMPSessionID, differentSession)
+	}
+}
 
 func TestBridgeResolveAdoptsAFreshWorkerSession(t *testing.T) {
 	f := newBridgeFixture(t)

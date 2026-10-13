@@ -64,6 +64,8 @@ const (
 	MaxResponseBytes = 1 << 20
 )
 
+const adoptionWriteAttempts = 3
+
 // Methods.
 const (
 	MethodResolve  = "resolve"
@@ -1120,31 +1122,41 @@ func (h *handler) adoptTaskSession(worker task.Task, announced task.Announcement
 		return binding(worker), errSessionMismatch
 	}
 	identity := adoptedIdentity(announced)
-	updated, err := h.store.UpdateTask(h.ctx, worker.ID, worker.Revision, func(next *task.Task) error {
-		if recorded := strings.TrimSpace(next.OMPSessionID); recorded != "" {
-			if recordsAnnouncement(recorded, announced) {
-				return nil
+	current := worker
+	for range adoptionWriteAttempts {
+		updated, err := h.store.UpdateTask(h.ctx, current.ID, current.Revision, func(next *task.Task) error {
+			if recorded := strings.TrimSpace(next.OMPSessionID); recorded != "" {
+				if recordsAnnouncement(recorded, announced) {
+					return nil
+				}
+				return errSessionMismatch
 			}
-			return errSessionMismatch
+			next.OMPSessionID = identity
+			return nil
+		})
+		if err == nil {
+			return binding(updated), nil
 		}
-		next.OMPSessionID = identity
-		return nil
-	})
-	if err == nil {
-		return binding(updated), nil
-	}
-	// A compare-and-swap conflict means another call changed the task first.
-	// Re-read and accept only the same announcement; a recorded session is never
-	// overwritten.
-	if errors.Is(err, state.ErrConflict) || errors.Is(err, errSessionMismatch) {
-		current, readErr := h.store.Task(h.ctx, worker.ID)
-		if readErr != nil {
+		if errors.Is(err, errSessionMismatch) {
+			current, readErr := h.store.Task(h.ctx, worker.ID)
+			if readErr != nil {
+				return state.Binding{}, fail(CodeStoreUnavailable, "the recorded task could not be read")
+			}
+			return binding(current), errSessionMismatch
+		}
+		if !errors.Is(err, state.ErrConflict) {
+			return state.Binding{}, fail(CodeStoreUnavailable, "the announced session could not be recorded")
+		}
+		current, err = h.store.Task(h.ctx, worker.ID)
+		if err != nil {
 			return state.Binding{}, fail(CodeStoreUnavailable, "the recorded task could not be read")
 		}
 		if recordsAnnouncement(current.OMPSessionID, announced) {
 			return binding(current), nil
 		}
-		return binding(current), errSessionMismatch
+		if strings.TrimSpace(current.OMPSessionID) != "" {
+			return binding(current), errSessionMismatch
+		}
 	}
 	return state.Binding{}, fail(CodeStoreUnavailable, "the announced session could not be recorded")
 }
