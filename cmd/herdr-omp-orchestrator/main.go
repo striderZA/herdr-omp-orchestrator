@@ -78,7 +78,7 @@ const (
 	envPluginEventJSON = "HERDR_PLUGIN_EVENT_JSON"
 )
 
-const usage = "usage: herdr-omp-orchestrator <setup [--dry-run]|bind|startup|event|board|open-board|reattach|open-reattach|bridge <method>|recover>"
+const usage = "usage: herdr-omp-orchestrator <setup [--dry-run]|bind|startup|event|board|open-board|reattach|open-reattach|bridge <method>|recover|--version>"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -129,6 +129,8 @@ func main() {
 		os.Exit(runBridge(env, os.Stdin, os.Stdout, os.Stderr, args))
 	case "recover":
 		os.Exit(runRecovery(env, os.Stderr, os.Args[2:]))
+	case "--version":
+		os.Exit(runVersion(os.Args[2:], os.Stdout, os.Stderr))
 	default:
 		fmt.Fprintf(os.Stderr, "herdr-omp-orchestrator: unknown command %q\n%s\n", os.Args[1], usage)
 		os.Exit(2)
