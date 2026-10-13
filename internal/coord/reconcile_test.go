@@ -1869,6 +1869,86 @@ func TestFlushInboxRequiresAProbeablePrimary(t *testing.T) {
 	}
 }
 
+func TestFlushInboxKeepsNotesPendingWhenPrimaryCheckoutIsUnreported(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	worker := f.boundWorker(t)
+	project := f.boundProject(t)
+	noteID := f.queueNote(t, worker, "progress", "halfway", "worker progress").ID
+	f.updatePlan(func(plan *fixturePlan) { plan.BlankCwdFor = project.PublicPaneID })
+
+	if err := f.coord.FlushInbox(context.Background(), f.projectKey()); err != nil {
+		t.Fatalf("FlushInbox with an unreported primary checkout: %v", err)
+	}
+	if state := f.noteState(t, noteID); state != task.DeliveryPending {
+		t.Fatalf("note state = %q, want %q", state, task.DeliveryPending)
+	}
+	if prompts := f.promptsTo(t, project.PublicPaneID); len(prompts) != 0 {
+		t.Fatalf("an unverified primary received %d prompts, want 0", len(prompts))
+	}
+	if reason := f.boundProject(t).PrimaryAttention; !strings.Contains(reason, "checkout") {
+		t.Fatalf("PrimaryAttention = %q, want the unreported checkout recorded", reason)
+	}
+}
+
+func TestReconcileKeepsPrimaryAttentionWhenCheckoutIsUnreported(t *testing.T) {
+	ctx := context.Background()
+	f := newCoordFixture(t, fixturePlan{})
+	worker := f.boundWorker(t)
+	primary := f.boundProject(t).PublicPaneID
+	noteID := f.queueNote(t, worker, "progress", "halfway", "worker progress").ID
+	f.updatePlan(func(plan *fixturePlan) { plan.BlankCwdFor = primary })
+
+	if err := f.coord.Reconcile(ctx); err != nil {
+		t.Fatalf("first Reconcile with an unreported primary checkout: %v", err)
+	}
+	attention := f.boundProject(t).PrimaryAttention
+	if !strings.Contains(attention, "checkout") {
+		t.Fatalf("PrimaryAttention = %q, want the unreported checkout recorded", attention)
+	}
+	if state := f.noteState(t, noteID); state != task.DeliveryPending {
+		t.Fatalf("note state = %q, want %q", state, task.DeliveryPending)
+	}
+	if prompts := f.promptsTo(t, primary); len(prompts) != 0 {
+		t.Fatalf("an unverified primary received %d prompts, want 0", len(prompts))
+	}
+
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(f.stateDir, "orchestrator.sqlite")))
+	if err != nil {
+		t.Fatalf("open state database: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if _, err := db.ExecContext(ctx, `CREATE TABLE project_update_count (count INTEGER NOT NULL)`); err != nil {
+		t.Fatalf("create project update counter: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO project_update_count VALUES (0)`); err != nil {
+		t.Fatalf("initialize project update counter: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `CREATE TRIGGER count_project_updates AFTER UPDATE ON projects
+		BEGIN UPDATE project_update_count SET count = count + 1; END`); err != nil {
+		t.Fatalf("count project updates: %v", err)
+	}
+
+	if err := f.coord.Reconcile(ctx); err != nil {
+		t.Fatalf("repeated Reconcile with an unreported primary checkout: %v", err)
+	}
+	var writes int
+	if err := db.QueryRowContext(ctx, `SELECT count FROM project_update_count`).Scan(&writes); err != nil {
+		t.Fatalf("read project update count: %v", err)
+	}
+	if writes != 0 {
+		t.Fatalf("repeated Reconcile wrote the project %d times, want 0", writes)
+	}
+	if got := f.boundProject(t).PrimaryAttention; got != attention {
+		t.Fatalf("PrimaryAttention = %q after repeat, want unchanged %q", got, attention)
+	}
+	if state := f.noteState(t, noteID); state != task.DeliveryPending {
+		t.Fatalf("note state after repeat = %q, want %q", state, task.DeliveryPending)
+	}
+	if prompts := f.promptsTo(t, primary); len(prompts) != 0 {
+		t.Fatalf("an unverified primary received %d prompts after repeat, want 0", len(prompts))
+	}
+}
+
 // TestInboxPromptIsBoundedAndNamesEveryTask pins the one prompt a flush submits.
 func TestInboxPromptIsBoundedAndNamesEveryTask(t *testing.T) {
 	notes := []task.Inbox{

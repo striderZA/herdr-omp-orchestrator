@@ -208,6 +208,28 @@ func TestFlushInboxKeepsThePrimaryAttentionTrue(t *testing.T) {
 		}
 	})
 
+	t.Run("a missing checkout replaces an older absence reason", func(t *testing.T) {
+		f := newCoordFixture(t, fixturePlan{})
+		worker := f.boundWorker(t)
+		project := f.boundProject(t)
+		noteID := f.queueNote(t, worker, "progress", "halfway", "worker progress").ID
+		f.setPrimaryAttention(t, "the recorded primary cannot be verified: pane absent from Herdr's snapshot")
+		f.updatePlan(func(plan *fixturePlan) { plan.BlankCwdFor = project.PublicPaneID })
+
+		if err := f.coord.FlushInbox(context.Background(), f.projectKey()); err != nil {
+			t.Fatalf("FlushInbox with an unreported checkout: %v", err)
+		}
+		if reason := f.boundProject(t).PrimaryAttention; !strings.Contains(reason, "checkout") || strings.Contains(reason, "absent") {
+			t.Fatalf("PrimaryAttention = %q, want the newer checkout finding instead of the stale absence", reason)
+		}
+		if state := f.noteState(t, noteID); state != task.DeliveryPending {
+			t.Fatalf("note state = %q, want %q", state, task.DeliveryPending)
+		}
+		if prompts := f.promptsTo(t, project.PublicPaneID); len(prompts) != 0 {
+			t.Fatalf("an unverified primary received %d prompts, want 0", len(prompts))
+		}
+	})
+
 	t.Run("a primary idle event clears it once the primary is back", func(t *testing.T) {
 		f := newCoordFixture(t, fixturePlan{})
 		worker := f.boundWorker(t)

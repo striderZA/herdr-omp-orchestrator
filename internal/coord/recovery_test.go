@@ -134,9 +134,15 @@ func newAttentionIDs(before, after map[string]bool) []string {
 // left the step unresumed, start nothing, and stop after exactly its stall budget.
 func TestRecoveryStopsWhenNoPassCanAdvanceAClaim(t *testing.T) {
 	f := newCoordFixture(t, fixturePlan{AgentStartError: "agent_start_failed"})
+	primary := f.boundProject(t).PublicPaneID
+	f.setAgentStatus(t, primary, "working")
 	stranded := strandDispatch(t, f, "stranded")
 	stripPanes(t, f, stranded)
 	starts := f.countCalls("agent start")
+	if got := len(f.promptsTo(t, primary)); got != 0 {
+		t.Fatalf("the foreground refusal prompted the working primary %d times", got)
+	}
+	f.setAgentStatus(t, primary, "idle")
 
 	returned, err := runRecoveryFor(10*time.Second, recoveryWorker(t, f), stranded.ID)
 	if !returned {
@@ -152,8 +158,15 @@ func TestRecoveryStopsWhenNoPassCanAdvanceAClaim(t *testing.T) {
 	if got := f.countCalls("agent start"); got != starts {
 		t.Fatalf("agent start calls = %d, want %d: recovery started a step no pane proved", got, starts)
 	}
-	if n := len(declinedNotes(t, f, stranded.ID)); n != 1 {
-		t.Fatalf("declined-claim notes for task %s = %d, want 1", stranded.ID, n)
+	notes := declinedNotes(t, f, stranded.ID)
+	if len(notes) != 1 {
+		t.Fatalf("declined-claim notes for task %s = %d, want 1", stranded.ID, len(notes))
+	}
+	if state := f.noteState(t, notes[0].ID); state != task.DeliveryPending {
+		t.Fatalf("background recovery note state = %q, want %q", state, task.DeliveryPending)
+	}
+	if prompts := f.promptsTo(t, primary); len(prompts) != 0 {
+		t.Fatalf("background recovery flushed inbox notes to the primary %d times, want 0", len(prompts))
 	}
 }
 

@@ -333,6 +333,26 @@ func TestReattachRefusesWhileTheRecordedPrimaryIsLive(t *testing.T) {
 	}
 }
 
+func TestReattachExplainsLiveSessionWhenCheckoutIsUnreported(t *testing.T) {
+	ctx := context.Background()
+	f := newCoordFixture(t, fixturePlan{})
+	project := f.boundProject(t)
+	pane, _ := f.startReplacement(t, project.Key, nil)
+	f.updatePlan(func(plan *fixturePlan) { plan.BlankCwdFor = project.PublicPaneID })
+	before := f.boundProject(t)
+
+	_, err := f.coord.PlanReattach(ctx, project.Key, pane)
+	if !errors.Is(err, ErrPrimaryLive) {
+		t.Fatalf("PlanReattach err = %v, want ErrPrimaryLive", err)
+	}
+	if !strings.Contains(err.Error(), "checkout is unreported") {
+		t.Fatalf("PlanReattach refusal = %q, want the missing checkout explained", err)
+	}
+	if after := f.boundProject(t); !reflect.DeepEqual(after, before) {
+		t.Fatalf("a refused reattach changed the project:\n got %+v\nwant %+v", after, before)
+	}
+}
+
 func TestReattachRefusesAnUnknownProject(t *testing.T) {
 	f := newCoordFixture(t, fixturePlan{})
 	pane, _ := f.startReplacement(t, f.root, nil)

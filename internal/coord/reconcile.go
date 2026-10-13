@@ -901,9 +901,9 @@ func refusal(sentinel error, id, reason string) error {
 //
 // A note recorded while the primary is already idle would otherwise wait for the
 // primary's next status transition - an event that may never come, because a
-// primary waiting for the user does not change status. So whoever records a
-// worker-sourced note also asks FlushInbox to carry it. The attempt is strictly
-// about delivery, never about the caller's own fact:
+// primary waiting for the user does not change status. Ordinary note writers ask
+// FlushInbox to carry the note; background recovery records notes without delivery.
+// This attempt is strictly about delivery, never about the caller's own fact:
 //
 //   - it runs after the note is committed, so a failed attempt cannot lose it;
 //   - FlushInbox claims the note transactionally and settles it, so a repeated
@@ -918,6 +918,9 @@ func refusal(sentinel error, id, reason string) error {
 //     leaves it.
 func (c *Coordinator) flushAfterNote(ctx context.Context, projectKey string) {
 	if strings.TrimSpace(projectKey) == "" {
+		return
+	}
+	if suppressed, _ := ctx.Value(recoveryNoInboxFlushKey{}).(bool); suppressed {
 		return
 	}
 	_ = c.FlushInbox(ctx, projectKey)
@@ -967,12 +970,26 @@ func (c *Coordinator) FlushInbox(ctx context.Context, projectKey string) error {
 	if err != nil {
 		return err
 	}
+	// The general primary probe treats a missing cwd as non-contradictory.
+	// Inbox delivery needs positive checkout proof before sending notes into the
+	// primary's conversation, so keep notes pending and record the missing proof.
+	checkoutUnproven := probe.Ours && !probe.CheckoutProven
+	if checkoutUnproven {
+		probe.Ours = false
+		probe.Idle = false
+		probe.Refusal = primaryCheckoutRefusal(project, probe)
+	}
 	// The probe is fresh evidence about the primary whether or not anything is
 	// queued, so it also keeps the project's recorded primary attention true: a
 	// verified primary retires it, and an unverified one is recorded. A failed
 	// write is reported after the delivery and never prevents it - the fact is
 	// informational, the notes are not.
-	attentionErr := c.settlePrimaryAttention(ctx, project, probe)
+	var attentionErr error
+	if checkoutUnproven {
+		attentionErr = c.recordPrimaryAttention(ctx, project, unverifiedPrimaryReason(probe), true)
+	} else {
+		attentionErr = c.settlePrimaryAttention(ctx, project, probe)
+	}
 	err = c.deliverVerified(ctx, pending, probe)
 	if attentionErr != nil {
 		return errors.Join(err, attentionErr)
@@ -1134,6 +1151,10 @@ func (c *Coordinator) probePrimary(ctx context.Context, project task.Project) (p
 		probe.Idle = strings.EqualFold(strings.TrimSpace(probe.Pane.AgentStatus), "idle")
 	}
 	return probe, nil
+}
+
+func primaryCheckoutRefusal(project task.Project, probe paneProbe) string {
+	return fmt.Sprintf("Herdr does not report the project's checkout %q for pane %s", project.Key, probe.Pane.PaneID)
 }
 
 // ---------------------------------------------------------------------------
@@ -1430,6 +1451,13 @@ func (c *Coordinator) reconcilePrimary(ctx context.Context, project task.Project
 	ours := oursOnly(probes)
 	switch {
 	case len(ours) == 1:
+		if !ours[0].CheckoutProven {
+			// The live session matches, but without its cwd this pass cannot
+			// verify the project checkout or retire primary attention.
+			probe := ours[0]
+			probe.Refusal = primaryCheckoutRefusal(project, probe)
+			return c.recordPrimaryAttention(ctx, project, unverifiedPrimaryReason(probe), true)
+		}
 		return c.applyPrimaryPane(ctx, project, ours[0])
 	case len(ours) > 1:
 		return c.primaryUnverified(ctx, project, fmt.Sprintf(
