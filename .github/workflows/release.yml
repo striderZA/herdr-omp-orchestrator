@@ -8,10 +8,11 @@
 # cannot tag an arbitrary commit. Run it by hand with a tag to rebuild the assets
 # of an existing release.
 #
-# The build fails unless the tagged commit's herdr-plugin.toml declares the tag's
-# version and the binary reports that same version, so the tag, the manifest and
-# the artifact cannot disagree. A failed run leaves the release without assets:
-# fix the cause, then rerun this workflow by hand with the same tag.
+# The tag must be `v` plus a SemVer 2.0.0 version. The build fails unless the
+# tagged commit's herdr-plugin.toml declares that version and the binary reports
+# it, so the tag, the manifest and the artifact cannot disagree. A failed run
+# leaves the release without assets: fix the cause, then rerun this workflow by
+# hand with the same tag.
 name: Release binaries
 
 on:
@@ -51,15 +52,22 @@ jobs:
 
       - name: Check the tag is vX.Y.Z and matches the manifest
         run: |
-          case "$TAG" in
-            v*.*.*) ;;
-            *) echo "::error::release tag $TAG is not vX.Y.Z"; exit 1 ;;
-          esac
+          export LC_ALL=C
           version="${TAG#v}"
+          # SemVer 2.0.0 (https://semver.org) as an anchored extended regex. The
+          # version goes into the manifest comparison and into -ldflags, so it
+          # must not carry separators, spaces or regex syntax.
+          semver='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*)(\.(0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*))*)?(\+[0-9a-zA-Z-]+(\.[0-9a-zA-Z-]+)*)?$'
+          if [[ "$TAG" != v* || ! "$version" =~ $semver ]]; then
+            echo "::error::release tag $TAG is not v followed by a SemVer 2.0.0 version (for example v1.2.3 or v1.2.3-rc.1)"
+            exit 1
+          fi
           # Read the tagged commit's manifest, not the working tree: a Windows
           # checkout may convert line endings, and the match below is exact.
           manifest=$(git show HEAD:herdr-plugin.toml)
-          grep -qx "version = \"$version\"" <<< "$manifest" || { echo "::error::herdr-plugin.toml version is not $version"; exit 1; }
+          # -F matches the line literally. As a regex, the dots in the version
+          # would match any character, so "0x1x0" would pass for 0.1.0.
+          grep -Fqx "version = \"$version\"" <<< "$manifest" || { echo "::error::herdr-plugin.toml version is not $version"; exit 1; }
 
       - uses: actions/setup-go@v7
         with:
@@ -128,6 +136,6 @@ jobs:
         run: |
           names=$(gh release view "$TAG" --json assets --jq '.assets[].name')
           for asset in $ASSETS SHA256SUMS; do
-            printf '%s\n' "$names" | grep -qx "$asset" || { echo "::error::release $TAG has no $asset"; exit 1; }
+            printf '%s\n' "$names" | grep -Fqx "$asset" || { echo "::error::release $TAG has no $asset"; exit 1; }
           done
           echo "release $TAG carries the binary and SHA256SUMS"
