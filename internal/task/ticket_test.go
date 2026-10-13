@@ -148,3 +148,19 @@ func TestTaskWithoutTicketIDDecodesAsUnlinked(t *testing.T) {
 		t.Fatalf("a stored task without a TicketID must read as unlinked: %+v", x)
 	}
 }
+
+func TestTextLengthCountsUTF16CodeUnits(t *testing.T) {
+	for _, tt := range []struct {
+		text string
+		want int
+	}{
+		{"ASCII", 5},
+		{"界", 1},
+		{"😀", 2},
+		{"😀界", 3},
+	} {
+		if got := TextLength(tt.text); got != tt.want {
+			t.Errorf("TextLength(%q) = %d, want %d", tt.text, got, tt.want)
+		}
+	}
+}

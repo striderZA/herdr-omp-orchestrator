@@ -141,9 +141,9 @@ func (c *Coordinator) CreateTicketFor(ctx context.Context, projectKey string, p 
 	switch {
 	case title == "":
 		return TicketView{}, fmt.Errorf("%w: a ticket title is required", ErrInvalidRequest)
-	case len(title) > maxTitleLength:
+	case task.TextLength(title) > maxTitleLength:
 		return TicketView{}, fmt.Errorf("%w: the ticket title exceeds %d characters", ErrInvalidRequest, maxTitleLength)
-	case len(body) > maxBriefLength:
+	case task.TextLength(body) > maxBriefLength:
 		return TicketView{}, fmt.Errorf("%w: the ticket body exceeds %d characters", ErrInvalidRequest, maxBriefLength)
 	}
 
@@ -265,7 +265,7 @@ func (c *Coordinator) MoveTicketFor(ctx context.Context, projectKey, ticketID, d
 	}
 
 	title := "Plan: " + ticket.Title
-	if len(title) > maxTitleLength+len("Plan: ") {
+	if task.TextLength(title) > maxTitleLength+len("Plan: ") {
 		return TicketView{}, fmt.Errorf("%w: the planner title exceeds its ticket-derived bound", ErrInvalidRequest)
 	}
 	var moved task.Ticket
@@ -339,7 +339,7 @@ func ticketPlannerBrief(ticket task.Ticket) (string, error) {
 	}
 	brief := plannerBriefInstructions + string(context)
 	if len(brief) > maxPlannerBriefLength {
-		return "", fmt.Errorf("%w: the planner brief for ticket %s exceeds its Windows command-line safety bound", ErrInvalidRequest, ticket.ID)
+		return "", fmt.Errorf("%w: the planner brief for ticket %s is %d bytes once encoded, over the %d-byte Windows command-line bound; shorten the ticket body", ErrInvalidRequest, ticket.ID, len(brief), maxPlannerBriefLength)
 	}
 	return brief, nil
 }

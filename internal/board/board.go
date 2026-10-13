@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 	"unicode"
-	"unicode/utf8"
 
 	"herdr-omp-orchestrator/internal/herdr"
 	"herdr-omp-orchestrator/internal/state"
@@ -87,7 +86,7 @@ type ticketWriteMsg struct {
 }
 
 const (
-	// ticketTitleLimit mirrors the coordinator's title bound (160 bytes). The
+	// ticketTitleLimit mirrors the coordinator's title bound (160 UTF-16 units). The
 	// board imports nothing from the coordinator, so the prompt keeps its own copy;
 	// the coordinator stays the authority and refuses anything longer.
 	ticketTitleLimit = 160
@@ -854,7 +853,7 @@ func (m *Model) typeIntoPrompt(text string) {
 		case unsafeRune(r) < 0:
 			continue
 		}
-		if len(m.promptText)+utf8.RuneLen(r) > ticketTitleLimit {
+		if task.TextLength(m.promptText+string(r)) > ticketTitleLimit {
 			break
 		}
 		m.promptText += string(r)

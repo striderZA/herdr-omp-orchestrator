@@ -2404,7 +2404,7 @@ func textField(value string, limit int, what string) (string, error) {
 		return "", fmt.Errorf("%s is empty", what)
 	case !utf8.ValidString(text):
 		return "", fmt.Errorf("%s is not valid UTF-8", what)
-	case utf8.RuneCountInString(text) > limit:
+	case task.TextLength(text) > limit:
 		return "", fmt.Errorf("%s exceeds %d characters", what, limit)
 	}
 	return text, nil

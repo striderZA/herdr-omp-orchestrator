@@ -142,6 +142,23 @@ func TestCreateTicketRecordsABacklogTicket(t *testing.T) {
 	}
 }
 
+func TestCreateTicketUsesUTF16CharacterLimits(t *testing.T) {
+	ctx := context.Background()
+	f, key := ticketFixture(t)
+	if _, err := f.coord.CreateTicketFor(ctx, key, TicketCreateParams{Title: strings.Repeat("界", 160)}); err != nil {
+		t.Fatalf("160-character CJK title rejected: %v", err)
+	}
+	if _, err := f.coord.CreateTicketFor(ctx, key, TicketCreateParams{Title: strings.Repeat("界", 161)}); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("161-character CJK title error = %v, want ErrInvalidRequest", err)
+	}
+	if _, err := f.coord.CreateTicketFor(ctx, key, TicketCreateParams{Title: "body", Body: strings.Repeat("界", 4000)}); err != nil {
+		t.Fatalf("multibyte body within both limits rejected: %v", err)
+	}
+	if _, err := f.coord.CreateTicketFor(ctx, key, TicketCreateParams{Title: "body", Body: strings.Repeat("界", 16001)}); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("16001-character CJK body error = %v, want ErrInvalidRequest", err)
+	}
+}
+
 func TestCreateTicketRejectsPlannerBriefThatExceedsWindowsArgumentBudget(t *testing.T) {
 	ctx := context.Background()
 	f, key := ticketFixture(t)
@@ -149,8 +166,12 @@ func TestCreateTicketRejectsPlannerBriefThatExceedsWindowsArgumentBudget(t *test
 	if len(body) > maxBriefLength {
 		t.Fatalf("test body has %d bytes, beyond the ticket body limit", len(body))
 	}
-	if _, err := f.coord.CreateTicketFor(ctx, key, TicketCreateParams{Title: "quoted context", Body: body}); !errors.Is(err, ErrInvalidRequest) {
+	_, err := f.coord.CreateTicketFor(ctx, key, TicketCreateParams{Title: "quoted context", Body: body})
+	if !errors.Is(err, ErrInvalidRequest) {
 		t.Fatalf("CreateTicketFor with an argv-expanding body = %v, want ErrInvalidRequest", err)
+	}
+	if !strings.Contains(err.Error(), "shorten the ticket body") {
+		t.Fatalf("the refusal must say what to shorten: %v", err)
 	}
 	if tickets, err := f.store.Tickets(ctx, key); err != nil || len(tickets) != 0 {
 		t.Fatalf("an oversized planner context must not be persisted: %+v, %v", tickets, err)
@@ -941,5 +962,19 @@ func TestQueuedTicketPlannerDrainsWithoutChecks(t *testing.T) {
 	}
 	if starts := f.countCalls("agent start"); starts != 4 {
 		t.Fatalf("planner starts after a slot opens = %d, want 4", starts)
+	}
+}
+
+// The planner brief is budgeted in bytes, so multibyte text reaches the budget at
+// about a third of the characters ASCII does, and creation must count the same way.
+func TestCreateTicketBudgetsThePlannerBriefInBytes(t *testing.T) {
+	ctx := context.Background()
+	f, key := ticketFixture(t)
+	if _, err := f.coord.CreateTicketFor(ctx, key, TicketCreateParams{Title: "cjk body", Body: strings.Repeat("界", 4_000)}); err != nil {
+		t.Fatalf("a 4000-character CJK body fits the planner budget, about 12 KB of text: %v", err)
+	}
+	_, err := f.coord.CreateTicketFor(ctx, key, TicketCreateParams{Title: "cjk body", Body: strings.Repeat("界", 5_000)})
+	if !errors.Is(err, ErrInvalidRequest) || !strings.Contains(err.Error(), "shorten the ticket body") {
+		t.Fatalf("a 5000-character CJK body = %v, want ErrInvalidRequest that says what to shorten", err)
 	}
 }

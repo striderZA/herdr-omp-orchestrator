@@ -372,3 +372,11 @@ func TestSupersededDependencyNamesTheRepointPathAndTheListShowsTheSuccessor(t *t
 		t.Fatalf("the task list shows %+v for the superseded task, want successor %s", entries, successor.ID)
 	}
 }
+func TestNormalizeSuccessorUsesUTF16Units(t *testing.T) {
+	if got, err := normalizeSuccessor(strings.Repeat("😀", 32)); err != nil || got == "" {
+		t.Fatalf("64 UTF-16-unit successor rejected: %q, %v", got, err)
+	}
+	if _, err := normalizeSuccessor(strings.Repeat("😀", 33)); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("66 UTF-16-unit successor error = %v, want ErrInvalidRequest", err)
+	}
+}

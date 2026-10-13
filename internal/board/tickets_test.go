@@ -935,19 +935,19 @@ func TestTicketTitlePromptIsBounded(t *testing.T) {
 	}
 	press(t, m, cmd())
 	if len(ops.creates) != 1 || len(ops.creates[0].title) != 160 {
-		t.Fatalf("the title is bounded at 160 bytes, the coordinator's limit: %+v", ops.creates)
+		t.Fatalf("the title is bounded at 160 UTF-16 units, the coordinator's limit: %+v", ops.creates)
 	}
 
 	typeText(t, m, "n")
-	typeText(t, m, strings.Repeat("日", 100))
+	typeText(t, m, strings.Repeat("😀", 100))
 	cmd = press(t, m, tea.KeyMsg{Type: tea.KeyEnter})
 	if cmd == nil {
-		t.Fatal("a wide title must still submit")
+		t.Fatal("an astral title must still submit")
 	}
 	press(t, m, cmd())
 	title := ops.creates[1].title
-	if !utf8.ValidString(title) || len(title) > 160 || len([]rune(title)) != 53 {
-		t.Fatalf("a multi-byte title must be cut on a rune boundary within 160 bytes, got %d bytes / %d runes", len(title), len([]rune(title)))
+	if !utf8.ValidString(title) || task.TextLength(title) != 160 || len([]rune(title)) != 80 {
+		t.Fatalf("a 160-unit title must be cut on a rune boundary, got %d UTF-16 units / %d runes", task.TextLength(title), len([]rune(title)))
 	}
 
 	// Pasted control characters never reach the title.

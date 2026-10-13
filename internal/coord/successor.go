@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"unicode/utf8"
 
 	"herdr-omp-orchestrator/internal/state"
 	"herdr-omp-orchestrator/internal/task"
@@ -40,7 +39,7 @@ type decisionSubject struct {
 // normalizeSuccessor trims a successor id and bounds it. An empty id means none.
 func normalizeSuccessor(value string) (string, error) {
 	text := strings.TrimSpace(value)
-	if utf8.RuneCountInString(text) > successorLimit {
+	if task.TextLength(text) > successorLimit {
 		return "", fmt.Errorf("%w: the successor id is longer than %d characters", ErrInvalidRequest, successorLimit)
 	}
 	return text, nil

@@ -1585,7 +1585,7 @@ export default function (pi: ExtensionAPI, options: ExtensionOptions = {}) {
     label: "Record ticket",
     defaultInactive: true,
     description:
-      "Record a new ticket in the project's backlog. A ticket is a note of intended work: creating one starts nothing. Give it a short title and, optionally, a body with the details.",
+      "Record a new ticket in the project's backlog. A ticket is a note of intended work: creating one starts nothing. Give it a short title and, optionally, a body with the details. Creation is refused when the body's planner brief would exceed 14,000 bytes once encoded, which can happen well before the 16,000-character limit for long or non-ASCII text.",
     parameters: z.object({
       title: z.string().min(1).max(160),
       body: z.string().max(16000).default(""),

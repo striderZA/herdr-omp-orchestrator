@@ -636,6 +636,10 @@ if (ticketCreate) {
   check(tryParse(schema, { title: "t".repeat(160), body: "b".repeat(16000) }).ok, "orch_ticket_create refused the largest valid call");
   check(!tryParse(schema, { title: "t".repeat(161) }).ok, "orch_ticket_create accepted a title over 160 characters");
   check(!tryParse(schema, { title: "x", body: "b".repeat(16001) }).ok, "orch_ticket_create accepted a body over 16000 characters");
+  check(
+    ticketCreate.description.includes("14,000 bytes"),
+    "orch_ticket_create does not say that creation is refused past the 14,000-byte planner budget",
+  );
 }
 const ticketReview = tools.find((tool) => tool.name === "orch_ticket_review");
 if (ticketReview) {

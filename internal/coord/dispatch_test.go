@@ -4884,3 +4884,55 @@ func TestDispatchRequiresARecordedProject(t *testing.T) {
 		t.Fatalf("dispatch without a project err = %v, want ErrProjectUnknown", err)
 	}
 }
+func TestNewDispatchRequestUsesUTF16CharacterLimits(t *testing.T) {
+	tests := []struct {
+		name  string
+		title string
+		brief string
+		check string
+		valid bool
+	}{
+		{"ASCII title at limit", strings.Repeat("a", 160), "brief", "check", true},
+		{"ASCII title over limit", strings.Repeat("a", 161), "brief", "check", false},
+		{"CJK title within limit", strings.Repeat("界", 54), "brief", "check", true},
+		{"CJK title at limit", strings.Repeat("界", 160), "brief", "check", true},
+		{"CJK title over limit", strings.Repeat("界", 161), "brief", "check", false},
+		{"CJK check at limit", "title", "brief", strings.Repeat("界", 512), true},
+		{"CJK check over limit", "title", "brief", strings.Repeat("界", 513), false},
+		{"astral title at limit", strings.Repeat("😀", 80), "brief", "check", true},
+		{"astral title over limit", strings.Repeat("😀", 81), "brief", "check", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := newDispatchRequest(tt.title, tt.brief, []string{tt.check}, nil, nil)
+			if (err == nil) != tt.valid {
+				t.Fatalf("newDispatchRequest() error = %v, valid = %v", err, tt.valid)
+			}
+		})
+	}
+}
+
+func TestNewDispatchRequestBoundsReservedPathsInUTF16Units(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		ok   bool
+	}{
+		{"ASCII path at limit", strings.Repeat("a", 512), true},
+		{"ASCII path over limit", strings.Repeat("a", 513), false},
+		{"CJK path at limit", strings.Repeat("界", 512), true},
+		{"astral path at limit", strings.Repeat("😀", 256), true},
+		{"astral path over limit", strings.Repeat("😀", 257), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := newDispatchRequest("title", "brief", []string{"check"}, nil, []string{tt.path})
+			if tt.ok && err != nil {
+				t.Fatalf("reserved path refused: %v", err)
+			}
+			if !tt.ok && !errors.Is(err, ErrInvalidRequest) {
+				t.Fatalf("reserved path err = %v, want ErrInvalidRequest", err)
+			}
+		})
+	}
+}
