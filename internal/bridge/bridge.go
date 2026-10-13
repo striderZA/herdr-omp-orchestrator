@@ -810,7 +810,8 @@ func encode(result any, failure error) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(data) > MaxResponseBytes {
+	const responseNewlineBytes = 1
+	if len(data)+responseNewlineBytes > MaxResponseBytes {
 		data, err = json.Marshal(response{
 			OK:    false,
 			Error: &errorBody{Code: CodeResponseTooLarge, Message: fmt.Sprintf("the answer exceeds the %d byte bound", MaxResponseBytes)},

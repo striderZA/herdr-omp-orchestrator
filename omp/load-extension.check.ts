@@ -18,10 +18,13 @@
 // Run it with the OMP builder resolvable, e.g.
 //   NODE_PATH=%USERPROFILE%\node_modules bun omp/load-extension.check.ts
 // or point OMP_TYPED_BUILDER straight at the zod module file.
+import { EventEmitter } from "node:events";
+import { PassThrough, Writable } from "node:stream";
 import extension, {
   adjudicateConfirmRequest,
   answerConfirmRequest,
   afterTurnRefresh,
+  callBridge,
   cleanupConfirmRequest,
   confirmThen,
   dialogConfirmRequest,
@@ -2409,7 +2412,89 @@ async function checkRoleToolAccess(): Promise<void> {
   );
 }
 
+// --- the bridge's stdout bound ----------------------------------------------
+
+// The Go bridge ends each answer with a newline, and the extension refuses more
+// than MAX_OUTPUT_BYTES (1 MiB) of stdout, counting that newline. The answers
+// below go through callBridge's own child seam, so the byte accounting checked
+// here is the production accounting; no process is spawned.
+function scriptedBridgeChild(stdoutChunks: string[]) {
+  const child = new EventEmitter() as EventEmitter & {
+    stdout: PassThrough;
+    stderr: PassThrough;
+    stdin: Writable;
+    kill(): boolean;
+  };
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.stdin = new Writable({ write: (_chunk, _encoding, done) => done() });
+  child.kill = () => true;
+  child.stdout.on("end", () => child.emit("close", 0));
+  setImmediate(() => {
+    for (const chunk of stdoutChunks) child.stdout.write(chunk);
+    child.stdout.end();
+    child.stderr.end();
+  });
+  return child;
+}
+
+async function checkBridgeOutputBound(): Promise<void> {
+  const BOUND = 1 << 20;
+  const identity = { id: "omp-session", file: "", onDisk: false };
+  type SpawnSeam = Parameters<typeof callBridge>[4];
+  const answer = async (chunks: string[]) => {
+    let spawned: string[] = [];
+    const spawnChild = ((_command: string, args: string[]) => {
+      spawned = args;
+      return scriptedBridgeChild(chunks);
+    }) as unknown as SpawnSeam;
+    try {
+      const result = await callBridge("ticket_list", {}, identity, undefined, spawnChild);
+      return { result, code: undefined as string | undefined, spawned };
+    } catch (error) {
+      const code = (error as { code?: unknown } | null)?.code;
+      return { result: undefined as unknown, code: typeof code === "string" ? code : String(error), spawned };
+    }
+  };
+  const head = '{"ok":true,"result":"';
+  const tail = '"}';
+  const headBytes = Buffer.byteLength(head);
+  const tailBytes = Buffer.byteLength(tail);
+
+  // Exactly the bound with the newline counted, in multibyte text: accepted.
+  const twoByteRuns = (BOUND - 1 - headBytes - tailBytes) / 2;
+  const exact = await answer([head + "\u00e9".repeat(twoByteRuns) + tail, "\n"]);
+  check(
+    exact.result === "\u00e9".repeat(twoByteRuns),
+    `an answer of exactly ${BOUND} bytes, newline included, was ${exact.code ?? "not returned as sent"}`,
+  );
+  check(
+    JSON.stringify(exact.spawned) === JSON.stringify(["bridge", "ticket_list"]),
+    `callBridge spawned ${JSON.stringify(exact.spawned)}, want the bridge with its method`,
+  );
+
+  // The JSON alone fills the bound; the newline takes stdout one byte past it.
+  const jsonAtBound = head + "a".repeat(BOUND - headBytes - tailBytes) + tail;
+  check(
+    Buffer.byteLength(jsonAtBound) === BOUND,
+    `the scripted JSON is ${Buffer.byteLength(jsonAtBound)} bytes, want ${BOUND}`,
+  );
+  const oneOver = await answer([jsonAtBound, "\n"]);
+  check(
+    oneOver.code === "bridge_output_too_large",
+    `stdout of ${BOUND + 1} bytes, newline included, was ${oneOver.code ?? "accepted"}, want bridge_output_too_large`,
+  );
+
+  // Under the bound in UTF-16 units but over it in bytes: refused, so the bound counts bytes.
+  const wide = await answer([head + "\u00e9".repeat(600_000) + tail, "\n"]);
+  check(
+    wide.code === "bridge_output_too_large",
+    `a multibyte answer over ${BOUND} bytes was ${wide.code ?? "accepted"}, want bridge_output_too_large`,
+  );
+}
+
 await checkRoleToolAccess();
+await checkBridgeOutputBound();
 
 if (failures.length > 0) {
   for (const failure of failures) console.error(`load check FAILED: ${failure}`);

@@ -1025,11 +1025,14 @@ function toolRefusal(reason: string) {
 // plugin state directory are handed to every child explicitly: an ordinary
 // Herdr-managed OMP pane is not guaranteed to inherit plugin-command
 // environment, so the extension cannot rely on process.env carrying them.
-async function callBridge(
+// spawnChild exists only so the load check can script a child's stdout; every
+// production caller takes the default.
+export async function callBridge(
   method: string,
   params: unknown,
   identity: SessionIdentity,
   signal?: AbortSignal,
+  spawnChild: typeof spawn = spawn,
 ): Promise<unknown> {
   const request = JSON.stringify({
     version: BRIDGE_PROTOCOL,
@@ -1051,7 +1054,7 @@ async function callBridge(
       settle();
     };
 
-    const child = spawn(PLUGIN_EXECUTABLE, ["bridge", method], {
+    const child = spawnChild(PLUGIN_EXECUTABLE, ["bridge", method], {
       windowsHide: true,
       stdio: ["pipe", "pipe", "pipe"],
       env: {

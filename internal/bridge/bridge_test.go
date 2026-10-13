@@ -1986,6 +1986,77 @@ func TestBridgeProtocolSurface(t *testing.T) {
 	}
 }
 
+func TestEncodeResponseIncludesNewlineAtBound(t *testing.T) {
+	type paddedResult struct {
+		Padding string `json:"padding"`
+	}
+	resultForSize := func(target int) paddedResult {
+		t.Helper()
+		low, high := 0, target
+		for low <= high {
+			n := low + (high-low)/2
+			result := paddedResult{Padding: strings.Repeat("a", n)}
+			raw, err := json.Marshal(result)
+			if err != nil {
+				t.Fatalf("marshal result: %v", err)
+			}
+			body, err := json.Marshal(response{OK: true, Result: raw})
+			if err != nil {
+				t.Fatalf("marshal expected response: %v", err)
+			}
+			if len(body) == target {
+				return result
+			}
+			if len(body) < target {
+				low = n + 1
+			} else {
+				high = n - 1
+			}
+		}
+		t.Fatalf("cannot produce %d byte response", target)
+		return paddedResult{}
+	}
+	check := func(t *testing.T, data []byte) response {
+		t.Helper()
+		if data[len(data)-1] != '\n' {
+			t.Fatal("response is missing trailing newline")
+		}
+		var got response
+		if err := json.Unmarshal(data, &got); err != nil {
+			t.Fatalf("invalid JSON response: %v", err)
+		}
+		return got
+	}
+	t.Run("body one byte below limit fits with newline", func(t *testing.T) {
+		wantResult := resultForSize(MaxResponseBytes - 1)
+		data, err := encode(wantResult, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(data) != MaxResponseBytes {
+			t.Fatalf("output length = %d, want %d", len(data), MaxResponseBytes)
+		}
+		got := check(t, data)
+		var carried paddedResult
+		if !got.OK || got.Result == nil || json.Unmarshal(got.Result, &carried) != nil || carried != wantResult {
+			t.Fatalf("response result does not carry expected value")
+		}
+	})
+	t.Run("body at limit replaced by bounded envelope", func(t *testing.T) {
+		data, err := encode(resultForSize(MaxResponseBytes), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(data) > MaxResponseBytes {
+			t.Fatalf("output length = %d, exceeds %d", len(data), MaxResponseBytes)
+		}
+		got := check(t, data)
+		if got.OK || got.Error == nil || got.Error.Code != CodeResponseTooLarge {
+			t.Fatalf("response = %+v, want response_too_large", got)
+		}
+	})
+}
+
 // ---------------------------------------------------------------------------
 // Task 5: a scripted Herdr, worker reports and reviewed decisions
 // ---------------------------------------------------------------------------
