@@ -68,7 +68,7 @@ The hooks require Conventional Commit subjects (`<type>(optional-scope): <short 
 
 ## Releasing
 
-The plugin version is `version` in `herdr-plugin.toml`, in semver. Cut a release from the default branch: merge the version bump, tag that commit `vX.Y.Z`, and make sure its manifest declares `X.Y.Z`.
+The plugin version is `version` in `herdr-plugin.toml`, a SemVer 2.0.0 version (`X.Y.Z`, optionally with `-prerelease` and `+build`). Cut a release from the default branch: merge the version bump, tag that commit `v` followed by the version, and make sure its manifest declares that version. The release workflow refuses any other tag.
 
 1. Merge the version bump to the default branch.
 2. Tag the merged commit and push the tag: `git tag -a vX.Y.Z -m "vX.Y.Z"`, then `git push origin vX.Y.Z`.
