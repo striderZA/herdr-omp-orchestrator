@@ -84,6 +84,10 @@ func recoveryDeclined(taskID string) string {
 		"and no empty pane of the task remains, so nothing was started or submitted", taskID)
 }
 
+// recoveryNoInboxFlushKey marks notes written during a background pass as
+// pending-only; startup and ordinary event paths own inbox delivery.
+type recoveryNoInboxFlushKey struct{}
+
 // RecoverUntilIdle runs identity-checked recovery of provisioning claims until none is
 // left that it can attempt or await. An empty scope is every task, the scope a startup
 // route's worker takes; a non-empty one is the claims of one completed operation.
@@ -99,6 +103,7 @@ func recoveryDeclined(taskID string) string {
 // claim remains that it can attempt or await, with an error matching ErrRecoveryStalled.
 // Waiting for a live owner is not a stall.
 func (c *Coordinator) RecoverUntilIdle(ctx context.Context, taskIDs ...string) error {
+	ctx = context.WithValue(ctx, recoveryNoInboxFlushKey{}, true)
 	pacing := map[string]*claimPacing{}
 	var lastErr error
 	for {

@@ -248,6 +248,10 @@ func (c *Coordinator) verifyReattach(ctx context.Context, projectKey, paneID str
 		return reattachFacts{}, fmt.Errorf("the recorded primary of %s could not be checked, so nothing was substituted for it: %w", project.Key, err)
 	}
 	if probe.Ours {
+		if !probe.CheckoutProven {
+			return reattachFacts{}, fmt.Errorf("%w: pane %s still reports the recorded primary session of %s, but its project checkout is unreported; reattach will not replace a live session",
+				ErrPrimaryLive, probe.Pane.PaneID, project.Key)
+		}
 		return reattachFacts{}, fmt.Errorf("%w: pane %s is verified as the primary of %s; reattach replaces only a primary that is lost or unproven",
 			ErrPrimaryLive, probe.Pane.PaneID, project.Key)
 	}
@@ -419,7 +423,8 @@ func (c *Coordinator) recordReattach(ctx context.Context, facts reattachFacts) (
 		next.AgentName = plan.AgentName
 		next.PrimaryAttention = truncateRunes(fmt.Sprintf(
 			"reattached to pane %s (session %s): the replacement has not confirmed its handshake yet",
-			plan.PaneID, plan.Session.Value), primaryAttentionLimit)
+			plan.PaneID, plan.Session.Value,
+		), primaryAttentionLimit)
 		// A new binding starts with no notice attempt: the attempt belongs to the
 		// pane and session it was made for.
 		next.ReattachNotice = task.NoticeAttempt{}
