@@ -1614,6 +1614,41 @@ func TestBindRejectsANonRepository(t *testing.T) {
 // Dispatch
 // ---------------------------------------------------------------------------
 
+func TestDispatchBoundsAcceptanceCheckCount(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	checks := make([]string, 32)
+	for i := range checks {
+		checks[i] = fmt.Sprintf("check %d", i)
+	}
+	st, err := f.dispatch("32 checks", "brief", checks, nil, nil, f.base)
+	if err != nil {
+		t.Fatalf("dispatch 32 checks: %v", err)
+	}
+	if len(st.Checks) != 32 {
+		t.Errorf("returned checks = %d, want 32", len(st.Checks))
+	}
+	tasks, err := f.store.Tasks(context.Background(), f.project)
+	if err != nil {
+		t.Fatalf("Tasks: %v", err)
+	}
+	if len(tasks) != 1 || len(tasks[0].Checks) != 32 {
+		t.Fatalf("persisted tasks/checks = %d/%d, want 1/32", len(tasks), len(tasks[0].Checks))
+	}
+
+	before := len(tasks)
+	checks = append(checks, "check 32")
+	if _, err := f.dispatch("33 checks", "brief", checks, nil, nil, f.base); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("dispatch 33 checks err = %v, want ErrInvalidRequest", err)
+	}
+	tasks, err = f.store.Tasks(context.Background(), f.project)
+	if err != nil {
+		t.Fatalf("Tasks after refusal: %v", err)
+	}
+	if len(tasks) != before {
+		t.Errorf("persisted task count = %d, want unchanged at %d", len(tasks), before)
+	}
+}
+
 func TestDispatchDoesNotCopyADirtyPrimaryCheckout(t *testing.T) {
 	f := newCoordFixture(t, fixturePlan{})
 	// An uncommitted change in the primary checkout must never reach a worker.

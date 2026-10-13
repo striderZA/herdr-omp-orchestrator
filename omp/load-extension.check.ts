@@ -385,12 +385,28 @@ if (!dispatch) {
     "orch_dispatch accepted 33 dependencies, which Go refuses",
   );
   check(
+    tryParse(schema, { ...payload, checks: manyDispatchItems(32, "check") }).ok,
+    "orch_dispatch rejected 32 acceptance checks, which Go accepts",
+  );
+  check(
+    !tryParse(schema, { ...payload, checks: manyDispatchItems(33, "check") }).ok,
+    "orch_dispatch accepted 33 acceptance checks, which Go refuses",
+  );
+  check(
     tryParse(schema, { ...payload, reservedPaths: manyDispatchItems(32, "src/file") }).ok,
     "orch_dispatch rejected 32 reserved paths, which Go accepts",
   );
   check(
     !tryParse(schema, { ...payload, reservedPaths: manyDispatchItems(33, "src/file") }).ok,
     "orch_dispatch accepted 33 reserved paths, which Go refuses",
+  );
+  check(
+    tryParse(schema, { ...payload, reservedPaths: ["p".repeat(512)] }).ok,
+    "orch_dispatch rejected a 512-character reserved path, which Go accepts",
+  );
+  check(
+    !tryParse(schema, { ...payload, reservedPaths: ["p".repeat(513)] }).ok,
+    "orch_dispatch accepted a 513-character reserved path, which Go refuses",
   );
 }
 
@@ -517,6 +533,21 @@ if (!report) {
 // call the model is told to make; a missing or too-loose schema is a load
 // failure waiting for the user's machine.
 const toolCalls: { name: string; params: Record<string, unknown>; bad: Record<string, unknown> | null }[] = [
+  {
+    name: "orch_dispatch",
+    params: {
+      title: "Bounded task",
+      brief: "Do the bounded thing.",
+      checks: Array.from({ length: 32 }, (_, i) => `check${i}`),
+      baseRevision: "0123456",
+    },
+    bad: {
+      title: "Bounded task",
+      brief: "Do the bounded thing.",
+      checks: Array.from({ length: 33 }, (_, i) => `check${i}`),
+      baseRevision: "0123456",
+    },
+  },
   // orch_report is the one worker tool; each kind is a call the model is told to
   // make, and the bad case for a kind is that kind with its own field missing.
   { name: "orch_report", params: { kind: "progress", summary: "ported the lexer" }, bad: { kind: "progress", summary: "" } },

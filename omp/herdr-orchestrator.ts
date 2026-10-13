@@ -240,7 +240,9 @@ interface CleanupPreview {
 export const CHECK_OUTCOMES = ["passed", "failed", "skipped"] as const;
 const REPORT_CHECKS_MAX = 32;
 const DISPATCH_DEPENDENCIES_MAX = 32;
+const DISPATCH_CHECKS_MAX = 32; // Mirrors the Go maxChecks.
 const DISPATCH_RESERVED_PATHS_MAX = 32;
+const DISPATCH_RESERVED_PATH_MAX = 512; // Mirrors the Go maxPathLength.
 const REPORT_EVIDENCE_MAX = 64;
 
 // Persisted report and revision returned by the primary-only report_preview
@@ -1391,9 +1393,9 @@ export default function (pi: ExtensionAPI, options: ExtensionOptions = {}) {
     parameters: z.object({
       title: z.string().min(1).max(160),
       brief: z.string().min(1).max(16000),
-      checks: z.array(z.string().min(1).max(512)).min(1),
+      checks: z.array(z.string().min(1).max(512)).min(1).max(DISPATCH_CHECKS_MAX),
       dependencies: z.array(z.string()).max(DISPATCH_DEPENDENCIES_MAX).default(() => []),
-      reservedPaths: z.array(z.string()).max(DISPATCH_RESERVED_PATHS_MAX).default(() => []),
+      reservedPaths: z.array(z.string().max(DISPATCH_RESERVED_PATH_MAX)).max(DISPATCH_RESERVED_PATHS_MAX).default(() => []),
       baseRevision: z.string().min(7),
       // Strict-mode calls use null for an unlinked task; the coordinator refuses ids
       // that are not this project's ticket, are already decided, or have no accepted plan.

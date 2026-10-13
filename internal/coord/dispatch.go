@@ -317,6 +317,8 @@ const (
 	maxPathLength    = 512
 	maxDependencies  = 32
 	maxReservedPaths = 32
+	// maxChecks mirrors the extension's DISPATCH_CHECKS_MAX.
+	maxChecks = 32
 )
 
 func newDispatchRequest(title, brief string, checks, dependencies, reservedPaths []string) (dispatchRequest, error) {
@@ -335,6 +337,8 @@ func newDispatchRequest(title, brief string, checks, dependencies, reservedPaths
 		return dispatchRequest{}, fmt.Errorf("%w: the brief exceeds %d characters", ErrInvalidRequest, maxBriefLength)
 	case len(checks) == 0:
 		return dispatchRequest{}, fmt.Errorf("%w: at least one acceptance check is required", ErrInvalidRequest)
+	case len(checks) > maxChecks:
+		return dispatchRequest{}, fmt.Errorf("%w: more than %d acceptance checks", ErrInvalidRequest, maxChecks)
 	}
 	for _, check := range checks {
 		trimmed := strings.TrimSpace(check)
