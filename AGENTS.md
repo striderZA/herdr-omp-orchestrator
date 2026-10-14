@@ -36,9 +36,11 @@ This is a Windows-only Herdr plugin that connects Oh My Pi (OMP) agents to a dur
 Run from the repository root:
 
 ```sh
-go test ./...
+go test -timeout 30m ./...
 go build -o herdr-omp-orchestrator.exe ./cmd/herdr-omp-orchestrator
 ```
+
+`internal/coord` takes more than ten minutes on Windows, longer than `go test`'s default 10-minute limit, so the full run needs `-timeout 30m`.
 
 The plugin manifest builds without CGO; on Windows the equivalent is:
 
@@ -65,6 +67,16 @@ git config core.hooksPath .githooks
 ```
 
 The hooks require Conventional Commit subjects (`<type>(optional-scope): <short description>`) and reject staged files under `docs/superpowers/` or `.superpowers/`.
+
+## Releasing
+
+The plugin version is `version` in `herdr-plugin.toml`, a SemVer 2.0.0 version (`X.Y.Z`, optionally with `-prerelease` and `+build`). Cut a release from the default branch: merge the version bump, tag that commit `v` followed by the version, and make sure its manifest declares that version. The release workflow refuses any other tag.
+
+1. Merge the version bump to the default branch.
+2. Tag the merged commit and push the tag: `git tag -a vX.Y.Z -m "vX.Y.Z"`, then `git push origin vX.Y.Z`.
+3. Publish the release: `gh release create vX.Y.Z --verify-tag --generate-notes`.
+
+`.github/workflows/release.yml` then builds `herdr-omp-orchestrator-windows-amd64.exe` with `-X main.version=X.Y.Z`. It fails unless the tagged manifest declares that version and the binary reports it (`herdr-omp-orchestrator --version`), and it attaches the binary and `SHA256SUMS` to the release. Local builds report `dev`. The workflow does not run the tests, so run `go test -timeout 30m ./...` on the commit before tagging. To rebuild an existing release's assets, run the workflow by hand with the tag.
 
 ## Code Conventions & Common Patterns
 

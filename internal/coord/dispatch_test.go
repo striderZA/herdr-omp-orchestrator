@@ -1109,7 +1109,7 @@ func (f *coordFixture) sibling() *Coordinator {
 	coordinator, err := New(store, f.client, Options{
 		Concurrency:      3,
 		CallTimeout:      5 * time.Second,
-		ReadinessTimeout: 2 * time.Second,
+		ReadinessTimeout: 10 * time.Second,
 		PollInterval:     10 * time.Millisecond,
 	})
 	if err != nil {
@@ -1174,10 +1174,12 @@ func newCoordFixture(t *testing.T, plan fixturePlan) *coordFixture {
 	}
 	f.client = client
 
+	// Each readiness poll starts the stand-in CLI as a child process, and a
+	// loaded run once went past 2 s; 10 s keeps this wait test-only.
 	coord, err := New(store, client, Options{
 		Concurrency:      3,
 		CallTimeout:      5 * time.Second,
-		ReadinessTimeout: 2 * time.Second,
+		ReadinessTimeout: 10 * time.Second,
 		PollInterval:     10 * time.Millisecond,
 		// These tests are about what happens after a satisfied gate; the gate
 		// itself is exercised against the setup check in bind_preflight_test.go.

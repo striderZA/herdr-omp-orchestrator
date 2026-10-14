@@ -1,0 +1,141 @@
+# Attaches the Windows binary and SHA256SUMS to a GitHub release.
+#
+# Runs when a release is published. Cut it from the default branch, after the
+# version bump is merged, on a tag that is already pushed:
+#   git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z
+#   gh release create vX.Y.Z --verify-tag --generate-notes
+# `--verify-tag` refuses a tag that was never pushed, so creating the release
+# cannot tag an arbitrary commit. Run it by hand with a tag to rebuild the assets
+# of an existing release.
+#
+# The tag must be `v` plus a SemVer 2.0.0 version. The build fails unless the
+# tagged commit's herdr-plugin.toml declares that version and the binary reports
+# it, so the tag, the manifest and the artifact cannot disagree. A failed run
+# leaves the release without assets: fix the cause, then rerun this workflow by
+# hand with the same tag.
+name: Release binaries
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag, e.g. v0.2.0
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  TAG: ${{ github.event.release.tag_name || inputs.tag }}
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: windows-amd64
+            goos: windows
+            goarch: amd64
+            os: windows-2025
+            runs: true
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ env.TAG }}
+
+      - name: Check the tag is vX.Y.Z and matches the manifest
+        run: |
+          export LC_ALL=C
+          version="${TAG#v}"
+          # SemVer 2.0.0 (https://semver.org) as an anchored extended regex. The
+          # version goes into the manifest comparison and into -ldflags, so it
+          # must not carry separators, spaces or regex syntax.
+          semver='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*)(\.(0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*))*)?(\+[0-9a-zA-Z-]+(\.[0-9a-zA-Z-]+)*)?$'
+          if [[ "$TAG" != v* || ! "$version" =~ $semver ]]; then
+            echo "::error::release tag $TAG is not v followed by a SemVer 2.0.0 version (for example v1.2.3 or v1.2.3-rc.1)"
+            exit 1
+          fi
+          # Read the tagged commit's manifest, not the working tree: a Windows
+          # checkout may convert line endings, and the match below is exact.
+          manifest=$(git show HEAD:herdr-plugin.toml)
+          # -F matches the line literally. As a regex, the dots in the version
+          # would match any character, so "0x1x0" would pass for 0.1.0.
+          grep -Fqx "version = \"$version\"" <<< "$manifest" || { echo "::error::herdr-plugin.toml version is not $version"; exit 1; }
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          version="${TAG#v}"
+          mkdir -p dist
+          # -X stamps the version that --version reports; -trimpath keeps the
+          # build machine's paths out of the binary.
+          go build -trimpath -ldflags "-X main.version=$version" \
+            -o "dist/herdr-omp-orchestrator-${{ matrix.target }}.exe" ./cmd/herdr-omp-orchestrator
+
+      - name: Check it runs and reports the release version
+        if: matrix.runs
+        run: |
+          version="${TAG#v}"
+          out=$("dist/herdr-omp-orchestrator-${{ matrix.target }}.exe" --version)
+          echo "$out"
+          [ "$out" = "herdr-omp-orchestrator $version" ] || { echo "::error::expected herdr-omp-orchestrator $version"; exit 1; }
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: herdr-omp-orchestrator-${{ matrix.target }}
+          path: dist/herdr-omp-orchestrator-${{ matrix.target }}.exe
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      ASSETS: >-
+        herdr-omp-orchestrator-windows-amd64.exe
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Check every binary is there and write SHA256SUMS
+        working-directory: dist
+        run: |
+          for asset in $ASSETS; do
+            [ -s "$asset" ] || { echo "::error::$asset is missing"; exit 1; }
+          done
+          # shellcheck disable=SC2086 # $ASSETS is a word list
+          sha256sum $ASSETS > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Upload to the release
+        working-directory: dist
+        run: |
+          # shellcheck disable=SC2086 # $ASSETS is a word list
+          gh release upload "$TAG" $ASSETS SHA256SUMS --clobber
+
+      - name: Check the release carries every asset
+        run: |
+          names=$(gh release view "$TAG" --json assets --jq '.assets[].name')
+          for asset in $ASSETS SHA256SUMS; do
+            printf '%s\n' "$names" | grep -Fqx "$asset" || { echo "::error::release $TAG has no $asset"; exit 1; }
+          done
+          echo "release $TAG carries the binary and SHA256SUMS"
