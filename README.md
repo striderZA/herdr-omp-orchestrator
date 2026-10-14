@@ -10,6 +10,26 @@ A Windows-only Herdr plugin that connects Oh My Pi (OMP) primary and worker agen
 - [Disposition contract (ADR 0001)](docs/adr/0001-disposition-contract.md) — how task decisions close tasks and release dependents.
 - [Successors and re-points (ADR 0005)](docs/adr/0005-successors-and-repoint.md) — how a superseded decision names its successor and how queued dependents are re-pointed to it.
 
+## Install
+
+This plugin runs on Windows only. Before you install it, make sure these are available in a new terminal:
+
+- `herdr`: Herdr 0.9.0 or newer.
+- `go`: Go 1.27.1, the version `go.mod` names, to build the plugin executable.
+- Oh My Pi (OMP), which the plugin extends.
+
+From the repository root, run:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+The script builds `herdr-omp-orchestrator.exe`, checks Herdr's OMP integration (it runs `herdr integration install omp` only when Herdr reports it missing), links this folder as a Herdr plugin, and runs the plugin's `setup` action. It stops at the first failure and prints what to fix. Running it again is safe.
+
+The script never unlinks or uninstalls the plugin. Its writes go through Herdr's own commands and the plugin's `setup` action: the built executable, the plugin link, Herdr's OMP integration only when Herdr reports it missing, and the OMP extension file. If Herdr already links the plugin from another folder, it stops before changing anything. If that folder is gone or this checkout has moved, run `herdr plugin unlink user.omp-orchestrator`, then run the script again.
+
+Afterwards, use the plugin's `bind` action from a pane in the repository you want to orchestrate, and its `board` action to open the task board.
+
 ## What setup writes
 
 Setup (the plugin's `setup` action, or `herdr-omp-orchestrator.exe setup` run from the plugin directory) writes one file: `herdr-orchestrator.ts`, the plugin's OMP extension. It goes in OMP's effective extensions directory for the active profile:
