@@ -49,6 +49,12 @@ $env:CGO_ENABLED = '0'
 go build -o herdr-omp-orchestrator.exe ./cmd/herdr-omp-orchestrator
 ```
 
+Install script checks run `install.ps1` against stub `herdr` and `go` executables. They never start Herdr or touch a real Herdr, Go or OMP installation:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\install_tests.ps1
+```
+
 Windows acceptance checks:
 
 ```powershell
