@@ -1,6 +1,6 @@
 # ADR 0006: Forget a project
 
-Status: Accepted (design). Approved in chat and reviewed; implementation pending.
+Status: Accepted and implemented on `feat/forget-project`; not yet integrated.
 
 ## Context
 
@@ -22,7 +22,7 @@ A repository can be bound but never removed. `bind` refuses a pane that a projec
    Recording a decision on an undecided task needs a verified primary. When the primary is gone, the forget refusal names reattach as the first step.
 6. **One fingerprint, one transaction.** `internal/state` computes a fingerprint over the project row, each task's ID and revision, each note's ID and state, each ticket's ID and revision, and whether the project's session and intent rows exist. `ForgetFingerprint` computes it for the plan. `ForgetProject(key, fingerprint)` recomputes it inside the write transaction, applies every refusal in rule 5, and refuses with `forget_plan_changed` if the fingerprint differs. Deletion happens in that transaction or not at all.
 7. **Identity.** The key comes from the invoking pane, never from typed text. The write checks that it receives the key the plan named.
-8. **Output and codes.** As reattach does, the pane prints the outcome and the leftover list to stdout and writes the envelope to stderr. New codes: `forget_refused` (reasons in the message), `forget_plan_changed` and `forget_not_confirmed`. `project_unknown` covers an unresolved or ambiguous pane.
+8. **Output and codes.** As reattach does, the pane prints the outcome and the leftover list to stdout and writes the envelope to stderr. New codes: `forget_refused` (reasons in the message), `forget_plan_changed` and `forget_not_confirmed`. `project_unknown` covers an unresolved or ambiguous pane. A missing or unreadable invocation context answers `context_unavailable`, as reattach does.
 9. **The primary keeps its read-only restriction** until its OMP session restarts (AGENTS.md). The pane says so and names the two ways to clear it: restart the session, or close its pane.
 
 ## Rejected alternatives
