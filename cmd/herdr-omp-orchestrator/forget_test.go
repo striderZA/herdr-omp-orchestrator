@@ -184,3 +184,15 @@ func TestManifestDeclaresTheForgetActionAndItsPane(t *testing.T) {
 		t.Errorf("pane placement = %s, want %s", got, want)
 	}
 }
+
+func TestReadmeNamesEveryForgetCode(t *testing.T) {
+	readme, err := os.ReadFile(filepath.Join("..", "..", "README.md"))
+	if err != nil {
+		t.Fatalf("read README: %v", err)
+	}
+	for _, code := range []string{"forget_refused", "forget_plan_changed", "forget_not_confirmed"} {
+		if !strings.Contains(string(readme), code) {
+			t.Errorf("README does not contain %q", code)
+		}
+	}
+}

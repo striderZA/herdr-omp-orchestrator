@@ -8,7 +8,7 @@ A Windows-only Herdr plugin that connects Oh My Pi (OMP) primary and worker agen
 - [Repository and development rules](AGENTS.md) — architecture, conventions, and commands.
 - [Herdr compatibility facts](docs/herdr-facts.md) — the external Herdr behavior this plugin depends on and how it was verified.
 - [Disposition contract (ADR 0001)](docs/adr/0001-disposition-contract.md) — how task decisions close tasks and release dependents.
-- [Successors and re-points (ADR 0005)](docs/adr/0005-successors-and-repoint.md) — how a superseded decision names its successor and how queued dependents are re-pointed to it.
+- [Forgetting a project (ADR 0006)](docs/adr/0006-forget-a-project.md) — how to remove one project's plugin records without removing its repository, worktrees, branches, or Herdr panes.
 
 ## Install
 
@@ -85,6 +85,16 @@ Run **Open the task board**. It opens as an overlay in the project's workspace.
 - Restarting Herdr keeps the recorded task facts and board state. At startup the plugin reconciles its records with Herdr's live state.
 - If the board shows **Primary not verified**, the recorded primary is absent or cannot be verified; the text after the label gives the reason. Run **Reattach the primary OMP session** from the pane that runs the replacement OMP, at the repository root. It shows what it would record and asks you to confirm first.
 
+### 6. Forget a project
+
+Use **Forget a project** when you want to remove this plugin's records for a repository so you can bind it again as a new project. Start from a pane in that repository and open the action. The plan is read-only; review its counts and what will stay before confirming.
+
+Forget refuses if a task has no outcome: record its outcome through the primary first. If the primary is gone, reattach it before recording that outcome. A task that is still active, a `sending` or `uncertain` note, a bind in progress, or an uncertain reattach notice also blocks forgetting. Wait for `sending` or `uncertain` notes to resolve; do not try to clear them by forgetting.
+
+After a confirmed forget, the plugin's project, task, ticket, inbox, and session records are deleted. The repository, its branches and worktrees, and Herdr workspaces and panes stay; forgetting does not remove checkouts or close sessions. To confirm, type the project's folder name exactly as shown in the prompt. Pressing Enter without that name cancels and deletes nothing.
+
+The primary keeps its read-only restriction until its OMP session restarts. Restart that session or close its pane to clear the restriction.
+
 Common refusal codes. Bind and setup write theirs to the plugin log; a dispatch refusal reaches the primary through the bridge, and the board shows a ticket refusal as a notice:
 
 | Code | Meaning and fix |
@@ -94,6 +104,9 @@ Common refusal codes. Bind and setup write theirs to the plugin log; a dispatch 
 | `not_git_repository` | The folder is not inside a Git work tree. Bind from a folder inside one. |
 | `different_repository` | The pane's working directory is not the repository root. `cd` to the root in that pane and bind again. |
 | `bad_base_revision` | The base is not a commit of this repository. For a dispatch, give the primary a hash of at least seven hex characters from `git rev-parse --short HEAD`; `HEAD` and branch names such as `main` are refused. A ticket move also needs a commit at HEAD, so a repository with no commits needs a first commit. |
+| `forget_refused` | The plan has a blocking reason. Record undecided task outcomes through the primary (reattach it first if it is gone); wait for `sending` or `uncertain` notes to resolve, and clear any other listed blocker before trying again. |
+| `forget_plan_changed` | The project changed after planning. Open the forget action again, review the new plan, and confirm it again. |
+| `forget_not_confirmed` | The typed folder name did not match, or confirmation was cancelled. Run the action again and type the prompted folder name; Enter cancels. |
 
 ## What setup writes
 
