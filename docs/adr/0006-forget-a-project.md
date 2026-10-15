@@ -10,12 +10,12 @@ A repository can be bound but never removed. `bind` refuses a pane that a projec
 
 1. **Forget deletes one project's plugin records and nothing else.** It removes the project's `projects` row, its `tasks`, `tickets` and `inbox` rows, and the `ready_sessions` rows for its launch pane and its tasks' launch panes. It never changes Git (the repository, branches and worktrees), Herdr (workspaces, panes and agent sessions) or the installed extension.
 2. **Entry is a pane, as reattach is.** The `forget` action (`open-forget`, contexts `pane` and `workspace`) resolves the project with `board.ProjectFor`, which refuses when no project or more than one matches. It passes the resolved key to the `forget` overlay pane. The action writes nothing.
-3. **Plan first, read-only.** `coord.PlanForget` reports the counts (tasks decided and undecided, tickets, notes by delivery state, launch and public pane claims), the refusal reasons, and what stays: the repository, its `orch/` branches, the worktree paths, the Herdr workspace, and the primary and worker panes. Planning writes nothing and makes no mutating Herdr call. When a refusal applies, the pane shows the reasons and stops.
+3. **Plan first, read-only.** `coord.PlanForget` lists the counts (tasks decided and undecided, tickets, and notes by delivery state), refusal reasons, and what stays: the repository, its `orch/` branches, the worktree paths, the Herdr workspace, and the primary and worker panes. Planning writes nothing and makes no mutating Herdr call. When a refusal applies, the pane shows the reasons and stops.
 4. **Typed confirmation.** Otherwise the pane asks the user to type the last path element of the project key. The comparison trims the text and ignores case. Anything else, including an empty line, cancels and deletes nothing.
 5. **Refusals,** checked in the plan and again inside the write transaction:
    - a task with an empty disposition. The message names an outcome to record first, such as `abandoned`;
    - a task with `slot_claimed_at > 0` or a non-empty `step_claim_owner`;
-   - a note in state `sending` or `uncertain`. A `pending` note is not in flight, so it does not block; the plan counts it as lost;
+   - a note in state `sending` or `uncertain`. A `pending` note is not in flight, so it does not block; the plan counts it among the notes that forgetting deletes;
    - a bind intent for the project's key, which is the canonical root;
    - a reattach notice in state `uncertain`.
 
