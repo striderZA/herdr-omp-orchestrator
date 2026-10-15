@@ -258,9 +258,20 @@ func TestForgetProjectRefusesEachChangedFingerprintComponent(t *testing.T) {
 		{
 			name: "claimed task IDs",
 			mutate: func(t *testing.T, s *state.Store) {
-				claimed, stored, _, err := s.ClaimTask(ctx, gateTask(t, "task-claimed", "repo-a", nil), 3)
+				before, err := s.Task(ctx, "task-a")
+				if err != nil {
+					t.Fatalf("Task before claim: %v", err)
+				}
+				claimed, _, err := s.ClaimProvisioningSlot(ctx, "task-a", 3)
 				if err != nil || !claimed {
-					t.Fatalf("ClaimTask = (%v, %+v, %v), want claimed", claimed, stored, err)
+					t.Fatalf("ClaimProvisioningSlot = (%v, %v), want true", claimed, err)
+				}
+				after, err := s.Task(ctx, "task-a")
+				if err != nil {
+					t.Fatalf("Task after claim: %v", err)
+				}
+				if !reflect.DeepEqual(after, before) {
+					t.Errorf("task facts changed when claiming a slot: before %+v, after %+v", before, after)
 				}
 			},
 		},
