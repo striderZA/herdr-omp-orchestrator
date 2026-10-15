@@ -93,22 +93,31 @@ func forgetSession(ctx context.Context, c forgetter, key string, in *bufio.Reade
 	}
 	if len(plan.Blockers) != 0 {
 		fmt.Fprintf(stdout, "Cannot forget %s:\n", key)
-		for _, reason := range plan.Blockers { fmt.Fprintf(stdout, "- %s\n", reason) }
+		for _, reason := range plan.Blockers {
+			fmt.Fprintf(stdout, "- %s\n", reason)
+		}
 		return failureBody("forget_refused", strings.Join(plan.Blockers, "; "))
 	}
 	fmt.Fprintf(stdout, "Forgetting %s: %d tasks (%d decided), %d tickets, %d delivered notes, %d pending notes.\n", key, plan.Tasks, plan.Decided, plan.Tickets, plan.NotesDelivered, plan.NotesPending)
-	for _, line := range plan.Stays { fmt.Fprintf(stdout, "Stays: %s\n", line) }
+	for _, line := range plan.Stays {
+		fmt.Fprintf(stdout, "Stays: %s\n", line)
+	}
+	fmt.Fprintln(stdout, "The primary keeps its read-only restriction until its OMP session restarts. Restart the session, or close its pane, to clear it.")
 	fmt.Fprintf(stdout, "Type %s to forget %s, or press Enter to cancel: ", plan.FolderName, key)
 	line, _ := in.ReadString('\n')
 	if !strings.EqualFold(strings.TrimSpace(line), plan.FolderName) {
 		fmt.Fprintln(stdout, "\nCancelled. Nothing was changed.")
-		return map[string]any{"ok": true, "forgotten": false, "project": key}
+		return map[string]any{"ok": true, "forgotten": false}
 	}
 	actCtx, cancel := context.WithTimeout(ctx, forgetTimeout)
 	defer cancel()
 	result, err := c.Forget(actCtx, key, plan)
-	if err != nil { return failureBody(coordCode(err), err.Error()) }
-	for _, stays := range result.Stays { fmt.Fprintf(stdout, "Stays: %s\n", stays) }
+	if err != nil {
+		return failureBody(coordCode(err), err.Error())
+	}
+	for _, stays := range result.Stays {
+		fmt.Fprintf(stdout, "Stays: %s\n", stays)
+	}
 	counts := result.Deleted
 	fmt.Fprintf(stdout, "Forgot %s: %d tasks, %d tickets, %d notes removed.\n", key, counts.Tasks, counts.Tickets, counts.Notes)
 	return map[string]any{"ok": true, "forgotten": true, "project": key, "tasks": counts.Tasks, "tickets": counts.Tickets, "notes": counts.Notes}
@@ -117,7 +126,10 @@ func forgetSession(ctx context.Context, c forgetter, key string, in *bufio.Reade
 func finishForget(stdout, stderr io.Writer, in *bufio.Reader, body map[string]any) int {
 	if ok, _ := body["ok"].(bool); !ok {
 		code, message := "internal", ""
-		if failure, found := body["error"].(map[string]any); found { code, _ = failure["code"].(string); message, _ = failure["message"].(string) }
+		if failure, found := body["error"].(map[string]any); found {
+			code, _ = failure["code"].(string)
+			message, _ = failure["message"].(string)
+		}
 		fmt.Fprintf(stdout, "\nNot forgotten (%s): %s\n", code, message)
 	}
 	fmt.Fprint(stdout, "\nPress Enter to close.")
