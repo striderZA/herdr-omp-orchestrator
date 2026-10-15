@@ -222,6 +222,9 @@ func TestForgetDeletesTheRecordsAndLeavesGitAndHerdrAlone(t *testing.T) {
 	if result.Deleted.Tasks != 1 {
 		t.Fatalf("Deleted.Tasks = %d", result.Deleted.Tasks)
 	}
+	if !containsForgetLine(result.Stays, "branch: "+branch) {
+		t.Fatalf("Forget result Stays = %q, want branch %q", result.Stays, branch)
+	}
 	if _, err := f.coord.PlanForget(context.Background(), f.projectKey()); !errors.Is(err, ErrProjectUnknown) {
 		t.Fatalf("PlanForget after forget = %v, want ErrProjectUnknown", err)
 	}
@@ -278,26 +281,27 @@ func TestPlanForgetOfAnUnknownProjectIsProjectUnknown(t *testing.T) {
 
 func (f *coordFixture) settleForgetTask(t *testing.T, id string) {
 	t.Helper()
+	token, err := f.store.ProvisioningSlotToken(context.Background(), id)
+	if err != nil {
+		t.Fatalf("ProvisioningSlotToken(%s): %v", id, err)
+	}
+	if err := f.store.ReleaseStep(context.Background(), id, f.coord.owner); err != nil {
+		t.Fatalf("ReleaseStep(%s): %v", id, err)
+	}
 	st := f.taskByID(t, id)
 	updated, err := f.store.UpdateTask(context.Background(), id, st.Revision, func(next *task.Task) error {
 		next.Phase = task.Intent
-		next.WorktreePath = ""
-		next.Branch = ""
-		next.WorktreeWorkspaceID = ""
-		next.LaunchPaneID = ""
-		next.PublicPaneID = ""
-		next.AgentName = ""
-		next.OMPSessionID = ""
 		return nil
 	})
 	if err != nil {
 		t.Fatalf("settle phase for task %s: %v", id, err)
 	}
 	settled := f.recordDisposition(updated, "settled before forget")
-	if err := f.store.ReleaseStep(context.Background(), id, f.coord.owner); err != nil {
-		t.Fatalf("ReleaseStep(%s): %v", id, err)
+	if settled.Branch != st.Branch || settled.WorktreePath != st.WorktreePath {
+		t.Fatalf("settling task erased Git identity: branch %q/%q, worktree %q/%q",
+			settled.Branch, st.Branch, settled.WorktreePath, st.WorktreePath)
 	}
-	if err := f.store.ReleaseProvisioningSlot(context.Background(), id, f.slotClaimToken(settled.ID)); err != nil {
+	if err := f.store.ReleaseProvisioningSlot(context.Background(), id, token); err != nil {
 		t.Fatalf("ReleaseProvisioningSlot(%s): %v", id, err)
 	}
 }

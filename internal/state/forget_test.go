@@ -13,6 +13,36 @@ import (
 	"herdr-omp-orchestrator/internal/task"
 )
 
+func TestProvisioningSlotTokenReturnsCurrentClaimToken(t *testing.T) {
+	ctx := context.Background()
+	s := open(t, t.TempDir())
+	createForgetProject(t, s, "repo-token", "w9:p1")
+	st := gateTask(t, "task-token", "repo-token", nil)
+	claimed, stored, token, err := s.ClaimTask(ctx, st, 1)
+	if err != nil || !claimed {
+		t.Fatalf("ClaimTask = (%v, %v), want a claimed task", claimed, err)
+	}
+	if token == 0 {
+		t.Fatal("ClaimTask returned an empty token")
+	}
+	got, err := s.ProvisioningSlotToken(ctx, stored.ID)
+	if err != nil {
+		t.Fatalf("ProvisioningSlotToken: %v", err)
+	}
+	if got != token {
+		t.Fatalf("ProvisioningSlotToken = %d, want %d", got, token)
+	}
+	if _, err := s.ProvisioningSlotToken(ctx, "missing-task"); !errors.Is(err, state.ErrNotFound) {
+		t.Fatalf("ProvisioningSlotToken(unknown) = %v, want ErrNotFound", err)
+	}
+	if err := s.ReleaseProvisioningSlot(ctx, stored.ID, token); err != nil {
+		t.Fatalf("ReleaseProvisioningSlot: %v", err)
+	}
+	if got, err := s.ProvisioningSlotToken(ctx, stored.ID); err != nil || got != 0 {
+		t.Fatalf("ProvisioningSlotToken after release = (%d, %v), want (0, nil)", got, err)
+	}
+}
+
 func TestForgetFactsReturnsNotFoundForAnUnknownProject(t *testing.T) {
 	s := open(t, t.TempDir())
 	_, err := s.ForgetFacts(context.Background(), "repo-missing")

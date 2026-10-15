@@ -25,6 +25,28 @@ func (s *Store) ForgetFacts(ctx context.Context, key string) (task.ForgetFacts, 
 	return facts, nil
 }
 
+// ProvisioningSlotToken returns the active provisioning-slot token for a task.
+// A task without an active claim reports zero; an unknown task reports
+// ErrNotFound. Callers must use ReleaseProvisioningSlot with the returned token
+// to release a claim safely.
+func (s *Store) ProvisioningSlotToken(ctx context.Context, taskID string) (int64, error) {
+	if strings.TrimSpace(taskID) == "" {
+		return 0, fmt.Errorf("%w: task id is required", ErrInvalid)
+	}
+	var token, claimedAt int64
+	err := s.db.QueryRowContext(ctx, `SELECT slot_token, slot_claimed_at FROM tasks WHERE id = ?`, taskID).Scan(&token, &claimedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, fmt.Errorf("%w: task %s", ErrNotFound, taskID)
+	}
+	if err != nil {
+		return 0, fmt.Errorf("read provisioning-slot token for task %s: %w", taskID, err)
+	}
+	if claimedAt == 0 {
+		return 0, nil
+	}
+	return token, nil
+}
+
 // ForgetProject rechecks the planned facts and removes the project's records in
 // one transaction. Herdr resources, worktrees and Git state are not touched.
 func (s *Store) ForgetProject(ctx context.Context, key, fingerprint string) (ForgetCounts, error) {
