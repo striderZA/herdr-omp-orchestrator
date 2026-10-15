@@ -79,6 +79,26 @@ func TestForgetBlockersRefusesEachInFlightKind(t *testing.T) {
 	}
 }
 
+func TestForgetBlockersReasonsHaveStableOrder(t *testing.T) {
+	facts := ForgetFacts{
+		Project: Project{Key: "project-root"},
+		Tasks:   []Task{{ID: "task-z"}, {ID: "task-a"}},
+		Notes: []Inbox{
+			{ID: "note-uncertain", DeliveryState: DeliveryUncertain},
+			{ID: "note-sending", DeliveryState: DeliverySending},
+		},
+	}
+	want := []string{
+		"task task-a has no outcome: record one first, such as abandoned",
+		"task task-z has no outcome: record one first, such as abandoned",
+		"note note-sending is sending",
+		"note note-uncertain is uncertain",
+	}
+	if got := ForgetBlockers(facts); !equalStrings(got, want) {
+		t.Fatalf("ForgetBlockers() = %v, want %v", got, want)
+	}
+}
+
 func TestForgetBlockersAllowsDecidedHistoryAndPendingNotes(t *testing.T) {
 	facts := ForgetFacts{
 		Project: Project{Key: "project-root"},
@@ -96,10 +116,12 @@ func TestForgetBlockersAllowsDecidedHistoryAndPendingNotes(t *testing.T) {
 
 func TestForgetFingerprintChangesWithAnyRecordedFact(t *testing.T) {
 	base := ForgetFacts{
-		Project: Project{Key: "project-root"},
-		Tasks:   []Task{{ID: "task-a", Revision: 1}, {ID: "task-b", Revision: 1}},
-		Notes:   []Inbox{{ID: "note-a", DeliveryState: DeliveryPending}},
-		Tickets: []Ticket{{ID: "ticket-a", Revision: 1}},
+		Project:           Project{Key: "project-root"},
+		Tasks:             []Task{{ID: "task-a", Revision: 1}, {ID: "task-b", Revision: 1}},
+		Notes:             []Inbox{{ID: "note-a", DeliveryState: DeliveryPending}, {ID: "note-b", DeliveryState: DeliveryDelivered}},
+		Tickets:           []Ticket{{ID: "ticket-a", Revision: 1}, {ID: "ticket-b", Revision: 1}},
+		ClaimedTaskIDs:    []string{"task-a", "task-b"},
+		ReadySessionPanes: []string{"pane-project", "pane-task"},
 	}
 	baseFingerprint := forgetFingerprint(t, base)
 
@@ -111,6 +133,7 @@ func TestForgetFingerprintChangesWithAnyRecordedFact(t *testing.T) {
 		{"note state", func(f *ForgetFacts) { f.Notes[0].DeliveryState = DeliverySending }},
 		{"ticket revision", func(f *ForgetFacts) { f.Tickets[0].Revision++ }},
 		{"claimed set", func(f *ForgetFacts) { f.ClaimedTaskIDs = []string{"task-a"} }},
+		{"ready session panes", func(f *ForgetFacts) { f.ReadySessionPanes = append(f.ReadySessionPanes, "pane-new") }},
 		{"bind intent", func(f *ForgetFacts) { f.BindIntentOpen = true }},
 		{"primary attention", func(f *ForgetFacts) { f.Project.PrimaryAttention = "primary unavailable" }},
 	}
@@ -124,10 +147,29 @@ func TestForgetFingerprintChangesWithAnyRecordedFact(t *testing.T) {
 		})
 	}
 
-	reversed := cloneForgetFacts(base)
-	reversed.Tasks[0], reversed.Tasks[1] = reversed.Tasks[1], reversed.Tasks[0]
-	if got := forgetFingerprint(t, reversed); got != baseFingerprint {
-		t.Fatalf("reversing Tasks changed fingerprint: got %s, want %s", got, baseFingerprint)
+	assertFingerprintInvariant(t, base, baseFingerprint, "Tasks", func(f *ForgetFacts) {
+		f.Tasks[0], f.Tasks[1] = f.Tasks[1], f.Tasks[0]
+	})
+	assertFingerprintInvariant(t, base, baseFingerprint, "Notes", func(f *ForgetFacts) {
+		f.Notes[0], f.Notes[1] = f.Notes[1], f.Notes[0]
+	})
+	assertFingerprintInvariant(t, base, baseFingerprint, "Tickets", func(f *ForgetFacts) {
+		f.Tickets[0], f.Tickets[1] = f.Tickets[1], f.Tickets[0]
+	})
+	assertFingerprintInvariant(t, base, baseFingerprint, "ClaimedTaskIDs", func(f *ForgetFacts) {
+		f.ClaimedTaskIDs[0], f.ClaimedTaskIDs[1] = f.ClaimedTaskIDs[1], f.ClaimedTaskIDs[0]
+	})
+	assertFingerprintInvariant(t, base, baseFingerprint, "ReadySessionPanes", func(f *ForgetFacts) {
+		f.ReadySessionPanes[0], f.ReadySessionPanes[1] = f.ReadySessionPanes[1], f.ReadySessionPanes[0]
+	})
+}
+
+func assertFingerprintInvariant(t *testing.T, base ForgetFacts, want, sliceName string, reorder func(*ForgetFacts)) {
+	t.Helper()
+	facts := cloneForgetFacts(base)
+	reorder(&facts)
+	if got := forgetFingerprint(t, facts); got != want {
+		t.Fatalf("reversing %s changed fingerprint: got %s, want %s", sliceName, got, want)
 	}
 }
 
@@ -145,7 +187,20 @@ func cloneForgetFacts(f ForgetFacts) ForgetFacts {
 	f.ClaimedTaskIDs = append([]string(nil), f.ClaimedTaskIDs...)
 	f.Notes = append([]Inbox(nil), f.Notes...)
 	f.Tickets = append([]Ticket(nil), f.Tickets...)
+	f.ReadySessionPanes = append([]string(nil), f.ReadySessionPanes...)
 	return f
+}
+
+func equalStrings(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func containsString(value, fragment string) bool {

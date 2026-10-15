@@ -9,12 +9,13 @@ import (
 
 // ForgetFacts is the durable project state relevant to planning a forget.
 type ForgetFacts struct {
-	Project        Project
-	Tasks          []Task
-	ClaimedTaskIDs []string // tasks with a provisioning slot or a step claim
-	Notes          []Inbox
-	Tickets        []Ticket
-	BindIntentOpen bool // a bind_intents row exists for Project.Key
+	Project           Project
+	Tasks             []Task
+	ClaimedTaskIDs    []string // tasks with a provisioning slot or a step claim
+	ReadySessionPanes []string // launch panes with a ready_sessions row
+	Notes             []Inbox
+	Tickets           []Ticket
+	BindIntentOpen    bool // a bind_intents row exists for Project.Key
 }
 
 // ForgetBlockers returns refusal reasons in a stable order, or nil when the
@@ -73,12 +74,13 @@ func ForgetFingerprint(f ForgetFacts) (string, error) {
 		DeliveryState string
 	}
 	type canonicalFacts struct {
-		Project        Project
-		Tasks          []revisionFact
-		Notes          []noteFact
-		Tickets        []revisionFact
-		ClaimedTaskIDs []string
-		BindIntentOpen bool
+		Project           Project
+		Tasks             []revisionFact
+		Notes             []noteFact
+		Tickets           []revisionFact
+		ClaimedTaskIDs    []string
+		ReadySessionPanes []string
+		BindIntentOpen    bool
 	}
 
 	tasks := make([]revisionFact, 0, len(f.Tasks))
@@ -116,9 +118,18 @@ func ForgetFingerprint(f ForgetFacts) (string, error) {
 
 	claimed := append([]string{}, f.ClaimedTaskIDs...)
 	sort.Strings(claimed)
+	readySessionPanes := append([]string{}, f.ReadySessionPanes...)
+	sort.Strings(readySessionPanes)
+	distinctReadySessionPanes := readySessionPanes[:0]
+	for _, pane := range readySessionPanes {
+		if len(distinctReadySessionPanes) == 0 || distinctReadySessionPanes[len(distinctReadySessionPanes)-1] != pane {
+			distinctReadySessionPanes = append(distinctReadySessionPanes, pane)
+		}
+	}
 	encoded, err := json.Marshal(canonicalFacts{
 		Project: f.Project, Tasks: tasks, Notes: notes, Tickets: tickets,
-		ClaimedTaskIDs: claimed, BindIntentOpen: f.BindIntentOpen,
+		ClaimedTaskIDs: claimed, ReadySessionPanes: distinctReadySessionPanes,
+		BindIntentOpen: f.BindIntentOpen,
 	})
 	if err != nil {
 		return "", err
