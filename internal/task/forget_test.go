@@ -164,6 +164,27 @@ func TestForgetFingerprintChangesWithAnyRecordedFact(t *testing.T) {
 	})
 }
 
+func TestForgetFingerprintIgnoresEmptyAndDuplicateReadySessionPanes(t *testing.T) {
+	tests := []struct {
+		name  string
+		left  []string
+		right []string
+	}{
+		{name: "all empty equals nil", left: nil, right: []string{"", ""}},
+		{name: "duplicates equal one pane", left: []string{"p1", "p1"}, right: []string{"p1"}},
+		{name: "empty plus pane equals pane", left: []string{"", "p1"}, right: []string{"p1"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			left := forgetFingerprint(t, ForgetFacts{ReadySessionPanes: tt.left})
+			right := forgetFingerprint(t, ForgetFacts{ReadySessionPanes: tt.right})
+			if left != right {
+				t.Fatalf("fingerprints differ: left %s, right %s", left, right)
+			}
+		})
+	}
+}
+
 func assertFingerprintInvariant(t *testing.T, base ForgetFacts, want, sliceName string, reorder func(*ForgetFacts)) {
 	t.Helper()
 	facts := cloneForgetFacts(base)

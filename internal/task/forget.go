@@ -118,7 +118,12 @@ func ForgetFingerprint(f ForgetFacts) (string, error) {
 
 	claimed := append([]string{}, f.ClaimedTaskIDs...)
 	sort.Strings(claimed)
-	readySessionPanes := append([]string{}, f.ReadySessionPanes...)
+	readySessionPanes := make([]string, 0, len(f.ReadySessionPanes))
+	for _, pane := range f.ReadySessionPanes {
+		if pane != "" {
+			readySessionPanes = append(readySessionPanes, pane)
+		}
+	}
 	sort.Strings(readySessionPanes)
 	distinctReadySessionPanes := readySessionPanes[:0]
 	for _, pane := range readySessionPanes {
