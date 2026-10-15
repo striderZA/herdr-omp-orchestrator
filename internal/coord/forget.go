@@ -35,28 +35,17 @@ type ForgetResult struct {
 
 // PlanForget returns a read-only snapshot of the project facts that would be
 // removed by Forget and the external resources that will remain.
-
 func (c *Coordinator) PlanForget(ctx context.Context, projectKey string) (ForgetPlan, error) {
-	key := strings.TrimSpace(projectKey)
-	if key == "" {
-		return ForgetPlan{}, fmt.Errorf("%w: project key is required", ErrInvalidRequest)
-	}
-	facts, err := c.store.ForgetFacts(ctx, key)
-	if errors.Is(err, state.ErrNotFound) {
-		return ForgetPlan{}, fmt.Errorf("%w: %s", ErrProjectUnknown, key)
-	}
+	_, facts, fingerprint, err := c.forgetSnapshot(ctx, projectKey)
 	if err != nil {
 		return ForgetPlan{}, err
 	}
-	fingerprint, err := task.ForgetFingerprint(facts)
-	if err != nil {
-		return ForgetPlan{}, fmt.Errorf("fingerprint forget facts: %w", err)
-	}
+	blockers := forgetBlockers(facts)
 	plan := ForgetPlan{
 		ProjectKey:  facts.Project.Key,
 		FolderName:  filepath.Base(filepath.Clean(facts.Project.Key)),
 		Tickets:     len(facts.Tickets),
-		Blockers:    task.ForgetBlockers(facts),
+		Blockers:    blockers,
 		Fingerprint: fingerprint,
 	}
 	for _, item := range facts.Tasks {
@@ -75,42 +64,27 @@ func (c *Coordinator) PlanForget(ctx context.Context, projectKey string) (Forget
 			plan.NotesBlocking++
 		}
 	}
-	if len(plan.Blockers) != 0 && facts.Project.PrimaryAttention != "" {
-		plan.Blockers = append(plan.Blockers, "the primary is not verified: reattach it first to record outcomes or deliver notes")
-	}
 	plan.Stays = forgetStays(facts)
 	return plan, nil
 }
 
 // Forget deletes the project's durable facts only when the supplied snapshot
 // fingerprint still matches and all refusal conditions are clear.
-
 func (c *Coordinator) Forget(ctx context.Context, projectKey string, confirmed ForgetPlan) (ForgetResult, error) {
 	if strings.TrimSpace(confirmed.Fingerprint) == "" {
 		return ForgetResult{}, ErrForgetNotConfirmed
 	}
-	key := strings.TrimSpace(projectKey)
-	if key == "" {
-		return ForgetResult{}, fmt.Errorf("%w: project key is required", ErrInvalidRequest)
-	}
-	facts, err := c.store.ForgetFacts(ctx, key)
-	if errors.Is(err, state.ErrNotFound) {
-		return ForgetResult{}, fmt.Errorf("%w: %s", ErrProjectUnknown, key)
-	}
+	key, facts, fingerprint, err := c.forgetSnapshot(ctx, projectKey)
 	if err != nil {
 		return ForgetResult{}, err
 	}
-	fingerprint, err := task.ForgetFingerprint(facts)
-	if err != nil {
-		return ForgetResult{}, fmt.Errorf("fingerprint forget facts: %w", err)
+	if confirmed.ProjectKey != key {
+		return ForgetResult{}, fmt.Errorf("%w: confirmed key %q differs from requested key %q", ErrForgetPlanChanged, confirmed.ProjectKey, key)
 	}
 	if fingerprint != confirmed.Fingerprint {
 		return ForgetResult{}, fmt.Errorf("%w: project %q", ErrForgetPlanChanged, key)
 	}
-	if blockers := task.ForgetBlockers(facts); len(blockers) != 0 {
-		if facts.Project.PrimaryAttention != "" {
-			blockers = append(blockers, "the primary is not verified: reattach it first to record outcomes or deliver notes")
-		}
+	if blockers := forgetBlockers(facts); len(blockers) != 0 {
 		return ForgetResult{}, fmt.Errorf("%w: %s", ErrForgetRefused, strings.Join(blockers, "; "))
 	}
 	counts, err := c.store.ForgetProject(ctx, key, confirmed.Fingerprint)
@@ -127,6 +101,33 @@ func (c *Coordinator) Forget(ctx context.Context, projectKey string, confirmed F
 		return ForgetResult{}, err
 	}
 	return ForgetResult{Deleted: counts, Stays: forgetStays(facts)}, nil
+}
+
+func (c *Coordinator) forgetSnapshot(ctx context.Context, projectKey string) (string, task.ForgetFacts, string, error) {
+	key := strings.TrimSpace(projectKey)
+	if key == "" {
+		return "", task.ForgetFacts{}, "", fmt.Errorf("%w: project key is required", ErrInvalidRequest)
+	}
+	facts, err := c.store.ForgetFacts(ctx, key)
+	if errors.Is(err, state.ErrNotFound) {
+		return "", task.ForgetFacts{}, "", fmt.Errorf("%w: %s", ErrProjectUnknown, key)
+	}
+	if err != nil {
+		return "", task.ForgetFacts{}, "", err
+	}
+	fingerprint, err := task.ForgetFingerprint(facts)
+	if err != nil {
+		return "", task.ForgetFacts{}, "", fmt.Errorf("fingerprint forget facts: %w", err)
+	}
+	return key, facts, fingerprint, nil
+}
+
+func forgetBlockers(facts task.ForgetFacts) []string {
+	blockers := task.ForgetBlockers(facts)
+	if len(blockers) != 0 && facts.Project.PrimaryAttention != "" {
+		blockers = append(blockers, "the primary is not verified: reattach it first to record outcomes or deliver notes")
+	}
+	return blockers
 }
 
 func forgetStays(facts task.ForgetFacts) []string {
