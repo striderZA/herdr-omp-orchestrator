@@ -2,7 +2,9 @@ package coord
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -215,6 +217,7 @@ func TestForgetDeletesTheRecordsAndLeavesGitAndHerdrAlone(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	beforeCalls := f.calls()
 	result, err := f.coord.Forget(context.Background(), f.projectKey(), plan)
 	if err != nil {
 		t.Fatal(err)
@@ -230,6 +233,9 @@ func TestForgetDeletesTheRecordsAndLeavesGitAndHerdrAlone(t *testing.T) {
 	}
 	if f.countCalls("worktree remove") != 0 {
 		t.Fatal("forget removed a Herdr worktree")
+	}
+	if got := f.calls(); !reflect.DeepEqual(got, beforeCalls) {
+		t.Fatalf("Herdr calls changed: before %#v, after %#v", beforeCalls, got)
 	}
 	if _, err := os.Stat(worktree); err != nil {
 		t.Fatalf("worktree path removed: %v", err)
@@ -252,9 +258,35 @@ func TestPrimaryGoneHintIsAppendedToTheRefusal(t *testing.T) {
 	}
 }
 
+func TestPrimaryWithoutAttentionHasNoReattachHint(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{})
+	project := f.boundProject(t)
+	plan, err := f.coord.PlanForget(context.Background(), project.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, blocker := range plan.Blockers {
+		if strings.Contains(blocker, "reattach") {
+			t.Fatalf("Blockers = %q, want no reattach hint for verified primary", plan.Blockers)
+		}
+	}
+}
+
 func TestEventForAForgottenPaneIsANoOp(t *testing.T) {
 	f := newCoordFixture(t, fixturePlan{})
 	project := f.boundProject(t)
+	if err := f.store.RecordReady(context.Background(), project.PublicPaneID, task.Announcement{ID: "omp-forget-event"}, 1); err != nil {
+		t.Fatal(err)
+	}
+	tasksBefore, err := f.store.Tasks(context.Background(), project.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inboxBefore, err := f.store.ProjectInbox(context.Background(), project.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readyBefore := forgetCoordReadySnapshot(t, f)
 	plan, err := f.coord.PlanForget(context.Background(), project.Key)
 	if err != nil {
 		t.Fatal(err)
@@ -262,13 +294,69 @@ func TestEventForAForgottenPaneIsANoOp(t *testing.T) {
 	if _, err := f.coord.Forget(context.Background(), project.Key, plan); err != nil {
 		t.Fatal(err)
 	}
-	payload := eventFixture(t, "pane_agent_status_changed.json", "w2:p1", project.PublicPaneID, `"workspace_id": "w2"`, `"workspace_id": "w2"`)
+	readyBefore = forgetCoordReadySnapshot(t, f)
+	payload := eventFixture(t, "pane_agent_status_changed.json", "w2:p1", project.PublicPaneID, `"workspace_id": "w2"`, `"workspace_id": "w1"`)
 	if err := f.coord.HandleEvent(context.Background(), EventAgentStatus, payload); err != nil {
 		t.Fatalf("HandleEvent: %v", err)
 	}
 	if _, err := f.store.Project(context.Background(), project.Key); !errors.Is(err, state.ErrNotFound) {
 		t.Fatalf("project recreated: %v", err)
 	}
+	tasksAfter, err := f.store.Tasks(context.Background(), project.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inboxAfter, err := f.store.ProjectInbox(context.Background(), project.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(tasksAfter, tasksBefore) {
+		t.Errorf("event changed tasks: before %#v, after %#v", tasksBefore, tasksAfter)
+	}
+	if !reflect.DeepEqual(inboxAfter, inboxBefore) {
+		t.Errorf("event changed inbox: before %#v, after %#v", inboxBefore, inboxAfter)
+	}
+	if readyAfter := forgetCoordReadySnapshot(t, f); !reflect.DeepEqual(readyAfter, readyBefore) {
+		t.Errorf("event changed ready_sessions: before %#v, after %#v", readyBefore, readyAfter)
+	}
+}
+
+func forgetCoordReadySnapshot(t *testing.T, f *coordFixture) map[string][]string {
+	t.Helper()
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(f.stateDir, "orchestrator.sqlite")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	rows, err := db.QueryContext(context.Background(), "SELECT * FROM ready_sessions ORDER BY launch_pane_id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	columns, err := rows.Columns()
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := map[string][]string{}
+	for rows.Next() {
+		values := make([]any, len(columns))
+		destinations := make([]any, len(columns))
+		for i := range values {
+			destinations[i] = &values[i]
+		}
+		if err := rows.Scan(destinations...); err != nil {
+			t.Fatal(err)
+		}
+		row := make([]string, len(values))
+		for i, value := range values {
+			row[i] = fmt.Sprintf("%T:%#v", value, value)
+		}
+		snapshot[row[0]] = row
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return snapshot
 }
 
 func TestPlanForgetOfAnUnknownProjectIsProjectUnknown(t *testing.T) {

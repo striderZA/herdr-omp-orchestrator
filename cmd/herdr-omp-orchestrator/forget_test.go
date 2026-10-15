@@ -53,6 +53,38 @@ func runForgetSession(t *testing.T, f *fakeForgetter, input string) (map[string]
 	body := forgetSession(context.Background(), f, f.plan.ProjectKey, bufio.NewReader(strings.NewReader(input)), &out)
 	return body, out.String()
 }
+func TestRunForgetWithoutProjectContextDoesNotOpenCoordinator(t *testing.T) {
+	stateDir := t.TempDir()
+	store, err := state.Open(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	calls := filepath.Join(t.TempDir(), "calls.jsonl")
+	env := map[string]string{
+		envForgetProject: "", envStateDir: stateDir, envHerdrBinary: os.Args[0],
+		routeFixtureEnv: "1", routeFixtureCalls: calls,
+	}
+	t.Setenv(routeFixtureEnv, "1")
+	t.Setenv(routeFixtureCalls, calls)
+	t.Setenv(envForgetProject, "")
+	var stdout, stderr bytes.Buffer
+
+	code := runForget(env, strings.NewReader("\n"), &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("runForget exit code = %d, want 1", code)
+	}
+	answer := decodeAnswer(t, stderr.Bytes())
+	if answer.Error == nil || answer.Error.Code != "context_unavailable" {
+		t.Fatalf("stderr answer = %+v, want context_unavailable", answer.Error)
+	}
+	if got := readRouteCalls(t, calls); len(got) != 0 {
+		t.Fatalf("Herdr called without invocation context: %v", got)
+	}
+}
 func TestForgetPaneDeletesOnlyOnTheTypedFolderName(t *testing.T) {
 	for _, tc := range []struct {
 		name, input string
@@ -106,7 +138,7 @@ func TestForgetPaneShowsWhatStays(t *testing.T) {
 			t.Errorf("output misses %q: %s", line, shown)
 		}
 	}
-	for _, required := range []string{"read-only restriction", "restart", "close its pane"} {
+	for _, required := range []string{"read-only restriction", "restart the session", "close its pane"} {
 		if !strings.Contains(strings.ToLower(shown), required) {
 			t.Errorf("output misses restart note phrase %q: %s", required, shown)
 		}
@@ -175,6 +207,9 @@ func TestManifestDeclaresTheForgetActionAndItsPane(t *testing.T) {
 	action := manifestEntry(t, "actions", "forget")
 	if got, want := action.fields["command"], `["./herdr-omp-orchestrator.exe", "open-forget"]`; got != want {
 		t.Errorf("action command = %s, want %s", got, want)
+	}
+	if got, want := action.fields["contexts"], `["pane", "workspace"]`; got != want {
+		t.Errorf("action contexts = %s, want %s", got, want)
 	}
 	pane := manifestEntry(t, "panes", "forget")
 	if got, want := pane.fields["command"], `["./herdr-omp-orchestrator.exe", "forget"]`; got != want {

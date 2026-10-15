@@ -5,9 +5,10 @@ import "testing"
 func TestForgetBlockersRefusesEachInFlightKind(t *testing.T) {
 	base := ForgetFacts{Project: Project{Key: "project-root"}}
 	tests := []struct {
-		name  string
-		facts ForgetFacts
-		id    string
+		name        string
+		facts       ForgetFacts
+		id          string
+		wantBlocker bool
 	}{
 		{
 			name: "undecided task",
@@ -16,7 +17,8 @@ func TestForgetBlockersRefusesEachInFlightKind(t *testing.T) {
 				f.Tasks = []Task{{ID: "task-undecided"}}
 				return f
 			}(),
-			id: "task-undecided",
+			id:          "task-undecided",
+			wantBlocker: true,
 		},
 		{
 			name: "claimed task",
@@ -26,7 +28,8 @@ func TestForgetBlockersRefusesEachInFlightKind(t *testing.T) {
 				f.ClaimedTaskIDs = []string{"task-claimed"}
 				return f
 			}(),
-			id: "task-claimed",
+			id:          "task-claimed",
+			wantBlocker: true,
 		},
 		{
 			name: "sending note",
@@ -35,7 +38,8 @@ func TestForgetBlockersRefusesEachInFlightKind(t *testing.T) {
 				f.Notes = []Inbox{{ID: "note-sending", DeliveryState: DeliverySending}}
 				return f
 			}(),
-			id: "note-sending",
+			id:          "note-sending",
+			wantBlocker: true,
 		},
 		{
 			name: "uncertain note",
@@ -44,7 +48,8 @@ func TestForgetBlockersRefusesEachInFlightKind(t *testing.T) {
 				f.Notes = []Inbox{{ID: "note-uncertain", DeliveryState: DeliveryUncertain}}
 				return f
 			}(),
-			id: "note-uncertain",
+			id:          "note-uncertain",
+			wantBlocker: true,
 		},
 		{
 			name: "open bind intent",
@@ -53,7 +58,8 @@ func TestForgetBlockersRefusesEachInFlightKind(t *testing.T) {
 				f.BindIntentOpen = true
 				return f
 			}(),
-			id: "project-root",
+			id:          "project-root",
+			wantBlocker: true,
 		},
 		{
 			name: "uncertain reattach notice",
@@ -62,18 +68,32 @@ func TestForgetBlockersRefusesEachInFlightKind(t *testing.T) {
 				f.Project.ReattachNotice = NoticeAttempt{PaneID: "pane-notice", State: NoticeUncertain}
 				return f
 			}(),
-			id: "pane-notice",
+			id:          "pane-notice",
+			wantBlocker: true,
+		},
+		{
+			name: "sent reattach notice",
+			facts: func() ForgetFacts {
+				f := base
+				f.Project.ReattachNotice = NoticeAttempt{PaneID: "pane-notice", State: NoticeSent}
+				return f
+			}(),
+			wantBlocker: false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			blockers := ForgetBlockers(tt.facts)
-			if len(blockers) == 0 {
-				t.Fatal("ForgetBlockers returned no refusal reason")
-			}
-			if !containsString(blockers[0], tt.id) {
-				t.Fatalf("first refusal %q does not name %q", blockers[0], tt.id)
+			if tt.wantBlocker {
+				if len(blockers) == 0 {
+					t.Fatal("ForgetBlockers returned no refusal reason")
+				}
+				if !containsString(blockers[0], tt.id) {
+					t.Fatalf("first refusal %q does not name %q", blockers[0], tt.id)
+				}
+			} else if len(blockers) != 0 {
+				t.Fatalf("ForgetBlockers = %v, want no blocker", blockers)
 			}
 		})
 	}
@@ -101,7 +121,7 @@ func TestForgetBlockersReasonsHaveStableOrder(t *testing.T) {
 
 func TestForgetBlockersAllowsDecidedHistoryAndPendingNotes(t *testing.T) {
 	facts := ForgetFacts{
-		Project: Project{Key: "project-root"},
+		Project: taskProjectWithSentNotice(),
 		Tasks:   []Task{{ID: "task-done", Disposition: "accepted", Outcome: OutcomeIntegrated}},
 		Notes: []Inbox{
 			{ID: "note-pending", DeliveryState: DeliveryPending},
@@ -112,6 +132,10 @@ func TestForgetBlockersAllowsDecidedHistoryAndPendingNotes(t *testing.T) {
 	if blockers := ForgetBlockers(facts); blockers != nil {
 		t.Fatalf("ForgetBlockers = %v, want nil", blockers)
 	}
+}
+
+func taskProjectWithSentNotice() Project {
+	return Project{Key: "project-root", ReattachNotice: NoticeAttempt{PaneID: "pane-notice", State: NoticeSent}}
 }
 
 func TestForgetFingerprintChangesWithAnyRecordedFact(t *testing.T) {

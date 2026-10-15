@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -221,13 +222,13 @@ func TestForgetProjectRefusesAndWritesNothing(t *testing.T) {
 			createForgetProject(t, s, "repo-a", "w1:p1")
 			tc.setup(t, s)
 			db := rawState(t, dir)
-			before := forgetTableCounts(t, db)
+			before := forgetTableSnapshot(t, db)
 			fingerprint := forgetFingerprint(t, s, "repo-a")
 			if _, err := s.ForgetProject(ctx, "repo-a", fingerprint); !errors.Is(err, state.ErrForgetBlocked) {
 				t.Fatalf("ForgetProject = %v, want ErrForgetBlocked", err)
 			}
-			if after := forgetTableCounts(t, db); !reflect.DeepEqual(after, before) {
-				t.Errorf("a refusal changed row counts: before %v, after %v", before, after)
+			if after := forgetTableSnapshot(t, db); !reflect.DeepEqual(after, before) {
+				t.Errorf("a refusal changed table contents: before %v, after %v", before, after)
 			}
 		})
 	}
@@ -251,12 +252,12 @@ func TestForgetProjectRefusesAStaleFingerprint(t *testing.T) {
 		t.Fatalf("UpdateTask: %v", err)
 	}
 	db := rawState(t, dir)
-	before := forgetTableCounts(t, db)
+	before := forgetTableSnapshot(t, db)
 	if _, err := s.ForgetProject(ctx, "repo-a", fingerprint); !errors.Is(err, state.ErrConflict) {
 		t.Fatalf("ForgetProject(stale fingerprint) = %v, want ErrConflict", err)
 	}
-	if after := forgetTableCounts(t, db); !reflect.DeepEqual(after, before) {
-		t.Errorf("stale fingerprint refusal changed row counts: before %v, after %v", before, after)
+	if after := forgetTableSnapshot(t, db); !reflect.DeepEqual(after, before) {
+		t.Errorf("stale fingerprint refusal changed table contents: before %v, after %v", before, after)
 	}
 }
 func TestForgetProjectRefusesEachChangedFingerprintComponent(t *testing.T) {
@@ -357,8 +358,9 @@ func TestForgetProjectRollsBackWhenTicketDeleteFails(t *testing.T) {
 	before := forgetTableSnapshot(t, db)
 	fingerprint := forgetFingerprint(t, s, "repo-a")
 	if _, err := s.ForgetProject(ctx, "repo-a", fingerprint); err == nil ||
-		errors.Is(err, state.ErrConflict) || errors.Is(err, state.ErrForgetBlocked) {
-		t.Fatalf("ForgetProject with ticket-delete failure = %v, want another error", err)
+		errors.Is(err, state.ErrConflict) || errors.Is(err, state.ErrForgetBlocked) ||
+		!strings.Contains(err.Error(), "injected ticket delete failure") {
+		t.Fatalf("ForgetProject with ticket-delete failure = %v, want injected ticket delete failure", err)
 	}
 	if after := forgetTableSnapshot(t, db); !reflect.DeepEqual(after, before) {
 		t.Errorf("failed forget changed table contents: before %v, after %v", before, after)
