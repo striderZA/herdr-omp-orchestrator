@@ -28,7 +28,72 @@ The script builds `herdr-omp-orchestrator.exe`, checks Herdr's OMP integration (
 
 The script never unlinks or uninstalls the plugin. Its writes go through Herdr's own commands and the plugin's `setup` action: the built executable, the plugin link, Herdr's OMP integration only when Herdr reports it missing, and the OMP extension file. If Herdr already links the plugin from another folder, it stops before changing anything. If that folder is gone or this checkout has moved, run `herdr plugin unlink user.omp-orchestrator`, then run the script again.
 
-Afterwards, use the plugin's `bind` action from a pane in the repository you want to orchestrate, and its `board` action to open the task board.
+Then follow [First use](#first-use) to bind a repository and open its task board.
+
+## First use
+
+After the install script finishes, bind a repository and open its board. Herdr runs plugin actions without a terminal, so `bind` and `setup` write their answer, including a refusal, to Herdr's plugin log. List it with `herdr plugin log list --plugin user.omp-orchestrator`.
+
+The plugin's actions have these titles in Herdr: **Bind this repository as an orchestrated project** (`bind`), **Open the task board** (`board`), **Reattach the primary OMP session** (`reattach`) and **Setup OMP orchestrator extension** (`setup`).
+
+### 1. Bind a repository
+
+1. Open a pane in the repository and `cd` to its root. Bind refuses a pane whose working directory is not the repository root, including a subfolder.
+2. Run **Bind this repository as an orchestrated project**.
+
+Bind starts the primary, an OMP session that coordinates the work. If the pane you ran it from is a plain shell that no record claims, the primary runs in that pane. If the pane already runs an agent, such as your own OMP session, bind leaves that session alone and starts the primary in a new workspace on the same checkout. Bind sends the primary no message, so it waits for your first request. Running bind again on the same repository reopens the recorded primary and never starts a second one. If that primary's pane is gone, bind refuses and names the Reattach action, because it never substitutes a new primary.
+
+### 2. Ask the primary for work
+
+Type requests into the primary's pane. It can read and search the repository and use the plugin's tools, but it cannot edit files or run commands, so workers make the changes. Each dispatch you ask for needs a base commit. Before the first dispatch the plugin gives the primary none, and the primary cannot run git, so pass one in your request, for example from:
+
+```
+git rev-parse --short HEAD
+```
+
+For example: "Make two independent changes, X and Y, each by its own worker. Branch both from abc1234."
+
+A ticket's planner takes the current HEAD by itself, so it needs no commit from you.
+
+Then:
+
+- A dispatch that is not for a ticket shows an OMP confirmation with the exact request. Answer it in the primary's pane. A declined confirmation starts nothing.
+- Each worker gets its own Git worktree on its own `orch/` branch. Three workers run at once by default; the rest queue.
+- A worker's question makes its task **Needs input**. The primary asks you, and sends your answer only after you confirm its exact text.
+- Worker reports and questions reach the primary as inbox notes when it is idle. Delivered notes say they were recorded by workers and the orchestrator, not by you.
+- When a worker finishes, its task is **Ready for review**. The report alone never completes it. The primary asks you to record an outcome: `integrated` and `kept` accept the work and release anything waiting on it; `rejected`, `superseded` and `abandoned` do not.
+- The plugin never merges or pushes, so any merge is yours. To remove a reviewed worker's checkout, ask the primary; it asks you to confirm, keeps the branch and refuses a live or dirty checkout.
+
+### 3. Use the board
+
+Run **Open the task board**. It opens as an overlay in the project's workspace.
+
+- **Backlog** and **Todo** show tickets that have no implementation work and no undecided planner. Once a ticket has either, the board shows it through its tasks instead. **Queued**, **Running**, **Needs input**, **Ready for review** and **Done** hold tasks.
+- Arrow keys or `j`/`k` move, and Tab or Shift+Tab switches columns. `Enter` toggles details, and `Esc` closes them, or closes the board when none are open. `/` filters, `f` focuses the selected worker's pane, `r` refreshes and `q` closes the board.
+- `n` creates a ticket from a title you type; Enter saves it and Esc cancels. Creating a ticket starts nothing.
+- `m` moves the selected backlog ticket to **Todo** and records its planner, which starts or queues when all worker slots are busy. From then on the board shows the ticket through that planner's task. The keypress is the only confirmation: the board shows no dialog for `m`. It needs a commit at HEAD.
+
+### 4. Plan a ticket before coding (optional)
+
+1. Press `n` on the board and title the ticket.
+2. Select it in **Backlog** and press `m`. Its planner works in its own worktree and reports a plan. It edits nothing.
+3. When the plan is reported, the primary asks you to accept it. Accepting it (outcome `integrated` or `kept`) lets the primary dispatch implementation for the ticket, which still needs a base commit as above. Nothing starts from the plan by itself.
+4. When the ticket's tasks are decided, the primary asks you to close the ticket with an outcome. A ticket cannot close while a linked task is still open.
+
+### 5. When something goes wrong
+
+- Restarting Herdr keeps the recorded task facts and board state. At startup the plugin reconciles its records with Herdr's live state.
+- If the board shows **Primary not verified**, the recorded primary is absent or cannot be verified; the text after the label gives the reason. Run **Reattach the primary OMP session** from the pane that runs the replacement OMP, at the repository root. It shows what it would record and asks you to confirm first.
+
+Common refusal codes. Bind and setup write theirs to the plugin log; a dispatch refusal reaches the primary through the bridge, and the board shows a ticket refusal as a notice:
+
+| Code | Meaning and fix |
+|---|---|
+| `integration_missing` | Herdr does not report its OMP integration as installed. Run `herdr integration install omp`, or run `install.ps1` again. |
+| `extension_missing` | The OMP extension is not in the active profile. Run **Setup OMP orchestrator extension**, or run `install.ps1` again. |
+| `not_git_repository` | The folder is not inside a Git work tree. Bind from a folder inside one. |
+| `different_repository` | The pane's working directory is not the repository root. `cd` to the root in that pane and bind again. |
+| `bad_base_revision` | The base is not a commit of this repository. For a dispatch, give the primary a hash of at least seven hex characters from `git rev-parse --short HEAD`; `HEAD` and branch names such as `main` are refused. A ticket move also needs a commit at HEAD, so a repository with no commits needs a first commit. |
 
 ## What setup writes
 
