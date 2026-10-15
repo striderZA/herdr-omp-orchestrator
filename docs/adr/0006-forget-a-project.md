@@ -19,7 +19,7 @@ A repository can be bound but never removed. `bind` refuses a pane that a projec
    - a bind intent for the project's key, which is the canonical root;
    - a reattach notice in state `uncertain`.
 
-   Recording a decision on an undecided task needs a verified primary. If the primary is gone, the refusal says to reattach it first.
+   Recording a decision on an undecided task needs a verified primary. When the primary is gone, the forget refusal names reattach as the first step.
 6. **One fingerprint, one transaction.** `internal/state` computes a fingerprint over the project row, each task's ID and revision, each note's ID and state, each ticket's ID and revision, and whether the project's session and intent rows exist. `ForgetFingerprint` computes it for the plan. `ForgetProject(key, fingerprint)` recomputes it inside the write transaction, applies every refusal in rule 5, and refuses with `forget_plan_changed` if the fingerprint differs. Deletion happens in that transaction or not at all.
 7. **Identity.** The key comes from the invoking pane, never from typed text. The write checks that it receives the key the plan named.
 8. **Output and codes.** As reattach does, the pane prints the outcome and the leftover list to stdout and writes the envelope to stderr. New codes: `forget_refused` (reasons in the message), `forget_plan_changed` and `forget_not_confirmed`. `project_unknown` covers an unresolved or ambiguous pane.
@@ -38,7 +38,7 @@ A repository can be bound but never removed. `bind` refuses a pane that a projec
 - Worktrees and branches stay on disk. A later `bind` of the same repository starts a new project, and nothing records the old worktrees, so nothing adopts them.
 - A board open on the forgotten project should fail its read until it is closed. This is expected and not yet observed.
 - No bridge method, extension change or protocol change.
-- Forget keeps the `task_history` rows. Their append-only triggers forbid DELETE, and they are the audit trail of forgotten work; they keep the forgotten project's key, and no reader of the plugin depends on them.
+- Forget keeps the `task_history` rows. Their append-only triggers forbid DELETE, and they are the audit trail of forgotten work; they keep the forgotten project's key. No reader queries a forgotten task's rows: the board reads history only for tasks it projects, and forgetting removes those tasks.
 
 ## Decided in review
 
