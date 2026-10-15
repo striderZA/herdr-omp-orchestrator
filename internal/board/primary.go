@@ -21,6 +21,7 @@ const (
 	// primaryMarkerLabel opens the marker. It is words, not a glyph or a color, so
 	// it reads the same on a terminal without either.
 	primaryMarkerLabel = "Primary not verified: "
+	primaryMarkerInstruction = "Reattach the primary OMP session"
 	// primaryMarkerMaxLines bounds the marker so a long recorded reason cannot push
 	// the board off a small terminal.
 	primaryMarkerMaxLines = 4
@@ -67,16 +68,25 @@ func (b *Board) PrimaryAttention() string {
 //
 // The reason is recorded text, so it is folded onto lines like any other stored
 // value (wrap drops what must never reach a terminal). A reason that does not fit
-// is cut with a plain-ASCII ellipsis.
+// is cut with a plain-ASCII ellipsis before the reattach instruction.
 func primaryMarker(b *Board, width int, th Theme) []string {
 	reason := b.PrimaryAttention()
 	if reason == "" {
 		return nil
 	}
-	lines := wrap(primaryMarkerLabel+reason, width)
+	reasonLines := wrap(primaryMarkerLabel+reason, width)
+	instructionLines := wrap(primaryMarkerInstruction, width)
+	reasonLimit := primaryMarkerMaxLines - len(instructionLines)
+	if reasonLimit < 1 {
+		reasonLimit = 1
+	}
+	if len(reasonLines) > reasonLimit {
+		reasonLines = reasonLines[:reasonLimit]
+		reasonLines[reasonLimit-1] = ellipsize(reasonLines[reasonLimit-1], width)
+	}
+	lines := append(reasonLines, instructionLines...)
 	if len(lines) > primaryMarkerMaxLines {
-		lines = lines[:primaryMarkerMaxLines]
-		lines[primaryMarkerMaxLines-1] = ellipsize(lines[primaryMarkerMaxLines-1], width)
+		lines = lines[len(lines)-primaryMarkerMaxLines:]
 	}
 	for i, line := range lines {
 		lines[i] = th.paint(Attention, line)

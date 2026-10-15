@@ -78,14 +78,22 @@ func TestPrimaryMarkerHeadsEveryLayoutWithinTheWidth(t *testing.T) {
 				}
 			}
 			block := markerLines(marked)
-			if width >= 12 && (len(block) == 0 || !strings.HasPrefix(block[0], "Primary not")) {
+			if width >= 24 && (len(block) == 0 || !strings.HasPrefix(block[0], "Primary not")) {
 				t.Errorf("%s, width %d: the board does not open with the marker, head %q", name, width, block)
 			}
-			// The marker block itself - not the rest of the board - carries the
-			// reason wherever the width allows a readable line.
-			if flat := strings.Join(strings.Fields(strings.Join(block, " ")), " "); width >= 24 && !strings.Contains(flat, "absent from Herdr's snapshot") {
+			// At narrow widths the remedy takes precedence over the full diagnostic.
+			if flat := strings.Join(strings.Fields(strings.Join(block, " ")), " "); width >= 40 && !strings.Contains(flat, "absent from Herdr's snapshot") {
 				t.Errorf("%s, width %d: the marker does not carry the reason:\n%s", name, width, marked)
 			}
+		}
+	}
+}
+func TestPrimaryMarkerEndsWithReattachInstructionAtClippedWidth(t *testing.T) {
+	const instruction = "Reattach the primary OMP session"
+	for _, width := range []int{120, 60, 40, 24} {
+		marker := primaryMarker(NewBoard(nil).WithPrimaryAttention(sampleAbsence), width, Theme{Profile: termenv.Ascii})
+		if len(marker) == 0 || !strings.HasSuffix(strings.Join(marker, " "), instruction) {
+			t.Errorf("width %d: marker does not end with %q: %q", width, instruction, marker)
 		}
 	}
 }
@@ -168,8 +176,11 @@ func TestPrimaryMarkerIsBoundedAndSanitized(t *testing.T) {
 		if blank > primaryMarkerMaxLines {
 			t.Errorf("width %d: the marker is %d lines, want at most %d:\n%s", width, blank, primaryMarkerMaxLines, out)
 		}
-		if last := lines[primaryMarkerMaxLines-1]; !strings.HasSuffix(last, "...") {
-			t.Errorf("width %d: a cut reason does not say so: %q", width, last)
+		if width >= 12 && !strings.HasSuffix(strings.Join(lines[:blank], " "), primaryMarkerInstruction) {
+			t.Errorf("width %d: marker does not end in the reattach instruction: %q", width, lines[:blank])
+		}
+		if width >= 24 && !strings.Contains(strings.Join(lines[:blank], " "), "...") {
+			t.Errorf("width %d: a cut reason does not say so: %q", width, lines[:blank])
 		}
 		for _, line := range lines {
 			if got := runeWidth(line); got > width {
@@ -273,8 +284,13 @@ func TestPrimaryMarkerLeadsTheDetailPage(t *testing.T) {
 			if len(block) == 0 || !strings.HasPrefix(block[0], "Primary not verified:") {
 				t.Fatalf("%s, width %d: the page does not open with the marker:\n%s", selected, width, marked)
 			}
-			if flat := strings.Join(strings.Fields(strings.Join(block, " ")), " "); !strings.Contains(flat, "absent from Herdr's snapshot") {
-				t.Errorf("%s, width %d: the page marker does not carry the reason:\n%s", selected, width, marked)
+			if !strings.HasSuffix(strings.Join(block, " "), primaryMarkerInstruction) {
+				t.Errorf("%s, width %d: the page marker does not end with the remedy:\n%s", selected, width, marked)
+			}
+			if width >= 40 {
+				if flat := strings.Join(strings.Fields(strings.Join(block, " ")), " "); !strings.Contains(flat, "absent from Herdr's snapshot") {
+					t.Errorf("%s, width %d: the page marker does not carry the reason:\n%s", selected, width, marked)
+				}
 			}
 			if !strings.HasSuffix(marked, "\n\n"+bare) {
 				t.Errorf("%s, width %d: the marker changed the page under it:\n%s\n--- bare ---\n%s", selected, width, marked, bare)
