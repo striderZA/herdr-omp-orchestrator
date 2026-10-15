@@ -1015,11 +1015,11 @@ func TestBoardWithoutTicketsMatchesTheSearchBaseline(t *testing.T) {
 	}
 	want := map[string]string{
 		"100/none":     "cc6c0ee8a5d3fc5e0c0132841044a5a38c8e34c9d81c0593a3c6b82f480ab0fe",
-		"100/selected": "73320d5851be69e4aba549f486596e4602eb8944dc8c3befad3b974c1a6cc43c",
-		"100/expanded": "daf4f7c8acfa17255aedf3c68cf2c907a2ad641b1791e5893707aa798f2a0dca",
+		"100/selected": "1dac0bbce058d6389ff497b08c6a9c83f60283ca48727824bd7f0d7ba0a97318",
+		"100/expanded": "3d811fa42132d7ecad0f953b7e8ba5e2b56cd2603fd9c75a2fe3f756dfdb03ff",
 		"80/none":      "06c08aaa33cff016bd0895171c4567c4b690b02f7a544d01ef43f9fa18caf154",
-		"80/selected":  "de59818d4e84c36f1f1194dcdfb759b4f4c655dc7adfe66857363718de74b68e",
-		"80/expanded":  "bff265a9655d1ffd4fd9e1d3009bb570a3cdcbf6a01a72e65a90cd601022eda9",
+		"80/selected":  "48ac078acccc3ca7e91895681cb0ba2fa3b00960dcef8bf97f5c091e782400eb",
+		"80/expanded":  "7b59300045c64ebcec805fae2d147c0f48334f3bb5cacab0b61bfec14e62e38f",
 	}
 	digest := func(out string) string {
 		sum := sha256.Sum256([]byte(out))

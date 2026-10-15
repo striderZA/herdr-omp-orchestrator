@@ -660,7 +660,7 @@ func detailLines(b *Board, d Detail, width int, th Theme) []string {
 	if notice := noticeLine(d, th, width); notice != "" {
 		out = append(out, notice)
 	}
-	out = append(out, clip(helpLine(d), width))
+	out = append(out, clipHelpLine(helpLine(d), width))
 	return out
 }
 
@@ -696,13 +696,31 @@ func noSelectionHelp(d Detail) string {
 
 // helpLine is the short keyboard help: the board has no other chrome.
 func helpLine(d Detail) string {
+	parts := []string{"r refresh"}
 	if d.Expanded {
-		return "Esc collapse, / search, f focus, q close"
+		parts = append(parts, "Esc collapse")
+	} else {
+		parts = append(parts, "Enter details")
 	}
-	if d.TicketWrites {
-		return "Enter details, / search, f focus, n new ticket, q close"
+	parts = append(parts, "/ search", "f focus")
+	if !d.Expanded && d.TicketWrites {
+		parts = append(parts, "n new ticket")
 	}
-	return "Enter details, / search, f focus, q close"
+	parts = append(parts, "Tab next column", "Shift+Tab previous column", "q close")
+	return strings.Join(parts, ", ")
+}
+
+// clipHelpLine preserves the close key when a narrow terminal clips the help.
+func clipHelpLine(line string, width int) string {
+	const close = "q close"
+	if width <= runewidth.StringWidth(close) || runewidth.StringWidth(line) <= width {
+		return clip(line, width)
+	}
+	prefixWidth := width - runewidth.StringWidth(close) - 2
+	if prefixWidth <= 0 {
+		return close
+	}
+	return clip(line, prefixWidth) + ", " + close
 }
 
 // noticeLine renders the last action's outcome, if it said anything, as one line

@@ -362,6 +362,37 @@ func TestBoardSelectionShowsTheTaskFacts(t *testing.T) {
 		t.Errorf("the renamed task lost its details:\n%s", got)
 	}
 }
+func TestBoardHelpLineShowsRefreshAndTabBeforeClose(t *testing.T) {
+	f := newBoardFixture(t, fixturePlan{})
+	observed := sampleTask("orch_help", nil)
+	f.seed(t, observed)
+	cards, err := ProjectCards(context.Background(), f.store, f.project)
+	if err != nil {
+		t.Fatalf("ProjectCards: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		detail Detail
+	}{
+		{name: "collapsed", detail: Detail{SelectedID: observed.ID}},
+		{name: "expanded", detail: Detail{SelectedID: observed.ID, Expanded: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			view := Render(NewBoard(cards), tc.detail, 120, Theme{Profile: termenv.Ascii})
+			help := lineContaining(t, strings.Split(view, "\n"), "q close")
+			for _, want := range []string{"r refresh", "Tab", "Shift+Tab", "q close"} {
+				if !strings.Contains(help, want) {
+					t.Errorf("help line lacks %q:\n%s", want, help)
+				}
+			}
+			clipped := Render(NewBoard(cards), tc.detail, 12, Theme{Profile: termenv.Ascii})
+			if !strings.Contains(clipped, "q close") {
+				t.Errorf("close key is not visible in the clipped board:\n%s", clipped)
+			}
+		})
+	}
+}
 
 // TestBoardEmptyStateNamesTheWayOut covers the board with nothing to show.
 func TestBoardEmptyStateNamesTheWayOut(t *testing.T) {
