@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"reflect"
 	"testing"
 	"time"
@@ -121,6 +122,27 @@ func TestForgetProjectRefusesAndWritesNothing(t *testing.T) {
 			},
 		},
 		{
+			name: "step-claimed task",
+			setup: func(t *testing.T, s *state.Store) {
+				work := gateTask(t, "task-step-claimed", "repo-a", nil)
+				work.Phase = task.WorktreeCreated
+				if err := s.CreateTask(ctx, work); err != nil {
+					t.Fatalf("CreateTask: %v", err)
+				}
+				stored, err := s.UpdateTask(ctx, work.ID, 1, func(x *task.Task) error {
+					x.Outcome, x.Disposition = task.OutcomeAbandoned, "already settled"
+					return nil
+				})
+				if err != nil {
+					t.Fatalf("UpdateTask(decide task): %v", err)
+				}
+				claimed, err := s.ClaimStep(ctx, stored.ID, task.WorktreeCreated, "owner-1", time.Minute)
+				if err != nil || !claimed {
+					t.Fatalf("ClaimStep = (%v, %v), want true", claimed, err)
+				}
+			},
+		},
+		{
 			name: "sending note",
 			setup: func(t *testing.T, s *state.Store) {
 				addForgetNote(t, s, "note-sending", "repo-a")
@@ -205,6 +227,100 @@ func TestForgetProjectRefusesAStaleFingerprint(t *testing.T) {
 	}
 	if after := forgetTableCounts(t, db); !reflect.DeepEqual(after, before) {
 		t.Errorf("stale fingerprint refusal changed row counts: before %v, after %v", before, after)
+	}
+}
+func TestForgetProjectRefusesEachChangedFingerprintComponent(t *testing.T) {
+	ctx := context.Background()
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, *state.Store)
+	}{
+		{
+			name: "ready-session panes",
+			mutate: func(t *testing.T, s *state.Store) {
+				recordForgetReady(t, s, "w1:p2")
+			},
+		},
+		{
+			name: "notes",
+			mutate: func(t *testing.T, s *state.Store) {
+				addForgetNote(t, s, "note-new", "repo-a")
+			},
+		},
+		{
+			name: "ticket revision",
+			mutate: func(t *testing.T, s *state.Store) {
+				if _, err := s.DecideTicket(ctx, "ticket-a", 1, task.OutcomeIntegrated, "resolved", ""); err != nil {
+					t.Fatalf("DecideTicket: %v", err)
+				}
+			},
+		},
+		{
+			name: "claimed task IDs",
+			mutate: func(t *testing.T, s *state.Store) {
+				claimed, stored, _, err := s.ClaimTask(ctx, gateTask(t, "task-claimed", "repo-a", nil), 3)
+				if err != nil || !claimed {
+					t.Fatalf("ClaimTask = (%v, %+v, %v), want claimed", claimed, stored, err)
+				}
+			},
+		},
+		{
+			name: "project",
+			mutate: func(t *testing.T, s *state.Store) {
+				if err := s.UpdateProject(ctx, "repo-a", func(p *task.Project) error {
+					p.OMPSessionID = "updated-session"
+					return nil
+				}); err != nil {
+					t.Fatalf("UpdateProject: %v", err)
+				}
+			},
+		},
+		{
+			name: "bind intent",
+			mutate: func(t *testing.T, s *state.Store) {
+				if _, acquired, created, err := s.ClaimBindIntent(ctx, "repo-a", "owner", time.Minute, nil, nil); err != nil || !acquired || !created {
+					t.Fatalf("ClaimBindIntent = (acquired %v, created %v, err %v), want new intent", acquired, created, err)
+				}
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := open(t, t.TempDir())
+			createForgetProject(t, s, "repo-a", "w1:p1")
+			createDecidedForgetTask(t, s, "task-a", "repo-a", "w1:p2")
+			mustCreateTicket(t, s, seedTicket("ticket-a", "repo-a"))
+			fingerprint := forgetFingerprint(t, s, "repo-a")
+			tc.mutate(t, s)
+			if _, err := s.ForgetProject(ctx, "repo-a", fingerprint); !errors.Is(err, state.ErrConflict) {
+				t.Fatalf("ForgetProject(stale %s) = %v, want ErrConflict", tc.name, err)
+			}
+		})
+	}
+}
+
+func TestForgetProjectRollsBackWhenTicketDeleteFails(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	s := open(t, dir)
+	createForgetProject(t, s, "repo-a", "w1:p1")
+	recordForgetReady(t, s, "w1:p1")
+	addForgetNote(t, s, "note-a", "repo-a")
+	mustCreateTicket(t, s, seedTicket("ticket-a", "repo-a"))
+	db := rawState(t, dir)
+	if _, err := db.Exec(`CREATE TRIGGER fail_forget_ticket BEFORE DELETE ON tickets
+		BEGIN SELECT RAISE(ABORT, 'injected ticket delete failure'); END`); err != nil {
+		t.Fatalf("create ticket-delete trigger: %v", err)
+	}
+	before := forgetTableSnapshot(t, db)
+	fingerprint := forgetFingerprint(t, s, "repo-a")
+	if _, err := s.ForgetProject(ctx, "repo-a", fingerprint); err == nil ||
+		errors.Is(err, state.ErrConflict) || errors.Is(err, state.ErrForgetBlocked) {
+		t.Fatalf("ForgetProject with ticket-delete failure = %v, want another error", err)
+	}
+	if after := forgetTableSnapshot(t, db); !reflect.DeepEqual(after, before) {
+		t.Errorf("failed forget changed table contents: before %v, after %v", before, after)
 	}
 }
 
@@ -336,4 +452,43 @@ func readyPaneExists(t *testing.T, db *sql.DB, panes ...string) []bool {
 		got[i] = count != 0
 	}
 	return got
+}
+func forgetTableSnapshot(t *testing.T, db *sql.DB) map[string][][]string {
+	t.Helper()
+	snapshot := make(map[string][][]string)
+	for _, table := range []string{"projects", "tasks", "inbox", "tickets", "ready_sessions", "bind_intents", "task_history"} {
+		rows, err := db.QueryContext(context.Background(), "SELECT * FROM "+table+" ORDER BY rowid")
+		if err != nil {
+			t.Fatalf("read %s rows: %v", table, err)
+		}
+		columns, err := rows.Columns()
+		if err != nil {
+			_ = rows.Close()
+			t.Fatalf("read %s columns: %v", table, err)
+		}
+		for rows.Next() {
+			values := make([]any, len(columns))
+			destinations := make([]any, len(columns))
+			for i := range values {
+				destinations[i] = &values[i]
+			}
+			if err := rows.Scan(destinations...); err != nil {
+				_ = rows.Close()
+				t.Fatalf("scan %s row: %v", table, err)
+			}
+			record := make([]string, len(values))
+			for i, value := range values {
+				record[i] = fmt.Sprintf("%T:%#v", value, value)
+			}
+			snapshot[table] = append(snapshot[table], record)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			t.Fatalf("iterate %s rows: %v", table, err)
+		}
+		if err := rows.Close(); err != nil {
+			t.Fatalf("close %s rows: %v", table, err)
+		}
+	}
+	return snapshot
 }

@@ -937,7 +937,7 @@ func (s *Store) PendingInbox(ctx context.Context, projectKey string) ([]task.Inb
 	if strings.TrimSpace(projectKey) == "" {
 		return nil, fmt.Errorf("%w: project key is required", ErrInvalid)
 	}
-	return s.inboxRows(ctx, "the pending inbox of "+fmt.Sprintf("%q", projectKey),
+	return inboxRows(ctx, s.db, "the pending inbox of "+fmt.Sprintf("%q", projectKey),
 		`SELECT `+inboxSelect+` FROM inbox WHERE project_key = ? AND delivery_state = ?
 		 ORDER BY rowid`, projectKey, task.DeliveryPending)
 }
@@ -950,13 +950,13 @@ func (s *Store) ProjectInbox(ctx context.Context, projectKey string) ([]task.Inb
 	if strings.TrimSpace(projectKey) == "" {
 		return nil, fmt.Errorf("%w: project key is required", ErrInvalid)
 	}
-	return s.inboxRows(ctx, "the inbox of "+fmt.Sprintf("%q", projectKey),
+	return inboxRows(ctx, s.db, "the inbox of "+fmt.Sprintf("%q", projectKey),
 		`SELECT `+inboxSelect+` FROM inbox WHERE project_key = ? ORDER BY rowid`, projectKey)
 }
 
 // inboxRows runs one inbox query and scans every row it returns.
-func (s *Store) inboxRows(ctx context.Context, what, query string, args ...any) ([]task.Inbox, error) {
-	rows, err := s.db.QueryContext(ctx, query, args...)
+func inboxRows(ctx context.Context, q querier, what, query string, args ...any) ([]task.Inbox, error) {
+	rows, err := q.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", what, err)
 	}

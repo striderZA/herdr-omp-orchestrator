@@ -132,7 +132,8 @@ func readForgetFacts(ctx context.Context, q forgetFactQuerier, key string) (task
 		return task.ForgetFacts{}, fmt.Errorf("close claimed tasks for project %q: %w", key, err)
 	}
 
-	notes, err := queryForgetInbox(ctx, q, key)
+	notes, err := inboxRows(ctx, q, "inbox notes for project "+fmt.Sprintf("%q", key),
+		`SELECT `+inboxSelect+` FROM inbox WHERE project_key = ? ORDER BY rowid, id`, key)
 	if err != nil {
 		return task.ForgetFacts{}, err
 	}
@@ -160,28 +161,6 @@ func readForgetFacts(ctx context.Context, q forgetFactQuerier, key string) (task
 		Tickets:           tickets,
 		BindIntentOpen:    intentCount > 0,
 	}, nil
-}
-
-func queryForgetInbox(ctx context.Context, q querier, key string) ([]task.Inbox, error) {
-	rows, err := q.QueryContext(ctx,
-		`SELECT `+inboxSelect+` FROM inbox WHERE project_key = ? ORDER BY rowid, id`, key)
-	if err != nil {
-		return nil, fmt.Errorf("read inbox notes for project %q: %w", key, err)
-	}
-	defer rows.Close()
-
-	notes := make([]task.Inbox, 0)
-	for rows.Next() {
-		note, err := scanInbox(rows, "inbox note for project "+key)
-		if err != nil {
-			return nil, err
-		}
-		notes = append(notes, note)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate inbox notes for project %q: %w", key, err)
-	}
-	return notes, nil
 }
 
 // forgetReadySessionPanes is shared by the read-only plan snapshot and the
