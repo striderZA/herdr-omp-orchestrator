@@ -38,6 +38,7 @@ A repository can be bound but never removed. `bind` refuses a pane that a projec
 - Worktrees and branches stay on disk. A later `bind` of the same repository starts a new project, and nothing records the old worktrees, so nothing adopts them.
 - A board open on the forgotten project should fail its read until it is closed. This is expected and not yet observed.
 - No bridge method, extension change or protocol change.
+- Forget keeps the `task_history` rows. Their append-only triggers forbid DELETE, and they are the audit trail of forgotten work; they keep the forgotten project's key, and no reader of the plugin depends on them.
 
 ## Decided in review
 

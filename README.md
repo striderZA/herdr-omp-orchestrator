@@ -91,7 +91,7 @@ Use **Forget a project** when you want to remove this plugin's records for a rep
 
 Forget refuses if a task has no outcome: record its outcome through the primary first. If the primary is gone, reattach it before recording that outcome. A task that is still active, a `sending` or `uncertain` note, a bind in progress, or an uncertain reattach notice also blocks forgetting. Wait for `sending` or `uncertain` notes to resolve; do not try to clear them by forgetting.
 
-After a confirmed forget, the plugin's project, task, ticket, inbox, and session records are deleted. The repository, its branches and worktrees, and Herdr workspaces and panes stay; forgetting does not remove checkouts or close sessions. To confirm, type the project's folder name exactly as shown in the prompt. Pressing Enter without that name cancels and deletes nothing.
+After a confirmed forget, the plugin deletes the project's `ready_sessions`, `inbox`, `tickets`, `tasks`, and `projects` rows. It does not delete `task_history`; those rows remain as the audit trail for the forgotten work, including the project key.
 
 The primary keeps its read-only restriction until its OMP session restarts. Restart that session or close its pane to clear the restriction.
 
