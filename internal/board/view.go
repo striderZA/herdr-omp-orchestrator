@@ -540,7 +540,9 @@ func cardColor(card Card, selected string) string {
 }
 
 // cardText is one card's single line: its selection marker, a text attention
-// marker for needs-input cards, its ID and title, and Herdr's activity separately.
+// marker for needs-input cards, its title, its ID and Herdr's activity. The title
+// comes first, so a narrow column clips the identifier, not the words a reader
+// scans for.
 func cardText(card Card, selected bool) string {
 	marker := "  "
 	if selected {
@@ -549,11 +551,21 @@ func cardText(card Card, selected bool) string {
 	if card.Stage == task.NeedsInput {
 		marker += "! "
 	}
-	text := marker + "[" + card.ID() + "] " + singleLine(card.Title())
+	text := identifiedText(marker, card.Title(), card.ID())
 	if activity := card.Activity(); activity != "" {
 		text += " (" + activity + ")"
 	}
 	return text
+}
+
+// identifiedText is a card's label: the title, then its ID in brackets. Both
+// layouts use it, so a task and a ticket read the same way.
+func identifiedText(marker, title, id string) string {
+	title = singleLine(title)
+	if title == "" {
+		return marker + "[" + id + "]"
+	}
+	return marker + title + " [" + id + "]"
 }
 
 // singleLine collapses a human-entered value onto one line. A title or branch

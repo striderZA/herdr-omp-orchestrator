@@ -628,6 +628,30 @@ func TestBoardColorsFollowTheTheme(t *testing.T) {
 	}
 }
 
+// TestWideCardsShowEachTitleInItsColumn pins the wide layout's readability: a
+// card's title comes before its ID, so a long identifier clips the ID rather than
+// the words a reader scans for. Each title must show at every wide width.
+func TestWideCardsShowEachTitleInItsColumn(t *testing.T) {
+	needs := sampleTask("orch_c3d4e5f60718", func(x *task.Task) {
+		x.Title = "Wire up the reattach notice"
+		x.Blocker = "which error contract?"
+	})
+	board := NewBoardWithTickets([]Card{
+		{Task: sampleTask("orch_74f44236d891", func(x *task.Task) { x.Title = "Plan: add a single line to the root readme" }), Stage: task.Queued},
+		{Task: sampleTask("orch_9a1c2e7b0f35", func(x *task.Task) { x.Title = "Add Hello World line to README" }), Stage: task.Running},
+		{Task: needs, Stage: task.NeedsInput},
+	}, []TicketCard{ticketCardOf("tkt_1e7d7716b6fa", "add a single line to the root readme", task.TicketBacklog)})
+	theme := Theme{Profile: termenv.Ascii, Unicode: true}
+	for _, width := range []int{MinWideWidth, 100, 120} {
+		out := Render(board, Detail{}, width, theme)
+		for _, title := range []string{"Plan: add", "Add Hello", "Wire up", "add a singl"} {
+			if !strings.Contains(out, title) {
+				t.Errorf("width %d: the wide board does not show %q, so the ID hides the title:\n%s", width, title, out)
+			}
+		}
+	}
+}
+
 func TestNeedsInputMarkerIsVisibleWithoutColorInWideAndNarrowLayouts(t *testing.T) {
 	needs := sampleTask("orch_n3", func(x *task.Task) { x.Blocker = "which error contract?"; x.Title = "x" })
 	running := sampleTask("orch_r2", func(x *task.Task) { x.Activity = "done"; x.Title = "x" })
@@ -647,11 +671,11 @@ func TestNeedsInputMarkerIsVisibleWithoutColorInWideAndNarrowLayouts(t *testing.
 		t.Run(tc.name, func(t *testing.T) {
 			unselected := Render(board, Detail{SelectedID: running.ID}, tc.width, theme)
 			needsLine := lineContaining(t, strings.Split(unselected, "\n"), "["+needs.ID+"]")
-			if !strings.Contains(needsLine, "! ["+needs.ID+"]") {
+			if !strings.Contains(needsLine, "! x ["+needs.ID+"]") {
 				t.Errorf("unselected needs-input card lacks a plain-text attention marker:\n%s", needsLine)
 			}
 			runningLine := lineContaining(t, strings.Split(unselected, "\n"), "["+running.ID+"]")
-			if strings.Contains(runningLine, "! ["+running.ID+"]") {
+			if strings.Contains(runningLine, "! x ["+running.ID+"]") {
 				t.Errorf("running card carries the needs-input marker:\n%s", runningLine)
 			}
 			if !strings.Contains(runningLine, "(done)") {
@@ -660,7 +684,7 @@ func TestNeedsInputMarkerIsVisibleWithoutColorInWideAndNarrowLayouts(t *testing.
 
 			selected := Render(board, Detail{SelectedID: needs.ID}, tc.width, theme)
 			selectedNeedsLine := lineContaining(t, strings.Split(selected, "\n"), "["+needs.ID+"]")
-			if !strings.Contains(selectedNeedsLine, "> ! ["+needs.ID+"]") {
+			if !strings.Contains(selectedNeedsLine, "> ! x ["+needs.ID+"]") {
 				t.Errorf("selection hides or replaces the needs-input marker:\n%s", selectedNeedsLine)
 			}
 

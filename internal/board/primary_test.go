@@ -144,7 +144,7 @@ func TestPrimaryMarkerShowsOnABoardWithNothingElse(t *testing.T) {
 		t.Errorf("an empty board hides the marker or its own message:\n%s", empty)
 	}
 	ticketsOnly := Render(NewBoardWithTickets(nil, []TicketCard{ticketCardOf("tkt_a1", "first", task.TicketBacklog)}).WithPrimaryAttention(sampleAbsence), Detail{}, 100, th)
-	if !strings.HasPrefix(ticketsOnly, "Primary not verified: ") || !strings.Contains(ticketsOnly, "[tkt_a1] first") {
+	if !strings.HasPrefix(ticketsOnly, "Primary not verified: ") || !strings.Contains(ticketsOnly, "first [tkt_a1]") {
 		t.Errorf("a board with only tickets hides the marker or a ticket:\n%s", ticketsOnly)
 	}
 }

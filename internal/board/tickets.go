@@ -175,14 +175,14 @@ func (b *Board) showsTickets(d Detail) bool {
 	return d.TicketWrites || (b != nil && len(b.tickets) > 0)
 }
 
-// ticketText is one ticket card's single line: its ID (the identity) and its
-// title, collapsed onto one line like a task's.
+// ticketText is one ticket card's single line: its title, then its ID (the
+// identity), the same order a task card uses.
 func ticketText(card TicketCard, selected bool) string {
 	marker := "  "
 	if selected {
 		marker = "> "
 	}
-	return marker + "[" + card.ID() + "] " + singleLine(card.Ticket.Title)
+	return identifiedText(marker, card.Ticket.Title, card.ID())
 }
 
 func ticketColor(card TicketCard, selected string) string {

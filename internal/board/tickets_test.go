@@ -81,13 +81,13 @@ func TestTicketColumnsAppearOnlyWithATicketOrEnabledWrites(t *testing.T) {
 	}
 	// A ticket, writes disabled: the columns are drawn because there is a card.
 	board := NewBoardWithTickets(cards, []TicketCard{ticketCardOf("tkt_a1", "first", task.TicketBacklog)})
-	if out := Render(board, Detail{}, 100, ticketTheme); !strings.Contains(out, "[tkt_a1] first") {
+	if out := Render(board, Detail{}, 100, ticketTheme); !strings.Contains(out, "first [tkt_a1]") {
 		t.Fatalf("a backlog ticket must be drawn even when writes are disabled:\n%s", out)
 	}
 	// Tickets and no tasks at all: the ticket columns replace nothing and the
 	// task message still says there are no tasks.
 	only := Render(NewBoardWithTickets(nil, []TicketCard{ticketCardOf("tkt_a1", "first", task.TicketBacklog)}), Detail{}, 100, ticketTheme)
-	if !strings.Contains(only, "[tkt_a1] first") || !strings.Contains(only, "No tasks yet") {
+	if !strings.Contains(only, "first [tkt_a1]") || !strings.Contains(only, "No tasks yet") {
 		t.Fatalf("a board with tickets and no tasks shows both:\n%s", only)
 	}
 }
@@ -106,7 +106,7 @@ func TestTicketColumnsRenderBeforeQueued(t *testing.T) {
 		if backlog < 0 || todo < 0 || queued < 0 || backlog >= queued || todo >= queued {
 			t.Fatalf("width %d: Backlog (%d) and Todo (%d) must precede Queued (%d):\n%s", width, backlog, todo, queued, out)
 		}
-		if indexOfLine(lines, "[tkt_b1] write the docs") < 0 || indexOfLine(lines, "[tkt_t1] ship the thing") < 0 {
+		if indexOfLine(lines, "write the docs") < 0 || indexOfLine(lines, "ship the thing") < 0 {
 			t.Fatalf("width %d: both tickets must be drawn:\n%s", width, out)
 		}
 		if got := len(board.TicketColumn(task.TicketBacklog)); got != 1 {
@@ -153,7 +153,7 @@ func TestTicketCardStaysOneBoundedLine(t *testing.T) {
 	}
 	// Where the cell holds it, every rune of the title is intact on one line.
 	out := Render(board, Detail{}, 100, ticketTheme)
-	if !strings.Contains(out, "[tkt_cjk] 日本語 second") {
+	if !strings.Contains(out, "日本語 second") {
 		t.Fatalf("the wide title must be one intact line:\n%s", out)
 	}
 }
@@ -300,7 +300,7 @@ func TestAnUnplacedTicketIsShownNotDropped(t *testing.T) {
 	stranded := ticketCardOf("tkt_s1", "stranded", task.TicketInProgress)
 	board := NewBoardWithTickets(nil, []TicketCard{stranded})
 	out := Render(board, Detail{}, 100, ticketTheme)
-	if !strings.Contains(out, "Not placed by this build:") || !strings.Contains(out, "[tkt_s1] stranded") {
+	if !strings.Contains(out, "Not placed by this build:") || !strings.Contains(out, "stranded [tkt_s1]") {
 		t.Fatalf("a ticket this build cannot place must still be shown:\n%s", out)
 	}
 	if strings.Contains(out, "Backlog") {
@@ -1000,7 +1000,9 @@ func TestControlCharactersInStoredTextNeverReachTheScreen(t *testing.T) {
 // TestBoardWithoutTicketsRendersExactlyAsBefore does) cannot catch a change in the
 // no-ticket output. These SHA-256 digests record the board after f653bb6 added the
 // search footer (the current base's no-ticket render) for these cards, widths, and
-// selections. Ticket rendering must not change that baseline.
+// selections. Ticket rendering must not change that baseline. They were re-recorded
+// once, on purpose, when a task card moved its title before its ID: that order is
+// the only change these plain (uncolored) renders show.
 func TestBoardWithoutTicketsMatchesTheSearchBaseline(t *testing.T) {
 	cards := []Card{
 		{Task: sampleTask("orch_a", nil), Stage: task.Running},
@@ -1012,12 +1014,12 @@ func TestBoardWithoutTicketsMatchesTheSearchBaseline(t *testing.T) {
 		"expanded": {SelectedID: "orch_a", Expanded: true},
 	}
 	want := map[string]string{
-		"100/none":     "263c7331e70d55a87fd3ef4dd9a1385daa921577a6d31a026c3c7e15e94fb393",
-		"100/selected": "3fc1d5f6585ec75ff3eb6d7f8af5d6d07b661e533d2f3e7b9a0b90588cfb064b",
-		"100/expanded": "06eca67407fa95564743ee794a29f05ec46d547ba6c102942a88a63118bb02bd",
-		"80/none":      "0f53761920731b01c96057d061a9021e10c8099ac63861075d1acd81a99c1c2b",
-		"80/selected":  "3b7da3cd845c34e5515cf2ae5f17924baf9f846d69af161a613b03d198e0b10c",
-		"80/expanded":  "8d5f702422c13760abd1e9a3c1caa88d4c845abbda0c68a0288550f860bad8ef",
+		"100/none":     "cc6c0ee8a5d3fc5e0c0132841044a5a38c8e34c9d81c0593a3c6b82f480ab0fe",
+		"100/selected": "73320d5851be69e4aba549f486596e4602eb8944dc8c3befad3b974c1a6cc43c",
+		"100/expanded": "daf4f7c8acfa17255aedf3c68cf2c907a2ad641b1791e5893707aa798f2a0dca",
+		"80/none":      "06c08aaa33cff016bd0895171c4567c4b690b02f7a544d01ef43f9fa18caf154",
+		"80/selected":  "de59818d4e84c36f1f1194dcdfb759b4f4c655dc7adfe66857363718de74b68e",
+		"80/expanded":  "bff265a9655d1ffd4fd9e1d3009bb570a3cdcbf6a01a72e65a90cd601022eda9",
 	}
 	digest := func(out string) string {
 		sum := sha256.Sum256([]byte(out))
