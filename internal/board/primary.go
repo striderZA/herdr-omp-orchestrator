@@ -20,7 +20,7 @@ import (
 const (
 	// primaryMarkerLabel opens the marker. It is words, not a glyph or a color, so
 	// it reads the same on a terminal without either.
-	primaryMarkerLabel = "Primary not verified: "
+	primaryMarkerLabel       = "Primary not verified: "
 	primaryMarkerInstruction = "Reattach the primary OMP session"
 	// primaryMarkerMaxLines bounds the marker so a long recorded reason cannot push
 	// the board off a small terminal.
