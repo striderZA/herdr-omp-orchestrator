@@ -171,3 +171,16 @@ func TestCoordCodeMapsTheForgetErrors(t *testing.T) {
 		}
 	}
 }
+func TestManifestDeclaresTheForgetActionAndItsPane(t *testing.T) {
+	action := manifestEntry(t, "actions", "forget")
+	if got, want := action.fields["command"], `["./herdr-omp-orchestrator.exe", "open-forget"]`; got != want {
+		t.Errorf("action command = %s, want %s", got, want)
+	}
+	pane := manifestEntry(t, "panes", "forget")
+	if got, want := pane.fields["command"], `["./herdr-omp-orchestrator.exe", "forget"]`; got != want {
+		t.Errorf("pane command = %s, want %s", got, want)
+	}
+	if got, want := pane.fields["placement"], `"overlay"`; got != want {
+		t.Errorf("pane placement = %s, want %s", got, want)
+	}
+}
