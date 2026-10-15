@@ -652,6 +652,33 @@ func TestWideCardsShowEachTitleInItsColumn(t *testing.T) {
 	}
 }
 
+// TestColumnHeadingsAreBoldInColorTerminals pins emphasis by weight: every column
+// heading, task and ticket alike, opens with a bold sequence in a color terminal,
+// in both layouts. The colors stay with the cards.
+func TestColumnHeadingsAreBoldInColorTerminals(t *testing.T) {
+	board := NewBoardWithTickets(
+		[]Card{{Task: sampleTask("orch_r2", nil), Stage: task.Running}},
+		[]TicketCard{ticketCardOf("tkt_a1", "first", task.TicketBacklog)},
+	)
+	headings := []string{
+		StageLabel(task.Queued), StageLabel(task.Running), StageLabel(task.NeedsInput),
+		StageLabel(task.ReadyForReview), StageLabel(task.Done),
+		TicketStageLabel(task.TicketBacklog), TicketStageLabel(task.TicketTodo),
+	}
+	for _, width := range []int{60, 100} {
+		out := Render(board, Detail{}, width, Theme{Profile: termenv.TrueColor, Unicode: true})
+		for _, heading := range headings {
+			at := strings.Index(out, heading)
+			if at < 0 {
+				t.Fatalf("width %d: the board does not show the heading %q:\n%s", width, heading, out)
+			}
+			if params := sgrParamsBefore(out, at); !strings.Contains(";"+params+";", ";1;") {
+				t.Errorf("width %d: the heading %q is not bold (escape parameters %q)", width, heading, params)
+			}
+		}
+	}
+}
+
 func TestNeedsInputMarkerIsVisibleWithoutColorInWideAndNarrowLayouts(t *testing.T) {
 	needs := sampleTask("orch_n3", func(x *task.Task) { x.Blocker = "which error contract?"; x.Title = "x" })
 	running := sampleTask("orch_r2", func(x *task.Task) { x.Activity = "done"; x.Title = "x" })
@@ -723,6 +750,20 @@ func visibleWidth(line string) int {
 
 // runeWidth is the same count for an uncolored line.
 func runeWidth(line string) int { return runewidth.StringWidth(line) }
+
+// sgrParamsBefore returns the SGR parameters of the escape sequence that opens
+// the text at index at, or "" when no escape sequence opens it.
+func sgrParamsBefore(s string, at int) string {
+	open := strings.LastIndex(s[:at], "\x1b[")
+	if open < 0 {
+		return ""
+	}
+	end := strings.IndexByte(s[open:], 'm')
+	if end < 0 || open+end >= at {
+		return ""
+	}
+	return s[open+2 : open+end]
+}
 
 func lineContaining(t *testing.T, lines []string, want string) string {
 	t.Helper()

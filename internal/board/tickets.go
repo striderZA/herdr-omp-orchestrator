@@ -215,7 +215,7 @@ func wideTicketColumns(b *Board, d Detail, width int, th Theme) []string {
 
 	heads := make([]string, len(TicketColumns))
 	for i, stage := range TicketColumns {
-		heads[i] = padded(th.paint(Muted, clip(TicketStageLabel(stage), cell)), cell)
+		heads[i] = padded(th.bold(clip(TicketStageLabel(stage), cell)), cell)
 	}
 	out := []string{strings.Join(heads, " ")}
 	for row := range rows {
@@ -240,7 +240,7 @@ func narrowTicketSections(b *Board, d Detail, width int, th Theme) []string {
 			out = append(out, "")
 		}
 		cards := b.TicketColumn(stage)
-		out = append(out, th.paint(Muted, clip(fmt.Sprintf("%s (%d)", TicketStageLabel(stage), len(cards)), width)))
+		out = append(out, th.bold(clip(fmt.Sprintf("%s (%d)", TicketStageLabel(stage), len(cards)), width)))
 		for _, card := range cards {
 			out = append(out, th.paint(ticketColor(card, d.SelectedID), clip(ticketText(card, card.ID() == d.SelectedID), width)))
 		}

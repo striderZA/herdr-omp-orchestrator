@@ -101,6 +101,16 @@ func (t Theme) paint(hex, text string) string {
 	return t.Profile.String(text).Foreground(t.Profile.Color(hex)).String()
 }
 
+// bold sets a heading apart by weight rather than by another palette color, so
+// the palette keeps its single strong accent. The text keeps the terminal's own
+// color, and the Ascii profile yields it unchanged.
+func (t Theme) bold(text string) string {
+	if text == "" || t.Profile == termenv.Ascii {
+		return text
+	}
+	return t.Profile.String(text).Bold().String()
+}
+
 func (t Theme) rule() string {
 	if t.Unicode {
 		return "─"
@@ -477,7 +487,7 @@ func wideColumns(b *Board, d Detail, width int, th Theme) []string {
 
 	heads := make([]string, len(Columns))
 	for i, stage := range Columns {
-		heads[i] = padded(th.paint(Muted, clip(StageLabel(stage), cell)), cell)
+		heads[i] = padded(th.bold(clip(StageLabel(stage), cell)), cell)
 	}
 	out := []string{strings.Join(heads, " ")}
 
@@ -516,7 +526,7 @@ func narrowSections(b *Board, d Detail, width int, th Theme) []string {
 		}
 		cards := b.Column(stage)
 		heading := fmt.Sprintf("%s (%d)", StageLabel(stage), len(cards))
-		out = append(out, th.paint(Muted, clip(heading, width)))
+		out = append(out, th.bold(clip(heading, width)))
 		for _, card := range cards {
 			out = append(out, th.paint(cardColor(card, d.SelectedID), clip(cardText(card, card.ID() == d.SelectedID), width)))
 		}
