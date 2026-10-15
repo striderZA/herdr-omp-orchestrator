@@ -595,6 +595,12 @@ func herdrBinary(env map[string]string) string {
 // plugin log can classify.
 func coordCode(err error) string {
 	switch {
+	case errors.Is(err, coord.ErrForgetRefused):
+		return "forget_refused"
+	case errors.Is(err, coord.ErrForgetPlanChanged):
+		return "forget_plan_changed"
+	case errors.Is(err, coord.ErrForgetNotConfirmed):
+		return "forget_not_confirmed"
 	case errors.Is(err, coord.ErrReattachPending):
 		// Checked first: a pending reattach wraps the cause that left it pending
 		// (a readiness timeout, a refused notice), and the caller must hear that
