@@ -33,16 +33,23 @@ type InboxPreviewParams struct {
 
 // InboxSettlePreview is the read-only view a user decides an uncertain note on.
 // Digest covers every fact shown, so a settlement quotes back exactly what was
-// inspected. Summary is the worker's own text, bounded for display.
+// inspected. Summary is the worker's own text, bounded for display. Each
+// *Truncated flag reports that the display cut its text to the bound. The digest
+// still covers the whole text, so the dialog must say which texts were cut. The
+// flags are always present, so a reader that needs them can refuse a preview that
+// lacks them.
 type InboxSettlePreview struct {
-	NoteID         string `json:"noteId"`
-	TaskID         string `json:"taskId,omitempty"`
-	Kind           string `json:"kind"`
-	Label          string `json:"label,omitempty"`
-	Summary        string `json:"summary"`
-	DeliveryState  string `json:"deliveryState"`
-	DeliveryDetail string `json:"deliveryDetail"`
-	Digest         string `json:"digest"`
+	NoteID                  string `json:"noteId"`
+	TaskID                  string `json:"taskId,omitempty"`
+	Kind                    string `json:"kind"`
+	Label                   string `json:"label,omitempty"`
+	LabelTruncated          bool   `json:"labelTruncated"`
+	Summary                 string `json:"summary"`
+	SummaryTruncated        bool   `json:"summaryTruncated"`
+	DeliveryState           string `json:"deliveryState"`
+	DeliveryDetail          string `json:"deliveryDetail"`
+	DeliveryDetailTruncated bool   `json:"deliveryDetailTruncated"`
+	Digest                  string `json:"digest"`
 }
 
 // InboxSettleParams is the inbox_settle request body: the note, the digest the user
@@ -68,15 +75,22 @@ func (c *Coordinator) InboxPreviewFor(ctx context.Context, projectKey, noteID st
 	if err != nil {
 		return InboxSettlePreview{}, err
 	}
+	summary := strings.TrimSpace(note.Summary)
+	label := truncateRunes(note.Delivery, inspectTextLimit)
+	shownSummary := truncateRunes(summary, inspectTextLimit)
+	detail := truncateRunes(note.DeliveryDetail, inspectDetailLimit)
 	return InboxSettlePreview{
-		NoteID:         note.ID,
-		TaskID:         note.TaskID,
-		Kind:           note.Kind,
-		Label:          truncateRunes(note.Delivery, inspectTextLimit),
-		Summary:        truncateRunes(strings.TrimSpace(note.Summary), inspectTextLimit),
-		DeliveryState:  note.State(),
-		DeliveryDetail: truncateRunes(note.DeliveryDetail, inspectDetailLimit),
-		Digest:         note.Digest(),
+		NoteID:                  note.ID,
+		TaskID:                  note.TaskID,
+		Kind:                    note.Kind,
+		Label:                   label,
+		LabelTruncated:          label != note.Delivery,
+		Summary:                 shownSummary,
+		SummaryTruncated:        shownSummary != summary,
+		DeliveryState:           note.State(),
+		DeliveryDetail:          detail,
+		DeliveryDetailTruncated: detail != note.DeliveryDetail,
+		Digest:                  note.Digest(),
 	}, nil
 }
 

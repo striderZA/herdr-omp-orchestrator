@@ -161,3 +161,37 @@ func TestInboxSettleRefusesAStaleDigestAndAnUnknownDecision(t *testing.T) {
 		t.Fatalf("repeat settlement = %v, want ErrNoteNotUncertain", err)
 	}
 }
+
+// TestInboxPreviewSaysWhichTextItShortens pins the evidence the settle dialog
+// gives. The digest covers each full text, so a preview that cuts the label, the
+// summary or the recorded detail must say which one. A text that fits is shown
+// whole and is not flagged.
+func TestInboxPreviewSaysWhichTextItShortens(t *testing.T) {
+	long := strings.Repeat("x", inspectTextLimit+inspectDetailLimit)
+	for _, tc := range []struct {
+		name                            string
+		summary, label, detail          string
+		labelCut, summaryCut, detailCut bool
+	}{
+		{"nothing is shortened", "finished", "worker result", "short detail", false, false, false},
+		{"the label is shortened", "finished", long, "short detail", true, false, false},
+		{"the summary is shortened", long, "worker result", "short detail", false, true, false},
+		{"the detail is shortened", "finished", "worker result", long, false, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newCoordFixture(t, fixturePlan{})
+			id := f.queueNote(t, f.boundWorker(t), "result", tc.summary, tc.label).ID
+			f.settleInboxNote(id, task.DeliveryUncertain, tc.detail)
+			preview, err := f.coord.InboxPreviewFor(context.Background(), f.projectKey(), id)
+			if err != nil {
+				t.Fatalf("InboxPreviewFor: %v", err)
+			}
+			if preview.LabelTruncated != tc.labelCut || preview.SummaryTruncated != tc.summaryCut ||
+				preview.DeliveryDetailTruncated != tc.detailCut {
+				t.Fatalf("truncated label %t, summary %t, detail %t; want %t, %t, %t",
+					preview.LabelTruncated, preview.SummaryTruncated, preview.DeliveryDetailTruncated,
+					tc.labelCut, tc.summaryCut, tc.detailCut)
+			}
+		})
+	}
+}
