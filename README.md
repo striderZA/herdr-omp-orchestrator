@@ -110,6 +110,7 @@ Common refusal codes. Bind and setup write theirs to the plugin log; a dispatch 
 | `forget_refused` | The plan has a blocking reason. Record undecided task outcomes through the primary (reattach it first if it is gone); if a task is active, wait for its work to stop, then record its outcome. An active claim must finish. An open bind intent may clear by running **Bind this repository as an orchestrated project**; an uncertain reattach notice can be cleared by running **Reattach the primary OMP session** once the replacement session has announced itself. `sending` and `uncertain` notes block forgetting, and the plugin has no action that clears an `uncertain` note yet. |
 | `forget_plan_changed` | The project changed after planning. Open the forget action again, review the new plan, and confirm it again. |
 | `forget_not_confirmed` | The typed folder name did not match, or Enter cancelled. The pane prints “Cancelled. Nothing was changed.” and writes this code to its stderr envelope; nothing is deleted. The coordinator returns the same code for a plan that has no fingerprint. |
+| `extension_conflict` | The OMP extensions directory for the active profile already contains a `herdr-orchestrator.ts` that was not written by this plugin. Move or rename the existing `herdr-orchestrator.ts` in that directory, then run **Setup OMP orchestrator extension** again. |
 
 ## What setup writes
 
