@@ -74,6 +74,10 @@ Run **Open the task board**. It opens as an overlay in the project's workspace.
 - `n` creates a ticket from a title you type; Enter saves it and Esc cancels. Creating a ticket starts nothing.
 - `m` moves the selected backlog ticket to **Todo** and records its planner, which starts or queues when all worker slots are busy. From then on the board shows the ticket through that planner's task. The keypress is the only confirmation: the board shows no dialog for `m`. It needs a commit at HEAD.
 
+### Status of the plugin
+
+Run **Show orchestrator status** to open the status overlay. It reports `OMP integration` and `Plugin extension` verification from setup; the project resolved for this pane, or that no project resolves; whether the primary is verified (`Primary: verified`) or needs reattaching (`Primary: not verified; reattach is needed`); and whether the board can open (`Board: can open` or `Board: cannot open`). When no project resolves, the line is `Project: none resolved`. The status pane writes nothing. Press Enter to close it.
+
 ### 4. Plan a ticket before coding (optional)
 
 1. Press `n` on the board and title the ticket.
