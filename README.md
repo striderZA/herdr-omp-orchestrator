@@ -92,9 +92,9 @@ Use **Forget this project's orchestrator records** when you want to remove this 
 
 For an undecided task, record its outcome through the primary. If the primary is gone, the forget refusal says to reattach it first. If a task is still active, wait until its work stops, then record its outcome through the primary. A task with an active claim, a `sending` or `uncertain` note, an open bind intent, or an uncertain reattach notice also blocks forgetting. `sending` and `uncertain` notes block the action; the plugin has no action that clears an `uncertain` note yet. For an open bind intent, run **Bind this repository as an orchestrated project**. For an uncertain reattach notice, run **Reattach the primary OMP session** once the replacement session has announced itself.
 
-After a confirmed forget, the plugin deletes the `ready_sessions` rows for the panes currently recorded by the project, and the project's `inbox`, `tickets`, `tasks`, and `projects` rows. It does not delete `task_history`; those rows remain as the audit trail for the forgotten work, including the project key. Pending notes are deleted with the project. Forgetting cannot be undone.
+After a confirmed forget, the plugin deletes the project's `inbox`, `tickets`, `tasks`, and `projects` rows, and the `ready_sessions` rows for the project's current launch pane and its tasks' current launch panes. Rows for panes the project no longer records are kept: a worker pane that was cleaned up, and a primary pane the project was reattached away from. It does not delete `task_history`; those rows remain as the audit trail for the forgotten work, including the project key. Pending notes are deleted with the project. Forgetting cannot be undone.
 The repository, its branches and worktrees, and the Herdr workspaces and panes stay. Forgetting does not remove checkouts or close sessions.
-To confirm, type the project's folder name as the prompt shows it. Pressing Enter alone cancels and deletes nothing.
+To confirm, type the project's folder name as the prompt shows it. Anything else, including Enter alone, cancels and deletes nothing; the pane reports `forget_not_confirmed`.
 
 The primary keeps its read-only restriction until its OMP session restarts. Restart that session or close its pane to clear the restriction.
 
@@ -109,7 +109,7 @@ Common refusal codes. Bind and setup write theirs to the plugin log; a dispatch 
 | `bad_base_revision` | The base is not a commit of this repository. For a dispatch, give the primary a hash of at least seven hex characters from `git rev-parse --short HEAD`; `HEAD` and branch names such as `main` are refused. A ticket move also needs a commit at HEAD, so a repository with no commits needs a first commit. |
 | `forget_refused` | The plan has a blocking reason. Record undecided task outcomes through the primary (reattach it first if it is gone); if a task is active, wait for its work to stop, then record its outcome. An active claim must finish. An open bind intent may clear by running **Bind this repository as an orchestrated project**; an uncertain reattach notice can be cleared by running **Reattach the primary OMP session** once the replacement session has announced itself. `sending` and `uncertain` notes block forgetting, and the plugin has no action that clears an `uncertain` note yet. |
 | `forget_plan_changed` | The project changed after planning. Open the forget action again, review the new plan, and confirm it again. |
-| `forget_not_confirmed` | The forget pane does not return this code: a mismatched typed name or Enter cancels with “Cancelled. Nothing was changed.” and returns `ok: true, forgotten: false`; nothing is deleted. The coordinator returns this code only when a plan has no fingerprint. |
+| `forget_not_confirmed` | The typed folder name did not match, or Enter cancelled. The pane prints “Cancelled. Nothing was changed.” and writes this code to its stderr envelope; nothing is deleted. The coordinator returns the same code for a plan that has no fingerprint. |
 
 ## What setup writes
 
