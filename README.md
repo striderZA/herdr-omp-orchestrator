@@ -72,7 +72,7 @@ Run **Open the task board**. It opens as an overlay in the project's workspace.
 - **Backlog** and **Todo** show tickets that have no implementation work and no undecided planner. Once a ticket has either, the board shows it through its tasks instead. **Queued**, **Running**, **Needs input**, **Ready for review** and **Done** hold tasks.
 - Arrow keys or `j`/`k` move, and Tab or Shift+Tab switches columns. `Enter` toggles details, and `Esc` closes them, or closes the board when none are open. `/` filters, `f` focuses the selected worker's pane, `r` refreshes and `q` closes the board.
 - `n` creates a ticket from a title you type; Enter saves it and Esc cancels. Creating a ticket starts nothing.
-- `m` moves the selected backlog ticket to **Todo** and records its planner, which starts or queues when all worker slots are busy. From then on the board shows the ticket through that planner's task. The keypress is the only confirmation: the board shows no dialog for `m`. It needs a commit at HEAD.
+- `m` moves the selected backlog ticket to **Todo** and records its planner, which starts or queues when all worker slots are busy. From then on the board shows the ticket through that planner's task. `m` asks for confirmation; `y` moves the ticket. It needs a commit at HEAD.
 
 ### Status of the plugin
 

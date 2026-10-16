@@ -739,7 +739,9 @@ func TestMoveKeyOtherKeyCancelsWithoutWriting(t *testing.T) {
 	if cmd := typeText(t, m, "m"); cmd != nil || !strings.Contains(m.View(), "Move this ticket to todo and start its planner? y/N") {
 		t.Fatalf("m must open confirmation before a non-y key cancels it: cmd=%v view:\n%s", cmd != nil, m.View())
 	}
-	press(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")})
+	if cmd := press(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")}); cmd != nil {
+		press(t, m, cmd())
+	}
 	ticket, err := f.store.Ticket(ctx, "tkt_a_backlog")
 	if err != nil {
 		t.Fatalf("read ticket after cancellation: %v", err)
@@ -1151,8 +1153,12 @@ func TestRepeatedMoveKeyDoesNotStartASecondMoveWhileOneIsInFlight(t *testing.T) 
 	if first == nil {
 		t.Fatal("m on a backlog ticket must start the write")
 	}
-	if second := typeText(t, m, "m"); second != nil {
-		t.Fatal("a second m while the first move is in flight must not start another write")
+	if cmd := typeText(t, m, "m"); cmd != nil {
+		t.Fatal("a second m while the first move is in flight must only ask")
+	}
+	if cmd := typeText(t, m, "y"); cmd != nil {
+		press(t, m, cmd())
+		t.Fatal("a second confirmed move while the first is in flight must not start a write")
 	}
 	press(t, m, first())
 	if len(ops.moves) != 1 {
@@ -1213,18 +1219,29 @@ func TestMoveGuardRemembersEveryTicketInFlight(t *testing.T) {
 		t.Fatal("a move for a different ticket is independent and must be allowed while the first is in flight")
 	}
 	press(t, m, tea.KeyMsg{Type: tea.KeyUp})
-	if again := typeText(t, m, "m"); again != nil {
-		t.Fatal("a repeat of m on the first ticket must still be refused while its write is in flight, even after another ticket started")
+	if cmd := typeText(t, m, "m"); cmd != nil {
+		t.Fatal("a repeat of m on the first ticket must only ask")
+	}
+	if cmd := typeText(t, m, "y"); cmd != nil {
+		press(t, m, cmd())
+		t.Fatal("the first ticket's in-flight guard must refuse the confirmed move")
 	}
 	// The first write finishes while the second is still in flight: finishing one
 	// ticket's write must not release the guard of another.
 	press(t, m, startA())
+	if len(ops.moves) != 1 || ops.moves[0].id != "tkt_a_backlog" {
+		t.Fatalf("running the first move must write exactly once, got %+v", ops.moves)
+	}
 	press(t, m, tea.KeyMsg{Type: tea.KeyDown})
 	if got := m.SelectedID(); got != "tkt_b_backlog" {
 		t.Fatalf("selected %q, want the second backlog ticket", got)
 	}
-	if again := typeText(t, m, "m"); again != nil {
-		t.Fatal("the second ticket's write is still in flight: m on it must stay refused after the first write finished")
+	if cmd := typeText(t, m, "m"); cmd != nil {
+		t.Fatal("the second ticket's in-flight move must only ask")
+	}
+	if cmd := typeText(t, m, "y"); cmd != nil {
+		press(t, m, cmd())
+		t.Fatal("the second ticket's in-flight guard must refuse the confirmed move")
 	}
 	press(t, m, startB())
 	if len(ops.moves) != 2 || ops.moves[0].id != "tkt_a_backlog" || ops.moves[1].id != "tkt_b_backlog" {

@@ -250,7 +250,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // key applies one keystroke. Outside this model only two things can change: "f"
 // focuses a pane FocusVerified proved, and "n" and "m" write tickets through
-// TicketOps; "m" is the human's confirmation to start the ticket planner.
+// TicketOps; "m" asks, and "y" confirms the ticket move.
 func (m *Model) key(key tea.KeyMsg) tea.Cmd {
 	if m.promptOpen {
 		return m.promptKey(key)
