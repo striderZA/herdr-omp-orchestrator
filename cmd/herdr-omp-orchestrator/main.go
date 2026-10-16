@@ -25,6 +25,7 @@ import (
 	"herdr-omp-orchestrator/internal/herdr"
 	"herdr-omp-orchestrator/internal/setup"
 	"herdr-omp-orchestrator/internal/state"
+	"herdr-omp-orchestrator/internal/task"
 )
 
 // bridgeTimeout bounds one bridge invocation in the executable itself. The
@@ -155,13 +156,22 @@ type pluginContext struct {
 	WorkspaceID      string `json:"workspace_id"`
 }
 
+func bindNextStep(project task.Project, launchPaneID, invokingPaneID string) string {
+	location := "the primary runs in this pane"
+	if launchPaneID != invokingPaneID {
+		location = fmt.Sprintf("the primary runs in a new workspace on pane %s", launchPaneID)
+	}
+	return fmt.Sprintf("%s for project %s; start work from the task board (open it with the \"Open the task board\" action).", location, project.Key)
+}
+
+func finishBind(project task.Project, invokingPaneID string, answer map[string]any, stdout, stderr io.Writer) int {
+	fmt.Fprintln(stderr, bindNextStep(project, project.LaunchPaneID, invokingPaneID))
+	return emit(stdout, stderr, answer)
+}
+
 // runBind binds the primary OMP session to the repository the action was
 // invoked in. The action answers with one JSON object like every other route,
 // so the Herdr plugin log shows the same result a caller sees.
-func bindNextStep(project string) string {
-	return fmt.Sprintf("The primary runs in the pane this bind ran from for project %s; start work from the task board (open it with the \"Open the task board\" action).", project)
-}
-
 func runBind(env map[string]string, stdout, stderr io.Writer) int {
 	stateDir := strings.TrimSpace(env[envStateDir])
 	if stateDir == "" {
@@ -210,9 +220,7 @@ func runBind(env map[string]string, stdout, stderr io.Writer) int {
 			"resumeUnavailable": "the announced session could not be read back: " + hintErr.Error(),
 		}
 	}
-	fmt.Fprintln(stderr, bindNextStep(project.Key))
-
-	return emit(stdout, stderr, answer)
+	return finishBind(project, invocation.FocusedPaneID, answer, stdout, stderr)
 }
 
 // runStartup is Herdr's `[[startup]]` hook: it reconciles the recorded
