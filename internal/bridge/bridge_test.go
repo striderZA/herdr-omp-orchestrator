@@ -981,6 +981,7 @@ func TestBridgeAdjudicationRefusalsAreCoded(t *testing.T) {
 		{"evidence changed", coord.ErrEvidenceChanged, "evidence_changed"},
 		{"step in flight", coord.ErrStepInFlight, "step_in_flight"},
 		{"invalid request", coord.ErrInvalidRequest, "bad_request"},
+		{"note not uncertain", coord.ErrNoteNotUncertain, "note_not_uncertain"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := coordErrorCode(fmt.Errorf("wrapped: %w", tc.err)); got != tc.want {
