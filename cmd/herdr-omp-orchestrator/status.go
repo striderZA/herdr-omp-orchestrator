@@ -49,10 +49,14 @@ func runStatus(env map[string]string, stdin io.Reader, stdout, stderr io.Writer)
 		body = failureBody("state_dir_unavailable", envStateDir+" is not set")
 		return finishStatus(stdout, stderr, in, lines, body)
 	}
-	store, err := state.Open(stateDir)
+	store, err := state.OpenReadOnly(stateDir)
 	if err != nil {
+		if errors.Is(err, state.ErrStateAbsent) {
+			lines = append(lines, "Project: none resolved (no state recorded yet)", "Board: cannot open (no state recorded yet)")
+			return finishStatus(stdout, stderr, in, lines, body)
+		}
 		lines = append(lines, "Project: none resolved", "Board: cannot open (state store unavailable)")
-		body = failureBody("state_write_failed", fmt.Sprintf("open the orchestrator state: %v", err))
+		body = failureBody("state_read_failed", fmt.Sprintf("read the orchestrator state: %v", err))
 		return finishStatus(stdout, stderr, in, lines, body)
 	}
 	defer func() { _ = store.Close() }()

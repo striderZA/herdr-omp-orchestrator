@@ -24,10 +24,11 @@ import (
 
 // Errors returned by Store. Callers compare them with errors.Is.
 var (
-	ErrConflict  = errors.New("state: conflicting revision")
-	ErrNotFound  = errors.New("state: not found")
-	ErrInvalid   = errors.New("state: invalid record")
-	ErrAmbiguous = errors.New("state: ambiguous session binding")
+	ErrConflict    = errors.New("state: conflicting revision")
+	ErrNotFound    = errors.New("state: not found")
+	ErrInvalid     = errors.New("state: invalid record")
+	ErrStateAbsent = errors.New("state: database is absent")
+	ErrAmbiguous   = errors.New("state: ambiguous session binding")
 	// ErrMismatch reports an announced session that is not the identity the
 	// record was confirmed (or announced) with. It is never a reason to replace
 	// the recorded identity: a human decides which process owns the pane.
@@ -301,6 +302,37 @@ func Open(dir string) (*Store, error) {
 	if _, err := db.Exec(postMigrateIndexes); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("index %q: %w", path, err)
+	}
+	identity, _ := CurrentProcessIdentity()
+	return &Store{
+		db:                  db,
+		processIdentity:     identity,
+		completedTaskOwners: make(map[completedTaskOwner]struct{}),
+	}, nil
+}
+
+// OpenReadOnly opens an existing database without creating files or changing
+// SQLite state. immutable avoids WAL/SHM sidecar creation for a cleanly closed
+// database, as used by the status pane.
+func OpenReadOnly(dir string) (*Store, error) {
+	if strings.TrimSpace(dir) == "" {
+		return nil, fmt.Errorf("%w: empty state dir", ErrInvalid)
+	}
+	path := filepath.Join(dir, dbFile)
+	if _, err := os.Stat(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("%w: %q", ErrStateAbsent, path)
+		}
+		return nil, fmt.Errorf("inspect state database %q: %w", path, err)
+	}
+	uri := "file:" + filepath.ToSlash(path) + "?mode=ro&immutable=1"
+	db, err := sql.Open("sqlite", uri)
+	if err != nil {
+		return nil, fmt.Errorf("open read-only state database %q: %w", path, err)
+	}
+	if err := db.Ping(); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("open read-only state database %q: %w", path, err)
 	}
 	identity, _ := CurrentProcessIdentity()
 	return &Store{

@@ -93,18 +93,33 @@ func TestStatusPaneDoesNotWriteStoreOrSetupFiles(t *testing.T) {
 	}
 }
 
-func TestStatusPaneReportsNoProjectInsteadOfFailing(t *testing.T) {
+func TestStatusPaneReportsNoProjectWithoutCreatingState(t *testing.T) {
 	stateDir := t.TempDir()
+	before, err := os.ReadDir(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var stdout, stderr bytes.Buffer
 	env := map[string]string{envStateDir: stateDir, envWorkspaceID: "unbound", envHerdrBinary: "herdr"}
 	if code := runStatus(env, strings.NewReader("\n"), &stdout, &stderr); code != 0 {
 		t.Fatalf("runStatus = %d: %s", code, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "Project: none resolved") {
-		t.Fatalf("status output = %s", stdout.String())
+	after, err := os.ReadDir(stateDir)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(stdout.String(), "Board: cannot open (") {
-		t.Fatalf("status output = %s", stdout.String())
+	if len(after) != len(before) {
+		t.Fatalf("status changed empty state directory: before=%d entries after=%d", len(before), len(after))
+	}
+	for i := range before {
+		if before[i].Name() != after[i].Name() {
+			t.Fatalf("status changed empty state directory: before=%q after=%q", before[i].Name(), after[i].Name())
+		}
+	}
+	for _, want := range []string{"Project: none resolved (no state recorded yet)", "Board: cannot open (no state recorded yet)"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Errorf("status missing %q:\n%s", want, stdout.String())
+		}
 	}
 }
 func TestManifestDeclaresTheStatusActionAndPane(t *testing.T) {
