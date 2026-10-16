@@ -312,8 +312,8 @@ func Open(dir string) (*Store, error) {
 }
 
 // OpenReadOnly opens an existing database without creating files or changing
-// SQLite state. immutable avoids WAL/SHM sidecar creation for a cleanly closed
-// database, as used by the status pane.
+// SQLite state. A cleanly closed store needs immutable mode to avoid creating
+// WAL/SHM sidecars; an existing WAL or SHM must be honored for fresh reads.
 func OpenReadOnly(dir string) (*Store, error) {
 	if strings.TrimSpace(dir) == "" {
 		return nil, fmt.Errorf("%w: empty state dir", ErrInvalid)
@@ -325,7 +325,21 @@ func OpenReadOnly(dir string) (*Store, error) {
 		}
 		return nil, fmt.Errorf("inspect state database %q: %w", path, err)
 	}
-	uri := "file:" + filepath.ToSlash(path) + "?mode=ro&immutable=1"
+	uri := "file:" + filepath.ToSlash(path) + "?mode=ro"
+	hasSidecar := false
+	for _, suffix := range []string{"-wal", "-shm"} {
+		_, err := os.Stat(path + suffix)
+		if err == nil {
+			hasSidecar = true
+			continue
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("inspect state database sidecar %q: %w", path+suffix, err)
+		}
+	}
+	if !hasSidecar {
+		uri += "&immutable=1"
+	}
 	db, err := sql.Open("sqlite", uri)
 	if err != nil {
 		return nil, fmt.Errorf("open read-only state database %q: %w", path, err)
