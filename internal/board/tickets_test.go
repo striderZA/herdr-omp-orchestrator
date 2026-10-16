@@ -566,6 +566,17 @@ func typeText(t *testing.T, m *Model, text string) tea.Cmd {
 	return press(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(text)})
 }
 
+func moveWithConfirm(t *testing.T, m *Model) tea.Cmd {
+	t.Helper()
+	if cmd := typeText(t, m, "m"); cmd != nil {
+		t.Fatal("m must open confirmation without starting a write")
+	}
+	if !strings.Contains(m.View(), "Move this ticket to todo and start its planner? y/N") {
+		t.Fatalf("m must show the move confirmation:\n%s", m.View())
+	}
+	return typeText(t, m, "y")
+}
+
 func TestNewTicketPromptCapturesKeysAndSubmitsOnce(t *testing.T) {
 	f := newBoardFixture(t, fixturePlan{})
 	f.addTicket(t, "tkt_a_backlog", task.ColumnBacklog)
@@ -694,6 +705,49 @@ func TestBlankTitleIsNotSubmitted(t *testing.T) {
 		t.Fatalf("the title is trimmed: %+v", ops.creates)
 	}
 }
+func TestMoveKeyRequiresYConfirmation(t *testing.T) {
+	f := newBoardFixture(t, fixturePlan{})
+	f.addTicket(t, "tkt_a_backlog", task.ColumnBacklog)
+	f.seed(t)
+	ops := &fakeTicketOps{}
+	m := f.model(t, Options{Tickets: ops})
+
+	if cmd := typeText(t, m, "m"); cmd != nil || len(ops.moves) != 0 {
+		t.Fatalf("m must ask without starting a write: cmd=%v moves=%+v", cmd != nil, ops.moves)
+	}
+	if !strings.Contains(m.View(), "Move this ticket to todo and start its planner? y/N") {
+		t.Fatalf("m must show the confirmation prompt:\n%s", m.View())
+	}
+	if cmd := press(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")}); cmd == nil {
+		t.Fatal("y must start the ticket move")
+	} else {
+		press(t, m, cmd())
+	}
+	if len(ops.moves) != 1 || ops.moves[0].id != "tkt_a_backlog" {
+		t.Fatalf("y must move the ticket exactly once, got %+v", ops.moves)
+	}
+}
+
+func TestMoveKeyOtherKeyCancelsWithoutWriting(t *testing.T) {
+	ctx := context.Background()
+	f := newBoardFixture(t, fixturePlan{})
+	f.addTicket(t, "tkt_a_backlog", task.ColumnBacklog)
+	f.seed(t)
+	ops := &fakeTicketOps{}
+	m := f.model(t, Options{Tickets: ops})
+
+	if cmd := typeText(t, m, "m"); cmd != nil || !strings.Contains(m.View(), "Move this ticket to todo and start its planner? y/N") {
+		t.Fatalf("m must open confirmation before a non-y key cancels it: cmd=%v view:\n%s", cmd != nil, m.View())
+	}
+	press(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")})
+	ticket, err := f.store.Ticket(ctx, "tkt_a_backlog")
+	if err != nil {
+		t.Fatalf("read ticket after cancellation: %v", err)
+	}
+	if len(ops.moves) != 0 || ticket.Column != task.ColumnBacklog {
+		t.Fatalf("a non-y key must cancel without writing: moves=%+v ticket=%+v", ops.moves, ticket)
+	}
+}
 
 func TestMoveKeyActsOnlyOnASelectedBacklogTicket(t *testing.T) {
 	ctx := context.Background()
@@ -732,7 +786,7 @@ func TestMoveKeyActsOnlyOnASelectedBacklogTicket(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read the ticket: %v", err)
 	}
-	cmd := typeText(t, m, "m")
+	cmd := moveWithConfirm(t, m)
 	if cmd == nil {
 		t.Fatal("m on a backlog ticket must start the write")
 	}
@@ -778,7 +832,7 @@ func TestMoveRefusalBecomesANoticeAndRefreshes(t *testing.T) {
 	if len(m.board.TicketColumn(task.TicketBacklog)) != 1 {
 		t.Fatal("the board starts with the ticket in the backlog")
 	}
-	cmd := typeText(t, m, "m")
+	cmd := moveWithConfirm(t, m)
 	if cmd == nil {
 		t.Fatal("m on a backlog ticket must start the write")
 	}
@@ -815,7 +869,7 @@ func TestAMoveWhosePlannerDidNotStartStillSaysItMoved(t *testing.T) {
 		}
 	}
 	m := f.model(t, Options{Tickets: ops})
-	cmd := typeText(t, m, "m")
+	cmd := moveWithConfirm(t, m)
 	if cmd == nil {
 		t.Fatal("m on a backlog ticket must start the write")
 	}
@@ -851,7 +905,7 @@ func TestAMoveWhoseRecoverySignalFailedStillSaysItMoved(t *testing.T) {
 		}
 	}
 	m := f.model(t, Options{Tickets: ops})
-	cmd := typeText(t, m, "m")
+	cmd := moveWithConfirm(t, m)
 	if cmd == nil {
 		t.Fatal("m on a backlog ticket must start the write")
 	}
@@ -1094,7 +1148,7 @@ func TestRepeatedMoveKeyDoesNotStartASecondMoveWhileOneIsInFlight(t *testing.T) 
 	ops := &fakeTicketOps{}
 	m := f.model(t, Options{Tickets: ops})
 
-	first := typeText(t, m, "m")
+	first := moveWithConfirm(t, m)
 	if first == nil {
 		t.Fatal("m on a backlog ticket must start the write")
 	}
@@ -1119,7 +1173,7 @@ func TestMoveKeyWorksAgainAfterAFailedMove(t *testing.T) {
 	ops := &fakeTicketOps{moveErr: errors.New("ticket_changed: the ticket changed after its preview")}
 	m := f.model(t, Options{Tickets: ops})
 
-	first := typeText(t, m, "m")
+	first := moveWithConfirm(t, m)
 	if first == nil {
 		t.Fatal("m on a backlog ticket must start the write")
 	}
@@ -1127,7 +1181,7 @@ func TestMoveKeyWorksAgainAfterAFailedMove(t *testing.T) {
 	if !m.noticeErr {
 		t.Fatalf("the refusal must be an error notice: %q", m.notice)
 	}
-	if again := typeText(t, m, "m"); again == nil {
+	if again := moveWithConfirm(t, m); again == nil {
 		t.Fatal("after a failed move finished, m must be able to try again")
 	}
 }
@@ -1147,7 +1201,7 @@ func TestMoveGuardRemembersEveryTicketInFlight(t *testing.T) {
 	if got := m.SelectedID(); got != "tkt_a_backlog" {
 		t.Fatalf("selected %q, want the first backlog ticket", got)
 	}
-	startA := typeText(t, m, "m")
+	startA := moveWithConfirm(t, m)
 	if startA == nil {
 		t.Fatal("m on the first backlog ticket must start the write")
 	}
@@ -1155,7 +1209,7 @@ func TestMoveGuardRemembersEveryTicketInFlight(t *testing.T) {
 	if got := m.SelectedID(); got != "tkt_b_backlog" {
 		t.Fatalf("selected %q, want the second backlog ticket", got)
 	}
-	startB := typeText(t, m, "m")
+	startB := moveWithConfirm(t, m)
 	if startB == nil {
 		t.Fatal("a move for a different ticket is independent and must be allowed while the first is in flight")
 	}
@@ -1179,7 +1233,7 @@ func TestMoveGuardRemembersEveryTicketInFlight(t *testing.T) {
 	}
 	// Once its own write finished, the ticket is free again (the fake store did not
 	// move it, so it is still a backlog ticket).
-	if again := typeText(t, m, "m"); again == nil {
+	if again := moveWithConfirm(t, m); again == nil {
 		t.Fatal("after the second ticket's own write finished, m on it must work again")
 	}
 }

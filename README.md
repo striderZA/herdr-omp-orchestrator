@@ -77,7 +77,7 @@ Run **Open the task board**. It opens as an overlay in the project's workspace.
 ### 4. Plan a ticket before coding (optional)
 
 1. Press `n` on the board and title the ticket.
-2. Select it in **Backlog** and press `m`. Its planner works in its own worktree and reports a plan. It edits nothing.
+2. Select it in **Backlog** and press `m`; when asked, press `y` to move the ticket to **Todo** and start its planner. Its planner works in its own worktree and reports a plan. It edits nothing.
 3. When the plan is reported, the primary asks you to accept it. Accepting it (outcome `integrated` or `kept`) lets the primary dispatch implementation for the ticket, which still needs a base commit as above. Nothing starts from the plan by itself.
 4. When the ticket's tasks are decided, the primary asks you to close the ticket with an outcome. A ticket cannot close while a linked task is still open.
 
