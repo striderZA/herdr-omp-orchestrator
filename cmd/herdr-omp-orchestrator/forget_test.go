@@ -98,8 +98,18 @@ func TestForgetPaneDeletesOnlyOnTheTypedFolderName(t *testing.T) {
 			}
 			var out bytes.Buffer
 			body := forgetSession(context.Background(), f, f.plan.ProjectKey, bufio.NewReader(input), &out)
-			if body["forgotten"] != tc.delete {
-				t.Fatalf("body = %v, want forgotten=%v", body, tc.delete)
+			if tc.delete {
+				if body["forgotten"] != true {
+					t.Fatalf("body = %v, want forgotten", body)
+				}
+			} else {
+				failure, _ := body["error"].(map[string]any)
+				if body["ok"] != false || failure["code"] != "forget_not_confirmed" {
+					t.Fatalf("body = %v, want forget_not_confirmed", body)
+				}
+				if message, _ := failure["message"].(string); !strings.Contains(message, "Nothing was changed") {
+					t.Fatalf("decline message = %q, want the nothing-changed note", message)
+				}
 			}
 			if got := len(f.forgotten); got != map[bool]int{true: 1, false: 0}[tc.delete] {
 				t.Fatalf("Forget calls = %d", got)
@@ -143,9 +153,9 @@ func TestForgetPaneShowsWhatStays(t *testing.T) {
 			t.Errorf("output misses restart note phrase %q: %s", required, shown)
 		}
 	}
-	want := map[string]any{"ok": true, "forgotten": false}
-	if len(body) != len(want) || body["ok"] != true || body["forgotten"] != false {
-		t.Errorf("declined body = %v, want exactly %v", body, want)
+	failure, _ := body["error"].(map[string]any)
+	if body["ok"] != false || failure["code"] != "forget_not_confirmed" {
+		t.Errorf("declined body = %v, want forget_not_confirmed", body)
 	}
 }
 func TestForgetPaneArgsCarryTheKeyVerbatim(t *testing.T) {

@@ -106,8 +106,7 @@ func forgetSession(ctx context.Context, c forgetter, key string, in *bufio.Reade
 	fmt.Fprintf(stdout, "Type %s to forget %s, or press Enter to cancel: ", plan.FolderName, key)
 	line, _ := in.ReadString('\n')
 	if !strings.EqualFold(strings.TrimSpace(line), plan.FolderName) {
-		fmt.Fprintln(stdout, "\nCancelled. Nothing was changed.")
-		return map[string]any{"ok": true, "forgotten": false}
+		return failureBody("forget_not_confirmed", "Cancelled. Nothing was changed: the typed folder name did not match, or Enter was pressed.")
 	}
 	actCtx, cancel := context.WithTimeout(ctx, forgetTimeout)
 	defer cancel()
