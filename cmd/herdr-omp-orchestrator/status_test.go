@@ -107,7 +107,7 @@ func TestStatusPaneShowsEveryResolvedProjectCheck(t *testing.T) {
 	if code := runStatus(env, strings.NewReader("\n"), &stdout, &stderr); code != 0 {
 		t.Fatalf("runStatus = %d: %s", code, stderr.String())
 	}
-	for _, want := range []string{"OMP integration: verified", "Plugin extension: verified", `Project: C:\work\demo`, "Primary: verified", "Board: can open"} {
+	for _, want := range []string{"OMP integration: verified", "Plugin extension: verified", `Project: C:\work\demo`, "Primary: no problem recorded", "Board: can open"} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Errorf("status missing %q:\n%s", want, stdout.String())
 		}
@@ -154,7 +154,7 @@ func TestStatusPaneDoesNotWriteStoreOrSetupFiles(t *testing.T) {
 	if got := fixture.configTree(t); !maps.Equal(got, beforeConfig) {
 		t.Fatal("status modified setup profile files")
 	}
-	for _, want := range []string{"OMP integration: verified", "Plugin extension: verified", "Project: " + projectDir, "Primary: verified", "Board: can open"} {
+	for _, want := range []string{"OMP integration: verified", "Plugin extension: verified", "Project: " + projectDir, "Primary: no problem recorded", "Board: can open"} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Errorf("status missing %q:\n%s", want, stdout.String())
 		}

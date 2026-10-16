@@ -16,7 +16,7 @@ import (
 
 const statusEntrypoint = "status"
 
-// runOpenStatus opens the read-only status overlay with the invoking pane active.
+// runOpenStatus opens the read-only status overlay for the invoking workspace or checkout.
 func runOpenStatus(env map[string]string, stdout, stderr io.Writer) int {
 	binary := herdrBinary(env)
 	if strings.TrimSpace(binary) == "" {
@@ -36,7 +36,7 @@ func runOpenStatus(env map[string]string, stdout, stderr io.Writer) int {
 	return emit(stdout, stderr, map[string]any{"ok": true, "pane": opened})
 }
 
-// runStatus displays read-only checks for this pane and waits for Enter.
+// runStatus displays read-only checks for the invoking workspace or checkout and waits for Enter.
 func runStatus(env map[string]string, stdin io.Reader, stdout, stderr io.Writer) int {
 	in := bufio.NewReader(stdin)
 	body := map[string]any{"ok": true}
@@ -71,7 +71,7 @@ func runStatus(env map[string]string, stdin io.Reader, stdout, stderr io.Writer)
 	}
 	lines = append(lines, "Project: "+project.Key)
 	if strings.TrimSpace(project.PrimaryAttention) == "" {
-		lines = append(lines, "Primary: verified")
+		lines = append(lines, "Primary: no problem recorded")
 	} else {
 		lines = append(lines, "Primary: not verified; reattach is needed")
 	}

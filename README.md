@@ -76,7 +76,7 @@ Run **Open the task board**. It opens as an overlay in the project's workspace.
 
 ### Status of the plugin
 
-Run **Show orchestrator status** to open the status overlay. It reports `OMP integration` and `Plugin extension` verification from setup; the project resolved for this pane, or that no project resolves; whether the primary is verified (`Primary: verified`) or needs reattaching (`Primary: not verified; reattach is needed`); and whether the board can open (`Board: can open` or `Board: cannot open`). When no project resolves, the line is `Project: none resolved`. The status pane writes nothing. Press Enter to close it.
+Run **Show orchestrator status** to open the status overlay. It reports `OMP integration` and `Plugin extension` verification from setup; the project resolved for this workspace or checkout, or that no project resolves; the primary's recorded attention (`Primary: no problem recorded` when the store records none, or `Primary: not verified; reattach is needed` when it records an issue); and whether the board can open (`Board: can open` or `Board: cannot open`). When no project resolves, the line is `Project: none resolved`; if no state has been recorded yet, it is `Project: none resolved (no state recorded yet)`. The status pane writes nothing. Press Enter to close it.
 
 ### 4. Plan a ticket before coding (optional)
 
