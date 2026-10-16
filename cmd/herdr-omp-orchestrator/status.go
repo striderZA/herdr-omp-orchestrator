@@ -86,6 +86,12 @@ func setupStatusLines(verifyErr error) []string {
 	if errors.Is(verifyErr, setup.ErrExtensionMissing) {
 		return []string{"OMP integration: verified", "Plugin extension: not verified (" + verifyErr.Error() + ")"}
 	}
+	if errors.Is(verifyErr, setup.ErrExtensionConflict) {
+		return []string{
+			"OMP integration: verified",
+			"Plugin extension: conflict (" + verifyErr.Error() + "); move or rename the existing herdr-orchestrator.ts, then run Setup again",
+		}
+	}
 	if errors.Is(verifyErr, setup.ErrIntegrationMissing) {
 		return []string{"OMP integration: not verified (" + verifyErr.Error() + ")", "Plugin extension: not checked"}
 	}

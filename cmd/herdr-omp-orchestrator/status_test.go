@@ -5,15 +5,83 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"errors"
 	"maps"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
+	"herdr-omp-orchestrator/internal/setup"
 	"herdr-omp-orchestrator/internal/state"
 	"herdr-omp-orchestrator/internal/task"
 )
+
+func TestSetupStatusLines(t *testing.T) {
+	conflictErr := statusExtensionConflict(t)
+	tests := []struct {
+		name string
+		err  error
+		want []string
+	}{
+		{
+			name: "all verified",
+			want: []string{"OMP integration: verified", "Plugin extension: verified"},
+		},
+		{
+			name: "integration missing",
+			err:  setup.ErrIntegrationMissing,
+			want: []string{"OMP integration: not verified (" + setup.ErrIntegrationMissing.Error() + ")", "Plugin extension: not checked"},
+		},
+		{
+			name: "extension missing",
+			err:  setup.ErrExtensionMissing,
+			want: []string{"OMP integration: verified", "Plugin extension: not verified (" + setup.ErrExtensionMissing.Error() + ")"},
+		},
+		{
+			name: "extension conflict",
+			err:  conflictErr,
+			want: []string{
+				"OMP integration: verified",
+				"Plugin extension: conflict (" + conflictErr.Error() + "); move or rename the existing herdr-orchestrator.ts, then run Setup again",
+			},
+		},
+		{
+			name: "source unavailable",
+			err:  setup.ErrSourceUnavailable,
+			want: []string{"OMP integration: not checked (" + setup.ErrSourceUnavailable.Error() + ")", "Plugin extension: not checked"},
+		},
+		{
+			name: "other error",
+			err:  errors.New("unexpected setup failure"),
+			want: []string{"OMP integration: not checked (unexpected setup failure)", "Plugin extension: not checked"},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := setupStatusLines(test.err); !reflect.DeepEqual(got, test.want) {
+				t.Errorf("setupStatusLines(%v) = %#v, want %#v", test.err, got, test.want)
+			}
+		})
+	}
+}
+
+func statusExtensionConflict(t *testing.T) error {
+	t.Helper()
+	fixture := newSetupRouteFixture(t)
+	if status, answer := runSetupRoute(t, fixture.env); status != 0 || !answer.OK {
+		t.Fatalf("install fixture extension: status=%d answer=%+v", status, answer)
+	}
+	if err := os.WriteFile(fixture.extension(), []byte("unmanaged extension\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := setup.Verify(context.Background(), fixture.env, herdrBinary(fixture.env))
+	if !errors.Is(err, setup.ErrExtensionConflict) {
+		t.Fatalf("Verify error = %v, want extension conflict", err)
+	}
+	return err
+}
 
 func TestStatusPaneShowsEveryResolvedProjectCheck(t *testing.T) {
 	fixture := newSetupRouteFixture(t)
