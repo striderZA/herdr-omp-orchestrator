@@ -751,6 +751,24 @@ func TestMoveKeyOtherKeyCancelsWithoutWriting(t *testing.T) {
 	}
 }
 
+func TestMoveKeyAcceptsUppercaseY(t *testing.T) {
+	f := newBoardFixture(t, fixturePlan{})
+	f.addTicket(t, "tkt_a_backlog", task.ColumnBacklog)
+	f.seed(t)
+	ops := &fakeTicketOps{}
+	m := f.model(t, Options{Tickets: ops})
+
+	typeText(t, m, "m")
+	if cmd := press(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("Y")}); cmd == nil {
+		t.Fatal("Y must start the ticket move, as the y/N prompt invites")
+	} else {
+		press(t, m, cmd())
+	}
+	if len(ops.moves) != 1 || ops.moves[0].id != "tkt_a_backlog" {
+		t.Fatalf("Y must move the ticket exactly once, got %+v", ops.moves)
+	}
+}
+
 func TestMoveKeyActsOnlyOnASelectedBacklogTicket(t *testing.T) {
 	ctx := context.Background()
 	f := newBoardFixture(t, fixturePlan{})

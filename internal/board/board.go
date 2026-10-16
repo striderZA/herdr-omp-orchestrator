@@ -922,7 +922,7 @@ func (m *Model) beginMoveConfirm() tea.Cmd {
 
 func (m *Model) confirmMoveKey(key tea.KeyMsg) tea.Cmd {
 	m.confirmMove = false
-	if key.Type == tea.KeyRunes && string(key.Runes) == "y" {
+	if key.Type == tea.KeyRunes && (string(key.Runes) == "y" || string(key.Runes) == "Y") {
 		return m.moveTicket()
 	}
 	m.notice = "Move cancelled"
