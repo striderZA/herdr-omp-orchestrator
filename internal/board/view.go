@@ -689,9 +689,9 @@ func cardSummary(card Card) string {
 // whenever ticket writes are enabled; a read-only board offers only q.
 func noSelectionHelp(d Detail) string {
 	if d.TicketWrites {
-		return "/ search, n new ticket, q close"
+		return "r refresh, Tab next column, Shift+Tab previous column, / search, n new ticket, q close"
 	}
-	return "/ search, q close"
+	return "r refresh, Tab next column, Shift+Tab previous column, / search, q close"
 }
 
 // helpLine is the short keyboard help: the board has no other chrome.
@@ -706,14 +706,20 @@ func helpLine(d Detail) string {
 	if !d.Expanded && d.TicketWrites {
 		parts = append(parts, "n new ticket")
 	}
-	parts = append(parts, "Tab next column", "Shift+Tab previous column", "q close")
+	if !d.Expanded {
+		parts = append(parts, "Tab next column", "Shift+Tab previous column")
+	}
+	parts = append(parts, "q close")
 	return strings.Join(parts, ", ")
 }
 
 // clipHelpLine preserves the close key when a narrow terminal clips the help.
 func clipHelpLine(line string, width int) string {
 	const close = "q close"
-	if width <= runewidth.StringWidth(close) || runewidth.StringWidth(line) <= width {
+	if width < runewidth.StringWidth(close) {
+		return clip(line, width)
+	}
+	if runewidth.StringWidth(line) <= width {
 		return clip(line, width)
 	}
 	prefixWidth := width - runewidth.StringWidth(close) - 2

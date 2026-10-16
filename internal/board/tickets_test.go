@@ -1052,11 +1052,10 @@ func TestControlCharactersInStoredTextNeverReachTheScreen(t *testing.T) {
 
 // NewBoard now delegates to NewBoardWithTickets, so comparing the two renders (as
 // TestBoardWithoutTicketsRendersExactlyAsBefore does) cannot catch a change in the
-// no-ticket output. These SHA-256 digests record the board after f653bb6 added the
-// search footer (the current base's no-ticket render) for these cards, widths, and
-// selections. Ticket rendering must not change that baseline. They were re-recorded
-// once, on purpose, when a task card moved its title before its ID: that order is
-// the only change these plain (uncolored) renders show.
+// search footer and board help for these cards, widths, and selections. Ticket rendering must not
+// change that baseline. They were re-recorded once, on purpose, when a task card moved its title
+// before its ID: that order was the only change those plain (uncolored) renders showed. The current
+// digests also include the intentional addition of refresh and Tab keys to the help.
 func TestBoardWithoutTicketsMatchesTheSearchBaseline(t *testing.T) {
 	cards := []Card{
 		{Task: sampleTask("orch_a", nil), Stage: task.Running},
@@ -1068,12 +1067,12 @@ func TestBoardWithoutTicketsMatchesTheSearchBaseline(t *testing.T) {
 		"expanded": {SelectedID: "orch_a", Expanded: true},
 	}
 	want := map[string]string{
-		"100/none":     "cc6c0ee8a5d3fc5e0c0132841044a5a38c8e34c9d81c0593a3c6b82f480ab0fe",
+		"100/none":     "307059b15d1edcaeedf2b8f224775a0396f839807da93f064c2021105f5de774",
 		"100/selected": "1dac0bbce058d6389ff497b08c6a9c83f60283ca48727824bd7f0d7ba0a97318",
-		"100/expanded": "3d811fa42132d7ecad0f953b7e8ba5e2b56cd2603fd9c75a2fe3f756dfdb03ff",
-		"80/none":      "06c08aaa33cff016bd0895171c4567c4b690b02f7a544d01ef43f9fa18caf154",
+		"100/expanded": "dbdcea2ca6dacb6937d491f4cda2c7130435665c4134ea51d84bb9bf5306cda6",
+		"80/none":      "1452847cf6f57d6aba1136030f69037f191f70f97521f7b2c9d4cbf941d811a2",
 		"80/selected":  "48ac078acccc3ca7e91895681cb0ba2fa3b00960dcef8bf97f5c091e782400eb",
-		"80/expanded":  "7b59300045c64ebcec805fae2d147c0f48334f3bb5cacab0b61bfec14e62e38f",
+		"80/expanded":  "4a0bc766575b41463482ff49fe6ebf558a91c31ed923b9b268d55c4552a351a1",
 	}
 	digest := func(out string) string {
 		sum := sha256.Sum256([]byte(out))
