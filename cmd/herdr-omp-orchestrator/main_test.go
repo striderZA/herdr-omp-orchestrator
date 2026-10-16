@@ -384,6 +384,34 @@ func TestCoordCodePreservesAmbiguousOperation(t *testing.T) {
 // bind route
 // ---------------------------------------------------------------------------
 
+func TestBindNextStepNamesThePrimaryAndTheBoard(t *testing.T) {
+	project := "project-123"
+	line := bindNextStep(project)
+	for _, want := range []string{project, "Open the task board", "primary runs"} {
+		if !strings.Contains(line, want) {
+			t.Errorf("bindNextStep(%q) = %q; want it to contain %q", project, line, want)
+		}
+	}
+	if strings.ContainsAny(line, "\r\n") {
+		t.Fatalf("bindNextStep(%q) = %q; want one line", project, line)
+	}
+}
+
+func TestBindRefusalPrintsNoNextStep(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := runBind(map[string]string{}, &stdout, &stderr)
+	if code == 0 {
+		t.Fatal("runBind with no state directory succeeded")
+	}
+	answer := decodeAnswer(t, stdout.Bytes())
+	if answer.OK {
+		t.Fatal("refusal answer has ok=true")
+	}
+	if strings.Contains(stderr.String(), "Open the task board") {
+		t.Fatalf("refusal printed a next step: %q", stderr.String())
+	}
+}
+
 const (
 	routeStatusInstalled    = "omp: current (v10) (C:\\Users\\fixture\\.omp\\agent\\extensions\\herdr-omp-agent-state.ts)"
 	routeStatusNotInstalled = "omp: not installed (C:\\Users\\fixture\\.omp\\agent\\extensions\\herdr-omp-agent-state.ts)"

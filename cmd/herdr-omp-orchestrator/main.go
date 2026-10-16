@@ -154,6 +154,10 @@ type pluginContext struct {
 // runBind binds the primary OMP session to the repository the action was
 // invoked in. The action answers with one JSON object like every other route,
 // so the Herdr plugin log shows the same result a caller sees.
+func bindNextStep(project string) string {
+	return fmt.Sprintf("The primary runs in the pane this bind ran from for project %s; start work from the task board (open it with the \"Open the task board\" action).", project)
+}
+
 func runBind(env map[string]string, stdout, stderr io.Writer) int {
 	stateDir := strings.TrimSpace(env[envStateDir])
 	if stateDir == "" {
@@ -202,6 +206,8 @@ func runBind(env map[string]string, stdout, stderr io.Writer) int {
 			"resumeUnavailable": "the announced session could not be read back: " + hintErr.Error(),
 		}
 	}
+	fmt.Fprintln(stderr, bindNextStep(project.Key))
+
 	return emit(stdout, stderr, answer)
 }
 
