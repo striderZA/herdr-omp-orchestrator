@@ -62,8 +62,9 @@ func (b *Board) PrimaryAttention() string {
 	return b.primaryAttention
 }
 
-// primaryMarker draws the marker as at most primaryMarkerMaxLines lines, each
-// within width, in the one accent the board reserves for what needs a human.
+// primaryMarker draws the marker as at most primaryMarkerMaxLines plus
+// primaryMarkerInstructionMaxLines lines, each within width, in the one accent
+// the board reserves for what needs a human.
 // With no recorded attention it draws nothing, so a healthy board is exactly what
 // it was before the marker existed.
 //
