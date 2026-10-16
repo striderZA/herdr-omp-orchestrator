@@ -31,6 +31,7 @@ import extension, {
   dispatchConfirmRequest,
   dispatchWithConsent,
   refreshIdentity,
+  readInboxSettlePreview,
   readReportPreview,
   readRepointPreview,
   readTicketPreview,
@@ -44,6 +45,7 @@ import extension, {
   sendAnswerWithConsent,
   successorRefusal,
   settleConfirmRequest,
+  settleNoteConfirmRequest,
   uiGate,
   warnOnce,
 } from "./herdr-orchestrator.ts";
@@ -194,6 +196,7 @@ const wantNames = [
   "orch_report",
   "orch_review",
   "orch_settle_input",
+  "orch_settle_note",
   "orch_task_list",
   "orch_ticket_create",
   "orch_ticket_list",
@@ -606,6 +609,7 @@ const toolCalls: { name: string; params: Record<string, unknown>; bad: Record<st
   { name: "orch_task_list", params: { stage: "needs_input", limit: 20 }, bad: { limit: 0 } },
   { name: "orch_inbox_list", params: {}, bad: { state: "lost" } },
   { name: "orch_inbox_list", params: { state: "uncertain", limit: 20 }, bad: { limit: 0 } },
+  { name: "orch_settle_note", params: { noteId: "note-1", decision: "delivered" }, bad: { decision: "maybe" } },
 ];
 
 for (const call of toolCalls) {
@@ -1856,6 +1860,52 @@ async function checkGates(): Promise<void> {
   check(!settleConfirmRequest("orch_abc", "maybe").ok, "the settlement accepted a decision the user cannot make");
   check(!settleConfirmRequest("", "delivered").ok, "the settlement accepted no task");
 
+  // A note settlement is the user's decision about one uncertain note. Its
+  // confirmation is built from the bridge's own preview (never from what the
+  // model typed), and a decision the coordinator would refuse is refused first.
+  const notePreview = readInboxSettlePreview({
+    noteId: "note-1",
+    taskId: "orch_abc",
+    kind: "result",
+    label: "worker result",
+    summary: "finished",
+    deliveryState: "uncertain",
+    deliveryDetail: "inspect the pane",
+    digest: "abc123",
+  });
+  check(notePreview !== null, "a well-formed note preview was refused");
+  check(readInboxSettlePreview({ noteId: "note-1" }) === null, "a note preview with no digest was accepted");
+  check(readInboxSettlePreview(null) === null, "a null note preview was accepted");
+  if (notePreview) {
+    const delivered = settleNoteConfirmRequest(notePreview, "delivered");
+    if (!delivered.ok) {
+      failures.push(`the delivered note settlement was refused: ${delivered.reason}`);
+    } else {
+      check(
+        delivered.request.title === "Settle inbox note",
+        `the note settlement confirmation is titled ${JSON.stringify(delivered.request.title)}`,
+      );
+      check(
+        delivered.request.message.includes("note-1") && delivered.request.message.includes("DID arrive"),
+        `the note settlement confirmation does not say what the user confirms: ${JSON.stringify(delivered.request.message)}`,
+      );
+    }
+    const notDelivered = settleNoteConfirmRequest(notePreview, "not_delivered");
+    check(
+      notDelivered.ok && notDelivered.request.message.includes("did NOT arrive"),
+      "the not-delivered note settlement does not say the note did not arrive",
+    );
+    check(!settleNoteConfirmRequest(notePreview, "maybe").ok, "the note settlement accepted a decision the user cannot make");
+    check(
+      !settleNoteConfirmRequest({ ...notePreview, deliveryState: "delivered" }, "delivered").ok,
+      "a note that is not uncertain was offered for settlement",
+    );
+    check(
+      !settleNoteConfirmRequest({ ...notePreview, digest: "" }, "delivered").ok,
+      "a note settlement with no digest was offered",
+    );
+  }
+
   // A brief adjudication is decided on evidence, so the confirmation must show the
   // pane, the revision, the digest and the terminal text the digest covers, and it
   // must refuse a decision the coordinator would not accept.
@@ -2362,6 +2412,7 @@ async function checkRoleToolAccess(): Promise<void> {
     `a primary kept tools beyond read-only plus primary tools: ${listed(primary.activeTools)}`,
   );
   check(primary.activeTools.has("orch_repoint"), "the primary lost orch_repoint, which only the primary may use");
+  check(primary.activeTools.has("orch_settle_note"), "the primary lost orch_settle_note, which only the primary may use");
   check(primaryPrompt.includes("read-only coordinator"), "the primary role prompt does not say it is a read-only coordinator");
   for (const name of ["bash", "write"]) {
     const result = await primary.call(name);

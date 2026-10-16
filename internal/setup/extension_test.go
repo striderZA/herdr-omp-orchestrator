@@ -990,6 +990,7 @@ func TestCanonicalExtensionSourceIsTheSubstitutionTemplate(t *testing.T) {
 		`name: "orch_report"`,
 		`name: "orch_task_list"`,
 		`name: "orch_inbox_list"`,
+		`name: "orch_settle_note"`,
 		`name: "orch_ticket_create"`,
 		`name: "orch_ticket_list"`,
 		`name: "orch_ticket_move"`,
