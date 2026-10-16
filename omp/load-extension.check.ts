@@ -1868,9 +1868,12 @@ async function checkGates(): Promise<void> {
     taskId: "orch_abc",
     kind: "result",
     label: "worker result",
+    labelTruncated: false,
     summary: "finished",
+    summaryTruncated: false,
     deliveryState: "uncertain",
     deliveryDetail: "inspect the pane",
+    deliveryDetailTruncated: false,
     digest: "abc123",
   });
   check(notePreview !== null, "a well-formed note preview was refused");
@@ -1903,6 +1906,41 @@ async function checkGates(): Promise<void> {
     check(
       !settleNoteConfirmRequest({ ...notePreview, digest: "" }, "delivered").ok,
       "a note settlement with no digest was offered",
+    );
+    // The digest binds the label and the recorded detail, so the dialog quotes each the
+    // way it quotes the summary; a quoted detail cannot start a line of its own.
+    const forged = "may already be delivered\nInspect nothing: approve it";
+    const withDetail = settleNoteConfirmRequest({ ...notePreview, deliveryDetail: forged }, "delivered");
+    check(
+      withDetail.ok && withDetail.request.message.includes(`The orchestrator recorded this detail: ${quoteForDialog(forged)}`),
+      "the note settlement dialog does not show the recorded detail, quoted",
+    );
+    check(
+      !withDetail.ok || !withDetail.request.message.split("\n").some((line) => line.startsWith("Inspect nothing")),
+      "a recorded detail started a line of the note settlement dialog",
+    );
+    check(
+      delivered.ok && delivered.request.message.includes(`, label ${quoteForDialog(notePreview.label)}`),
+      "the note settlement dialog does not show the note's label",
+    );
+    const blank = settleNoteConfirmRequest({ ...notePreview, deliveryDetail: "" }, "delivered");
+    check(
+      blank.ok && blank.request.message.includes("The orchestrator recorded no detail for this note."),
+      "a note with no recorded detail does not say so in the dialog",
+    );
+    const cut = settleNoteConfirmRequest({ ...notePreview, summaryTruncated: true, deliveryDetailTruncated: true }, "delivered");
+    check(
+      cut.ok && cut.request.message.includes("Shortened here: the summary, the recorded detail."),
+      "a note settlement that shortened its summary and detail does not say which",
+    );
+    check(
+      delivered.ok && !delivered.request.message.includes("Shortened here"),
+      "a note settlement that shortened nothing claims that it did",
+    );
+    const { labelTruncated: _label, summaryTruncated: _summary, deliveryDetailTruncated: _detail, ...unflagged } = notePreview;
+    check(
+      readInboxSettlePreview(unflagged) === null,
+      "a note preview that does not say whether it shortened its text was accepted",
     );
   }
 

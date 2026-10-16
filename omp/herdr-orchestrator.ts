@@ -628,29 +628,43 @@ export function settleConfirmRequest(taskId: string, decision: string): ConfirmP
 
 // InboxSettlePreview is one uncertain inbox note as the bridge persisted it. Digest
 // covers every fact shown, so a settlement quotes back exactly what was inspected.
+// Each *Truncated flag says the bridge cut that text to its display bound; the digest
+// still covers the whole text, so the dialog must say which texts were cut.
 export interface InboxSettlePreview {
   noteId: string;
   taskId: string;
   kind: string;
   label: string;
+  labelTruncated: boolean;
   summary: string;
+  summaryTruncated: boolean;
   deliveryState: string;
   deliveryDetail: string;
+  deliveryDetailTruncated: boolean;
   digest: string;
 }
 
 // readInboxSettlePreview trusts a bridge answer only when it names a note and carries
 // the digest a settlement must quote. Without a digest the decision could not be
-// bound to what the user inspected, so the whole preview is refused.
+// bound to what the user inspected, so the whole preview is refused. It also refuses a
+// preview that does not say which of its texts the bridge cut: read as complete, a cut
+// text would look whole to the user.
 export function readInboxSettlePreview(value: unknown): InboxSettlePreview | null {
+  if (typeof value !== "object" || value === null) return null;
+  for (const flag of ["labelTruncated", "summaryTruncated", "deliveryDetailTruncated"]) {
+    if (typeof (value as Record<string, unknown>)[flag] !== "boolean") return null;
+  }
   const preview: InboxSettlePreview = {
     noteId: previewText(value, "noteId"),
     taskId: previewText(value, "taskId"),
     kind: previewText(value, "kind"),
     label: previewText(value, "label"),
+    labelTruncated: previewFlag(value, "labelTruncated"),
     summary: previewText(value, "summary"),
+    summaryTruncated: previewFlag(value, "summaryTruncated"),
     deliveryState: previewText(value, "deliveryState"),
     deliveryDetail: previewText(value, "deliveryDetail"),
+    deliveryDetailTruncated: previewFlag(value, "deliveryDetailTruncated"),
     digest: previewText(value, "digest"),
   };
   if (preview.noteId === "" || preview.deliveryState === "" || preview.digest === "") return null;
@@ -660,7 +674,8 @@ export function readInboxSettlePreview(value: unknown): InboxSettlePreview | nul
 // settleNoteConfirmRequest is the confirmation a note settlement needs. It is built from
 // the bridge's preview, never from the model's text, and it refuses before the user is
 // asked when the note is not uncertain, has no digest, or the decision is one the user
-// cannot make.
+// cannot make. It shows the label, the summary and the recorded detail the digest covers,
+// and says which of them the bridge cut.
 export function settleNoteConfirmRequest(preview: InboxSettlePreview, decision: string): ConfirmPlan {
   if (preview.deliveryState !== "uncertain") {
     return {
@@ -682,15 +697,29 @@ export function settleNoteConfirmRequest(preview: InboxSettlePreview, decision: 
     ? "The note is ended and is never sent again."
     : "The note goes back to pending and is delivered at the primary's next idle turn.";
   const origin = preview.taskId === "" ? "a project note" : `task ${quoteForDialog(preview.taskId)}`;
+  const label = preview.label === "" ? "" : `, label ${quoteForDialog(preview.label)}`;
+  const detail = preview.deliveryDetail === ""
+    ? "The orchestrator recorded no detail for this note."
+    : `The orchestrator recorded this detail: ${quoteForDialog(preview.deliveryDetail)}`;
+  const cut = [
+    preview.labelTruncated ? "the label" : "",
+    preview.summaryTruncated ? "the summary" : "",
+    preview.deliveryDetailTruncated ? "the recorded detail" : "",
+  ].filter((name) => name !== "");
+  const lines = [
+    `Confirm that the notification for note ${quoteForDialog(preview.noteId)} (${quoteForDialog(preview.kind)}${label}, ${origin}) ${observed} in the primary's pane.`,
+    `The summary is the worker's own text, not the user's: ${quoteForDialog(preview.summary)}`,
+    detail,
+  ];
+  if (cut.length > 0) {
+    lines.push(`Shortened here: ${cut.join(", ")}. The decision covers the full text of each, so check the pane itself.`);
+  }
+  lines.push(`Inspect the primary's pane first. ${effect}`);
   return {
     ok: true,
     request: {
       title: "Settle inbox note",
-      message: [
-        `Confirm that the notification for note ${quoteForDialog(preview.noteId)} (${quoteForDialog(preview.kind)}, ${origin}) ${observed} in the primary's pane.`,
-        `The summary is the worker's own text, not the user's: ${quoteForDialog(preview.summary)}`,
-        `Inspect the primary's pane first. ${effect}`,
-      ].join("\n"),
+      message: lines.join("\n"),
     },
   };
 }
