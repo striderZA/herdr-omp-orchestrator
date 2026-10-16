@@ -56,6 +56,7 @@ const openBoardTimeout = 30 * time.Second
 const (
 	pluginID        = "user.omp-orchestrator"
 	boardEntrypoint = "board"
+	forgetEntrypoint = "forget"
 )
 
 // contextLimit bounds the plugin invocation context this executable accepts.
@@ -78,7 +79,7 @@ const (
 	envPluginEventJSON = "HERDR_PLUGIN_EVENT_JSON"
 )
 
-const usage = "usage: herdr-omp-orchestrator <setup [--dry-run]|bind|startup|event|board|open-board|reattach|open-reattach|bridge <method>|recover|--version>"
+const usage = "usage: herdr-omp-orchestrator <setup [--dry-run]|bind|startup|event|board|open-board|forget|open-forget|reattach|open-reattach|bridge <method>|recover|--version>"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -110,6 +111,10 @@ func main() {
 		os.Exit(runBoard(env, os.Stdout, os.Stderr))
 	case "open-board":
 		os.Exit(runOpenBoard(env, os.Stdout, os.Stderr))
+	case "forget":
+		os.Exit(runForget(env, os.Stdin, os.Stdout, os.Stderr))
+	case "open-forget":
+		os.Exit(runOpenForget(env, os.Stdout, os.Stderr))
 	case "reattach":
 		os.Exit(runReattach(env, os.Stdin, os.Stdout, os.Stderr))
 	case "open-reattach":
@@ -595,6 +600,12 @@ func herdrBinary(env map[string]string) string {
 // plugin log can classify.
 func coordCode(err error) string {
 	switch {
+	case errors.Is(err, coord.ErrForgetRefused):
+		return "forget_refused"
+	case errors.Is(err, coord.ErrForgetPlanChanged):
+		return "forget_plan_changed"
+	case errors.Is(err, coord.ErrForgetNotConfirmed):
+		return "forget_not_confirmed"
 	case errors.Is(err, coord.ErrReattachPending):
 		// Checked first: a pending reattach wraps the cause that left it pending
 		// (a readiness timeout, a refused notice), and the caller must hear that
