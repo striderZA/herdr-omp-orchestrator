@@ -78,7 +78,7 @@ const (
 	envPluginEventJSON = "HERDR_PLUGIN_EVENT_JSON"
 )
 
-const usage = "usage: herdr-omp-orchestrator <setup [--dry-run]|bind|startup|event|board|open-board|reattach|open-reattach|open-forget|forget|bridge <method>|recover|--version>"
+const usage = "usage: herdr-omp-orchestrator <setup [--dry-run]|bind|startup|event|board|open-board|reattach|open-reattach|open-forget|forget|open-status|status|bridge <method>|recover|--version>"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -118,6 +118,10 @@ func main() {
 		os.Exit(runOpenForget(env, os.Stdout, os.Stderr))
 	case "forget":
 		os.Exit(runForget(env, os.Stdin, os.Stdout, os.Stderr))
+	case "open-status":
+		os.Exit(runOpenStatus(env, os.Stdout, os.Stderr))
+	case "status":
+		os.Exit(runStatus(env, os.Stdin, os.Stdout, os.Stderr))
 	case "bridge":
 		args := os.Args[2:]
 		if scope, recoverable := bridgeRecoveryScope(args); recoverable {

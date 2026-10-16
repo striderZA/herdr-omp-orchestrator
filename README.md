@@ -35,7 +35,7 @@ Then follow [First use](#first-use) to bind a repository and open its task board
 
 After the install script finishes, bind a repository and open its board. Herdr runs plugin actions without a terminal, so `bind` and `setup` write their answer, including a refusal, to Herdr's plugin log. List it with `herdr plugin log list --plugin user.omp-orchestrator`.
 
-The plugin's actions have these titles in Herdr: **Bind this repository as an orchestrated project** (`bind`), **Open the task board** (`board`), **Reattach the primary OMP session** (`reattach`), **Setup OMP orchestrator extension** (`setup`) and **Forget this project's orchestrator records** (`forget`).
+The plugin's actions have these titles in Herdr: **Bind this repository as an orchestrated project** (`bind`), **Open the task board** (`board`), **Reattach the primary OMP session** (`reattach`), **Show orchestrator status** (`status`), **Setup OMP orchestrator extension** (`setup`) and **Forget this project's orchestrator records** (`forget`).
 
 ### 1. Bind a repository
 
