@@ -22,9 +22,10 @@ const (
 	// it reads the same on a terminal without either.
 	primaryMarkerLabel       = "Primary not verified: "
 	primaryMarkerInstruction = "Reattach the primary OMP session"
-	// primaryMarkerMaxLines bounds the marker so a long recorded reason cannot push
-	// the board off a small terminal.
-	primaryMarkerMaxLines = 4
+	// primaryMarkerMaxLines bounds the reason alone; the reattach instruction
+	// adds at most two lines.
+	primaryMarkerMaxLines            = 4
+	primaryMarkerInstructionMaxLines = 2
 )
 
 // ProjectPrimaryAttention reads why the project's primary is not verified, or the
@@ -75,19 +76,17 @@ func primaryMarker(b *Board, width int, th Theme) []string {
 		return nil
 	}
 	reasonLines := wrap(primaryMarkerLabel+reason, width)
-	instructionLines := wrap(primaryMarkerInstruction, width)
-	reasonLimit := primaryMarkerMaxLines - len(instructionLines)
-	if reasonLimit < 1 {
-		reasonLimit = 1
+	if len(reasonLines) > primaryMarkerMaxLines {
+		reasonLines = reasonLines[:primaryMarkerMaxLines]
+		reasonLines[primaryMarkerMaxLines-1] = ellipsize(reasonLines[primaryMarkerMaxLines-1], width)
 	}
-	if len(reasonLines) > reasonLimit {
-		reasonLines = reasonLines[:reasonLimit]
-		reasonLines[reasonLimit-1] = ellipsize(reasonLines[reasonLimit-1], width)
+	instructionLines := wrap(primaryMarkerInstruction, width)
+	if len(instructionLines) > primaryMarkerInstructionMaxLines {
+		instructionLines = instructionLines[:primaryMarkerInstructionMaxLines]
+		last := len(instructionLines) - 1
+		instructionLines[last] = ellipsize(instructionLines[last], width)
 	}
 	lines := append(reasonLines, instructionLines...)
-	if len(lines) > primaryMarkerMaxLines {
-		lines = lines[len(lines)-primaryMarkerMaxLines:]
-	}
 	for i, line := range lines {
 		lines[i] = th.paint(Attention, line)
 	}
