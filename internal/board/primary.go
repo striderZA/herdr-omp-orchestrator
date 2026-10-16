@@ -20,10 +20,12 @@ import (
 const (
 	// primaryMarkerLabel opens the marker. It is words, not a glyph or a color, so
 	// it reads the same on a terminal without either.
-	primaryMarkerLabel = "Primary not verified: "
-	// primaryMarkerMaxLines bounds the marker so a long recorded reason cannot push
-	// the board off a small terminal.
-	primaryMarkerMaxLines = 4
+	primaryMarkerLabel       = "Primary not verified: "
+	primaryMarkerInstruction = "Reattach the primary OMP session"
+	// primaryMarkerMaxLines bounds the reason alone; the reattach instruction
+	// adds at most two lines.
+	primaryMarkerMaxLines            = 4
+	primaryMarkerInstructionMaxLines = 2
 )
 
 // ProjectPrimaryAttention reads why the project's primary is not verified, or the
@@ -60,24 +62,32 @@ func (b *Board) PrimaryAttention() string {
 	return b.primaryAttention
 }
 
-// primaryMarker draws the marker as at most primaryMarkerMaxLines lines, each
-// within width, in the one accent the board reserves for what needs a human.
+// primaryMarker draws the marker as at most primaryMarkerMaxLines plus
+// primaryMarkerInstructionMaxLines lines, each within width, in the one accent
+// the board reserves for what needs a human.
 // With no recorded attention it draws nothing, so a healthy board is exactly what
 // it was before the marker existed.
 //
 // The reason is recorded text, so it is folded onto lines like any other stored
 // value (wrap drops what must never reach a terminal). A reason that does not fit
-// is cut with a plain-ASCII ellipsis.
+// is cut with a plain-ASCII ellipsis before the reattach instruction.
 func primaryMarker(b *Board, width int, th Theme) []string {
 	reason := b.PrimaryAttention()
 	if reason == "" {
 		return nil
 	}
-	lines := wrap(primaryMarkerLabel+reason, width)
-	if len(lines) > primaryMarkerMaxLines {
-		lines = lines[:primaryMarkerMaxLines]
-		lines[primaryMarkerMaxLines-1] = ellipsize(lines[primaryMarkerMaxLines-1], width)
+	reasonLines := wrap(primaryMarkerLabel+reason, width)
+	if len(reasonLines) > primaryMarkerMaxLines {
+		reasonLines = reasonLines[:primaryMarkerMaxLines]
+		reasonLines[primaryMarkerMaxLines-1] = ellipsize(reasonLines[primaryMarkerMaxLines-1], width)
 	}
+	instructionLines := wrap(primaryMarkerInstruction, width)
+	if len(instructionLines) > primaryMarkerInstructionMaxLines {
+		instructionLines = instructionLines[:primaryMarkerInstructionMaxLines]
+		last := len(instructionLines) - 1
+		instructionLines[last] = ellipsize(instructionLines[last], width)
+	}
+	lines := append(reasonLines, instructionLines...)
 	for i, line := range lines {
 		lines[i] = th.paint(Attention, line)
 	}

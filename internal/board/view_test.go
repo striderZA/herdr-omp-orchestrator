@@ -362,6 +362,41 @@ func TestBoardSelectionShowsTheTaskFacts(t *testing.T) {
 		t.Errorf("the renamed task lost its details:\n%s", got)
 	}
 }
+func TestBoardHelpLineShowsRefreshAndTabBeforeClose(t *testing.T) {
+	f := newBoardFixture(t, fixturePlan{})
+	observed := sampleTask("orch_help", nil)
+	f.seed(t, observed)
+	cards, err := ProjectCards(context.Background(), f.store, f.project)
+	if err != nil {
+		t.Fatalf("ProjectCards: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		board  *Board
+		detail Detail
+		want   []string
+	}{
+		{name: "collapsed", board: NewBoard(cards), detail: Detail{SelectedID: observed.ID}, want: []string{"r refresh", "Tab", "Shift+Tab", "q close"}},
+		{name: "expanded", board: NewBoard(cards), detail: Detail{SelectedID: observed.ID, Expanded: true}, want: []string{"r refresh", "q close"}},
+		{name: "ticket selected", board: NewBoardWithTickets(nil, []TicketCard{{Ticket: task.Ticket{ID: "tkt_help", Title: "help"}, Stage: task.TicketBacklog}}), detail: Detail{SelectedID: "tkt_help"}, want: []string{"r refresh", "Tab", "Shift+Tab", "q close"}},
+		{name: "no selection", board: NewBoard(cards), want: []string{"r refresh", "Tab", "Shift+Tab", "q close"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			view := Render(tc.board, tc.detail, 120, Theme{Profile: termenv.Ascii})
+			help := lineContaining(t, strings.Split(view, "\n"), "q close")
+			for _, want := range tc.want {
+				if !strings.Contains(help, want) {
+					t.Errorf("help line lacks %q:\n%s", want, help)
+				}
+			}
+		})
+	}
+
+	if got := clipHelpLine(helpLine(Detail{}), 7); !strings.Contains(got, "q close") {
+		t.Errorf("close key is not visible at width 7: %q", got)
+	}
+}
 
 // TestBoardEmptyStateNamesTheWayOut covers the board with nothing to show.
 func TestBoardEmptyStateNamesTheWayOut(t *testing.T) {

@@ -566,6 +566,17 @@ func typeText(t *testing.T, m *Model, text string) tea.Cmd {
 	return press(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(text)})
 }
 
+func moveWithConfirm(t *testing.T, m *Model) tea.Cmd {
+	t.Helper()
+	if cmd := typeText(t, m, "m"); cmd != nil {
+		t.Fatal("m must open confirmation without starting a write")
+	}
+	if !strings.Contains(m.View(), "Move this ticket to todo and start its planner? y/N") {
+		t.Fatalf("m must show the move confirmation:\n%s", m.View())
+	}
+	return typeText(t, m, "y")
+}
+
 func TestNewTicketPromptCapturesKeysAndSubmitsOnce(t *testing.T) {
 	f := newBoardFixture(t, fixturePlan{})
 	f.addTicket(t, "tkt_a_backlog", task.ColumnBacklog)
@@ -694,6 +705,69 @@ func TestBlankTitleIsNotSubmitted(t *testing.T) {
 		t.Fatalf("the title is trimmed: %+v", ops.creates)
 	}
 }
+func TestMoveKeyRequiresYConfirmation(t *testing.T) {
+	f := newBoardFixture(t, fixturePlan{})
+	f.addTicket(t, "tkt_a_backlog", task.ColumnBacklog)
+	f.seed(t)
+	ops := &fakeTicketOps{}
+	m := f.model(t, Options{Tickets: ops})
+
+	if cmd := typeText(t, m, "m"); cmd != nil || len(ops.moves) != 0 {
+		t.Fatalf("m must ask without starting a write: cmd=%v moves=%+v", cmd != nil, ops.moves)
+	}
+	if !strings.Contains(m.View(), "Move this ticket to todo and start its planner? y/N") {
+		t.Fatalf("m must show the confirmation prompt:\n%s", m.View())
+	}
+	if cmd := press(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")}); cmd == nil {
+		t.Fatal("y must start the ticket move")
+	} else {
+		press(t, m, cmd())
+	}
+	if len(ops.moves) != 1 || ops.moves[0].id != "tkt_a_backlog" {
+		t.Fatalf("y must move the ticket exactly once, got %+v", ops.moves)
+	}
+}
+
+func TestMoveKeyOtherKeyCancelsWithoutWriting(t *testing.T) {
+	ctx := context.Background()
+	f := newBoardFixture(t, fixturePlan{})
+	f.addTicket(t, "tkt_a_backlog", task.ColumnBacklog)
+	f.seed(t)
+	ops := &fakeTicketOps{}
+	m := f.model(t, Options{Tickets: ops})
+
+	if cmd := typeText(t, m, "m"); cmd != nil || !strings.Contains(m.View(), "Move this ticket to todo and start its planner? y/N") {
+		t.Fatalf("m must open confirmation before a non-y key cancels it: cmd=%v view:\n%s", cmd != nil, m.View())
+	}
+	if cmd := press(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")}); cmd != nil {
+		press(t, m, cmd())
+	}
+	ticket, err := f.store.Ticket(ctx, "tkt_a_backlog")
+	if err != nil {
+		t.Fatalf("read ticket after cancellation: %v", err)
+	}
+	if len(ops.moves) != 0 || ticket.Column != task.ColumnBacklog {
+		t.Fatalf("a non-y key must cancel without writing: moves=%+v ticket=%+v", ops.moves, ticket)
+	}
+}
+
+func TestMoveKeyAcceptsUppercaseY(t *testing.T) {
+	f := newBoardFixture(t, fixturePlan{})
+	f.addTicket(t, "tkt_a_backlog", task.ColumnBacklog)
+	f.seed(t)
+	ops := &fakeTicketOps{}
+	m := f.model(t, Options{Tickets: ops})
+
+	typeText(t, m, "m")
+	if cmd := press(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("Y")}); cmd == nil {
+		t.Fatal("Y must start the ticket move, as the y/N prompt invites")
+	} else {
+		press(t, m, cmd())
+	}
+	if len(ops.moves) != 1 || ops.moves[0].id != "tkt_a_backlog" {
+		t.Fatalf("Y must move the ticket exactly once, got %+v", ops.moves)
+	}
+}
 
 func TestMoveKeyActsOnlyOnASelectedBacklogTicket(t *testing.T) {
 	ctx := context.Background()
@@ -732,7 +806,7 @@ func TestMoveKeyActsOnlyOnASelectedBacklogTicket(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read the ticket: %v", err)
 	}
-	cmd := typeText(t, m, "m")
+	cmd := moveWithConfirm(t, m)
 	if cmd == nil {
 		t.Fatal("m on a backlog ticket must start the write")
 	}
@@ -778,7 +852,7 @@ func TestMoveRefusalBecomesANoticeAndRefreshes(t *testing.T) {
 	if len(m.board.TicketColumn(task.TicketBacklog)) != 1 {
 		t.Fatal("the board starts with the ticket in the backlog")
 	}
-	cmd := typeText(t, m, "m")
+	cmd := moveWithConfirm(t, m)
 	if cmd == nil {
 		t.Fatal("m on a backlog ticket must start the write")
 	}
@@ -815,7 +889,7 @@ func TestAMoveWhosePlannerDidNotStartStillSaysItMoved(t *testing.T) {
 		}
 	}
 	m := f.model(t, Options{Tickets: ops})
-	cmd := typeText(t, m, "m")
+	cmd := moveWithConfirm(t, m)
 	if cmd == nil {
 		t.Fatal("m on a backlog ticket must start the write")
 	}
@@ -851,7 +925,7 @@ func TestAMoveWhoseRecoverySignalFailedStillSaysItMoved(t *testing.T) {
 		}
 	}
 	m := f.model(t, Options{Tickets: ops})
-	cmd := typeText(t, m, "m")
+	cmd := moveWithConfirm(t, m)
 	if cmd == nil {
 		t.Fatal("m on a backlog ticket must start the write")
 	}
@@ -998,11 +1072,10 @@ func TestControlCharactersInStoredTextNeverReachTheScreen(t *testing.T) {
 
 // NewBoard now delegates to NewBoardWithTickets, so comparing the two renders (as
 // TestBoardWithoutTicketsRendersExactlyAsBefore does) cannot catch a change in the
-// no-ticket output. These SHA-256 digests record the board after f653bb6 added the
-// search footer (the current base's no-ticket render) for these cards, widths, and
-// selections. Ticket rendering must not change that baseline. They were re-recorded
-// once, on purpose, when a task card moved its title before its ID: that order is
-// the only change these plain (uncolored) renders show.
+// search footer and board help for these cards, widths, and selections. Ticket rendering must not
+// change that baseline. They were re-recorded once, on purpose, when a task card moved its title
+// before its ID: that order was the only change those plain (uncolored) renders showed. The current
+// digests also include the intentional addition of refresh and Tab keys to the help.
 func TestBoardWithoutTicketsMatchesTheSearchBaseline(t *testing.T) {
 	cards := []Card{
 		{Task: sampleTask("orch_a", nil), Stage: task.Running},
@@ -1014,12 +1087,12 @@ func TestBoardWithoutTicketsMatchesTheSearchBaseline(t *testing.T) {
 		"expanded": {SelectedID: "orch_a", Expanded: true},
 	}
 	want := map[string]string{
-		"100/none":     "cc6c0ee8a5d3fc5e0c0132841044a5a38c8e34c9d81c0593a3c6b82f480ab0fe",
-		"100/selected": "73320d5851be69e4aba549f486596e4602eb8944dc8c3befad3b974c1a6cc43c",
-		"100/expanded": "daf4f7c8acfa17255aedf3c68cf2c907a2ad641b1791e5893707aa798f2a0dca",
-		"80/none":      "06c08aaa33cff016bd0895171c4567c4b690b02f7a544d01ef43f9fa18caf154",
-		"80/selected":  "de59818d4e84c36f1f1194dcdfb759b4f4c655dc7adfe66857363718de74b68e",
-		"80/expanded":  "bff265a9655d1ffd4fd9e1d3009bb570a3cdcbf6a01a72e65a90cd601022eda9",
+		"100/none":     "307059b15d1edcaeedf2b8f224775a0396f839807da93f064c2021105f5de774",
+		"100/selected": "1dac0bbce058d6389ff497b08c6a9c83f60283ca48727824bd7f0d7ba0a97318",
+		"100/expanded": "dbdcea2ca6dacb6937d491f4cda2c7130435665c4134ea51d84bb9bf5306cda6",
+		"80/none":      "1452847cf6f57d6aba1136030f69037f191f70f97521f7b2c9d4cbf941d811a2",
+		"80/selected":  "48ac078acccc3ca7e91895681cb0ba2fa3b00960dcef8bf97f5c091e782400eb",
+		"80/expanded":  "4a0bc766575b41463482ff49fe6ebf558a91c31ed923b9b268d55c4552a351a1",
 	}
 	digest := func(out string) string {
 		sum := sha256.Sum256([]byte(out))
@@ -1094,12 +1167,16 @@ func TestRepeatedMoveKeyDoesNotStartASecondMoveWhileOneIsInFlight(t *testing.T) 
 	ops := &fakeTicketOps{}
 	m := f.model(t, Options{Tickets: ops})
 
-	first := typeText(t, m, "m")
+	first := moveWithConfirm(t, m)
 	if first == nil {
 		t.Fatal("m on a backlog ticket must start the write")
 	}
-	if second := typeText(t, m, "m"); second != nil {
-		t.Fatal("a second m while the first move is in flight must not start another write")
+	if cmd := typeText(t, m, "m"); cmd != nil {
+		t.Fatal("a second m while the first move is in flight must only ask")
+	}
+	if cmd := typeText(t, m, "y"); cmd != nil {
+		press(t, m, cmd())
+		t.Fatal("a second confirmed move while the first is in flight must not start a write")
 	}
 	press(t, m, first())
 	if len(ops.moves) != 1 {
@@ -1119,7 +1196,7 @@ func TestMoveKeyWorksAgainAfterAFailedMove(t *testing.T) {
 	ops := &fakeTicketOps{moveErr: errors.New("ticket_changed: the ticket changed after its preview")}
 	m := f.model(t, Options{Tickets: ops})
 
-	first := typeText(t, m, "m")
+	first := moveWithConfirm(t, m)
 	if first == nil {
 		t.Fatal("m on a backlog ticket must start the write")
 	}
@@ -1127,7 +1204,7 @@ func TestMoveKeyWorksAgainAfterAFailedMove(t *testing.T) {
 	if !m.noticeErr {
 		t.Fatalf("the refusal must be an error notice: %q", m.notice)
 	}
-	if again := typeText(t, m, "m"); again == nil {
+	if again := moveWithConfirm(t, m); again == nil {
 		t.Fatal("after a failed move finished, m must be able to try again")
 	}
 }
@@ -1147,7 +1224,7 @@ func TestMoveGuardRemembersEveryTicketInFlight(t *testing.T) {
 	if got := m.SelectedID(); got != "tkt_a_backlog" {
 		t.Fatalf("selected %q, want the first backlog ticket", got)
 	}
-	startA := typeText(t, m, "m")
+	startA := moveWithConfirm(t, m)
 	if startA == nil {
 		t.Fatal("m on the first backlog ticket must start the write")
 	}
@@ -1155,23 +1232,34 @@ func TestMoveGuardRemembersEveryTicketInFlight(t *testing.T) {
 	if got := m.SelectedID(); got != "tkt_b_backlog" {
 		t.Fatalf("selected %q, want the second backlog ticket", got)
 	}
-	startB := typeText(t, m, "m")
+	startB := moveWithConfirm(t, m)
 	if startB == nil {
 		t.Fatal("a move for a different ticket is independent and must be allowed while the first is in flight")
 	}
 	press(t, m, tea.KeyMsg{Type: tea.KeyUp})
-	if again := typeText(t, m, "m"); again != nil {
-		t.Fatal("a repeat of m on the first ticket must still be refused while its write is in flight, even after another ticket started")
+	if cmd := typeText(t, m, "m"); cmd != nil {
+		t.Fatal("a repeat of m on the first ticket must only ask")
+	}
+	if cmd := typeText(t, m, "y"); cmd != nil {
+		press(t, m, cmd())
+		t.Fatal("the first ticket's in-flight guard must refuse the confirmed move")
 	}
 	// The first write finishes while the second is still in flight: finishing one
 	// ticket's write must not release the guard of another.
 	press(t, m, startA())
+	if len(ops.moves) != 1 || ops.moves[0].id != "tkt_a_backlog" {
+		t.Fatalf("running the first move must write exactly once, got %+v", ops.moves)
+	}
 	press(t, m, tea.KeyMsg{Type: tea.KeyDown})
 	if got := m.SelectedID(); got != "tkt_b_backlog" {
 		t.Fatalf("selected %q, want the second backlog ticket", got)
 	}
-	if again := typeText(t, m, "m"); again != nil {
-		t.Fatal("the second ticket's write is still in flight: m on it must stay refused after the first write finished")
+	if cmd := typeText(t, m, "m"); cmd != nil {
+		t.Fatal("the second ticket's in-flight move must only ask")
+	}
+	if cmd := typeText(t, m, "y"); cmd != nil {
+		press(t, m, cmd())
+		t.Fatal("the second ticket's in-flight guard must refuse the confirmed move")
 	}
 	press(t, m, startB())
 	if len(ops.moves) != 2 || ops.moves[0].id != "tkt_a_backlog" || ops.moves[1].id != "tkt_b_backlog" {
@@ -1179,7 +1267,7 @@ func TestMoveGuardRemembersEveryTicketInFlight(t *testing.T) {
 	}
 	// Once its own write finished, the ticket is free again (the fake store did not
 	// move it, so it is still a backlog ticket).
-	if again := typeText(t, m, "m"); again == nil {
+	if again := moveWithConfirm(t, m); again == nil {
 		t.Fatal("after the second ticket's own write finished, m on it must work again")
 	}
 }
