@@ -130,8 +130,9 @@ type Model struct {
 
 	// promptOpen says the new-ticket title prompt is open. While it is, every key
 	// edits promptText and nothing navigates, focuses, writes or quits.
-	promptOpen bool
-	promptText string
+	promptOpen  bool
+	promptText  string
+	confirmMove bool
 
 	// moving is the set of tickets a move write is in flight for. While a ticket is
 	// in it, m on that ticket starts nothing: a repeat would lose the
@@ -249,10 +250,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // key applies one keystroke. Outside this model only two things can change: "f"
 // focuses a pane FocusVerified proved, and "n" and "m" write tickets through
-// TicketOps; "m" is the human's confirmation to start the ticket planner.
+// TicketOps; "m" asks, and "y" confirms the ticket move.
 func (m *Model) key(key tea.KeyMsg) tea.Cmd {
 	if m.promptOpen {
 		return m.promptKey(key)
+	}
+	if m.confirmMove {
+		return m.confirmMoveKey(key)
 	}
 	if m.searchOpen {
 		return m.searchKey(key)
@@ -325,7 +329,7 @@ func (m *Model) key(key tea.KeyMsg) tea.Cmd {
 		case "n":
 			return m.openPrompt()
 		case "m":
-			return m.moveTicket()
+			return m.beginMoveConfirm()
 		case "r":
 			m.notice = ""
 			m.noticeErr = false
@@ -716,6 +720,8 @@ func (m *Model) View() string {
 		out += "\n" + strings.Join(m.searchPromptLines(), "\n")
 	} else if m.promptOpen {
 		out += "\n" + strings.Join(m.promptLines(), "\n")
+	} else if m.confirmMove {
+		out += "\n" + clip("Move this ticket to todo and start its planner? y/N", m.width)
 	}
 	return out
 }
@@ -886,23 +892,55 @@ func (m *Model) submitPrompt() tea.Cmd {
 // card exactly as the board displays it. The coordinator atomically records the
 // planner task and starts or queues it; if the ticket changed since the board last
 // read it, the coordinator refuses and the board says so.
-func (m *Model) moveTicket() tea.Cmd {
+func (m *Model) moveAllowed() (TicketCard, bool) {
 	if m.opts.Tickets == nil {
 		m.notice = ticketWritesUnavailable
 		m.noticeErr = true
-		return nil
+		return TicketCard{}, false
 	}
 	card, ok := m.board.FindTicket(m.selected)
 	if !ok || card.Stage != task.TicketBacklog {
 		m.notice = "Select a backlog ticket to move it to todo"
 		m.noticeErr = true
+		return TicketCard{}, false
+	}
+	if m.moving[card.ID()] {
+		return TicketCard{}, false
+	}
+	return card, true
+}
+
+func (m *Model) beginMoveConfirm() tea.Cmd {
+	if _, ok := m.moveAllowed(); !ok {
+		return nil
+	}
+	m.confirmMove = true
+	m.notice = ""
+	m.noticeErr = false
+	return nil
+}
+
+func (m *Model) confirmMoveKey(key tea.KeyMsg) tea.Cmd {
+	m.confirmMove = false
+	if key.Type == tea.KeyRunes && (string(key.Runes) == "y" || string(key.Runes) == "Y") {
+		return m.moveTicket()
+	}
+	m.notice = "Move cancelled"
+	m.noticeErr = false
+	return nil
+}
+
+// moveTicket moves the selected backlog ticket to todo, sending the digest of the
+// card exactly as the board displays it. The coordinator atomically records the
+// planner task and starts or queues it; if the ticket changed since the board last
+// read it, the coordinator refuses and the board says so.
+func (m *Model) moveTicket() tea.Cmd {
+	card, ok := m.moveAllowed()
+	if !ok {
 		return nil
 	}
 	ops, ctx, project := m.opts.Tickets, m.ctx, m.project
 	id, digest := card.ID(), card.Ticket.Digest()
-	if m.moving[id] {
-		return nil
-	}
 	if m.moving == nil {
 		m.moving = map[string]bool{}
 	}

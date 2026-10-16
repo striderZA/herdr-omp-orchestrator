@@ -297,7 +297,7 @@ func ticketHelpLine(card TicketCard, d Detail) string {
 	if d.Expanded {
 		parts = []string{"Esc collapse"}
 	}
-	parts = append(parts, "/ search")
+	parts = append(parts, "r refresh", "Tab next column", "Shift+Tab previous column", "/ search")
 	parts = append(parts, ticketWriteKeys(card, d)...)
 	return strings.Join(append(parts, "q close"), ", ")
 }

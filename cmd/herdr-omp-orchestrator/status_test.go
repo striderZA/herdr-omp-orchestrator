@@ -1,0 +1,224 @@
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"errors"
+	"maps"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"testing"
+
+	"herdr-omp-orchestrator/internal/setup"
+	"herdr-omp-orchestrator/internal/state"
+	"herdr-omp-orchestrator/internal/task"
+)
+
+func TestSetupStatusLines(t *testing.T) {
+	conflictErr := statusExtensionConflict(t)
+	tests := []struct {
+		name string
+		err  error
+		want []string
+	}{
+		{
+			name: "all verified",
+			want: []string{"OMP integration: verified", "Plugin extension: verified"},
+		},
+		{
+			name: "integration missing",
+			err:  setup.ErrIntegrationMissing,
+			want: []string{"OMP integration: not verified (" + setup.ErrIntegrationMissing.Error() + ")", "Plugin extension: not checked"},
+		},
+		{
+			name: "extension missing",
+			err:  setup.ErrExtensionMissing,
+			want: []string{"OMP integration: verified", "Plugin extension: not verified (" + setup.ErrExtensionMissing.Error() + ")"},
+		},
+		{
+			name: "extension conflict",
+			err:  conflictErr,
+			want: []string{
+				"OMP integration: verified",
+				"Plugin extension: conflict (" + conflictErr.Error() + "); move or rename the existing herdr-orchestrator.ts, then run Setup again",
+			},
+		},
+		{
+			name: "source unavailable",
+			err:  setup.ErrSourceUnavailable,
+			want: []string{"OMP integration: not checked (" + setup.ErrSourceUnavailable.Error() + ")", "Plugin extension: not checked"},
+		},
+		{
+			name: "other error",
+			err:  errors.New("unexpected setup failure"),
+			want: []string{"OMP integration: not checked (unexpected setup failure)", "Plugin extension: not checked"},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := setupStatusLines(test.err); !reflect.DeepEqual(got, test.want) {
+				t.Errorf("setupStatusLines(%v) = %#v, want %#v", test.err, got, test.want)
+			}
+		})
+	}
+}
+
+func statusExtensionConflict(t *testing.T) error {
+	t.Helper()
+	fixture := newSetupRouteFixture(t)
+	if status, answer := runSetupRoute(t, fixture.env); status != 0 || !answer.OK {
+		t.Fatalf("install fixture extension: status=%d answer=%+v", status, answer)
+	}
+	if err := os.WriteFile(fixture.extension(), []byte("unmanaged extension\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := setup.Verify(context.Background(), fixture.env, herdrBinary(fixture.env))
+	if !errors.Is(err, setup.ErrExtensionConflict) {
+		t.Fatalf("Verify error = %v, want extension conflict", err)
+	}
+	return err
+}
+
+func TestStatusPaneShowsEveryResolvedProjectCheck(t *testing.T) {
+	fixture := newSetupRouteFixture(t)
+	if status, answer := runSetupRoute(t, fixture.env); status != 0 || !answer.OK {
+		t.Fatalf("install fixture extension: status=%d answer=%+v", status, answer)
+	}
+	stateDir := t.TempDir()
+	store, err := state.Open(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	project := task.Project{Key: `C:\work\demo`, RepoWorkspaceID: "workspace-1"}
+	if err := store.CreateProject(context.Background(), project); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	env := fixture.env
+	env[envStateDir] = stateDir
+	env[envWorkspaceID] = "workspace-1"
+	var stdout, stderr bytes.Buffer
+	if code := runStatus(env, strings.NewReader("\n"), &stdout, &stderr); code != 0 {
+		t.Fatalf("runStatus = %d: %s", code, stderr.String())
+	}
+	for _, want := range []string{"OMP integration: verified", "Plugin extension: verified", `Project: C:\work\demo`, "Primary: no problem recorded", "Board: can open"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Errorf("status missing %q:\n%s", want, stdout.String())
+		}
+	}
+}
+func TestStatusPaneDoesNotWriteStoreOrSetupFiles(t *testing.T) {
+	fixture := newSetupRouteFixture(t)
+	if status, answer := runSetupRoute(t, fixture.env); status != 0 || !answer.OK {
+		t.Fatalf("install fixture extension: status=%d answer=%+v", status, answer)
+	}
+	stateDir := t.TempDir()
+	store, err := state.Open(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	projectDir := filepath.Join(t.TempDir(), "demo")
+	if err := store.CreateProject(context.Background(), task.Project{Key: projectDir, RepoWorkspaceID: "workspace-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	stateFile := filepath.Join(stateDir, "orchestrator.sqlite")
+	before, err := os.ReadFile(stateFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeHash := sha256.Sum256(before)
+	beforeConfig := fixture.configTree(t)
+	env := fixture.env
+	env[envStateDir] = stateDir
+	env[envWorkspaceID] = "workspace-1"
+	var stdout, stderr bytes.Buffer
+	if code := runStatus(env, strings.NewReader("\n"), &stdout, &stderr); code != 0 {
+		t.Fatalf("runStatus = %d: %s", code, stderr.String())
+	}
+	after, err := os.ReadFile(stateFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := sha256.Sum256(after); got != beforeHash {
+		t.Fatal("status modified the store")
+	}
+	if got := fixture.configTree(t); !maps.Equal(got, beforeConfig) {
+		t.Fatal("status modified setup profile files")
+	}
+	for _, want := range []string{"OMP integration: verified", "Plugin extension: verified", "Project: " + projectDir, "Primary: no problem recorded", "Board: can open"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Errorf("status missing %q:\n%s", want, stdout.String())
+		}
+	}
+}
+
+func TestStatusPaneReportsNoProjectWithoutCreatingState(t *testing.T) {
+	stateDir := t.TempDir()
+	before, err := os.ReadDir(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	env := map[string]string{envStateDir: stateDir, envWorkspaceID: "unbound", envHerdrBinary: "herdr"}
+	if code := runStatus(env, strings.NewReader("\n"), &stdout, &stderr); code != 0 {
+		t.Fatalf("runStatus = %d: %s", code, stderr.String())
+	}
+	after, err := os.ReadDir(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != len(before) {
+		t.Fatalf("status changed empty state directory: before=%d entries after=%d", len(before), len(after))
+	}
+	for i := range before {
+		if before[i].Name() != after[i].Name() {
+			t.Fatalf("status changed empty state directory: before=%q after=%q", before[i].Name(), after[i].Name())
+		}
+	}
+	for _, want := range []string{"Project: none resolved (no state recorded yet)", "Board: cannot open (no state recorded yet)"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Errorf("status missing %q:\n%s", want, stdout.String())
+		}
+	}
+}
+func TestManifestDeclaresTheStatusActionAndPane(t *testing.T) {
+	action := manifestEntry(t, "actions", "status")
+	if got, want := action.fields["command"], `["./herdr-omp-orchestrator.exe", "open-status"]`; got != want {
+		t.Errorf("action command = %s, want %s", got, want)
+	}
+	pane := manifestEntry(t, "panes", "status")
+	if got, want := pane.fields["command"], `["./herdr-omp-orchestrator.exe", "status"]`; got != want {
+		t.Errorf("pane command = %s, want %s", got, want)
+	}
+	if got, want := pane.fields["placement"], `"overlay"`; got != want {
+		t.Errorf("pane placement = %s, want %s", got, want)
+	}
+}
+
+func TestUsageIncludesStatusRoutes(t *testing.T) {
+	for _, route := range []string{"open-status", "status"} {
+		if !strings.Contains(usage, route) {
+			t.Errorf("usage does not include %q: %s", route, usage)
+		}
+	}
+}
+
+func TestStatusEnvelopeIsSentToStderrAfterEnter(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := finishStatus(&stdout, &stderr, bufio.NewReader(strings.NewReader("\n")), []string{"Project: none resolved"}, map[string]any{"ok": true})
+	if code != 0 || !strings.Contains(stdout.String(), "Press Enter to close.") {
+		t.Fatalf("code=%d stdout=%q", code, stdout.String())
+	}
+	if !strings.Contains(stderr.String(), `"ok":true`) {
+		t.Fatalf("stderr=%q", stderr.String())
+	}
+}

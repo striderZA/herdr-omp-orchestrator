@@ -87,3 +87,29 @@ id = "reattach"
 title = "Reattach the primary OMP session"
 contexts = ["pane"]
 command = ["./herdr-omp-orchestrator.exe", "open-reattach"]
+# Forgetting a project is explicit and confirmed. The action only opens the pane
+# below, which shows what would be deleted and asks for the folder name first.
+[[actions]]
+id = "forget"
+title = "Forget this project's orchestrator records"
+contexts = ["pane", "workspace"]
+command = ["./herdr-omp-orchestrator.exe", "open-forget"]
+
+[[panes]]
+id = "forget"
+title = "Forget the project"
+placement = "overlay"
+command = ["./herdr-omp-orchestrator.exe", "forget"]
+
+# Read-only status of the project resolved from the invoking pane.
+[[actions]]
+id = "status"
+title = "Show orchestrator status"
+contexts = ["pane", "workspace"]
+command = ["./herdr-omp-orchestrator.exe", "open-status"]
+
+[[panes]]
+id = "status"
+title = "Orchestrator status"
+placement = "overlay"
+command = ["./herdr-omp-orchestrator.exe", "status"]

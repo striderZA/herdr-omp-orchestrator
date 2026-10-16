@@ -89,6 +89,43 @@ func TestPrimaryMarkerHeadsEveryLayoutWithinTheWidth(t *testing.T) {
 		}
 	}
 }
+func TestPrimaryMarkerKeepsReattachVisibleAtNarrowWidths(t *testing.T) {
+	for _, width := range []int{8, 11, 12, 24, 40} {
+		marker := primaryMarker(NewBoard(nil).WithPrimaryAttention(sampleAbsence), width, Theme{Profile: termenv.Ascii})
+		if len(marker) > primaryMarkerMaxLines+2 {
+			t.Errorf("width %d: marker has %d lines, want at most %d: %q", width, len(marker), primaryMarkerMaxLines+2, marker)
+		}
+		instructionVisible := false
+		for _, line := range marker {
+			if strings.HasPrefix(line, "Reattach") {
+				instructionVisible = true
+			}
+		}
+		if !instructionVisible {
+			t.Errorf("width %d: marker does not preserve the start of the reattach instruction: %q", width, marker)
+		}
+		reasonLines := marker
+		if len(reasonLines) > primaryMarkerMaxLines {
+			reasonLines = reasonLines[:primaryMarkerMaxLines]
+		}
+		if width >= 12 && !strings.Contains(strings.Join(reasonLines, " "), "Primary not verified:") {
+			t.Errorf("width %d: marker cut a word in the reason label: %q", width, reasonLines)
+		}
+		if width <= 12 && !strings.HasSuffix(marker[len(marker)-1], "...") {
+			t.Errorf("width %d: truncated instruction does not end with an ellipsis: %q", width, marker)
+		}
+	}
+}
+
+func TestPrimaryMarkerEndsWithReattachInstructionAtClippedWidth(t *testing.T) {
+	const instruction = "Reattach the primary OMP session"
+	for _, width := range []int{120, 60, 40, 24} {
+		marker := primaryMarker(NewBoard(nil).WithPrimaryAttention(sampleAbsence), width, Theme{Profile: termenv.Ascii})
+		if len(marker) == 0 || !strings.HasSuffix(strings.Join(marker, " "), instruction) {
+			t.Errorf("width %d: marker does not end with %q: %q", width, instruction, marker)
+		}
+	}
+}
 
 func TestPrimaryMarkerIsLegibleWithoutColorOrGlyphs(t *testing.T) {
 	plain := Render(NewBoard(markerCards()).WithPrimaryAttention(sampleAbsence), Detail{}, 100, Theme{Profile: termenv.Ascii})
@@ -165,8 +202,8 @@ func TestPrimaryMarkerIsBoundedAndSanitized(t *testing.T) {
 		if blank < 0 {
 			t.Fatalf("width %d: the marker is not followed by a blank line:\n%s", width, out)
 		}
-		if blank > primaryMarkerMaxLines {
-			t.Errorf("width %d: the marker is %d lines, want at most %d:\n%s", width, blank, primaryMarkerMaxLines, out)
+		if blank > primaryMarkerMaxLines+primaryMarkerInstructionMaxLines {
+			t.Errorf("width %d: the marker is %d lines, want at most %d:\n%s", width, blank, primaryMarkerMaxLines+primaryMarkerInstructionMaxLines, out)
 		}
 		if last := lines[primaryMarkerMaxLines-1]; !strings.HasSuffix(last, "...") {
 			t.Errorf("width %d: a cut reason does not say so: %q", width, last)

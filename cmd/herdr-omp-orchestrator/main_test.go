@@ -384,6 +384,65 @@ func TestCoordCodePreservesAmbiguousOperation(t *testing.T) {
 // bind route
 // ---------------------------------------------------------------------------
 
+func TestBindNextStepNamesActualPrimaryLocation(t *testing.T) {
+	project := task.Project{Key: "project-123"}
+	for _, tc := range []struct {
+		name       string
+		launchPane string
+		invoking   string
+		want       string
+	}{
+		{name: "reuses invoking pane", launchPane: "w1:p1", invoking: "w1:p1", want: "primary runs in this pane"},
+		{name: "dedicated workspace", launchPane: "w2:p1", invoking: "w1:p1", want: "primary runs in a new workspace on pane w2:p1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			line := bindNextStep(project, tc.launchPane, tc.invoking)
+			for _, want := range []string{project.Key, tc.want, "Open the task board"} {
+				if !strings.Contains(line, want) {
+					t.Errorf("bindNextStep() = %q; want it to contain %q", line, want)
+				}
+			}
+			if strings.ContainsAny(line, "\r\n") {
+				t.Fatalf("bindNextStep() = %q; want one line", line)
+			}
+		})
+	}
+}
+
+func TestFinishBindWritesNextStepAndAnswer(t *testing.T) {
+	project := task.Project{Key: "project-123", LaunchPaneID: "w2:p1"}
+	answer := map[string]any{"ok": true, "project": project}
+	var gotStdout, stderr, wantStdout bytes.Buffer
+	emit(&wantStdout, io.Discard, answer)
+
+	if code := finishBind(project, "w1:p1", answer, &gotStdout, &stderr); code != 0 {
+		t.Fatalf("finishBind() = %d, want 0", code)
+	}
+	if gotStdout.String() != wantStdout.String() {
+		t.Errorf("stdout = %q, want emit output %q", gotStdout.String(), wantStdout.String())
+	}
+	if !strings.Contains(stderr.String(), "the primary runs in a new workspace on pane w2:p1") {
+		t.Errorf("stderr = %q, want next-step line naming the launched pane", stderr.String())
+	}
+}
+
+func TestBindRefusalPrintsNoNextStep(t *testing.T) {
+	f := newBindRouteFixture(t, routeStatusNotInstalled)
+	f.installIntegration(t)
+	f.installExtension(t)
+	var stdout, stderr bytes.Buffer
+	if code := runBind(f.env, &stdout, &stderr); code == 0 {
+		t.Fatal("runBind succeeded when Herdr reports integration not installed")
+	}
+	answer := decodeAnswer(t, stdout.Bytes())
+	if answer.OK || answer.Error == nil || answer.Error.Code != "integration_missing" {
+		t.Fatalf("answer = %+v, want integration_missing refusal", answer)
+	}
+	if strings.Contains(stderr.String(), "Open the task board") {
+		t.Fatalf("refusal printed a next step: %q", stderr.String())
+	}
+}
+
 const (
 	routeStatusInstalled    = "omp: current (v10) (C:\\Users\\fixture\\.omp\\agent\\extensions\\herdr-omp-agent-state.ts)"
 	routeStatusNotInstalled = "omp: not installed (C:\\Users\\fixture\\.omp\\agent\\extensions\\herdr-omp-agent-state.ts)"

@@ -25,6 +25,7 @@ import (
 	"herdr-omp-orchestrator/internal/herdr"
 	"herdr-omp-orchestrator/internal/setup"
 	"herdr-omp-orchestrator/internal/state"
+	"herdr-omp-orchestrator/internal/task"
 )
 
 // bridgeTimeout bounds one bridge invocation in the executable itself. The
@@ -78,7 +79,7 @@ const (
 	envPluginEventJSON = "HERDR_PLUGIN_EVENT_JSON"
 )
 
-const usage = "usage: herdr-omp-orchestrator <setup [--dry-run]|bind|startup|event|board|open-board|reattach|open-reattach|bridge <method>|recover|--version>"
+const usage = "usage: herdr-omp-orchestrator <setup [--dry-run]|bind|startup|event|board|open-board|reattach|open-reattach|open-forget|forget|open-status|status|bridge <method>|recover|--version>"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -114,6 +115,14 @@ func main() {
 		os.Exit(runReattach(env, os.Stdin, os.Stdout, os.Stderr))
 	case "open-reattach":
 		os.Exit(runOpenReattach(env, os.Stdout, os.Stderr))
+	case "open-forget":
+		os.Exit(runOpenForget(env, os.Stdout, os.Stderr))
+	case "forget":
+		os.Exit(runForget(env, os.Stdin, os.Stdout, os.Stderr))
+	case "open-status":
+		os.Exit(runOpenStatus(env, os.Stdout, os.Stderr))
+	case "status":
+		os.Exit(runStatus(env, os.Stdin, os.Stdout, os.Stderr))
 	case "bridge":
 		args := os.Args[2:]
 		if scope, recoverable := bridgeRecoveryScope(args); recoverable {
@@ -145,6 +154,19 @@ type pluginContext struct {
 	FocusedPaneAgent string `json:"focused_pane_agent"`
 	WorkspaceCwd     string `json:"workspace_cwd"`
 	WorkspaceID      string `json:"workspace_id"`
+}
+
+func bindNextStep(project task.Project, launchPaneID, invokingPaneID string) string {
+	location := "the primary runs in this pane"
+	if launchPaneID != invokingPaneID {
+		location = fmt.Sprintf("the primary runs in a new workspace on pane %s", launchPaneID)
+	}
+	return fmt.Sprintf("%s for project %s; start work from the task board (open it with the \"Open the task board\" action).", location, project.Key)
+}
+
+func finishBind(project task.Project, invokingPaneID string, answer map[string]any, stdout, stderr io.Writer) int {
+	fmt.Fprintln(stderr, bindNextStep(project, project.LaunchPaneID, invokingPaneID))
+	return emit(stdout, stderr, answer)
 }
 
 // runBind binds the primary OMP session to the repository the action was
@@ -198,7 +220,7 @@ func runBind(env map[string]string, stdout, stderr io.Writer) int {
 			"resumeUnavailable": "the announced session could not be read back: " + hintErr.Error(),
 		}
 	}
-	return emit(stdout, stderr, answer)
+	return finishBind(project, invocation.FocusedPaneID, answer, stdout, stderr)
 }
 
 // runStartup is Herdr's `[[startup]]` hook: it reconciles the recorded
@@ -595,6 +617,12 @@ func herdrBinary(env map[string]string) string {
 // plugin log can classify.
 func coordCode(err error) string {
 	switch {
+	case errors.Is(err, coord.ErrForgetRefused):
+		return "forget_refused"
+	case errors.Is(err, coord.ErrForgetPlanChanged):
+		return "forget_plan_changed"
+	case errors.Is(err, coord.ErrForgetNotConfirmed):
+		return "forget_not_confirmed"
 	case errors.Is(err, coord.ErrReattachPending):
 		// Checked first: a pending reattach wraps the cause that left it pending
 		// (a readiness timeout, a refused notice), and the caller must hear that

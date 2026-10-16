@@ -9,6 +9,7 @@ A Windows-only Herdr plugin that connects Oh My Pi (OMP) primary and worker agen
 - [Herdr compatibility facts](docs/herdr-facts.md) — the external Herdr behavior this plugin depends on and how it was verified.
 - [Disposition contract (ADR 0001)](docs/adr/0001-disposition-contract.md) — how task decisions close tasks and release dependents.
 - [Successors and re-points (ADR 0005)](docs/adr/0005-successors-and-repoint.md) — how a superseded decision names its successor and how queued dependents are re-pointed to it.
+- [Forgetting a project (ADR 0006)](docs/adr/0006-forget-a-project.md) — how to remove one project's plugin records without removing its repository, worktrees, branches, or Herdr panes.
 
 ## Install
 
@@ -34,7 +35,7 @@ Then follow [First use](#first-use) to bind a repository and open its task board
 
 After the install script finishes, bind a repository and open its board. Herdr runs plugin actions without a terminal, so `bind` and `setup` write their answer, including a refusal, to Herdr's plugin log. List it with `herdr plugin log list --plugin user.omp-orchestrator`.
 
-The plugin's actions have these titles in Herdr: **Bind this repository as an orchestrated project** (`bind`), **Open the task board** (`board`), **Reattach the primary OMP session** (`reattach`) and **Setup OMP orchestrator extension** (`setup`).
+The plugin's actions have these titles in Herdr: **Bind this repository as an orchestrated project** (`bind`), **Open the task board** (`board`), **Reattach the primary OMP session** (`reattach`), **Show orchestrator status** (`status`), **Setup OMP orchestrator extension** (`setup`) and **Forget this project's orchestrator records** (`forget`).
 
 ### 1. Bind a repository
 
@@ -71,12 +72,16 @@ Run **Open the task board**. It opens as an overlay in the project's workspace.
 - **Backlog** and **Todo** show tickets that have no implementation work and no undecided planner. Once a ticket has either, the board shows it through its tasks instead. **Queued**, **Running**, **Needs input**, **Ready for review** and **Done** hold tasks.
 - Arrow keys or `j`/`k` move, and Tab or Shift+Tab switches columns. `Enter` toggles details, and `Esc` closes them, or closes the board when none are open. `/` filters, `f` focuses the selected worker's pane, `r` refreshes and `q` closes the board.
 - `n` creates a ticket from a title you type; Enter saves it and Esc cancels. Creating a ticket starts nothing.
-- `m` moves the selected backlog ticket to **Todo** and records its planner, which starts or queues when all worker slots are busy. From then on the board shows the ticket through that planner's task. The keypress is the only confirmation: the board shows no dialog for `m`. It needs a commit at HEAD.
+- `m` moves the selected backlog ticket to **Todo** and records its planner, which starts or queues when all worker slots are busy. From then on the board shows the ticket through that planner's task. `m` asks for confirmation; `y` moves the ticket. It needs a commit at HEAD.
+
+### Status of the plugin
+
+Run **Show orchestrator status** to open the status overlay. It reports `OMP integration` and `Plugin extension` verification from setup; the project resolved for this workspace or checkout, or that no project resolves; the primary's recorded attention (`Primary: no problem recorded` when the store records none, or `Primary: not verified; reattach is needed` when it records an issue); and whether the board can open (`Board: can open` or `Board: cannot open`). When no project resolves, the line is `Project: none resolved`; if no state has been recorded yet, it is `Project: none resolved (no state recorded yet)`. The status pane writes nothing. Press Enter to close it.
 
 ### 4. Plan a ticket before coding (optional)
 
 1. Press `n` on the board and title the ticket.
-2. Select it in **Backlog** and press `m`. Its planner works in its own worktree and reports a plan. It edits nothing.
+2. Select it in **Backlog** and press `m`; when asked, press `y` to move the ticket to **Todo** and start its planner. Its planner works in its own worktree and reports a plan. It edits nothing.
 3. When the plan is reported, the primary asks you to accept it. Accepting it (outcome `integrated` or `kept`) lets the primary dispatch implementation for the ticket, which still needs a base commit as above. Nothing starts from the plan by itself.
 4. When the ticket's tasks are decided, the primary asks you to close the ticket with an outcome. A ticket cannot close while a linked task is still open.
 
@@ -85,7 +90,19 @@ Run **Open the task board**. It opens as an overlay in the project's workspace.
 - Restarting Herdr keeps the recorded task facts and board state. At startup the plugin reconciles its records with Herdr's live state.
 - If the board shows **Primary not verified**, the recorded primary is absent or cannot be verified; the text after the label gives the reason. Run **Reattach the primary OMP session** from the pane that runs the replacement OMP, at the repository root. It shows what it would record and asks you to confirm first.
 
-Common refusal codes. Bind and setup write theirs to the plugin log; a dispatch refusal reaches the primary through the bridge, and the board shows a ticket refusal as a notice:
+### 6. Forget a project
+
+Use **Forget this project's orchestrator records** when you want to remove this plugin's records for a repository so you can bind it again as a new project. Start from a pane in that repository and open the action. The plan is read-only; review its counts and what will stay before confirming. The overlay is titled **Forget the project**.
+
+For an undecided task, record its outcome through the primary. If the primary is gone, the forget refusal says to reattach it first. If a task is still active, wait until its work stops, then record its outcome through the primary. A task with an active claim, a `sending` or `uncertain` note, an open bind intent, or an uncertain reattach notice also blocks forgetting. `sending` and `uncertain` notes block the action; the plugin has no action that clears an `uncertain` note yet. For an open bind intent, run **Bind this repository as an orchestrated project**. For an uncertain reattach notice, run **Reattach the primary OMP session** once the replacement session has announced itself.
+
+After a confirmed forget, the plugin deletes the project's `inbox`, `tickets`, `tasks`, and `projects` rows, and the `ready_sessions` rows for the project's current launch pane and its tasks' current launch panes. Rows for panes the project no longer records are kept: a worker pane that was cleaned up, and a primary pane the project was reattached away from. It does not delete `task_history`; those rows remain as the audit trail for the forgotten work, including the project key. Pending notes are deleted with the project. Forgetting cannot be undone.
+The repository, its branches and worktrees, and the Herdr workspaces and panes stay. Forgetting does not remove checkouts or close sessions.
+To confirm, type the project's folder name as the prompt shows it. Anything else, including Enter alone, cancels and deletes nothing; the pane reports `forget_not_confirmed`.
+
+The primary keeps its read-only restriction until its OMP session restarts. Restart that session or close its pane to clear the restriction.
+
+Common refusal codes. Bind and setup write theirs to the plugin log; a dispatch refusal reaches the primary through the bridge, and the board shows a ticket refusal as a notice. Forget codes appear in the forget pane's output and on its stderr envelope:
 
 | Code | Meaning and fix |
 |---|---|
@@ -94,6 +111,10 @@ Common refusal codes. Bind and setup write theirs to the plugin log; a dispatch 
 | `not_git_repository` | The folder is not inside a Git work tree. Bind from a folder inside one. |
 | `different_repository` | The pane's working directory is not the repository root. `cd` to the root in that pane and bind again. |
 | `bad_base_revision` | The base is not a commit of this repository. For a dispatch, give the primary a hash of at least seven hex characters from `git rev-parse --short HEAD`; `HEAD` and branch names such as `main` are refused. A ticket move also needs a commit at HEAD, so a repository with no commits needs a first commit. |
+| `forget_refused` | The plan has a blocking reason. Record undecided task outcomes through the primary (reattach it first if it is gone); if a task is active, wait for its work to stop, then record its outcome. An active claim must finish. An open bind intent may clear by running **Bind this repository as an orchestrated project**; an uncertain reattach notice can be cleared by running **Reattach the primary OMP session** once the replacement session has announced itself. `sending` and `uncertain` notes block forgetting, and the plugin has no action that clears an `uncertain` note yet. |
+| `forget_plan_changed` | The project changed after planning. Open the forget action again, review the new plan, and confirm it again. |
+| `forget_not_confirmed` | The typed folder name did not match, or Enter cancelled. The pane prints “Cancelled. Nothing was changed.” and writes this code to its stderr envelope; nothing is deleted. The coordinator returns the same code for a plan that has no fingerprint. |
+| `extension_conflict` | The OMP extensions directory for the active profile already contains a `herdr-orchestrator.ts` that was not written by this plugin. Move or rename the existing `herdr-orchestrator.ts` in that directory, then run **Setup OMP orchestrator extension** again. |
 
 ## What setup writes
 

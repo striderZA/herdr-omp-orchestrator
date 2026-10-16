@@ -24,10 +24,11 @@ import (
 
 // Errors returned by Store. Callers compare them with errors.Is.
 var (
-	ErrConflict  = errors.New("state: conflicting revision")
-	ErrNotFound  = errors.New("state: not found")
-	ErrInvalid   = errors.New("state: invalid record")
-	ErrAmbiguous = errors.New("state: ambiguous session binding")
+	ErrConflict    = errors.New("state: conflicting revision")
+	ErrNotFound    = errors.New("state: not found")
+	ErrInvalid     = errors.New("state: invalid record")
+	ErrStateAbsent = errors.New("state: database is absent")
+	ErrAmbiguous   = errors.New("state: ambiguous session binding")
 	// ErrMismatch reports an announced session that is not the identity the
 	// record was confirmed (or announced) with. It is never a reason to replace
 	// the recorded identity: a human decides which process owns the pane.
@@ -301,6 +302,51 @@ func Open(dir string) (*Store, error) {
 	if _, err := db.Exec(postMigrateIndexes); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("index %q: %w", path, err)
+	}
+	identity, _ := CurrentProcessIdentity()
+	return &Store{
+		db:                  db,
+		processIdentity:     identity,
+		completedTaskOwners: make(map[completedTaskOwner]struct{}),
+	}, nil
+}
+
+// OpenReadOnly opens an existing database without creating files or changing
+// SQLite state. A cleanly closed store needs immutable mode to avoid creating
+// WAL/SHM sidecars; an existing WAL or SHM must be honored for fresh reads.
+func OpenReadOnly(dir string) (*Store, error) {
+	if strings.TrimSpace(dir) == "" {
+		return nil, fmt.Errorf("%w: empty state dir", ErrInvalid)
+	}
+	path := filepath.Join(dir, dbFile)
+	if _, err := os.Stat(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("%w: %q", ErrStateAbsent, path)
+		}
+		return nil, fmt.Errorf("inspect state database %q: %w", path, err)
+	}
+	uri := "file:" + filepath.ToSlash(path) + "?mode=ro"
+	hasSidecar := false
+	for _, suffix := range []string{"-wal", "-shm"} {
+		_, err := os.Stat(path + suffix)
+		if err == nil {
+			hasSidecar = true
+			continue
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("inspect state database sidecar %q: %w", path+suffix, err)
+		}
+	}
+	if !hasSidecar {
+		uri += "&immutable=1"
+	}
+	db, err := sql.Open("sqlite", uri)
+	if err != nil {
+		return nil, fmt.Errorf("open read-only state database %q: %w", path, err)
+	}
+	if err := db.Ping(); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("open read-only state database %q: %w", path, err)
 	}
 	identity, _ := CurrentProcessIdentity()
 	return &Store{
@@ -937,7 +983,7 @@ func (s *Store) PendingInbox(ctx context.Context, projectKey string) ([]task.Inb
 	if strings.TrimSpace(projectKey) == "" {
 		return nil, fmt.Errorf("%w: project key is required", ErrInvalid)
 	}
-	return s.inboxRows(ctx, "the pending inbox of "+fmt.Sprintf("%q", projectKey),
+	return inboxRows(ctx, s.db, "the pending inbox of "+fmt.Sprintf("%q", projectKey),
 		`SELECT `+inboxSelect+` FROM inbox WHERE project_key = ? AND delivery_state = ?
 		 ORDER BY rowid`, projectKey, task.DeliveryPending)
 }
@@ -950,13 +996,13 @@ func (s *Store) ProjectInbox(ctx context.Context, projectKey string) ([]task.Inb
 	if strings.TrimSpace(projectKey) == "" {
 		return nil, fmt.Errorf("%w: project key is required", ErrInvalid)
 	}
-	return s.inboxRows(ctx, "the inbox of "+fmt.Sprintf("%q", projectKey),
+	return inboxRows(ctx, s.db, "the inbox of "+fmt.Sprintf("%q", projectKey),
 		`SELECT `+inboxSelect+` FROM inbox WHERE project_key = ? ORDER BY rowid`, projectKey)
 }
 
 // inboxRows runs one inbox query and scans every row it returns.
-func (s *Store) inboxRows(ctx context.Context, what, query string, args ...any) ([]task.Inbox, error) {
-	rows, err := s.db.QueryContext(ctx, query, args...)
+func inboxRows(ctx context.Context, q querier, what, query string, args ...any) ([]task.Inbox, error) {
+	rows, err := q.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", what, err)
 	}
