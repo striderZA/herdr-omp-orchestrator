@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Branch tests for install.sh, run against stub herdr, go and uname executables.
 #
-# Each scenario copies install.sh and linux/herdr-plugin.toml into a fresh folder
+# Each scenario copies install.sh, linux/herdr-plugin.toml and a placeholder
+# omp/herdr-orchestrator.ts into a fresh folder
 # under a directory this run owns, puts stub herdr, go and uname first on PATH,
 # and runs the copy with a PATH that holds nothing but the commands named in
 # install.sh's `# tools:` line, plus jq. So no real go or herdr can be found. The
@@ -196,11 +197,13 @@ CASE_NO=0
 #   c_nocalls   patterns no call may match
 #   c_argv      exact argument lines a Herdr call must receive; @FAKE@ is the repo
 #   c_min_pat   a call pattern that must match at least c_min times
+#   c_omp_link  1 to check that build/linux-plugin/omp/herdr-orchestrator.ts resolves to the repository's omp/herdr-orchestrator.ts
 begin() {
   CASE_NO=$((CASE_NO + 1))
   CASE_DIR="$RUN_ROOT/case-$CASE_NO"
   c_name=$1 c_exit=0 c_folder=fake-repo c_bin=full c_omit=0 c_symlink=0 c_skip_jq=0
   c_min_pat='' c_min=0
+  c_omp_link=0
   c_env=() c_state='{}' c_out=() c_calls=() c_nocalls=() c_argv=()
 }
 
@@ -243,12 +246,14 @@ first_match() {
 }
 
 run_case() {
-  local fake bin code output pat want line n hit joined problem found
+  local fake bin code output pat want line n hit joined problem found link_target want_target
   local -a calls argvs problems
   fake="$CASE_DIR/$c_folder"
   mkdir -p "$fake/linux" "$CASE_DIR/home" "$CASE_DIR/bin" "$CASE_DIR/tools"
   cp "$INSTALL_SH" "$fake/install.sh"
   if (( ! c_omit )); then cp "$MANIFEST" "$fake/linux/herdr-plugin.toml"; fi
+  mkdir -p "$fake/omp"
+  printf '%s\n' '// placeholder extension source' >"$fake/omp/herdr-orchestrator.ts"
   if (( c_symlink )); then ln -s "$fake" "$CASE_DIR/fake-link"; fi
 
   c_state=${c_state//@BUILD@/$fake/build/linux-plugin}
@@ -299,6 +304,11 @@ run_case() {
     n=$(count_matches "$c_min_pat" "${calls[@]}")
     (( n >= c_min )) || problems+=("matched $n calls to /$c_min_pat/, want at least $c_min")
   fi
+  if (( c_omp_link )); then
+    link_target=$(realpath -- "$fake/build/linux-plugin/omp/herdr-orchestrator.ts" 2>/dev/null) || link_target=''
+    want_target=$(realpath -- "$fake/omp/herdr-orchestrator.ts")
+    [[ -n $link_target && $link_target == "$want_target" ]] || problems+=("build/linux-plugin/omp/herdr-orchestrator.ts does not resolve to omp/herdr-orchestrator.ts")
+  fi
 
   checks=$((checks + 1))
   if (( ${#problems[@]} == 0 )); then
@@ -314,6 +324,7 @@ run_case() {
 
 begin 'fresh install runs every step'
 c_out=('Installed\.' 'extension: ')
+c_omp_link=1
 c_calls=("$BUILD_CALL" '^herdr integration install omp$' '^herdr plugin link ' "$INVOKE_CALL")
 c_nocalls=('plugin unlink' 'plugin enable')
 run_case
