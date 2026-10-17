@@ -37,3 +37,23 @@ The plugin was built, declared and installed for Windows only. Herdr publishes L
 - **Rebuilding over a running executable.** On this host, `go build -o` replaced a running executable without error. The measurement used a running `sleep` copy, not the board process. So the install step's `text file busy` hint in `install.sh` is probably unreachable on Linux. It is kept because `tests/install_linux_tests.sh` covers the message.
 - **Out of scope (issue #83).** Review, reattach and the board UI are not verified on Linux. They are recorded on the issue.
 - **The release workflow has not run on GitHub.** The Linux release job is written, but no tag has run it.
+
+## Verification
+
+Run on Linux x86_64 (WSL2, kernel 6.18) with Herdr 0.9.5, OMP 18.11.3, Go 1.27.1 and jq 1.8.1. The Go results come from commit `78f7a42`; no Go file changed after it.
+
+- **V1, Go suite.** `go test -count=1 -timeout 30m ./...` passes in every package (`internal/coord` took 219 s). Skips: two Windows-only tests in `cmd/herdr-omp-orchestrator`, and the OMP extension load check (`internal/setup/load_test.go`), which needs OMP's schema builder, not installed here. `tests/install_linux_tests.sh` passes 22 of 22 scenarios. `tests/acceptance_linux_state_test.py` passes 3 of 3.
+- **V2, cross-compile.** `GOOS=windows` and `GOOS=darwin` `go vet ./...` pass. `GOOS=linux GOARCH=arm64 go build ./...` passes; arm64 is compile-only.
+- **V3, release build.** `CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-X main.version=0.1.0"` prints `herdr-omp-orchestrator 0.1.0`.
+- **V4, install.** `./install.sh` exits 0 on this machine. Herdr reports `omp: current`. The plugin is linked to `build/linux-plugin`, enabled, with no warnings and six actions. The default Herdr server was stopped before, and the install started it for the setup step. It is still running.
+- **V5, smoke.** `tests/acceptance_linux.sh` exits 0 with 33 PASS checks and one INFO (the default session's focus is unchanged). Checks L0 to L8 cover setup, bind, dispatch, a verified worker, a ticket move with its planner, restart reconciliation, the pinned model in every transcript, and scoped state cleanup that left every other row identical.
+
+Found and fixed by these runs, before the passing results above:
+
+- The first real install failed at setup. The linked folder did not contain `omp/`, which setup reads. Fixed by linking it (`79c7f9f`). The stub harness could not catch this, so it now checks the link (`de0149b`).
+- The first smoke run refused at L0. Its checks read plugin and log answers without their `result` envelope, and the L5 check read `ticketId` from task entries, which do not carry it. Fixed (`5ed5703`).
+- `TestStoreProvisioningSlotClaimIsIdempotentAndReleasable` failed in about 18% of runs (55 of 300 on this branch). It also fails at the base commit `f19289d`, which the baseline run passed by chance. It asserted token freshness across tasks, which the design never promised. It now checks that a token is issued (`37a580c`). Per-task freshness stays covered by the renewal test.
+- `TestProcessIdentityDistinguishesLiveExitedAndReusedPIDs` also failed on the Wait text after its kill, which the plan did not list. It is fixed the same way as the store test.
+- A mutation check in a temporary copy broke six behaviors: worker stdio, zombie liveness, reused PID, command-name parsing, reservation folding, and manifest parity. Each one broke its named test.
+
+Git hooks in this clone are not executable, so `.githooks` did not run. The commit subjects follow Conventional Commits anyway.
