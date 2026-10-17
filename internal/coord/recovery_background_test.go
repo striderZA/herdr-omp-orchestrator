@@ -34,7 +34,7 @@ func TestBackgroundRecoveryLeavesUnrelatedCleanupToStartup(t *testing.T) {
 			Path: closed.WorktreePath, Branch: closed.Branch, WorkspaceID: closed.WorktreeWorkspaceID,
 		}
 	})
-	if out, err := runGit(f.root, "worktree", "remove", "--", closed.WorktreePath); err != nil {
+	if out, err := runGitTimed(f.timings, f.root, "worktree", "remove", "--", closed.WorktreePath); err != nil {
 		t.Fatalf("remove the checkout before task settlement: %v: %s", err, out)
 	}
 	session := f.state()

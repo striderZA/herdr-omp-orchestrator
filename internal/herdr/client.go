@@ -73,6 +73,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -174,7 +175,9 @@ var validReadSources = map[string]bool{
 // Client executes one Herdr binary. It holds no other state: every call is a
 // fresh process, and the caller owns the context deadline.
 type Client struct {
-	binary string
+	binary   string
+	mu       sync.RWMutex
+	observer func([]string, time.Duration, error)
 }
 
 // NewClient returns a client that runs binary. It does not check that the binary
@@ -188,6 +191,21 @@ func NewClient(binary string) (*Client, error) {
 
 // Binary reports the configured executable path.
 func (c *Client) Binary() string { return c.binary }
+
+// SetCallObserver installs an optional observer for each CLI process invocation.
+// The observer is called concurrently when calls run concurrently; argv is a
+// copy and callers must synchronize any shared observer state.
+func (c *Client) SetCallObserver(observer func([]string, time.Duration, error)) {
+	c.mu.Lock()
+	c.observer = observer
+	c.mu.Unlock()
+}
+
+func (c *Client) callObserver() func([]string, time.Duration, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.observer
+}
 
 // Call runs the binary with args and returns the raw JSON "result" member of a
 // successful response. args are passed verbatim as argv; they are never joined,
@@ -219,10 +237,17 @@ type callResult struct {
 // run executes the binary once. It reports transport-level failures only: a
 // non-zero exit status is not an error here, because the caller decides whether
 // an exit status is fatal (typical commands) or the payload (nothing yet).
-func (c *Client) run(ctx context.Context, op string, args []string) (*callResult, error) {
+func (c *Client) run(ctx context.Context, op string, args []string) (result *callResult, runErr error) {
 	if ctx == nil {
 		return nil, fmt.Errorf("%w: nil context for %s", ErrInvalidArgument, op)
 	}
+	start := time.Now()
+	var observerErr error
+	defer func() {
+		if observer := c.callObserver(); observer != nil {
+			observer(append([]string(nil), args...), time.Since(start), observerErr)
+		}
+	}()
 	// The only process-execution call in this package: argv goes straight to
 	// the executable. There is deliberately no sh -c / cmd /c path anywhere.
 	cmd := exec.CommandContext(ctx, c.binary, args...)
@@ -230,8 +255,7 @@ func (c *Client) run(ctx context.Context, op string, args []string) (*callResult
 	stderr := &boundedBuffer{limit: MaxOutputBytes, stream: streamStderr}
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
-	start := time.Now()
-	runErr := cmd.Run()
+	runErr = cmd.Run()
 	res := &callResult{
 		op:     op,
 		args:   append([]string(nil), args...),
@@ -239,21 +263,26 @@ func (c *Client) run(ctx context.Context, op string, args []string) (*callResult
 		stderr: stderr.Bytes(),
 	}
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		return res, &TimeoutError{Op: op, Args: res.args, Cause: ctxErr, Elapsed: time.Since(start)}
+		observerErr = &TimeoutError{Op: op, Args: res.args, Cause: ctxErr, Elapsed: time.Since(start)}
+		return res, observerErr
 	}
 	// Bound violations first: a truncated stream cannot be interpreted, so
 	// nothing derived from it may be reported as a result or a Herdr error.
 	if stdout.err != nil {
-		return res, stdout.err
+		observerErr = stdout.err
+		return res, observerErr
 	}
 	if stderr.err != nil {
-		return res, stderr.err
+		observerErr = stderr.err
+		return res, observerErr
 	}
 	if runErr != nil {
 		var exitErr *exec.ExitError
 		if !errors.As(runErr, &exitErr) {
-			return res, fmt.Errorf("herdr %s: start %q: %w", op, c.binary, runErr)
+			observerErr = fmt.Errorf("herdr %s: start %q: %w", op, c.binary, runErr)
+			return res, observerErr
 		}
+		observerErr = exitErr
 		res.exitCode = exitErr.ExitCode()
 	}
 	return res, nil
