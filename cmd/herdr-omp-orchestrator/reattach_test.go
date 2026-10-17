@@ -31,24 +31,7 @@ type manifestSection struct {
 // keeps each array-of-tables section's `key = value` lines verbatim.
 func readManifestSections(t *testing.T) []manifestSection {
 	t.Helper()
-	data, err := os.ReadFile(filepath.Join("..", "..", "herdr-plugin.toml"))
-	if err != nil {
-		t.Fatalf("read the manifest: %v", err)
-	}
-	var sections []manifestSection
-	for _, raw := range strings.Split(string(data), "\n") {
-		line := strings.TrimSpace(raw)
-		switch {
-		case strings.HasPrefix(line, "[[") && strings.HasSuffix(line, "]]"):
-			sections = append(sections, manifestSection{kind: strings.Trim(line, "[]"), fields: map[string]string{}})
-		case line == "" || strings.HasPrefix(line, "#") || len(sections) == 0:
-		default:
-			if key, value, ok := strings.Cut(line, "="); ok {
-				sections[len(sections)-1].fields[strings.TrimSpace(key)] = strings.TrimSpace(value)
-			}
-		}
-	}
-	return sections
+	return readManifestDoc(t, filepath.Join("..", "..", "herdr-plugin.toml")).sections
 }
 
 func manifestEntry(t *testing.T, kind, id string) manifestSection {
