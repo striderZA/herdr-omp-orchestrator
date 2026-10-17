@@ -144,7 +144,7 @@ l0_preflight() {
 
   local plist
   plist=$(hn plugin list --json --plugin "$PLUGIN_ID") || refuse L0.plugin "herdr plugin list --json failed"
-  entry=$(jq -c --arg id "$PLUGIN_ID" '[.plugins[]? | select(.plugin_id == $id)] | if length == 1 then .[0] else empty end' <<<"$plist")
+  entry=$(jq -c --arg id "$PLUGIN_ID" '[.result.plugins[]? | select(.plugin_id == $id)] | if length == 1 then .[0] else empty end' <<<"$plist")
   [[ -n $entry ]] || refuse L0.plugin "$PLUGIN_ID is not linked exactly once; link it first (this run never links)"
   root=$(jq -r '.plugin_root // ""' <<<"$entry")
   want=$(realpath -m "$REPO/build/linux-plugin")
@@ -210,7 +210,7 @@ start_isolated_server() {
 # ---------------------------------------------------------------------------
 log_entry() {
   hs plugin log list --plugin "$PLUGIN_ID" --limit 100 2>/dev/null |
-    jq -c --arg id "$1" '[.logs[]? | select(.log_id == $id)] | .[0] // empty'
+    jq -c --arg id "$1" '[.result.logs[]? | select(.log_id == $id)] | .[0] // empty'
 }
 setup_log_done() {
   SETUP_LOG=$(log_entry "$LOG_ID")
@@ -372,8 +372,8 @@ l4_worker() {
 # L5 ticket
 # ---------------------------------------------------------------------------
 planner_listed() {
-  bridge_as "$PRIMARY" task_list '{}' && bridge_ok &&
-    jq -e --arg t "$TICKET" '[.result.tasks[]? | select(.ticketId == $t)] | length > 0' >/dev/null <<<"$BRIDGE_OUT"
+  bridge_as "$PRIMARY" ticket_list '{}' && bridge_ok &&
+    jq -e --arg t "$TICKET" '[.result.tickets[]? | select(.ticketId == $t) | .taskIds[]?] | length > 0' >/dev/null <<<"$BRIDGE_OUT"
 }
 
 l5_ticket() {
@@ -427,7 +427,7 @@ l5_ticket() {
 restart_log_done() {
   local entry
   entry=$(hs plugin log list --plugin "$PLUGIN_ID" --limit 50 2>/dev/null |
-    jq -c --argjson w "$W" '[.logs[]? | select(.started_unix_ms > $w)] | sort_by(.started_unix_ms) | last // empty')
+    jq -c --argjson w "$W" '[.result.logs[]? | select(.started_unix_ms > $w)] | sort_by(.started_unix_ms) | last // empty')
   [[ -n $entry && $(jq -r '.status // ""' <<<"$entry") != running ]] || return 1
   RESTART_LOG=$entry
 }
