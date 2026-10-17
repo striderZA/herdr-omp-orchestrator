@@ -806,7 +806,11 @@ func (c *Coordinator) canonicalRoot(ctx context.Context, dir string) (string, er
 	}
 	out, err := c.git(ctx, abs, "rev-parse", "--show-toplevel")
 	if err != nil {
-		return "", fmt.Errorf("%w: %s is not inside a Git work tree (%s)", ErrNotGitRepository, dir, firstLine(out))
+		var exitErr *exec.ExitError
+		if ctx.Err() == nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) && errors.As(err, &exitErr) {
+			return "", fmt.Errorf("%w: %s is not inside a Git work tree (%s): %w", ErrNotGitRepository, dir, firstLine(out), err)
+		}
+		return "", fmt.Errorf("coord: resolve Git repository root for %s: %w", dir, err)
 	}
 	root := filepath.FromSlash(strings.TrimSpace(out))
 	if resolved, err := filepath.EvalSymlinks(root); err == nil {
