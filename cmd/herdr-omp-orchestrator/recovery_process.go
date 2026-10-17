@@ -147,8 +147,6 @@ func launchRecoveryChild(executable string, args, environ []string, markerPath, 
 	cmd.Env = append([]string(nil), environ...)
 	cmd.Dir = recoveryWorkerDir()
 	cmd.Stdin = nil
-	cmd.Stdout = io.Discard
-	cmd.Stderr = io.Discard
 	if err := configureDetachedRecoveryChild(cmd); err != nil {
 		return nil, fmt.Errorf("configure the recovery worker: %w", err)
 	}

@@ -898,6 +898,8 @@ const (
 	recoveryProcessMarkerEnv    = "ORCH_RECOVERY_PROCESS_MARKER"
 	recoveryProcessReadyEnv     = "ORCH_RECOVERY_PROCESS_READY"
 	recoveryProcessRecoveredEnv = "ORCH_RECOVERY_PROCESS_RECOVERED"
+	recoveryProcessLateEnv      = "ORCH_RECOVERY_PROCESS_LATE"
+	recoveryProcessLateFileEnv  = "ORCH_RECOVERY_PROCESS_LATE_FILE"
 )
 
 func TestDetachedRecoveryChildSurvivesTheForegroundRoute(t *testing.T) {
@@ -935,7 +937,7 @@ func TestDetachedRecoveryChildSurvivesTheForegroundRoute(t *testing.T) {
 
 func TestDetachedRecoveryWorkerDoesNotPinTheCallersDirectory(t *testing.T) {
 	if runtime.GOOS != "windows" {
-		t.Skip("the recovery child uses Windows breakaway process flags")
+		t.Skip("the working-directory pin matters only on Windows, where a process holds its directory open; its Linux behavior is not tested, by design")
 	}
 	exe, err := os.Executable()
 	if err != nil {
@@ -1073,9 +1075,12 @@ func recoveryProcessWorkerMain() int {
 	ready := os.Getenv(recoveryProcessReadyEnv)
 	marker := os.Getenv(recoveryProcessMarkerEnv)
 	recovered := os.Getenv(recoveryProcessRecoveredEnv)
-	if ready == "" || marker == "" || recovered == "" {
+	late := os.Getenv(recoveryProcessLateEnv) == "1"
+	lateFile := os.Getenv(recoveryProcessLateFileEnv)
+	if ready == "" || marker == "" || recovered == "" || (late && lateFile == "") {
 		return 41
 	}
+	foregroundPID := os.Getppid()
 	if err := os.WriteFile(ready, []byte("ready"), 0o600); err != nil {
 		return 42
 	}
@@ -1085,10 +1090,33 @@ func recoveryProcessWorkerMain() int {
 			if err := os.WriteFile(recovered, []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
 				return 43
 			}
-			return 0
+			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+	if !late {
+		return 0
+	}
+	// The foreground process exiting reparents this worker, which is the moment
+	// the stderr it inherited would have been closed on a real Herdr pane.
+	reparented := false
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); {
+		if os.Getppid() != foregroundPID {
+			reparented = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !reparented {
+		return 44
+	}
+	if _, err := os.Stderr.WriteString("late stderr write\n"); err != nil {
+		return 46
+	}
+	if err := os.WriteFile(lateFile, []byte("late"), 0o600); err != nil {
+		return 45
+	}
+	return 0
 }
 
 func replaceTestEnv(env []string, key, value string) []string {
