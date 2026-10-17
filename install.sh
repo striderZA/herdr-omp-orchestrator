@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tools: cp dirname jq mkdir mktemp realpath rm sleep
+# tools: cp dirname jq ln mkdir mktemp realpath rm sleep
 #
 # Installs this checkout as the OMP Orchestrator Herdr plugin on Linux. It is the
 # Linux counterpart of install.ps1 and runs the same steps in the same order,
@@ -8,8 +8,10 @@
 #   Preflight  Finds herdr, go and jq on PATH and reads the plugin's current
 #              Herdr link. If Herdr links the plugin from another folder, it
 #              stops here, before anything is built or written.
-#   [1/4]      Copies linux/herdr-plugin.toml into build/linux-plugin/, then
-#              builds herdr-omp-orchestrator there with CGO_ENABLED=0.
+#   [1/4]      Copies linux/herdr-plugin.toml into build/linux-plugin/, links
+#              omp/ there (setup reads its extension source from the plugin
+#              root, as on Windows), then builds herdr-omp-orchestrator there
+#              with CGO_ENABLED=0.
 #   [2/4]      Checks Herdr's OMP integration. It runs
 #              `herdr integration install omp` only when
 #              `herdr integration status` reports omp as not installed.
@@ -137,6 +139,7 @@ build_plugin() {
   echo "[1/4] Building $EXECUTABLE_NAME (CGO_ENABLED=0)"
   mkdir -p "$BUILD_DIR"
   cp "$REPO_ROOT/linux/herdr-plugin.toml" "$BUILD_DIR/herdr-plugin.toml"
+  ln -sfn -- "$REPO_ROOT/omp" "$BUILD_DIR/omp"
   out=$(cd "$REPO_ROOT" && CGO_ENABLED=0 go build -o "$BUILD_DIR/$EXECUTABLE_NAME" ./cmd/herdr-omp-orchestrator 2>&1) || rc=$?
   if (( rc != 0 )); then
     if [[ $out == *'text file busy'* ]]; then
