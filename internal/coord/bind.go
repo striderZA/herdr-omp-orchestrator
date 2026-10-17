@@ -1200,6 +1200,11 @@ func (c *Coordinator) awaitAgentReady(
 			}
 		case isMissingTarget(err):
 			last, lastErr = view, err
+		case errors.Is(err, herdr.ErrTimeout) && ctx.Err() == nil:
+			// A read that ran past its call budget is as transient as a pane that
+			// has not appeared yet: poll again while the readiness budget lasts. A
+			// cancelled caller still gets its error at once, from the default case.
+			last, lastErr = view, err
 		default:
 			return view, err
 		}
