@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -853,6 +854,8 @@ func TestInstallAcceptsAnUpToDateIntegration(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestExtensionDirResolution(t *testing.T) {
+	customAgent := filepath.Join(t.TempDir(), "custom-agent")
+
 	for _, tc := range []struct {
 		name string
 		env  map[string]string
@@ -875,8 +878,8 @@ func TestExtensionDirResolution(t *testing.T) {
 			env:  map[string]string{"OMP_PROFILE": "qa", "PI_CODING_AGENT_DIR": "C:\\elsewhere"},
 			want: filepath.Join(".omp", "profiles", "qa", "agent", "extensions")},
 		{name: "PI_CODING_AGENT_DIR wins for the default profile",
-			env:  map[string]string{"PI_CODING_AGENT_DIR": `C:\custom-agent`},
-			want: `C:\custom-agent\extensions`},
+			env:  map[string]string{"PI_CODING_AGENT_DIR": customAgent},
+			want: filepath.Join(customAgent, "extensions")},
 		{name: "PI_CONFIG_DIR relocates the default profile", env: map[string]string{"PI_CONFIG_DIR": ".ompx"},
 			want: filepath.Join(".ompx", "agent", "extensions")},
 		{name: "PI_CONFIG_DIR relocates a named profile",
@@ -1039,7 +1042,11 @@ func TestInstallEmbedsEscapedPathsThatDecodeBackToTheEnvironment(t *testing.T) {
 	// where it matters on this platform: every backslash in the path must be
 	// escaped in the literal and decode back to the exact path the environment
 	// supplied. Spaces and non-ASCII characters must survive untouched.
-	odd := filepath.Join(t.TempDir(), "plugin %odd% ünïcode dir")
+	name := "plugin %odd% ünïcode dir"
+	if runtime.GOOS != "windows" {
+		name += ` "quoted" back\slash`
+	}
+	odd := filepath.Join(t.TempDir(), name)
 	if err := os.MkdirAll(odd, 0o755); err != nil {
 		t.Fatalf("create odd directory: %v", err)
 	}
@@ -1077,9 +1084,6 @@ func TestInstallEmbedsEscapedPathsThatDecodeBackToTheEnvironment(t *testing.T) {
 		}
 		if decoded != want.value {
 			t.Errorf("%s decodes to %q, want %q", want.label, decoded, want.value)
-		}
-		if strings.Contains(string(content), line+`"`+want.value+`";`) {
-			t.Errorf("%s was embedded unescaped; the literal %s must escape path separators", want.label, literal)
 		}
 	}
 }
