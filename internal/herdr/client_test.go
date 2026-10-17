@@ -1298,6 +1298,24 @@ func TestCLITimeoutOutsideSubmissionIsNotAmbiguous(t *testing.T) {
 	}
 }
 
+func TestCLITimeoutReportsHowLongTheCallRan(t *testing.T) {
+	f := newFixture(t).hang()
+	_, err := f.client.AgentGet(shortCtx(t, 300*time.Millisecond), "w2:p1")
+	var timeout *TimeoutError
+	if !errors.As(err, &timeout) {
+		t.Fatalf("err = %v, want *TimeoutError", err)
+	}
+	// The call was cut off at its budget, so it ran for about that long; a zero
+	// or near-zero duration would not tell a caller how long it waited.
+	if timeout.Elapsed < 200*time.Millisecond {
+		t.Errorf("Elapsed = %s, want about the 300ms budget", timeout.Elapsed)
+	}
+	// Diagnostics read the message, so it must name the same duration.
+	if want := "after " + timeout.Elapsed.Round(time.Millisecond).String(); !strings.Contains(err.Error(), want) {
+		t.Errorf("message %q does not name how long the call ran (%q)", err.Error(), want)
+	}
+}
+
 func TestCLIWorktreeCreateTimeoutIsAmbiguous(t *testing.T) {
 	f := newFixture(t).hang()
 	_, err := f.client.WorktreeCreate(shortCtx(t, 300*time.Millisecond), `C:\work\demo-repo`, "demo-branch", "abc1234")

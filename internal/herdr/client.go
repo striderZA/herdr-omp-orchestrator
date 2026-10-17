@@ -73,6 +73,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // MaxOutputBytes bounds stdout and stderr independently for one CLI invocation.
@@ -229,6 +230,7 @@ func (c *Client) run(ctx context.Context, op string, args []string) (*callResult
 	stderr := &boundedBuffer{limit: MaxOutputBytes, stream: streamStderr}
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
+	start := time.Now()
 	runErr := cmd.Run()
 	res := &callResult{
 		op:     op,
@@ -237,7 +239,7 @@ func (c *Client) run(ctx context.Context, op string, args []string) (*callResult
 		stderr: stderr.Bytes(),
 	}
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		return res, &TimeoutError{Op: op, Args: res.args, Cause: ctxErr}
+		return res, &TimeoutError{Op: op, Args: res.args, Cause: ctxErr, Elapsed: time.Since(start)}
 	}
 	// Bound violations first: a truncated stream cannot be interpreted, so
 	// nothing derived from it may be reported as a result or a Herdr error.
@@ -540,13 +542,14 @@ func (e *AmbiguousError) Code() string {
 
 // TimeoutError reports that the caller context expired before the CLI finished.
 type TimeoutError struct {
-	Op    string
-	Args  []string
-	Cause error // context.DeadlineExceeded or context.Canceled
+	Op      string
+	Args    []string
+	Cause   error         // context.DeadlineExceeded or context.Canceled
+	Elapsed time.Duration // how long the CLI ran before it was cut off
 }
 
 func (e *TimeoutError) Error() string {
-	return fmt.Sprintf("herdr %s: %v after argv %q", e.Op, e.Cause, e.Args)
+	return fmt.Sprintf("herdr %s: %v after %s (argv %q)", e.Op, e.Cause, e.Elapsed.Round(time.Millisecond), e.Args)
 }
 
 func (e *TimeoutError) Unwrap() error { return e.Cause }
