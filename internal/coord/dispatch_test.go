@@ -54,8 +54,10 @@ const (
 // fixturePlan is what a test tells the stand-in CLI to do. Every knob exists to
 // make one failure or retry path reproducible.
 type fixturePlan struct {
-	RepoRoot string `json:"repo_root"`
-	// BindPane* describe the pane the bind action was invoked from. An empty
+	// CallTimeout can override the shared fixture's production-matched budget
+	// for tests that specifically exercise a shorter call budget.
+	CallTimeout time.Duration `json:"-"`
+	RepoRoot    string        `json:"repo_root"`
 	// BindPaneID makes `pane get` answer pane_not_found, so bind creates a
 	// workspace for the canonical root.
 	BindPaneID        string `json:"bind_pane_id"`
@@ -1119,9 +1121,13 @@ func (f *coordFixture) sibling() *Coordinator {
 		f.t.Fatalf("sibling state.Open: %v", err)
 	}
 	f.t.Cleanup(func() { _ = store.Close() })
+	callTimeout := f.plan.CallTimeout
+	if callTimeout <= 0 {
+		callTimeout = defaultCallTimeout
+	}
 	coordinator, err := New(store, f.client, Options{
 		Concurrency:      3,
-		CallTimeout:      5 * time.Second,
+		CallTimeout:      callTimeout,
 		ReadinessTimeout: 10 * time.Second,
 		PollInterval:     10 * time.Millisecond,
 	})
@@ -1189,9 +1195,15 @@ func newCoordFixture(t *testing.T, plan fixturePlan) *coordFixture {
 
 	// Each readiness poll starts the stand-in CLI as a child process, and a
 	// loaded run once went past 2 s; 10 s keeps this wait test-only.
+	callTimeout := f.plan.CallTimeout
+	if callTimeout <= 0 {
+		callTimeout = defaultCallTimeout
+	}
+	// Stand-in calls are process starts and slow under load; match production's
+	// per-call budget rather than failing tests at an artificially short limit.
 	coord, err := New(store, client, Options{
 		Concurrency:      3,
-		CallTimeout:      5 * time.Second,
+		CallTimeout:      callTimeout,
 		ReadinessTimeout: 10 * time.Second,
 		PollInterval:     10 * time.Millisecond,
 		// These tests are about what happens after a satisfied gate; the gate
@@ -1605,7 +1617,9 @@ func TestBindRetriesAnInterruptedPrimaryInTheSamePane(t *testing.T) {
 // the wait polls again while its own budget lasts, so the bind confirms the
 // agent it started instead of failing at the first slow call.
 func TestBindRetriesAReadinessPollThatRanPastItsCallBudget(t *testing.T) {
-	f := newCoordFixture(t, fixturePlan{SlowAgentGets: 1, AgentGetDelayMillis: 30_000})
+	f := newCoordFixture(t, fixturePlan{
+		CallTimeout: 5 * time.Second, SlowAgentGets: 1, AgentGetDelayMillis: 30_000,
+	})
 	if _, err := f.bind("", ""); err != nil {
 		t.Fatalf("bind: %v, want the retried poll to confirm the agent", err)
 	}
@@ -1615,7 +1629,9 @@ func TestBindRetriesAReadinessPollThatRanPastItsCallBudget(t *testing.T) {
 // the caller gets ErrReadinessTimeout (which the bridge reports as
 // readiness_timeout), not the raw CLI timeout of whichever read came last.
 func TestBindReportsReadinessTimeoutWhenEveryPollRunsPastItsBudget(t *testing.T) {
-	f := newCoordFixture(t, fixturePlan{SlowAgentGets: 1 << 20, AgentGetDelayMillis: 30_000})
+	f := newCoordFixture(t, fixturePlan{
+		CallTimeout: 5 * time.Second, SlowAgentGets: 1 << 20, AgentGetDelayMillis: 30_000,
+	})
 	if _, err := f.bind("", ""); !errors.Is(err, ErrReadinessTimeout) {
 		t.Fatalf("bind err = %v, want ErrReadinessTimeout", err)
 	}
@@ -2293,7 +2309,7 @@ func TestPendingBriefClaimOutlivesInFlightPrompt(t *testing.T) {
 	const (
 		lease        = 50 * time.Millisecond
 		promptDelay  = 3 * time.Second
-		callTimeout  = 5 * time.Second
+		callTimeout  = 20 * time.Second
 		readyTimeout = 2 * time.Second
 	)
 	f := newCoordFixture(t, fixturePlan{PromptDelayMillis: int(promptDelay / time.Millisecond)})
@@ -2414,7 +2430,7 @@ func TestPromptRecordFailureLeavesBriefAdjudicableWithoutResending(t *testing.T)
 	const lease = 30 * time.Millisecond
 	coordinator, err := New(f.store, f.client, Options{
 		Concurrency:      3,
-		CallTimeout:      5 * time.Second,
+		CallTimeout:      20 * time.Second,
 		ReadinessTimeout: 2 * time.Second,
 		PollInterval:     10 * time.Millisecond,
 		StepLease:        lease,
@@ -2459,7 +2475,7 @@ func TestPromptRecordFailureLeavesBriefAdjudicableWithoutResending(t *testing.T)
 	time.Sleep(lease + 20*time.Millisecond)
 	retry, err := New(f.store, f.client, Options{
 		Concurrency:      3,
-		CallTimeout:      5 * time.Second,
+		CallTimeout:      20 * time.Second,
 		ReadinessTimeout: 2 * time.Second,
 		PollInterval:     10 * time.Millisecond,
 		StepLease:        lease,

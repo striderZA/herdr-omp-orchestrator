@@ -3066,7 +3066,7 @@ func (f *coordFixture) shortLeaseCoordinator(t *testing.T) *Coordinator {
 	t.Helper()
 	coord, err := New(f.store, f.client, Options{
 		Concurrency:      3,
-		CallTimeout:      5 * time.Second,
+		CallTimeout:      20 * time.Second,
 		ReadinessTimeout: 2 * time.Second,
 		PollInterval:     10 * time.Millisecond,
 		StepLease:        50 * time.Millisecond,
