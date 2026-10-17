@@ -32,7 +32,7 @@ This is a Windows and Linux (x86_64) Herdr plugin that connects Oh My Pi (OMP) a
 - `internal/` — Go domain, persistence, CLI integration, orchestration, bridge, setup, and board packages; each package has adjacent `_test.go` files.
 - `omp/` — canonical OMP extension and its schema/load check.
 - `tests/` — Windows PowerShell helper-contract and full acceptance suites, the Linux install stubs (`install_linux_tests.sh`), and the Linux smoke path (`acceptance_linux.sh`, with its state helper test `acceptance_linux_state_test.py`).
-- `linux/` — the Linux plugin manifest (`linux/herdr-plugin.toml`). `install.sh` copies it into `build/linux-plugin/`.
+- `linux/` — the Linux plugin manifest (`linux/herdr-plugin.toml`). `install.sh` copies it into `build/linux-plugin/`, which also holds the built binary and a link to `omp/`, the extension source that setup reads from the plugin root.
 
 ## Development Commands
 

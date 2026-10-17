@@ -48,7 +48,7 @@ From the repository root, run:
 ./install.sh
 ```
 
-The script refuses any host that is not Linux, so macOS is refused. It builds `herdr-omp-orchestrator` with `CGO_ENABLED=0` into `build/linux-plugin/`, next to a copy of `linux/herdr-plugin.toml`, links that folder as a Herdr plugin, and runs the plugin's `setup` action. Like the Windows script, it runs `herdr integration install omp` only when Herdr reports the OMP integration missing. It stops at the first failure and prints what to fix. Running it again is safe. It never unlinks the plugin or overwrites Herdr's integration. If Herdr already links the plugin from another folder, it stops before changing anything, and the same unlink advice applies.
+The script refuses any host that is not Linux, so macOS is refused. It builds `herdr-omp-orchestrator` with `CGO_ENABLED=0` into `build/linux-plugin/`. That folder holds a copy of `linux/herdr-plugin.toml`, the built binary, and a link to `omp/`, because setup reads its extension source from the plugin root, as on Windows. The script links that folder as a Herdr plugin, and runs the plugin's `setup` action. Like the Windows script, it runs `herdr integration install omp` only when Herdr reports the OMP integration missing. It stops at the first failure and prints what to fix. Running it again is safe. It never unlinks the plugin or overwrites Herdr's integration. If Herdr already links the plugin from another folder, it stops before changing anything, and the same unlink advice applies.
 
 Then follow [First use](#first-use) to bind a repository and open its task board.
 
