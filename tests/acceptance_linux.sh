@@ -372,8 +372,8 @@ l4_worker() {
 # L5 ticket
 # ---------------------------------------------------------------------------
 planner_listed() {
-  bridge_as "$PRIMARY" ticket_list '{}' && bridge_ok &&
-    jq -e --arg t "$TICKET" '[.result.tickets[]? | select(.ticketId == $t) | .taskIds[]?] | length > 0' >/dev/null <<<"$BRIDGE_OUT"
+  bridge_as "$PRIMARY" task_list '{}' && bridge_ok &&
+    jq -e --arg t "$TICKET" '[.result.tasks[]? | select(.ticketId == $t)] | length > 0' >/dev/null <<<"$BRIDGE_OUT"
 }
 
 l5_ticket() {
