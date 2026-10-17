@@ -157,6 +157,10 @@ type Options struct {
 	PollInterval time.Duration
 	// Git is the git executable. It defaults to "git".
 	Git string
+	// GitObserver, when set, is called once per git invocation with its argv,
+	// elapsed time and outcome. It is a diagnostic hook: nil observes nothing and
+	// changes nothing.
+	GitObserver func(argv []string, elapsed time.Duration, err error)
 	// AgentKind is the Herdr agent kind the coordinator requires and starts. It
 	// defaults to "omp". The name is derived per agent (PrimaryAgentName /
 	// WorkerAgentName): Herdr keeps live agent names unique, so one name for
@@ -855,9 +859,19 @@ func isHexRevision(rev string) bool {
 	return true
 }
 
-// git runs one git invocation. argv goes straight to the executable; there is
-// deliberately no shell anywhere in this package.
+// git runs one git invocation and reports it to Options.GitObserver when set.
 func (c *Coordinator) git(ctx context.Context, dir string, args ...string) (string, error) {
+	start := time.Now()
+	out, err := c.execGit(ctx, dir, args...)
+	if observe := c.opts.GitObserver; observe != nil {
+		observe(append([]string{c.opts.Git, "-C", dir}, args...), time.Since(start), err)
+	}
+	return out, err
+}
+
+// execGit runs one git invocation. argv goes straight to the executable; there
+// is deliberately no shell anywhere in this package.
+func (c *Coordinator) execGit(ctx context.Context, dir string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.opts.CallTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, c.opts.Git, append([]string{"-C", dir}, args...)...)

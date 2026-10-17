@@ -3065,6 +3065,7 @@ func TestReconcileDoesNotProvisionWhenPrimaryReconciliationFails(t *testing.T) {
 func (f *coordFixture) shortLeaseCoordinator(t *testing.T) *Coordinator {
 	t.Helper()
 	coord, err := New(f.store, f.client, Options{
+		GitObserver:      f.timings.observer(),
 		Concurrency:      3,
 		CallTimeout:      5 * time.Second,
 		ReadinessTimeout: 2 * time.Second,
@@ -3314,7 +3315,7 @@ func TestRecoveryContinuesALaterProvisioningPhaseAfterLease(t *testing.T) {
 		t.Fatalf("the stopped caller's step claim = (%v, %v), want it taken", took, err)
 	}
 	f.updatePlan(func(plan *fixturePlan) { plan.AgentStartError = "" })
-	recovery, err := New(f.store, f.client, Options{StepLease: 750 * time.Millisecond})
+	recovery, err := New(f.store, f.client, Options{StepLease: 750 * time.Millisecond, GitObserver: f.timings.observer()})
 	if err != nil {
 		t.Fatalf("New (recovery): %v", err)
 	}
@@ -3564,7 +3565,7 @@ func TestReconcileSettlesInterruptedCleanupFromWorktreeAndBranchEvidence(t *test
 		}
 	})
 
-	if out, err := runGit(f.root, "worktree", "remove", "--", closed.WorktreePath); err != nil {
+	if out, err := runGitTimed(f.timings, f.root, "worktree", "remove", "--", closed.WorktreePath); err != nil {
 		t.Fatalf("remove the checkout before task settlement: %v: %s", err, out)
 	}
 	session := f.state()
@@ -3600,7 +3601,7 @@ func TestReconcileSettlesInterruptedCleanupFromWorktreeAndBranchEvidence(t *test
 	if _, err := os.Stat(closed.WorktreePath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("worktree path still exists after removal: %v", err)
 	}
-	if branch, err := runGit(f.root, "branch", "--list", closed.Branch); err != nil || !strings.Contains(branch, closed.Branch) {
+	if branch, err := runGitTimed(f.timings, f.root, "branch", "--list", closed.Branch); err != nil || !strings.Contains(branch, closed.Branch) {
 		t.Fatalf("branch %q was not retained: %q, %v", closed.Branch, branch, err)
 	}
 }
@@ -3615,7 +3616,7 @@ func TestReconcileDoesNotSettleCleanupWithoutRetainedBranch(t *testing.T) {
 			Path: closed.WorktreePath, Branch: closed.Branch, WorkspaceID: closed.WorktreeWorkspaceID,
 		}
 	})
-	if out, err := runGit(f.root, "worktree", "remove", "--", closed.WorktreePath); err != nil {
+	if out, err := runGitTimed(f.timings, f.root, "worktree", "remove", "--", closed.WorktreePath); err != nil {
 		t.Fatalf("remove the checkout before task settlement: %v: %s", err, out)
 	}
 	session := f.state()
@@ -3627,7 +3628,7 @@ func TestReconcileDoesNotSettleCleanupWithoutRetainedBranch(t *testing.T) {
 	}
 	session.Worktrees = remaining
 	session.save(f.dir)
-	if out, err := runGit(f.root, "branch", "-D", closed.Branch); err != nil {
+	if out, err := runGitTimed(f.timings, f.root, "branch", "-D", closed.Branch); err != nil {
 		t.Fatalf("remove the branch that cleanup must verify: %v: %s", err, out)
 	}
 

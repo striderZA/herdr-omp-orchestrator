@@ -240,7 +240,7 @@ func TestForgetDeletesTheRecordsAndLeavesGitAndHerdrAlone(t *testing.T) {
 	if _, err := os.Stat(worktree); err != nil {
 		t.Fatalf("worktree path removed: %v", err)
 	}
-	if out, err := runGit(f.root, "show-ref", "--verify", "refs/heads/"+branch); err != nil {
+	if out, err := runGitTimed(f.timings, f.root, "show-ref", "--verify", "refs/heads/"+branch); err != nil {
 		t.Fatalf("branch %q missing: %v: %s", branch, err, out)
 	}
 }

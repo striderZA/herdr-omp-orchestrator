@@ -83,6 +83,30 @@ func runGitTimed(log *callTimingLog, dir string, args ...string) (string, error)
 	return out, err
 }
 
+// observer returns a hook that records each call it is given into this log. It
+// has the shape of both herdr.Client.SetCallObserver and Options.GitObserver.
+func (l *callTimingLog) observer() func([]string, time.Duration, error) {
+	return func(argv []string, elapsed time.Duration, err error) {
+		l.record(time.Now().Add(-elapsed), elapsed, argv, err)
+	}
+}
+
+// newTimedCallLog returns the call timing log for one test. The test's records
+// are logged in order when it fails or runs longer than shouldLogCallTimings
+// allows.
+func newTimedCallLog(t *testing.T) *callTimingLog {
+	t.Helper()
+	timings := newCallTimingLog()
+	t.Cleanup(func() {
+		if shouldLogCallTimings(t.Failed(), time.Since(timings.started)) {
+			for _, line := range formatCallTimings(timings.snapshot()) {
+				t.Logf("%s", line)
+			}
+		}
+	})
+	return timings
+}
+
 func commitAllTimed(t *testing.T, log *callTimingLog, root, message string) string {
 	t.Helper()
 	for _, args := range [][]string{{"add", "-A"}, {"commit", "-m", message}} {
@@ -1182,6 +1206,7 @@ type coordFixture struct {
 	client   *herdr.Client
 	project  string
 	stateDir string
+	timings  *callTimingLog
 }
 
 // sibling opens a second store and coordinator over the same plugin state
@@ -1195,6 +1220,7 @@ func (f *coordFixture) sibling() *Coordinator {
 	}
 	f.t.Cleanup(func() { _ = store.Close() })
 	coordinator, err := New(store, f.client, Options{
+		GitObserver:      f.timings.observer(),
 		Concurrency:      3,
 		CallTimeout:      5 * time.Second,
 		ReadinessTimeout: 10 * time.Second,
@@ -1217,14 +1243,7 @@ type spec struct {
 // newCoordFixture builds a real repository with two commits, a stand-in Herdr
 // CLI and a coordinator wired to a real store.
 func newCoordFixture(t *testing.T, plan fixturePlan) *coordFixture {
-	timings := newCallTimingLog()
-	t.Cleanup(func() {
-		if shouldLogCallTimings(t.Failed(), time.Since(timings.started)) {
-			for _, line := range formatCallTimings(timings.snapshot()) {
-				t.Logf("%s", line)
-			}
-		}
-	})
+	timings := newTimedCallLog(t)
 	exe, err := os.Executable()
 	if err != nil {
 		t.Fatalf("os.Executable: %v", err)
@@ -1245,7 +1264,7 @@ func newCoordFixture(t *testing.T, plan fixturePlan) *coordFixture {
 	writeRepoFile(t, root, "src/main.txt", "second\n")
 	base := commitAllTimed(t, timings, root, "second commit")
 
-	f := &coordFixture{t: t, root: root, base: base, dir: t.TempDir()}
+	f := &coordFixture{t: t, root: root, base: base, dir: t.TempDir(), timings: timings}
 	plan.RepoRoot = root
 	f.plan = plan
 	f.writePlan()
@@ -1267,15 +1286,13 @@ func newCoordFixture(t *testing.T, plan fixturePlan) *coordFixture {
 	if err != nil {
 		t.Fatalf("herdr.NewClient: %v", err)
 	}
-	client.SetCallObserver(func(argv []string, elapsed time.Duration, err error) {
-		started := time.Now().Add(-elapsed)
-		timings.record(started, elapsed, argv, err)
-	})
+	client.SetCallObserver(timings.observer())
 	f.client = client
 
 	// Each readiness poll starts the stand-in CLI as a child process, and a
 	// loaded run once went past 2 s; 10 s keeps this wait test-only.
 	coord, err := New(store, client, Options{
+		GitObserver:      timings.observer(),
 		Concurrency:      3,
 		CallTimeout:      5 * time.Second,
 		ReadinessTimeout: 10 * time.Second,
@@ -1507,23 +1524,9 @@ func writeRepoFile(t *testing.T, root, rel, content string) {
 	}
 }
 
-func commitAll(t *testing.T, root, message string) string {
+func gitOutput(t *testing.T, log *callTimingLog, dir string, args ...string) string {
 	t.Helper()
-	for _, args := range [][]string{{"add", "-A"}, {"commit", "-m", message}} {
-		if out, err := runGit(root, args...); err != nil {
-			t.Fatalf("git %v: %v: %s", args, err, out)
-		}
-	}
-	out, err := runGit(root, "rev-parse", "HEAD")
-	if err != nil {
-		t.Fatalf("git rev-parse HEAD: %v: %s", err, out)
-	}
-	return strings.TrimSpace(out)
-}
-
-func gitOutput(t *testing.T, dir string, args ...string) string {
-	t.Helper()
-	out, err := runGit(dir, args...)
+	out, err := runGitTimed(log, dir, args...)
 	if err != nil {
 		t.Fatalf("git -C %s %v: %v: %s", dir, args, err, out)
 	}
@@ -1783,13 +1786,13 @@ func TestDispatchDoesNotCopyADirtyPrimaryCheckout(t *testing.T) {
 	if st.WorktreePath != wt.Path || st.WorktreeWorkspaceID != wt.WorkspaceID {
 		t.Errorf("recorded worktree = %q/%q, want the created %q/%q", st.WorktreePath, st.WorktreeWorkspaceID, wt.Path, wt.WorkspaceID)
 	}
-	if status := gitOutput(t, wt.Path, "status", "--porcelain"); status != "" {
+	if status := gitOutput(t, f.timings, wt.Path, "status", "--porcelain"); status != "" {
 		t.Errorf("worker checkout is dirty: %q", status)
 	}
-	if head := gitOutput(t, wt.Path, "rev-parse", "HEAD"); head != f.base {
+	if head := gitOutput(t, f.timings, wt.Path, "rev-parse", "HEAD"); head != f.base {
 		t.Errorf("worker HEAD = %s, want the committed base revision %s", head, f.base)
 	}
-	if dirty := gitOutput(t, f.root, "status", "--porcelain"); !strings.Contains(dirty, "src/main.txt") {
+	if dirty := gitOutput(t, f.timings, f.root, "status", "--porcelain"); !strings.Contains(dirty, "src/main.txt") {
 		t.Errorf("the primary's own checkout was disturbed: %q", dirty)
 	}
 }
@@ -2113,7 +2116,7 @@ func TestRetryAtEachPersistedPhaseRepeatsNoSideEffect(t *testing.T) {
 			t.Errorf("agent start calls = %d, want 2 (the failed attempt and the retry)", f.countCalls("agent start"))
 		}
 		// The real repository holds exactly one checkout for this branch.
-		list := gitOutput(t, f.root, "worktree", "list", "--porcelain")
+		list := gitOutput(t, f.timings, f.root, "worktree", "list", "--porcelain")
 		if strings.Count(list, "worktree ") != 2 {
 			t.Errorf("repository worktrees = %q, want the primary plus one worker", list)
 		}
@@ -2263,7 +2266,7 @@ func TestRetryAdoptsACheckoutWhosePhaseWasNeverRecorded(t *testing.T) {
 	f.projectKey()
 
 	path := filepath.Join(f.dir, "worktrees", "orch-"+identity)
-	if out, err := runGit(f.root, "worktree", "add", "-b", branch, path, f.base); err != nil {
+	if out, err := runGitTimed(f.timings, f.root, "worktree", "add", "-b", branch, path, f.base); err != nil {
 		t.Fatalf("git worktree add: %v: %s", err, out)
 	}
 	state := f.state()
@@ -2385,6 +2388,7 @@ func TestPendingBriefClaimOutlivesInFlightPrompt(t *testing.T) {
 	f := newCoordFixture(t, fixturePlan{PromptDelayMillis: int(promptDelay / time.Millisecond)})
 	projectKey := f.projectKey()
 	coordinator, err := New(f.store, f.client, Options{
+		GitObserver:      f.timings.observer(),
 		Concurrency:      3,
 		CallTimeout:      callTimeout,
 		ReadinessTimeout: readyTimeout,
@@ -2499,6 +2503,7 @@ func TestPromptRecordFailureLeavesBriefAdjudicableWithoutResending(t *testing.T)
 	f := newCoordFixture(t, fixturePlan{})
 	const lease = 30 * time.Millisecond
 	coordinator, err := New(f.store, f.client, Options{
+		GitObserver:      f.timings.observer(),
 		Concurrency:      3,
 		CallTimeout:      5 * time.Second,
 		ReadinessTimeout: 2 * time.Second,
@@ -2544,6 +2549,7 @@ func TestPromptRecordFailureLeavesBriefAdjudicableWithoutResending(t *testing.T)
 
 	time.Sleep(lease + 20*time.Millisecond)
 	retry, err := New(f.store, f.client, Options{
+		GitObserver:      f.timings.observer(),
 		Concurrency:      3,
 		CallTimeout:      5 * time.Second,
 		ReadinessTimeout: 2 * time.Second,
@@ -3814,7 +3820,7 @@ func TestResumeReusesTheClaimACrashLeft(t *testing.T) {
 	if started := f.countCalls("agent start"); started != beforeStart {
 		t.Errorf("agent start calls = %d, want %d: the retry started a second agent", started, beforeStart)
 	}
-	list := gitOutput(t, f.root, "worktree", "list", "--porcelain")
+	list := gitOutput(t, f.timings, f.root, "worktree", "list", "--porcelain")
 	if strings.Count(list, "orch/"+strings.TrimPrefix(admitted.Branch, "orch/")) != 1 {
 		t.Errorf("the repository has more than one checkout for %s:\n%s", admitted.Branch, list)
 	}
@@ -3970,7 +3976,7 @@ func TestDefiniteWorktreeFailureImmediatelyDrainsEligibleQueuedWork(t *testing.T
 	// while the failing attempt's `worktree create` is the one that is refused:
 	// what this test observes is the drain, not a second failure.
 	path := filepath.Join(f.dir, "worktrees", "queued")
-	if out, err := runGit(f.root, "worktree", "add", "-b", queued.Branch, path, f.base); err != nil {
+	if out, err := runGitTimed(f.timings, f.root, "worktree", "add", "-b", queued.Branch, path, f.base); err != nil {
 		t.Fatalf("git worktree add: %v: %s", err, out)
 	}
 	state := f.state()

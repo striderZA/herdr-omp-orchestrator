@@ -44,6 +44,7 @@ type reportFixture struct {
 	coord    *Coordinator
 	stateDir string
 	root     string
+	timings  *callTimingLog
 }
 
 func newReportFixture(t *testing.T) *reportFixture {
@@ -54,12 +55,14 @@ func newReportFixture(t *testing.T) *reportFixture {
 		t.Fatalf("state.Open: %v", err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
+	timings := newTimedCallLog(t)
 
 	client, err := herdr.NewClient(filepath.Join(t.TempDir(), "no-herdr-binary.exe"))
 	if err != nil {
 		t.Fatalf("herdr.NewClient: %v", err)
 	}
-	coordinator, err := New(store, client, Options{})
+	client.SetCallObserver(timings.observer())
+	coordinator, err := New(store, client, Options{GitObserver: timings.observer()})
 	if err != nil {
 		t.Fatalf("coord.New: %v", err)
 	}
@@ -68,7 +71,7 @@ func newReportFixture(t *testing.T) *reportFixture {
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		t.Fatalf("mkdir %s: %v", root, err)
 	}
-	return &reportFixture{t: t, store: store, coord: coordinator, stateDir: stateDir, root: root}
+	return &reportFixture{t: t, store: store, coord: coordinator, stateDir: stateDir, root: root, timings: timings}
 }
 
 // seedProject records one bound primary project.
@@ -1278,7 +1281,7 @@ func TestRecoveryContinuesQueuedIntentsAfterLeaseWithoutAnotherOperation(t *test
 				t.Fatalf("the stopped caller's claim = (%v, %v), want it taken", took, err)
 			}
 
-			recovery, err := New(f.store, f.client, Options{StepLease: 750 * time.Millisecond})
+			recovery, err := New(f.store, f.client, Options{StepLease: 750 * time.Millisecond, GitObserver: f.timings.observer()})
 			if err != nil {
 				t.Fatalf("New (recovery): %v", err)
 			}
@@ -1611,14 +1614,14 @@ func TestCleanupCheckoutStatusComesFromGit(t *testing.T) {
 		{"config", "user.name", "Orchestrator Test"},
 		{"config", "core.autocrlf", "false"},
 	} {
-		if out, err := runGit(root, args...); err != nil {
+		if out, err := runGitTimed(f.timings, root, args...); err != nil {
 			t.Fatalf("git %v: %v: %s", args, err, out)
 		}
 	}
 	writeRepoFile(t, root, "README.md", "first\n")
-	commitAll(t, root, "first commit")
+	commitAllTimed(t, f.timings, root, "first commit")
 	checkout := filepath.Join(t.TempDir(), "checkout")
-	if out, err := runGit(root, "worktree", "add", "-b", "orch/aaaaaaaaaaaa", checkout, "HEAD"); err != nil {
+	if out, err := runGitTimed(f.timings, root, "worktree", "add", "-b", "orch/aaaaaaaaaaaa", checkout, "HEAD"); err != nil {
 		t.Fatalf("git worktree add: %v: %s", err, out)
 	}
 	ctx := context.Background()
@@ -2134,7 +2137,7 @@ func TestRecoveryUntilIdleDoesNotReconcileWhenNoClaimsArePending(t *testing.T) {
 
 	f := newCoordFixture(t, fixturePlan{})
 	f.updatePlan(func(plan *fixturePlan) { plan.SnapshotProtocol = 23 })
-	recovery, err := New(f.store, f.client, Options{StepLease: time.Second})
+	recovery, err := New(f.store, f.client, Options{StepLease: time.Second, GitObserver: f.timings.observer()})
 	if err != nil {
 		t.Fatalf("New (recovery): %v", err)
 	}

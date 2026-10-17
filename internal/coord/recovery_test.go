@@ -23,7 +23,7 @@ var testRecoveryPace = recoveryPace{first: 5 * time.Millisecond, max: 20 * time.
 // the same store, with the short lease the stranded claims carry.
 func recoveryWorker(t *testing.T, f *coordFixture) *Coordinator {
 	t.Helper()
-	worker, err := New(f.store, f.client, Options{StepLease: 750 * time.Millisecond})
+	worker, err := New(f.store, f.client, Options{StepLease: 750 * time.Millisecond, GitObserver: f.timings.observer()})
 	if err != nil {
 		t.Fatalf("New (recovery worker): %v", err)
 	}
