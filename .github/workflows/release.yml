@@ -1,4 +1,4 @@
-# Attaches the Windows binary and SHA256SUMS to a GitHub release.
+# Attaches the Windows and Linux binaries and SHA256SUMS to a GitHub release.
 #
 # Runs when a release is published. Cut it from the default branch, after the
 # version bump is merged, on a tag that is already pushed:
@@ -41,6 +41,13 @@ jobs:
             goarch: amd64
             os: windows-2025
             runs: true
+            ext: .exe
+          - target: linux-amd64
+            goos: linux
+            goarch: amd64
+            os: ubuntu-24.04
+            runs: true
+            ext: ""
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -68,6 +75,8 @@ jobs:
           # -F matches the line literally. As a regex, the dots in the version
           # would match any character, so "0x1x0" would pass for 0.1.0.
           grep -Fqx "version = \"$version\"" <<< "$manifest" || { echo "::error::herdr-plugin.toml version is not $version"; exit 1; }
+          linux_manifest=$(git show HEAD:linux/herdr-plugin.toml)
+          grep -Fqx "version = \"$version\"" <<< "$linux_manifest" || { echo "::error::linux/herdr-plugin.toml version is not $version"; exit 1; }
 
       - uses: actions/setup-go@v7
         with:
@@ -84,20 +93,20 @@ jobs:
           # -X stamps the version that --version reports; -trimpath keeps the
           # build machine's paths out of the binary.
           go build -trimpath -ldflags "-X main.version=$version" \
-            -o "dist/herdr-omp-orchestrator-${{ matrix.target }}.exe" ./cmd/herdr-omp-orchestrator
+            -o "dist/herdr-omp-orchestrator-${{ matrix.target }}${{ matrix.ext }}" ./cmd/herdr-omp-orchestrator
 
       - name: Check it runs and reports the release version
         if: matrix.runs
         run: |
           version="${TAG#v}"
-          out=$("dist/herdr-omp-orchestrator-${{ matrix.target }}.exe" --version)
+          out=$("dist/herdr-omp-orchestrator-${{ matrix.target }}${{ matrix.ext }}" --version)
           echo "$out"
           [ "$out" = "herdr-omp-orchestrator $version" ] || { echo "::error::expected herdr-omp-orchestrator $version"; exit 1; }
 
       - uses: actions/upload-artifact@v7
         with:
           name: herdr-omp-orchestrator-${{ matrix.target }}
-          path: dist/herdr-omp-orchestrator-${{ matrix.target }}.exe
+          path: dist/herdr-omp-orchestrator-${{ matrix.target }}${{ matrix.ext }}
           if-no-files-found: error
 
   publish:
@@ -110,6 +119,7 @@ jobs:
       GH_REPO: ${{ github.repository }}
       ASSETS: >-
         herdr-omp-orchestrator-windows-amd64.exe
+        herdr-omp-orchestrator-linux-amd64
     steps:
       - uses: actions/download-artifact@v8
         with:
