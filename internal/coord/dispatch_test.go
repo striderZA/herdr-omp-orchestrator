@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -3043,9 +3044,15 @@ func TestAgentNamesAreUniqueAndLegal(t *testing.T) {
 
 	// A primary's name is stable per repository, unique across repositories, and
 	// distinct from every worker name.
-	first := PrimaryAgentName(`E:\work\repo-a`)
-	again := PrimaryAgentName(`e:/WORK/repo-a`)
-	other := PrimaryAgentName(`E:\work\repo-b`)
+	first := PrimaryAgentName("E:/work/repo-a")
+	again := PrimaryAgentName("e:/WORK/repo-a")
+	other := PrimaryAgentName("E:/work/repo-b")
+	if runtime.GOOS == "windows" {
+		// Backslash is a path separator only on Windows.
+		if backslash := PrimaryAgentName(`E:\work\repo-a`); backslash != first {
+			t.Errorf("PrimaryAgentName(backslash spelling) = %q, want %q", backslash, first)
+		}
+	}
 	if first != again {
 		t.Errorf("PrimaryAgentName is not stable: %q then %q", first, again)
 	}

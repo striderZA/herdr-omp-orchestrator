@@ -3,6 +3,7 @@ package coord
 import (
 	"context"
 	"errors"
+	"io/fs"
 	"os/exec"
 	"path/filepath"
 	"testing"
@@ -36,9 +37,8 @@ func TestCanonicalRootGitStartFailureIsNotNotGitRepository(t *testing.T) {
 	if errors.Is(err, ErrNotGitRepository) {
 		t.Fatalf("canonicalRoot error = %v, must not be ErrNotGitRepository", err)
 	}
-	var pathErr *exec.Error
-	if !errors.As(err, &pathErr) {
-		t.Fatalf("canonicalRoot error = %v, want wrapped executable start failure (*exec.Error)", err)
+	if !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("canonicalRoot error = %v, want wrapped executable start failure (fs.ErrNotExist)", err)
 	}
 }
 

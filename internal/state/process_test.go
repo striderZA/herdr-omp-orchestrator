@@ -2,6 +2,7 @@ package state_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -109,7 +110,9 @@ func TestProcessIdentityDistinguishesLiveExitedAndReusedPIDs(t *testing.T) {
 	}
 	if err := cmd.Wait(); err != nil {
 		// A forced stop is expected; the process handle must still be reaped.
-		if !strings.Contains(strings.ToLower(err.Error()), "exit status") {
+		// Its exit status differs by platform, so accept any exit error.
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) {
 			t.Fatalf("wait for identity helper: %v", err)
 		}
 	}
@@ -183,8 +186,14 @@ func TestStoreClaimStepDoesNotEnterAResourceTaskOwnedByAnotherLiveProcessBetween
 	if err := cmd.Process.Kill(); err != nil {
 		t.Fatalf("stop live task owner: %v", err)
 	}
-	if err := cmd.Wait(); err != nil && !strings.Contains(strings.ToLower(err.Error()), "exit status") {
-		t.Fatalf("wait for stopped task owner: %v", err)
+	if err := cmd.Wait(); err != nil {
+		// The owner was killed on purpose; its exit status differs by platform
+		// (signal on Unix, exit status on Windows). Only the reap matters, so
+		// accept any exit error and fail on anything else.
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) {
+			t.Fatalf("wait for stopped task owner: %v", err)
+		}
 	}
 	if took, err := s.ClaimStep(ctx, stored.ID, task.WorktreeCreated, "other-operation", time.Second); err != nil || !took {
 		t.Fatalf("ClaimStep after the owner exited and lease elapsed = (%v, %v), want takeover", took, err)
