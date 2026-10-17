@@ -1,6 +1,6 @@
 id = "user.omp-orchestrator"
 name = "OMP Orchestrator"
-version = "0.1.0"
+version = "0.2.0"
 # Semver orders any 0.9.1-preview BELOW 0.9.1, so declaring 0.9.1 cannot be
 # satisfied by a 0.9.1 preview build (observed: plugin_requires_newer_herdr on
 # herdr 0.9.1-preview.2026-09-21, which reports 0.9.0 for version comparison).
