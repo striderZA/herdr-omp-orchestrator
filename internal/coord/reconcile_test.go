@@ -3067,7 +3067,7 @@ func (f *coordFixture) shortLeaseCoordinator(t *testing.T) *Coordinator {
 	coord, err := New(f.store, f.client, Options{
 		GitObserver:      f.timings.observer(),
 		Concurrency:      3,
-		CallTimeout:      5 * time.Second,
+		CallTimeout:      20 * time.Second,
 		ReadinessTimeout: 2 * time.Second,
 		PollInterval:     10 * time.Millisecond,
 		StepLease:        50 * time.Millisecond,

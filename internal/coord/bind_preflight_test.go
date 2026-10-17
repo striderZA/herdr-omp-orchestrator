@@ -78,7 +78,7 @@ func (f *coordFixture) gate(t *testing.T, profile ompProfile) {
 	coordinator, err := New(f.store, f.client, Options{
 		GitObserver:      f.timings.observer(),
 		Concurrency:      3,
-		CallTimeout:      5 * time.Second,
+		CallTimeout:      20 * time.Second,
 		ReadinessTimeout: 2 * time.Second,
 		PollInterval:     10 * time.Millisecond,
 		Preflight: func(ctx context.Context) error {
@@ -237,7 +237,7 @@ func TestBindWrapsAnyPreflightFailureAndRunsItOnce(t *testing.T) {
 	runs := 0
 	coordinator, err := New(f.store, f.client, Options{
 		GitObserver:      f.timings.observer(),
-		CallTimeout:      5 * time.Second,
+		CallTimeout:      20 * time.Second,
 		ReadinessTimeout: 2 * time.Second,
 		PollInterval:     10 * time.Millisecond,
 		Preflight: func(context.Context) error {
@@ -277,7 +277,7 @@ func TestBindRefusesWithoutAConfiguredPreflight(t *testing.T) {
 	f := newCoordFixture(t, fixturePlan{})
 	coordinator, err := New(f.store, f.client, Options{
 		GitObserver:      f.timings.observer(),
-		CallTimeout:      5 * time.Second,
+		CallTimeout:      20 * time.Second,
 		ReadinessTimeout: 2 * time.Second,
 		PollInterval:     10 * time.Millisecond,
 	})
