@@ -153,6 +153,12 @@ type fixturePlan struct {
 	AgentStartTimeout bool `json:"agent_start_timeout"`
 	// SkipGitWorktree keeps the checkout off disk (an already-broken create).
 	SkipGitWorktree bool `json:"skip_git_worktree"`
+
+	// SlowAgentGets makes the first SlowAgentGets `agent get` calls on a live
+	// agent answer only after AgentGetDelayMillis, so the call outlives the
+	// coordinator's per-call budget the way a CLI start on a loaded host does.
+	SlowAgentGets       int `json:"slow_agent_gets"`
+	AgentGetDelayMillis int `json:"agent_get_delay_millis"`
 }
 
 // fixtureAgent is one live agent the stand-in CLI remembers. Terminal is the
@@ -400,6 +406,13 @@ func fixtureAgentGet(dir string, plan fixturePlan, state *fixtureState, argv []s
 		return fixtureError("agent_not_found", "agent target "+pane+" not found")
 	}
 	agent.Gets++
+	if agent.Gets <= plan.SlowAgentGets {
+		// The read is slow, not wrong: it answers only after the caller's call
+		// budget has run out. The counter is saved before the wait, because the
+		// caller kills this process at its budget and the next read must see it.
+		state.save(dir)
+		time.Sleep(time.Duration(plan.AgentGetDelayMillis) * time.Millisecond)
+	}
 	announced := fixtureAnnouncement(plan, agent.Session)
 	if plan.AdoptBeforeRecord {
 		adoptFixtureSession(pane, announced.ID)
@@ -1585,6 +1598,26 @@ func TestBindRetriesAnInterruptedPrimaryInTheSamePane(t *testing.T) {
 	}
 	if f.countCalls("agent start") != 2 {
 		t.Errorf("agent start calls = %d, want 2 (the failed attempt and the retry)", f.countCalls("agent start"))
+	}
+}
+
+// A readiness read that outlives its call budget is a slow read, not a refusal:
+// the wait polls again while its own budget lasts, so the bind confirms the
+// agent it started instead of failing at the first slow call.
+func TestBindRetriesAReadinessPollThatRanPastItsCallBudget(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{SlowAgentGets: 1, AgentGetDelayMillis: 30_000})
+	if _, err := f.bind("", ""); err != nil {
+		t.Fatalf("bind: %v, want the retried poll to confirm the agent", err)
+	}
+}
+
+// When every read outlives its budget, the readiness budget ends the wait and
+// the caller gets ErrReadinessTimeout (which the bridge reports as
+// readiness_timeout), not the raw CLI timeout of whichever read came last.
+func TestBindReportsReadinessTimeoutWhenEveryPollRunsPastItsBudget(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{SlowAgentGets: 1 << 20, AgentGetDelayMillis: 30_000})
+	if _, err := f.bind("", ""); !errors.Is(err, ErrReadinessTimeout) {
+		t.Fatalf("bind err = %v, want ErrReadinessTimeout", err)
 	}
 }
 
