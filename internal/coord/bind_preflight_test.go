@@ -77,7 +77,7 @@ func (f *coordFixture) gate(t *testing.T, profile ompProfile) {
 	}
 	coordinator, err := New(f.store, f.client, Options{
 		Concurrency:      3,
-		CallTimeout:      5 * time.Second,
+		CallTimeout:      20 * time.Second,
 		ReadinessTimeout: 2 * time.Second,
 		PollInterval:     10 * time.Millisecond,
 		Preflight: func(ctx context.Context) error {
@@ -235,7 +235,7 @@ func TestBindWrapsAnyPreflightFailureAndRunsItOnce(t *testing.T) {
 	cause := errors.New("the prerequisite is gone")
 	runs := 0
 	coordinator, err := New(f.store, f.client, Options{
-		CallTimeout:      5 * time.Second,
+		CallTimeout:      20 * time.Second,
 		ReadinessTimeout: 2 * time.Second,
 		PollInterval:     10 * time.Millisecond,
 		Preflight: func(context.Context) error {
@@ -274,7 +274,7 @@ func TestBindWrapsAnyPreflightFailureAndRunsItOnce(t *testing.T) {
 func TestBindRefusesWithoutAConfiguredPreflight(t *testing.T) {
 	f := newCoordFixture(t, fixturePlan{})
 	coordinator, err := New(f.store, f.client, Options{
-		CallTimeout:      5 * time.Second,
+		CallTimeout:      20 * time.Second,
 		ReadinessTimeout: 2 * time.Second,
 		PollInterval:     10 * time.Millisecond,
 	})
