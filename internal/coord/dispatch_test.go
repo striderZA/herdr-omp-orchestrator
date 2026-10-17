@@ -22,6 +22,81 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+type callTimingRecord struct {
+	offset   time.Duration
+	duration time.Duration
+	argv     []string
+	outcome  string
+}
+
+type callTimingLog struct {
+	started time.Time
+	mu      sync.Mutex
+	records []callTimingRecord
+}
+
+func newCallTimingLog() *callTimingLog {
+	return &callTimingLog{started: time.Now()}
+}
+
+func (l *callTimingLog) record(started time.Time, duration time.Duration, argv []string, err error) {
+	outcome := "ok"
+	if err != nil {
+		outcome = err.Error()
+	}
+	record := callTimingRecord{
+		offset:   started.Sub(l.started),
+		duration: duration,
+		argv:     append([]string(nil), argv...),
+		outcome:  outcome,
+	}
+	l.mu.Lock()
+	l.records = append(l.records, record)
+	l.mu.Unlock()
+}
+
+func (l *callTimingLog) snapshot() []callTimingRecord {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]callTimingRecord(nil), l.records...)
+}
+
+func shouldLogCallTimings(failed bool, elapsed time.Duration) bool {
+	return failed || elapsed > 30*time.Second
+}
+
+func formatCallTimings(records []callTimingRecord) []string {
+	ordered := append([]callTimingRecord(nil), records...)
+	sort.SliceStable(ordered, func(i, j int) bool { return ordered[i].offset < ordered[j].offset })
+	lines := make([]string, 0, len(ordered))
+	for _, record := range ordered {
+		lines = append(lines, fmt.Sprintf("call offset=%s duration=%s outcome=%q argv=%q",
+			record.offset.Round(time.Millisecond), record.duration.Round(time.Millisecond), record.outcome, record.argv))
+	}
+	return lines
+}
+
+func runGitTimed(log *callTimingLog, dir string, args ...string) (string, error) {
+	started := time.Now()
+	out, err := runGit(dir, args...)
+	log.record(started, time.Since(started), append([]string{"git", "-C", dir}, args...), err)
+	return out, err
+}
+
+func commitAllTimed(t *testing.T, log *callTimingLog, root, message string) string {
+	t.Helper()
+	for _, args := range [][]string{{"add", "-A"}, {"commit", "-m", message}} {
+		if out, err := runGitTimed(log, root, args...); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	out, err := runGitTimed(log, root, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatalf("git rev-parse HEAD: %v: %s", err, out)
+	}
+	return strings.TrimSpace(out)
+}
+
 // This file tests the coordinator against two kinds of real evidence:
 //
 //   - A real temporary Git repository with two commits. Worktree creation is
@@ -1142,7 +1217,14 @@ type spec struct {
 // newCoordFixture builds a real repository with two commits, a stand-in Herdr
 // CLI and a coordinator wired to a real store.
 func newCoordFixture(t *testing.T, plan fixturePlan) *coordFixture {
-	t.Helper()
+	timings := newCallTimingLog()
+	t.Cleanup(func() {
+		if shouldLogCallTimings(t.Failed(), time.Since(timings.started)) {
+			for _, line := range formatCallTimings(timings.snapshot()) {
+				t.Logf("%s", line)
+			}
+		}
+	})
 	exe, err := os.Executable()
 	if err != nil {
 		t.Fatalf("os.Executable: %v", err)
@@ -1154,14 +1236,14 @@ func newCoordFixture(t *testing.T, plan fixturePlan) *coordFixture {
 		{"config", "user.name", "Orchestrator Test"},
 		{"config", "core.autocrlf", "false"},
 	} {
-		if out, err := runGit(root, args...); err != nil {
+		if out, err := runGitTimed(timings, root, args...); err != nil {
 			t.Fatalf("git %v: %v: %s", args, err, out)
 		}
 	}
 	writeRepoFile(t, root, "README.md", "first\n")
-	commitAll(t, root, "first commit")
+	commitAllTimed(t, timings, root, "first commit")
 	writeRepoFile(t, root, "src/main.txt", "second\n")
-	base := commitAll(t, root, "second commit")
+	base := commitAllTimed(t, timings, root, "second commit")
 
 	f := &coordFixture{t: t, root: root, base: base, dir: t.TempDir()}
 	plan.RepoRoot = root
@@ -1185,6 +1267,10 @@ func newCoordFixture(t *testing.T, plan fixturePlan) *coordFixture {
 	if err != nil {
 		t.Fatalf("herdr.NewClient: %v", err)
 	}
+	client.SetCallObserver(func(argv []string, elapsed time.Duration, err error) {
+		started := time.Now().Add(-elapsed)
+		timings.record(started, elapsed, argv, err)
+	})
 	f.client = client
 
 	// Each readiness poll starts the stand-in CLI as a child process, and a
