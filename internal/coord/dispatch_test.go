@@ -1704,11 +1704,25 @@ func TestBindRetriesAnInterruptedPrimaryInTheSamePane(t *testing.T) {
 
 // A readiness read that outlives its call budget is a slow read, not a refusal:
 // the wait polls again while its own budget lasts, so the bind confirms the
-// agent it started instead of failing at the first slow call.
+// agent it started instead of failing at the first slow call. The call budget is
+// 10 s and the readiness budget 30 s, so the retry is not racing the readiness
+// deadline on a loaded host.
 func TestBindRetriesAReadinessPollThatRanPastItsCallBudget(t *testing.T) {
 	f := newCoordFixture(t, fixturePlan{
-		CallTimeout: 5 * time.Second, SlowAgentGets: 1, AgentGetDelayMillis: 30_000,
+		SlowAgentGets: 1, AgentGetDelayMillis: 30_000,
 	})
+	coordinator, err := New(f.store, f.client, Options{
+		GitObserver:      f.timings.observer(),
+		Concurrency:      3,
+		CallTimeout:      10 * time.Second,
+		ReadinessTimeout: 30 * time.Second,
+		PollInterval:     10 * time.Millisecond,
+		Preflight:        satisfiedPreflight,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	f.coord = coordinator
 	if _, err := f.bind("", ""); err != nil {
 		t.Fatalf("bind: %v, want the retried poll to confirm the agent", err)
 	}
@@ -1723,6 +1737,64 @@ func TestBindReportsReadinessTimeoutWhenEveryPollRunsPastItsBudget(t *testing.T)
 	})
 	if _, err := f.bind("", ""); !errors.Is(err, ErrReadinessTimeout) {
 		t.Fatalf("bind err = %v, want ErrReadinessTimeout", err)
+	}
+}
+
+// A readiness poll is bounded by the readiness budget as well as by its own call
+// budget: a read still running at the readiness deadline is cut there, so Bind
+// gives up at that deadline rather than when the read finally answers.
+func TestBindCutsAReadinessPollAtTheReadinessDeadline(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{
+		SuppressReady: true, SlowAgentGets: 1, AgentGetDelayMillis: 12_000,
+	})
+	coordinator, err := New(f.store, f.client, Options{
+		GitObserver:      f.timings.observer(),
+		Concurrency:      3,
+		CallTimeout:      20 * time.Second,
+		ReadinessTimeout: 2 * time.Second,
+		PollInterval:     10 * time.Millisecond,
+		Preflight:        satisfiedPreflight,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	f.coord = coordinator
+	if _, err := f.bind("", ""); !errors.Is(err, ErrReadinessTimeout) {
+		t.Fatalf("bind err = %v, want ErrReadinessTimeout", err)
+	}
+	var longest time.Duration
+	for _, rec := range f.timings.snapshot() {
+		if len(rec.argv) >= 2 && rec.argv[0] == "agent" && rec.argv[1] == "get" && rec.duration > longest {
+			longest = rec.duration
+		}
+	}
+	if longest >= 5*time.Second {
+		t.Fatalf("the readiness agent get ran %s, want it cut at the 2s readiness budget", longest)
+	}
+}
+
+// The wait never sleeps past the readiness budget that is left: with a poll
+// interval far longer than the budget, Bind still gives up at the budget.
+func TestBindDoesNotSleepPastTheReadinessDeadline(t *testing.T) {
+	f := newCoordFixture(t, fixturePlan{SuppressReady: true})
+	coordinator, err := New(f.store, f.client, Options{
+		GitObserver:      f.timings.observer(),
+		Concurrency:      3,
+		CallTimeout:      20 * time.Second,
+		ReadinessTimeout: time.Second,
+		PollInterval:     30 * time.Second,
+		Preflight:        satisfiedPreflight,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	f.coord = coordinator
+	start := time.Now()
+	if _, err := f.bind("", ""); err == nil {
+		t.Fatal("bind succeeded, want the readiness budget to end the wait")
+	}
+	if elapsed := time.Since(start); elapsed >= 15*time.Second {
+		t.Fatalf("bind ran %s against a 1s readiness budget and a 30s poll interval", elapsed.Round(time.Millisecond))
 	}
 }
 
