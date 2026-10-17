@@ -1,6 +1,6 @@
 # Herdr OMP Orchestrator
 
-A Windows-only Herdr plugin that connects Oh My Pi (OMP) primary and worker agents to a durable, human-supervised task orchestrator.
+A Windows and Linux (x86_64) Herdr plugin that connects Oh My Pi (OMP) primary and worker agents to a durable, human-supervised task orchestrator.
 
 ## Start here
 
@@ -13,7 +13,11 @@ A Windows-only Herdr plugin that connects Oh My Pi (OMP) primary and worker agen
 
 ## Install
 
-This plugin runs on Windows only. Before you install it, make sure these are available in a new terminal:
+This plugin runs on Windows and on Linux (x86_64). macOS is refused, and arm64 is untested.
+
+### Windows
+
+Before you install it, make sure these are available in a new terminal:
 
 - `herdr`: Herdr 0.9.0 or newer.
 - `go`: Go 1.27.1, the version `go.mod` names, to build the plugin executable.
@@ -28,6 +32,23 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
 The script builds `herdr-omp-orchestrator.exe`, checks Herdr's OMP integration (it runs `herdr integration install omp` only when Herdr reports it missing), links this folder as a Herdr plugin, and runs the plugin's `setup` action. It stops at the first failure and prints what to fix. Running it again is safe.
 
 The script never unlinks or uninstalls the plugin. Its writes go through Herdr's own commands and the plugin's `setup` action: the built executable, the plugin link, Herdr's OMP integration only when Herdr reports it missing, and the OMP extension file. If Herdr already links the plugin from another folder, it stops before changing anything. If that folder is gone or this checkout has moved, run `herdr plugin unlink user.omp-orchestrator`, then run the script again.
+
+### Linux (x86_64)
+
+Before you install it, make sure these are available in a new terminal:
+
+- `herdr`: Herdr 0.9.0 or newer. Its server must be running when the script runs its setup step.
+- `go`: Go 1.27.1, the version `go.mod` names, to build the plugin executable.
+- `jq`: the installer reads Herdr's JSON answers with it.
+- Oh My Pi (OMP), which the plugin extends.
+
+From the repository root, run:
+
+```sh
+./install.sh
+```
+
+The script refuses any host that is not Linux, so macOS is refused. It builds `herdr-omp-orchestrator` with `CGO_ENABLED=0` into `build/linux-plugin/`, next to a copy of `linux/herdr-plugin.toml`, links that folder as a Herdr plugin, and runs the plugin's `setup` action. Like the Windows script, it runs `herdr integration install omp` only when Herdr reports the OMP integration missing. It stops at the first failure and prints what to fix. Running it again is safe. It never unlinks the plugin or overwrites Herdr's integration. If Herdr already links the plugin from another folder, it stops before changing anything, and the same unlink advice applies.
 
 Then follow [First use](#first-use) to bind a repository and open its task board.
 
@@ -106,8 +127,8 @@ Common refusal codes. Bind and setup write theirs to the plugin log; a dispatch 
 
 | Code | Meaning and fix |
 |---|---|
-| `integration_missing` | Herdr does not report its OMP integration as installed. Run `herdr integration install omp`, or run `install.ps1` again. |
-| `extension_missing` | The OMP extension is not in the active profile. Run **Setup OMP orchestrator extension**, or run `install.ps1` again. |
+| `integration_missing` | Herdr does not report its OMP integration as installed. Run `herdr integration install omp`, or run `install.ps1` (Windows) or `install.sh` (Linux) again. |
+| `extension_missing` | The OMP extension is not in the active profile. Run **Setup OMP orchestrator extension**, or run `install.ps1` (Windows) or `install.sh` (Linux) again. |
 | `not_git_repository` | The folder is not inside a Git work tree. Bind from a folder inside one. |
 | `different_repository` | The pane's working directory is not the repository root. `cd` to the root in that pane and bind again. |
 | `bad_base_revision` | The base is not a commit of this repository. For a dispatch, give the primary a hash of at least seven hex characters from `git rev-parse --short HEAD`; `HEAD` and branch names such as `main` are refused. A ticket move also needs a commit at HEAD, so a repository with no commits needs a first commit. |
@@ -118,9 +139,9 @@ Common refusal codes. Bind and setup write theirs to the plugin log; a dispatch 
 
 ## What setup writes
 
-Setup (the plugin's `setup` action, or `herdr-omp-orchestrator.exe setup` run from the plugin directory) writes one file: `herdr-orchestrator.ts`, the plugin's OMP extension. It goes in OMP's effective extensions directory for the active profile:
+Setup (the plugin's `setup` action, or `herdr-omp-orchestrator.exe setup` on Windows or `herdr-omp-orchestrator setup` on Linux, run from the plugin directory) writes one file: `herdr-orchestrator.ts`, the plugin's OMP extension. It goes in OMP's effective extensions directory for the active profile:
 
-- **Default profile** (`default`, an empty value, or no profile selected): `$HOME/.omp/agent/extensions/herdr-orchestrator.ts`. `$HOME` falls back to `%USERPROFILE%` when it is unset or blank. `PI_CONFIG_DIR` replaces `.omp`, and `PI_CODING_AGENT_DIR` replaces `.omp/agent` with that directory.
+- **Default profile** (`default`, an empty value, or no profile selected): `$HOME/.omp/agent/extensions/herdr-orchestrator.ts`. `$HOME` falls back to `%USERPROFILE%` when it is unset or blank, on every platform. Windows sets that variable and Linux normally does not, so on Linux the fallback is rarely used. `PI_CONFIG_DIR` replaces `.omp`, and `PI_CODING_AGENT_DIR` replaces `.omp/agent` with that directory.
 - **Named profile** (from `OMP_PROFILE`, or from `PI_PROFILE` when `OMP_PROFILE` is not defined): `$HOME/.omp/profiles/<name>/agent/extensions/herdr-orchestrator.ts`, with `PI_CONFIG_DIR` replacing `.omp`. `PI_CODING_AGENT_DIR` does not apply to a named profile.
 
 Before it writes, setup runs `herdr integration status` and refuses unless Herdr reports its OMP integration installed, and Herdr's own `herdr-omp-agent-state.ts` is present in that same directory. The file it writes:
@@ -131,7 +152,7 @@ Before it writes, setup runs `herdr integration status` and refuses unless Herdr
 
 Setup never writes Herdr's own `herdr-omp-agent-state.ts`, never edits OMP configuration, and does not create the plugin state directory.
 
-To preview a setup without writing, run `herdr-omp-orchestrator.exe setup --dry-run`. It prints a JSON answer shaped like setup's, with `"dryRun": true` and the `action` setup would take (`create`, `refresh` or `unchanged`), or the refusal setup would give, and it writes nothing. The preview needs the environment the setup action gets: `HERDR_PLUGIN_STATE_DIR` and `HERDR_BIN_PATH` set, and `HERDR_PLUGIN_ROOT` naming a directory that contains `omp/herdr-orchestrator.ts` (or, when `HERDR_PLUGIN_ROOT` is unset, a working directory that does). Setup accepts no other arguments: any other argument fails with the `usage` code and exit status 2.
+To preview a setup without writing, run `herdr-omp-orchestrator.exe setup --dry-run` on Windows, or `herdr-omp-orchestrator setup --dry-run` on Linux. It prints a JSON answer shaped like setup's, with `"dryRun": true` and the `action` setup would take (`create`, `refresh` or `unchanged`), or the refusal setup would give, and it writes nothing. The preview needs the environment the setup action gets: `HERDR_PLUGIN_STATE_DIR` and `HERDR_BIN_PATH` set, and `HERDR_PLUGIN_ROOT` naming a directory that contains `omp/herdr-orchestrator.ts` (or, when `HERDR_PLUGIN_ROOT` is unset, a working directory that does). Setup accepts no other arguments: any other argument fails with the `usage` code and exit status 2.
 
 To remove the extension by hand, delete `herdr-orchestrator.ts` from your profile's extensions directory. Leave `herdr-omp-agent-state.ts` in place, because it belongs to Herdr. Until setup installs the extension again, `bind` refuses with `extension_missing`. The plugin has no uninstall action.
 
@@ -142,6 +163,7 @@ The project uses Go 1.27.1. From the repository root:
 ```sh
 go test ./...
 go build -o herdr-omp-orchestrator.exe ./cmd/herdr-omp-orchestrator
+CGO_ENABLED=0 go build -o herdr-omp-orchestrator ./cmd/herdr-omp-orchestrator
 ```
 
-On Windows, the manifest build uses `CGO_ENABLED=0`. The PowerShell helper and full acceptance commands, plus the optional OMP extension load check, are documented in [AGENTS.md](AGENTS.md). The full Windows acceptance suite needs real Herdr and OMP sessions; it creates an isolated named session and temporary worktree root.
+On Windows and Linux, the manifest build uses `CGO_ENABLED=0`. In the block above, the first build line is the Windows build and the second is the Linux build. The PowerShell helper and full Windows acceptance commands, the Linux install and smoke scripts, plus the optional OMP extension load check, are documented in [AGENTS.md](AGENTS.md). The Windows acceptance suite and the Linux smoke path both need real Herdr and OMP sessions; each creates an isolated named session and a temporary worktree root.

@@ -29,6 +29,19 @@ the evidence lives, and how each was verified. When Herdr changes, start here.
 - **Upgrading.** Re-capture the fixtures below against the new Herdr, review the
   diffs, then bump `SupportedProtocol` (and this file) in the same change.
 
+## Linux (issue #83, 2026-10-17)
+
+Probed on Herdr 0.9.5 on Linux x86_64 (WSL2, kernel 6.18), in an isolated named session (`--session`). Afterward the probe links were removed, the plugin registry was empty, the session was deleted, and the default Herdr server was never started. The facts below are F1 to F8 of the Linux support design (`docs/design/2026-10-17-linux-support-design.md`, Verified facts); each gives its evidence.
+
+- **F1: protocol 22 on Linux.** Evidence: `herdr api schema` and a live `api snapshot` on the isolated server.
+- **F2: duplicate action ids are rejected at link, even across platforms.** Evidence: `plugin link` failed with `duplicate action id 'probe'`.
+- **F3: unique ids with item-level `platforms` link and run per platform.** Evidence: the Linux entry ran; the Windows entry was refused with `platform_unsupported`.
+- **F4: `plugin action list` shows entries for every platform.** Evidence: both entries were listed on Linux.
+- **F5: a plugin whose `platforms` excludes Linux still links, with no refusal.** Evidence: `platforms = ["windows"]` linked and was enabled.
+- **F6: the plugin registry is global across sessions.** Evidence: the isolated session listed the default session's link.
+- **F7: `plugin link` and `plugin list` work with no server; `plugin action list` and `plugin unlink` return `server_not_running` without one.** `invoke` was tested only with a server. Evidence: the observed errors.
+- **F8: a `Setsid` child survives its action. With a Go pipe as its stderr, it never completes a late stderr write; with `/dev/null` it does.** Evidence: the discard child wrote `alive` and not `stderr-ok`; the devnull child wrote both.
+
 ## Fixtures and their provenance
 
 "Stated" means the fixture's own `_comment` or the test comments say so; "inferred"
