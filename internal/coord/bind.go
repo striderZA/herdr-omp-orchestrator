@@ -1175,10 +1175,18 @@ func (c *Coordinator) awaitAgentReady(
 	var last agentView
 	var lastErr error
 	sawReference := false
+	// observed is set once a read has completed, by answering or by failing on its
+	// own budget. A read the readiness deadline cut is not an observation.
+	observed := false
 	for {
-		view, err := c.agentGet(ctx, paneID)
+		// A read is bounded by the readiness deadline as well as by its own call
+		// budget: one still running at that deadline is cut there.
+		pollCtx, cancelPoll := context.WithDeadline(ctx, deadline)
+		view, err := c.agentGet(pollCtx, paneID)
+		cancelPoll()
 		switch {
 		case err == nil:
+			observed = true
 			last, lastErr = view, nil
 			if !strings.EqualFold(view.Agent.Agent, c.opts.AgentKind) {
 				return view, fmt.Errorf("%w: pane %q runs %q, not %q",
@@ -1217,16 +1225,31 @@ func (c *Coordinator) awaitAgentReady(
 				}
 			}
 		case isMissingTarget(err):
+			observed = true
 			last, lastErr = view, err
 		case errors.Is(err, herdr.ErrTimeout) && ctx.Err() == nil:
 			// A read that ran past its call budget is as transient as a pane that
 			// has not appeared yet: poll again while the readiness budget lasts. A
 			// cancelled caller still gets its error at once, from the default case.
-			last, lastErr = view, err
+			// A read the readiness deadline cut is not an observation: once a read has
+			// completed, the wait keeps that outcome.
+			if pollCtx.Err() == nil || !observed {
+				observed = true
+				last, lastErr = view, err
+			}
 		default:
 			return view, err
 		}
 
+		// Never sleep past the readiness deadline: once it has passed, the wait gives
+		// up without starting another read.
+		if wait := min(interval, time.Until(deadline)); wait > 0 {
+			select {
+			case <-ctx.Done():
+				return last, ctx.Err()
+			case <-time.After(wait):
+			}
+		}
 		if !time.Now().Before(deadline) {
 			if lastErr != nil {
 				return last, fmt.Errorf("%w: pane %s: %v", ErrReadinessTimeout, paneID, lastErr)
@@ -1237,11 +1260,6 @@ func (c *Coordinator) awaitAgentReady(
 			}
 			return last, fmt.Errorf("%w: pane %q did not announce the session Herdr reports in time; no brief was sent",
 				ErrReadinessTimeout, paneID)
-		}
-		select {
-		case <-ctx.Done():
-			return last, ctx.Err()
-		case <-time.After(interval):
 		}
 		// Back off so a slow integration does not spin, and reset whenever a
 		// reference appeared (the next step needs a fresh observation).
