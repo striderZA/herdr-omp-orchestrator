@@ -510,8 +510,11 @@ func TestWorktreeCreateAcceptsTheSpellingsHerdrReallyUses(t *testing.T) {
 // as Herdr sent them; only the probe's own paths were replaced.
 func TestDecodeWorktreeOpenResponse(t *testing.T) {
 	f := newFixture(t).captured("worktree-open.json")
-	opened, err := f.client.WorktreeOpen(shortCtx(t, 5*time.Second), `C:/work/orch-probe-repo`,
-		`C:\work\herdr\worktrees\orch-probe-repo\probe-moved`)
+	checkout := `C:\work\herdr\worktrees\orch-probe-repo\probe-moved`
+	if runtime.GOOS != "windows" {
+		checkout = `C:/work/herdr/worktrees/orch-probe-repo/probe-moved`
+	}
+	opened, err := f.client.WorktreeOpen(shortCtx(t, 5*time.Second), `C:/work/orch-probe-repo`, checkout)
 	if err != nil {
 		t.Fatalf("WorktreeOpen: %v", err)
 	}
@@ -537,7 +540,7 @@ func TestDecodeWorktreeOpenResponse(t *testing.T) {
 		t.Error("AlreadyOpen = false, want true: the moved checkout is still listed, which is why it had to be re-opened")
 	}
 	if raw := f.argv(); len(raw) != 7 || !slices.Equal(raw, []string{
-		"worktree", "open", "--cwd", `C:/work/orch-probe-repo`, "--path", `C:\work\herdr\worktrees\orch-probe-repo\probe-moved`, "--no-focus",
+		"worktree", "open", "--cwd", `C:/work/orch-probe-repo`, "--path", checkout, "--no-focus",
 	}) {
 		t.Errorf("argv = %q, want worktree open --cwd ... --path ... --no-focus", raw)
 	}
@@ -674,12 +677,16 @@ func TestWorktreeOpenAcceptsTheSpellingsHerdrReallyUses(t *testing.T) {
 
 	requests := []struct{ name, root, checkout string }{
 		{"the same spelling as the response", `C:/work/orch-probe-repo`, `C:/work/herdr/worktrees/orch-probe-repo/probe-moved`},
-		{"backslashes and a trailing separator", `C:\work\orch-probe-repo`, `C:\work\herdr\worktrees\orch-probe-repo\probe-moved\`},
 	}
 	if runtime.GOOS == "windows" {
-		requests = append(requests, struct{ name, root, checkout string }{
-			"a different case", `C:/WORK/Orch-Probe-Repo`, `c:/work/HERDR/worktrees/orch-probe-repo/PROBE-MOVED`,
-		})
+		requests = append(requests,
+			struct{ name, root, checkout string }{
+				"a different case", `C:/WORK/Orch-Probe-Repo`, `c:/work/HERDR/worktrees/orch-probe-repo/PROBE-MOVED`,
+			},
+			struct{ name, root, checkout string }{
+				"backslashes and a trailing separator", `C:\work\orch-probe-repo`, `C:\work\herdr\worktrees\orch-probe-repo\probe-moved\`,
+			},
+		)
 	}
 	for _, tc := range requests {
 		t.Run(tc.name, func(t *testing.T) {

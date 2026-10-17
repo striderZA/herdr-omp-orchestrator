@@ -1,0 +1,116 @@
+# Linux manifest for this plugin. install.sh copies this file into
+# build/linux-plugin/ as herdr-plugin.toml. It mirrors the root herdr-plugin.toml
+# (the Windows manifest) except for platforms, the build section, and the
+# executable name in each command. Parity is pinned by manifest_test.go.
+id = "user.omp-orchestrator"
+name = "OMP Orchestrator"
+version = "0.1.0"
+# Semver orders any 0.9.1-preview BELOW 0.9.1, so declaring 0.9.1 cannot be
+# satisfied by a 0.9.1 preview build (observed: plugin_requires_newer_herdr on
+# herdr 0.9.1-preview.2026-09-21, which reports 0.9.0 for version comparison).
+# Every method and hook event this plugin uses is present in that build's own
+# `herdr api schema --json`: pane.move, worktree.create/remove/list,
+# workspace.create, plugin.pane.open, events.subscribe/wait, session.snapshot,
+# agent.start/prompt/get/read, pane.get, pane.report_agent/release_agent,
+# pane.agent_status_changed and pane.moved. So the last released floor that
+# matches the required feature set is the correct declaration.
+min_herdr_version = "0.9.0"
+platforms = ["linux"]
+
+# Herdr runs the startup hook once per enabled plugin after it restores the
+# session and its API socket is ready (and again when a new server takes over).
+# The plugin reconciles every recorded pane binding from `herdr api snapshot` and
+# `worktree list`, because event hooks are one-shot and subscriptions are not
+# replayed: a move or a status change that happened while the plugin was not
+# running exists only in Herdr's live state.
+[[startup]]
+command = ["./herdr-omp-orchestrator", "startup"]
+
+# Both hook names are declared by the installed Herdr build's own
+# `herdr api schema --json` (event kinds pane_agent_status_changed and
+# pane_moved). A name Herdr does not know is only a link warning, which is why
+# `herdr plugin list --json` warnings are inspected after linking.
+[[events]]
+on = "pane.agent_status_changed"
+command = ["./herdr-omp-orchestrator", "event"]
+
+[[events]]
+on = "pane.moved"
+command = ["./herdr-omp-orchestrator", "event"]
+
+[[actions]]
+id = "setup"
+title = "Setup OMP orchestrator extension"
+command = ["./herdr-omp-orchestrator", "setup"]
+
+[[actions]]
+id = "bind"
+title = "Bind this repository as an orchestrated project"
+contexts = ["pane", "workspace"]
+command = ["./herdr-omp-orchestrator", "bind"]
+
+# The board is read-only for tasks: it reads task facts and derives each card's
+# stage. The human can create a ticket and move a backlog ticket to todo only
+# through its injected TicketOps, which the executable backs with internal/coord.
+# The board never writes a task, never dispatches, and never calls Herdr for a
+# ticket write; it can focus one verified worker pane.
+[[panes]]
+id = "board"
+title = "Task board"
+placement = "overlay"
+command = ["./herdr-omp-orchestrator", "board"]
+
+# The action opens that pane in the bound project's workspace. The pane route
+# then maps its own plugin context back to that project, so the action only has
+# to name the workspace.
+[[actions]]
+id = "board"
+title = "Open the task board"
+contexts = ["pane", "workspace"]
+command = ["./herdr-omp-orchestrator", "open-board"]
+
+# Re-establishing a lost primary is explicit and confirmed, never automatic. Bind
+# refuses to substitute a new primary for a recorded one that is gone and the
+# startup pass only records its absence; this is the one action that moves a
+# project to a replacement pane. Run it from the pane that runs the replacement
+# OMP at the repository root. Herdr runs action commands without a terminal, so
+# the action only opens the pane below, which shows what would be recorded and
+# asks for a yes before anything is written. The action passes it the pane the
+# user invoked it from, because the pane's own focus is the overlay.
+[[panes]]
+id = "reattach"
+title = "Reattach the primary"
+placement = "overlay"
+command = ["./herdr-omp-orchestrator", "reattach"]
+
+[[actions]]
+id = "reattach"
+title = "Reattach the primary OMP session"
+contexts = ["pane"]
+command = ["./herdr-omp-orchestrator", "open-reattach"]
+# Forgetting a project is explicit and confirmed. The action only opens the pane
+# below, which shows what would be deleted and asks for the folder name first.
+[[actions]]
+id = "forget"
+title = "Forget this project's orchestrator records"
+contexts = ["pane", "workspace"]
+command = ["./herdr-omp-orchestrator", "open-forget"]
+
+[[panes]]
+id = "forget"
+title = "Forget the project"
+placement = "overlay"
+command = ["./herdr-omp-orchestrator", "forget"]
+
+# Read-only status of the project resolved from the invoking pane.
+[[actions]]
+id = "status"
+title = "Show orchestrator status"
+contexts = ["pane", "workspace"]
+command = ["./herdr-omp-orchestrator", "open-status"]
+
+[[panes]]
+id = "status"
+title = "Orchestrator status"
+placement = "overlay"
+command = ["./herdr-omp-orchestrator", "status"]

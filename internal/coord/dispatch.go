@@ -378,8 +378,8 @@ func newDispatchRequest(title, brief string, checks, dependencies, reservedPaths
 }
 
 // normalizeReservedPath turns a repository-relative reservation into one
-// comparable form: forward slashes, no trailing separator, and — on Windows,
-// where the filesystem is case-insensitive — case-folded.
+// comparable form: forward slashes, no trailing separator, and case-folded on
+// every platform, so a reservation compares the same whatever the host OS.
 func normalizeReservedPath(path string) (string, error) {
 	trimmed := strings.TrimSpace(path)
 	if trimmed == "" {
@@ -396,9 +396,7 @@ func normalizeReservedPath(path string) (string, error) {
 	if cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") {
 		return "", fmt.Errorf("%w: the reserved path %q must stay inside the repository", ErrInvalidRequest, trimmed)
 	}
-	if isCaseInsensitivePath() {
-		cleaned = strings.ToLower(cleaned)
-	}
+	cleaned = strings.ToLower(cleaned)
 	return cleaned, nil
 }
 
@@ -461,12 +459,6 @@ func checkDependencies(existing []task.Task, dependencies []string) error {
 		}
 	}
 	return nil
-}
-
-// isCaseInsensitivePath reports whether this platform compares paths without
-// case, which is how a reservation is normalized before it is stored.
-func isCaseInsensitivePath() bool {
-	return filepath.Separator == '\\'
 }
 
 // findTask reads one task out of a project listing.

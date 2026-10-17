@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -1606,7 +1605,7 @@ func (s *Store) ProvisioningSlots(ctx context.Context, projectKey string) (int, 
 // reservedConflict finds the first pair of overlapping reservations between a
 // request and the tasks of one project: the same path, or one path containing the
 // other. Paths are compared as stored (repository-relative, forward slashes,
-// case-folded on Windows), and the comparison follows the platform's rules.
+// case-folded on every platform), and the comparison follows the same rules everywhere.
 func reservedConflict(existing []task.Task, requested []string) (owner, mine, theirs string, ok bool) {
 	for _, other := range existing {
 		if other.Disposition != "" || len(other.ReservedPaths) == 0 {
@@ -1626,10 +1625,7 @@ func reservedConflict(existing []task.Task, requested []string) (owner, mine, th
 // pathsOverlap reports whether one reservation covers the other: the same path,
 // or one is a directory containing the other.
 func pathsOverlap(a, b string) (string, bool) {
-	a, b = filepath.ToSlash(a), filepath.ToSlash(b)
-	if runtime.GOOS == "windows" {
-		a, b = strings.ToLower(a), strings.ToLower(b)
-	}
+	a, b = strings.ToLower(filepath.ToSlash(a)), strings.ToLower(filepath.ToSlash(b))
 	switch {
 	case a == b:
 		return a, true

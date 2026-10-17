@@ -1,6 +1,8 @@
 package task
 
 import (
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -75,6 +77,17 @@ func TestAnnouncementProvesTheRecordedSessionInEitherForm(t *testing.T) {
 
 	announced := Announcement{ID: id, File: file}
 
+	// The recorded path spelled with other separators. On Windows \ and / are the
+	// same separator, so the spelling is the file's own. Elsewhere a redundant
+	// separator in the native path names the same file.
+	spelled, spelledRecorded := announced, file
+	spelledRef := SessionRef{Kind: SessionKindPath, Value: strings.ReplaceAll(file, `\`, "/")}
+	if runtime.GOOS != "windows" {
+		native := filepath.Join("/omp", "sessions", "-work-orch", id+".jsonl")
+		spelled, spelledRecorded = Announcement{File: native}, native
+		spelledRef = SessionRef{Kind: SessionKindPath, Value: strings.Replace(native, "/omp/", "/omp//", 1)}
+	}
+
 	cases := []struct {
 		name      string
 		announced Announcement
@@ -87,8 +100,7 @@ func TestAnnouncementProvesTheRecordedSessionInEitherForm(t *testing.T) {
 		{"recorded path, Herdr reports the id", announced, file, SessionRef{Kind: SessionKindID, Value: id}, true},
 		{"recorded id, Herdr reports the id", announced, id, SessionRef{Kind: SessionKindID, Value: id}, true},
 		{"recorded path, Herdr reports the path", announced, file, SessionRef{Kind: SessionKindPath, Value: file}, true},
-		{"the recorded path spelled with other separators", announced, file,
-			SessionRef{Kind: SessionKindPath, Value: strings.ReplaceAll(file, `\`, "/")}, true},
+		{"the recorded path spelled with other separators", spelled, spelledRecorded, spelledRef, true},
 
 		// A different session is a different worker, whichever form it arrives in.
 		{"another session as an id", announced, other, SessionRef{Kind: SessionKindID, Value: other}, false},

@@ -3,7 +3,8 @@ package state
 import "fmt"
 
 // ProcessIdentity distinguishes a process from a later process that reuses its
-// PID. StartTime is the operating-system creation timestamp.
+// PID. On Windows StartTime is the creation time. On Linux it is the start time
+// in clock ticks since boot (field 22 of /proc/<pid>/stat).
 type ProcessIdentity struct {
 	PID       uint32
 	StartTime int64
