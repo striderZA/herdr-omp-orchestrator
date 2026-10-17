@@ -87,6 +87,11 @@ const (
 	MethodRepointPreview = "repoint_preview"
 	MethodRepoint        = "repoint"
 	MethodSettleInput    = "settle_input"
+	// MethodInboxPreview and MethodInboxSettle let the primary show the user one
+	// uncertain inbox note and record the decision the user confirmed about it.
+	// The preview is read-only; the settlement takes the digest the user was shown.
+	MethodInboxPreview = "inbox_preview"
+	MethodInboxSettle  = "inbox_settle"
 	// MethodBriefInspection reads the evidence a user decides an ambiguous brief
 	// submission on. The op itself mutates nothing, but it is authorized like any
 	// other primary call: a session that has not confirmed its handshake may not
@@ -254,6 +259,9 @@ type Ops struct {
 	// Read-only views (primary role). The project comes from the verified principal.
 	TaskList  func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
 	InboxList func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
+	// Inbox notes the user decides on (primary role). The project comes from the verified principal.
+	InboxPreview func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
+	InboxSettle  func(ctx context.Context, principal Principal, params json.RawMessage) (any, error)
 }
 
 // Options carries what the caller observed before reading the request.
@@ -483,6 +491,22 @@ func CoordinatorOps(c *coord.Coordinator) Ops {
 			result, err := c.ListInboxFor(ctx, p.ProjectKey, request)
 			return result, coordError(err)
 		},
+		InboxPreview: func(ctx context.Context, p Principal, params json.RawMessage) (any, error) {
+			var request coord.InboxPreviewParams
+			if err := decodeParams(params, &request); err != nil {
+				return nil, err
+			}
+			result, err := c.InboxPreviewFor(ctx, p.ProjectKey, request.NoteID)
+			return result, coordError(err)
+		},
+		InboxSettle: func(ctx context.Context, p Principal, params json.RawMessage) (any, error) {
+			var request coord.InboxSettleParams
+			if err := decodeParams(params, &request); err != nil {
+				return nil, err
+			}
+			result, err := c.SettleInboxFor(ctx, p.ProjectKey, request)
+			return result, coordError(err)
+		},
 	}
 }
 
@@ -521,6 +545,8 @@ func UnavailableOps(cause error) Ops {
 		TicketReview:      unavailable,
 		TaskList:          unavailable,
 		InboxList:         unavailable,
+		InboxPreview:      unavailable,
+		InboxSettle:       unavailable,
 	}
 }
 
@@ -601,6 +627,8 @@ func coordErrorCode(err error) string {
 		return "not_adjudicable"
 	case errors.Is(err, coord.ErrEvidenceChanged):
 		return "evidence_changed"
+	case errors.Is(err, coord.ErrNoteNotUncertain):
+		return "note_not_uncertain"
 	case errors.Is(err, coord.ErrStepInFlight):
 		return "step_in_flight"
 	case errors.Is(err, coord.ErrAgentChanged):
@@ -784,6 +812,10 @@ func run(ctx context.Context, env map[string]string, input io.Reader, opts Optio
 		return h.mutate(req, state.RolePrimary, announced, h.ops.TaskList)
 	case MethodInboxList:
 		return h.mutate(req, state.RolePrimary, announced, h.ops.InboxList)
+	case MethodInboxPreview:
+		return h.mutate(req, state.RolePrimary, announced, h.ops.InboxPreview)
+	case MethodInboxSettle:
+		return h.mutate(req, state.RolePrimary, announced, h.ops.InboxSettle)
 	default:
 		return nil, fail(CodeUnsupportedMethod, "unknown bridge method %q", req.Method)
 	}

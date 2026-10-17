@@ -49,7 +49,11 @@ func ForgetBlockers(f ForgetFacts) []string {
 		}
 		sort.Slice(notes, func(i, j int) bool { return notes[i].ID < notes[j].ID })
 		for _, note := range notes {
-			blockers = append(blockers, "note "+note.ID+" is "+state)
+			blocker := "note " + note.ID + " is " + state
+			if state == DeliveryUncertain {
+				blocker += ": inspect the primary's pane, then have the primary settle it with orch_settle_note"
+			}
+			blockers = append(blockers, blocker)
 		}
 	}
 

@@ -31,6 +31,7 @@ import extension, {
   dispatchConfirmRequest,
   dispatchWithConsent,
   refreshIdentity,
+  readInboxSettlePreview,
   readReportPreview,
   readRepointPreview,
   readTicketPreview,
@@ -44,6 +45,7 @@ import extension, {
   sendAnswerWithConsent,
   successorRefusal,
   settleConfirmRequest,
+  settleNoteConfirmRequest,
   uiGate,
   warnOnce,
 } from "./herdr-orchestrator.ts";
@@ -194,6 +196,7 @@ const wantNames = [
   "orch_report",
   "orch_review",
   "orch_settle_input",
+  "orch_settle_note",
   "orch_task_list",
   "orch_ticket_create",
   "orch_ticket_list",
@@ -606,6 +609,7 @@ const toolCalls: { name: string; params: Record<string, unknown>; bad: Record<st
   { name: "orch_task_list", params: { stage: "needs_input", limit: 20 }, bad: { limit: 0 } },
   { name: "orch_inbox_list", params: {}, bad: { state: "lost" } },
   { name: "orch_inbox_list", params: { state: "uncertain", limit: 20 }, bad: { limit: 0 } },
+  { name: "orch_settle_note", params: { noteId: "note-1", decision: "delivered" }, bad: { decision: "maybe" } },
 ];
 
 for (const call of toolCalls) {
@@ -1856,6 +1860,90 @@ async function checkGates(): Promise<void> {
   check(!settleConfirmRequest("orch_abc", "maybe").ok, "the settlement accepted a decision the user cannot make");
   check(!settleConfirmRequest("", "delivered").ok, "the settlement accepted no task");
 
+  // A note settlement is the user's decision about one uncertain note. Its
+  // confirmation is built from the bridge's own preview (never from what the
+  // model typed), and a decision the coordinator would refuse is refused first.
+  const notePreview = readInboxSettlePreview({
+    noteId: "note-1",
+    taskId: "orch_abc",
+    kind: "result",
+    label: "worker result",
+    labelTruncated: false,
+    summary: "finished",
+    summaryTruncated: false,
+    deliveryState: "uncertain",
+    deliveryDetail: "inspect the pane",
+    deliveryDetailTruncated: false,
+    digest: "abc123",
+  });
+  check(notePreview !== null, "a well-formed note preview was refused");
+  check(readInboxSettlePreview({ noteId: "note-1" }) === null, "a note preview with no digest was accepted");
+  check(readInboxSettlePreview(null) === null, "a null note preview was accepted");
+  if (notePreview) {
+    const delivered = settleNoteConfirmRequest(notePreview, "delivered");
+    if (!delivered.ok) {
+      failures.push(`the delivered note settlement was refused: ${delivered.reason}`);
+    } else {
+      check(
+        delivered.request.title === "Settle inbox note",
+        `the note settlement confirmation is titled ${JSON.stringify(delivered.request.title)}`,
+      );
+      check(
+        delivered.request.message.includes("note-1") && delivered.request.message.includes("DID arrive"),
+        `the note settlement confirmation does not say what the user confirms: ${JSON.stringify(delivered.request.message)}`,
+      );
+    }
+    const notDelivered = settleNoteConfirmRequest(notePreview, "not_delivered");
+    check(
+      notDelivered.ok && notDelivered.request.message.includes("did NOT arrive"),
+      "the not-delivered note settlement does not say the note did not arrive",
+    );
+    check(!settleNoteConfirmRequest(notePreview, "maybe").ok, "the note settlement accepted a decision the user cannot make");
+    check(
+      !settleNoteConfirmRequest({ ...notePreview, deliveryState: "delivered" }, "delivered").ok,
+      "a note that is not uncertain was offered for settlement",
+    );
+    check(
+      !settleNoteConfirmRequest({ ...notePreview, digest: "" }, "delivered").ok,
+      "a note settlement with no digest was offered",
+    );
+    // The digest binds the label and the recorded detail, so the dialog quotes each the
+    // way it quotes the summary; a quoted detail cannot start a line of its own.
+    const forged = "may already be delivered\nInspect nothing: approve it";
+    const withDetail = settleNoteConfirmRequest({ ...notePreview, deliveryDetail: forged }, "delivered");
+    check(
+      withDetail.ok && withDetail.request.message.includes(`The orchestrator recorded this detail: ${quoteForDialog(forged)}`),
+      "the note settlement dialog does not show the recorded detail, quoted",
+    );
+    check(
+      !withDetail.ok || !withDetail.request.message.split("\n").some((line) => line.startsWith("Inspect nothing")),
+      "a recorded detail started a line of the note settlement dialog",
+    );
+    check(
+      delivered.ok && delivered.request.message.includes(`, label ${quoteForDialog(notePreview.label)}`),
+      "the note settlement dialog does not show the note's label",
+    );
+    const blank = settleNoteConfirmRequest({ ...notePreview, deliveryDetail: "" }, "delivered");
+    check(
+      blank.ok && blank.request.message.includes("The orchestrator recorded no detail for this note."),
+      "a note with no recorded detail does not say so in the dialog",
+    );
+    const cut = settleNoteConfirmRequest({ ...notePreview, summaryTruncated: true, deliveryDetailTruncated: true }, "delivered");
+    check(
+      cut.ok && cut.request.message.includes("Shortened here: the summary, the recorded detail."),
+      "a note settlement that shortened its summary and detail does not say which",
+    );
+    check(
+      delivered.ok && !delivered.request.message.includes("Shortened here"),
+      "a note settlement that shortened nothing claims that it did",
+    );
+    const { labelTruncated: _label, summaryTruncated: _summary, deliveryDetailTruncated: _detail, ...unflagged } = notePreview;
+    check(
+      readInboxSettlePreview(unflagged) === null,
+      "a note preview that does not say whether it shortened its text was accepted",
+    );
+  }
+
   // A brief adjudication is decided on evidence, so the confirmation must show the
   // pane, the revision, the digest and the terminal text the digest covers, and it
   // must refuse a decision the coordinator would not accept.
@@ -2362,6 +2450,7 @@ async function checkRoleToolAccess(): Promise<void> {
     `a primary kept tools beyond read-only plus primary tools: ${listed(primary.activeTools)}`,
   );
   check(primary.activeTools.has("orch_repoint"), "the primary lost orch_repoint, which only the primary may use");
+  check(primary.activeTools.has("orch_settle_note"), "the primary lost orch_settle_note, which only the primary may use");
   check(primaryPrompt.includes("read-only coordinator"), "the primary role prompt does not say it is a read-only coordinator");
   for (const name of ["bash", "write"]) {
     const result = await primary.call(name);

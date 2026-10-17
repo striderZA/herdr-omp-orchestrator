@@ -112,7 +112,7 @@ func TestForgetBlockersReasonsHaveStableOrder(t *testing.T) {
 		"task task-a has no outcome: record one first, such as abandoned",
 		"task task-z has no outcome: record one first, such as abandoned",
 		"note note-sending is sending",
-		"note note-uncertain is uncertain",
+		"note note-uncertain is uncertain: inspect the primary's pane, then have the primary settle it with orch_settle_note",
 	}
 	if got := ForgetBlockers(facts); !equalStrings(got, want) {
 		t.Fatalf("ForgetBlockers() = %v, want %v", got, want)

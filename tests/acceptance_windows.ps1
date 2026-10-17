@@ -513,7 +513,7 @@ $script:MarkerPrefix = 'ACCEPT-'          # every fact this run injects is grepp
 # silently widening what it accepts.
 $script:ReadOnlyToolNames = @('read', 'grep', 'find', 'glob')
 $script:PrimaryToolNames = @(
-    'orch_dispatch', 'orch_answer', 'orch_approve_dialog', 'orch_review', 'orch_settle_input',
+    'orch_dispatch', 'orch_answer', 'orch_approve_dialog', 'orch_review', 'orch_settle_input', 'orch_settle_note',
     'orch_adjudicate_dispatch', 'orch_cleanup', 'orch_ticket_create', 'orch_ticket_list',
     'orch_ticket_move', 'orch_ticket_review', 'orch_task_list', 'orch_inbox_list', 'orch_repoint'
 )
@@ -4882,6 +4882,7 @@ function Get-ExtensionConsentDialogTitles {
         'Settle interrupted checkout cleanup',
         'Remove worker checkout',
         'Settle worker input',
+        'Settle inbox note',
         'Decide an uncertain dispatch',
         'Record review disposition',
         'Move ticket to todo',
