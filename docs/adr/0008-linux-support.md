@@ -43,6 +43,8 @@ The plugin was built, declared and installed for Windows only. Herdr publishes L
 
 Run on Linux x86_64 (WSL2, kernel 6.18) with Herdr 0.9.5, OMP 18.11.3, Go 1.27.1 and jq 1.8.1. The Go results come from commit `78f7a42`; no Go file changed after it.
 
+The Windows test suites did not run on this machine: `go test` on Linux skips Windows-only files, and the PowerShell suites need Windows. Windows is checked here only by cross-compile (V2).
+
 - **V1, Go suite.** `go test -count=1 -timeout 30m ./...` passes in every package. `tests/install_linux_tests.sh` passes 22 of 22 scenarios. `tests/acceptance_linux_state_test.py` passes its 3 tests.
 - **V2, cross-compile.** `GOOS=windows` and `GOOS=darwin` `go vet ./...` pass. `GOOS=linux GOARCH=arm64 go build ./...` passes; arm64 is compile-only.
 - **V3, release build.** Built with the release workflow's flags (`CGO_ENABLED=0`, `go build -trimpath -ldflags "-X main.version=0.1.0"`). The build reproduces, and the binary prints `herdr-omp-orchestrator 0.1.0`.
