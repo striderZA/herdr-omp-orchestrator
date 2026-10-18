@@ -705,6 +705,7 @@ func TestBlankTitleIsNotSubmitted(t *testing.T) {
 		t.Fatalf("the title is trimmed: %+v", ops.creates)
 	}
 }
+
 func TestMoveKeyRequiresYConfirmation(t *testing.T) {
 	f := newBoardFixture(t, fixturePlan{})
 	f.addTicket(t, "tkt_a_backlog", task.ColumnBacklog)
@@ -905,6 +906,7 @@ func TestAMoveWhosePlannerDidNotStartStillSaysItMoved(t *testing.T) {
 		t.Fatal("the board must re-read the moved ticket")
 	}
 }
+
 func TestAMoveWhoseRecoverySignalFailedStillSaysItMoved(t *testing.T) {
 	ctx := context.Background()
 	f := newBoardFixture(t, fixturePlan{})
@@ -1074,8 +1076,10 @@ func TestControlCharactersInStoredTextNeverReachTheScreen(t *testing.T) {
 // TestBoardWithoutTicketsRendersExactlyAsBefore does) cannot catch a change in the
 // search footer and board help for these cards, widths, and selections. Ticket rendering must not
 // change that baseline. They were re-recorded once, on purpose, when a task card moved its title
-// before its ID: that order was the only change those plain (uncolored) renders showed. The current
-// digests also include the intentional addition of refresh and Tab keys to the help.
+// before its ID: that order was the only change those plain (uncolored) renders showed. The digests
+// also included the intentional addition of refresh and Tab keys to the help. They were re-recorded
+// again for issue #98, on purpose: a card title too long for its cell now ends in "..." instead of
+// being cut silently, and a help line that does not fit drops whole hints instead of cutting one.
 func TestBoardWithoutTicketsMatchesTheSearchBaseline(t *testing.T) {
 	cards := []Card{
 		{Task: sampleTask("orch_a", nil), Stage: task.Running},
@@ -1087,11 +1091,11 @@ func TestBoardWithoutTicketsMatchesTheSearchBaseline(t *testing.T) {
 		"expanded": {SelectedID: "orch_a", Expanded: true},
 	}
 	want := map[string]string{
-		"100/none":     "307059b15d1edcaeedf2b8f224775a0396f839807da93f064c2021105f5de774",
-		"100/selected": "1dac0bbce058d6389ff497b08c6a9c83f60283ca48727824bd7f0d7ba0a97318",
-		"100/expanded": "dbdcea2ca6dacb6937d491f4cda2c7130435665c4134ea51d84bb9bf5306cda6",
+		"100/none":     "41e9f926f21188d2bd36d6c434b96f76794f1a931cd920edfd6028c3230cc6ca",
+		"100/selected": "5584be46253f957815920194e1ffe34da7781b6af24dcc9f7d43d7c519c16a16",
+		"100/expanded": "dbe18985217b1902b0db7ab2297b9a2c20687d0dabeb0d20051980c486224a73",
 		"80/none":      "1452847cf6f57d6aba1136030f69037f191f70f97521f7b2c9d4cbf941d811a2",
-		"80/selected":  "48ac078acccc3ca7e91895681cb0ba2fa3b00960dcef8bf97f5c091e782400eb",
+		"80/selected":  "6774d43a0fbb1b86b52ffc9934f8386b190aa2e3afb8d8c539fcf4aefdeb74ce",
 		"80/expanded":  "4a0bc766575b41463482ff49fe6ebf558a91c31ed923b9b268d55c4552a351a1",
 	}
 	digest := func(out string) string {
@@ -1311,5 +1315,22 @@ func TestTicketDetailNamesItsSuccessorTicket(t *testing.T) {
 	page := strings.Join(ticketPageLines(card, 100, ticketTheme), "\n")
 	if !strings.Contains(page, "Successor: tkt_s2") {
 		t.Errorf("the superseded ticket's page does not name its successor:\n%s", page)
+	}
+}
+
+// TestCutTicketTitlesAreMarkedAtEveryLayout: a ticket title too long for its cell
+// or its line ends in "..." as a task title does.
+func TestCutTicketTitlesAreMarkedAtEveryLayout(t *testing.T) {
+	long := ticketCardOf("tkt_long", "Write the board documentation for every terminal width and selection", task.TicketBacklog)
+	for _, width := range []int{60, 84} {
+		view := Render(NewBoardWithTickets(nil, []TicketCard{long}), Detail{}, width, ticketTheme)
+		if !strings.Contains(view, "...") {
+			t.Errorf("width %d: a cut ticket title has no cut mark:\n%s", width, view)
+		}
+		for _, line := range strings.Split(view, "\n") {
+			if got := displayWidth(line); got > width {
+				t.Errorf("width %d: a %d-column line: %q", width, got, line)
+			}
+		}
 	}
 }
