@@ -226,7 +226,7 @@ func wideTicketColumns(b *Board, d Detail, width int, th Theme) []string {
 				continue
 			}
 			card := b.TicketColumn(stage)[row]
-			parts[i] = padded(th.paint(ticketColor(card, d.SelectedID), clip(texts[i][row], cell)), cell)
+			parts[i] = padded(th.paint(ticketColor(card, d.SelectedID), cutText(texts[i][row], cell)), cell)
 		}
 		out = append(out, strings.Join(parts, " "))
 	}
@@ -242,7 +242,7 @@ func narrowTicketSections(b *Board, d Detail, width int, th Theme) []string {
 		cards := b.TicketColumn(stage)
 		out = append(out, th.bold(clip(fmt.Sprintf("%s (%d)", TicketStageLabel(stage), len(cards)), width)))
 		for _, card := range cards {
-			out = append(out, th.paint(ticketColor(card, d.SelectedID), clip(ticketText(card, card.ID() == d.SelectedID), width)))
+			out = append(out, th.paint(ticketColor(card, d.SelectedID), cutText(ticketText(card, card.ID() == d.SelectedID), width)))
 		}
 	}
 	return out
@@ -297,7 +297,7 @@ func ticketHelpLine(card TicketCard, d Detail) string {
 	if d.Expanded {
 		parts = []string{"Esc collapse"}
 	}
-	parts = append(parts, "r refresh", "Tab next column", "Shift+Tab previous column", "/ search")
+	parts = append(parts, "r refresh", "/ search", "Tab next column", "Shift+Tab previous column")
 	parts = append(parts, ticketWriteKeys(card, d)...)
 	return strings.Join(append(parts, "q close"), ", ")
 }
@@ -321,7 +321,7 @@ func ticketDetailLines(card TicketCard, d Detail, width int, th Theme) []string 
 	if notice := noticeLine(d, th, width); notice != "" {
 		out = append(out, notice)
 	}
-	return append(out, clip(ticketHelpLine(card, d), width))
+	return append(out, clipHelpLine(ticketHelpLine(card, d), width))
 }
 
 // ticketPageLines draws every fact of one ticket, wrapped to width: the body of

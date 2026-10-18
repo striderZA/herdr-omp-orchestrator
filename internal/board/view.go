@@ -428,7 +428,7 @@ func renderWithSearch(b *Board, d Detail, width int, th Theme, query string) str
 		if notice := noticeLine(d, th, width); notice != "" {
 			lines = append(lines, notice)
 		}
-		return strings.Join(append(lines, clip("/ search, q close", width)), "\n")
+		return strings.Join(append(lines, clipHelpLine("/ search, q close", width)), "\n")
 	}
 	if b.showsTickets(d) {
 		lines = append(lines, ticketColumnLines(b, d, width, th)...)
@@ -446,10 +446,10 @@ func renderWithSearch(b *Board, d Detail, width int, th Theme, query string) str
 	if b != nil && (len(b.unplaced) > 0 || len(b.unplacedTickets) > 0) {
 		lines = append(lines, "", clip("Not placed by this build:", width))
 		for _, card := range b.unplaced {
-			lines = append(lines, clip(cardText(card, card.ID() == d.SelectedID), width))
+			lines = append(lines, cutCardText(card, card.ID() == d.SelectedID, width))
 		}
 		for _, card := range b.unplacedTickets {
-			lines = append(lines, clip(ticketText(card, card.ID() == d.SelectedID), width))
+			lines = append(lines, cutText(ticketText(card, card.ID() == d.SelectedID), width))
 		}
 	}
 	lines = append(lines, strings.Repeat(th.rule(), width))
@@ -468,14 +468,14 @@ func taskEmptyMessage(query string) string {
 // ticket columns when there are tickets but no tasks.
 const noTasksMessage = "No tasks yet. Ask your primary to delegate a task"
 
-// wideColumns draws the five stage columns side by side, each cell clipped to
-// its own width so no line is wider than the terminal.
+// wideColumns draws the five stage columns side by side, each cell cut to its
+// own width with a cut mark, so no line is wider than the terminal.
 func wideColumns(b *Board, d Detail, width int, th Theme) []string {
 	cell := (width - columnGap*(len(Columns)-1)) / len(Columns)
 	texts := make([][]string, len(Columns))
 	for i, stage := range Columns {
 		for _, card := range b.Column(stage) {
-			texts[i] = append(texts[i], cardText(card, card.ID() == d.SelectedID))
+			texts[i] = append(texts[i], cutCardText(card, card.ID() == d.SelectedID, cell))
 		}
 	}
 	rows := 0
@@ -498,7 +498,7 @@ func wideColumns(b *Board, d Detail, width int, th Theme) []string {
 				parts[i] = padded("", cell)
 				continue
 			}
-			text := clip(texts[i][row], cell)
+			text := texts[i][row]
 			parts[i] = padded(th.paint(cardColor(rowCard(b, stage, row), d.SelectedID), text), cell)
 		}
 		out = append(out, strings.Join(parts, " "))
@@ -528,7 +528,7 @@ func narrowSections(b *Board, d Detail, width int, th Theme) []string {
 		heading := fmt.Sprintf("%s (%d)", StageLabel(stage), len(cards))
 		out = append(out, th.bold(clip(heading, width)))
 		for _, card := range cards {
-			out = append(out, th.paint(cardColor(card, d.SelectedID), clip(cardText(card, card.ID() == d.SelectedID), width)))
+			out = append(out, th.paint(cardColor(card, d.SelectedID), cutCardText(card, card.ID() == d.SelectedID, width)))
 		}
 	}
 	return out
@@ -554,6 +554,12 @@ func cardColor(card Card, selected string) string {
 // comes first, so a narrow column clips the identifier, not the words a reader
 // scans for.
 func cardText(card Card, selected bool) string {
+	return cardHead(card, selected) + activitySuffix(card)
+}
+
+// cardHead is a card's line without Herdr's activity: its marker, its title and
+// its identifier.
+func cardHead(card Card, selected bool) string {
 	marker := "  "
 	if selected {
 		marker = "> "
@@ -561,11 +567,26 @@ func cardText(card Card, selected bool) string {
 	if card.Stage == task.NeedsInput {
 		marker += "! "
 	}
-	text := identifiedText(marker, card.Title(), card.ID())
+	return identifiedText(marker, card.Title(), card.ID())
+}
+
+// activitySuffix is Herdr's activity in brackets, or nothing when there is none.
+func activitySuffix(card Card) string {
 	if activity := card.Activity(); activity != "" {
-		text += " (" + activity + ")"
+		return " (" + activity + ")"
 	}
-	return text
+	return ""
+}
+
+// cutCardText fits a task card's line to width. Herdr's activity goes first: when
+// the title and the identifier fit without it, the activity is left off. Otherwise
+// the line is cut with a cut mark (see cutText), so a title is never shown cut
+// silently.
+func cutCardText(card Card, selected bool, width int) string {
+	if line := cardText(card, selected); displayWidth(line) <= width {
+		return line
+	}
+	return cutText(cardHead(card, selected), width)
 }
 
 // identifiedText is a card's label: the title, then its ID in brackets. Both
@@ -612,7 +633,7 @@ func detailLines(b *Board, d Detail, width int, th Theme) []string {
 		if notice := noticeLine(d, th, width); notice != "" {
 			out = append(out, notice)
 		}
-		return append(out, clip(noSelectionHelp(d), width), clip("", width))
+		return append(out, clipHelpLine(noSelectionHelp(d), width), clip("", width))
 	}
 
 	sep := th.separator()
@@ -713,20 +734,38 @@ func helpLine(d Detail) string {
 	return strings.Join(parts, ", ")
 }
 
-// clipHelpLine preserves the close key when a narrow terminal clips the help.
+// clipHelpLine fits a key-help line to width. Hints are separated by ", " and
+// the close key is always last. A hint that does not fit is dropped whole, so no
+// key is shown cut in the middle of its words. "q close" stays whole from seven
+// columns, its own width. Narrower than that no whole close key fits, so the line
+// is clipped plainly.
 func clipHelpLine(line string, width int) string {
-	const close = "q close"
-	if width < runewidth.StringWidth(close) {
+	const closeKey = "q close"
+	if width <= 0 {
+		return ""
+	}
+	if displayWidth(line) <= width {
+		return line
+	}
+	if displayWidth(closeKey) > width || !strings.HasSuffix(line, ", "+closeKey) {
 		return clip(line, width)
 	}
-	if runewidth.StringWidth(line) <= width {
-		return clip(line, width)
+	hints := strings.Split(strings.TrimSuffix(line, ", "+closeKey), ", ")
+	for keep := len(hints); keep > 0; keep-- {
+		if kept := strings.Join(hints[:keep], ", ") + ", " + closeKey; displayWidth(kept) <= width {
+			return kept
+		}
 	}
-	prefixWidth := width - runewidth.StringWidth(close) - 2
-	if prefixWidth <= 0 {
-		return close
+	return closeKey
+}
+
+// cutText fits one card's line to its cell. A line too wide for the cell ends in
+// "..." so the cut is visible rather than silent.
+func cutText(line string, width int) string {
+	if displayWidth(line) <= width {
+		return line
 	}
-	return clip(line, prefixWidth) + ", " + close
+	return ellipsize(line, width)
 }
 
 // noticeLine renders the last action's outcome, if it said anything, as one line
