@@ -736,7 +736,9 @@ func helpLine(d Detail) string {
 
 // clipHelpLine fits a key-help line to width. Hints are separated by ", " and
 // the close key is always last. A hint that does not fit is dropped whole, so no
-// key is shown cut in the middle of its words and "q close" stays on screen.
+// key is shown cut in the middle of its words. "q close" stays whole from seven
+// columns, its own width. Narrower than that no whole close key fits, so the line
+// is clipped plainly.
 func clipHelpLine(line string, width int) string {
 	const closeKey = "q close"
 	if width <= 0 {

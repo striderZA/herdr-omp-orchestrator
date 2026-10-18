@@ -818,9 +818,10 @@ func indexContaining(t *testing.T, lines []string, want string) int {
 	return -1
 }
 
-// TestKeyHelpKeepsTheCloseKeyAndWholeHints pins the key help at every width the
-// board draws. "q close" stays on screen for each selection, and a hint that
-// does not fit is dropped whole rather than cut in the middle of its words.
+// TestKeyHelpKeepsTheCloseKeyAndWholeHints pins the key help from seven columns
+// up, the close key's own width. "q close" stays on screen for each selection,
+// and a hint that does not fit is dropped whole rather than cut in the middle of
+// its words.
 func TestKeyHelpKeepsTheCloseKeyAndWholeHints(t *testing.T) {
 	th := Theme{Profile: termenv.Ascii}
 	worker := Card{Task: sampleTask("orch_help", nil), Stage: task.Running}
@@ -839,7 +840,7 @@ func TestKeyHelpKeepsTheCloseKeyAndWholeHints(t *testing.T) {
 		{"nothing selected", NewBoard([]Card{worker}), none, noSelectionHelp(none)},
 		{"an empty board", NewBoard(nil), Detail{}, "/ search, q close"},
 	} {
-		for _, width := range []int{12, 24, 60, 84, 120} {
+		for _, width := range []int{7, 8, 9, 10, 11, 12, 24, 60, 84, 120} {
 			view := Render(tc.board, tc.detail, width, th)
 			help := lineContaining(t, strings.Split(view, "\n"), "q close")
 			if got := displayWidth(help); got > width {
@@ -879,5 +880,31 @@ func TestCutCardTitlesAreMarkedAtEveryLayout(t *testing.T) {
 	}), Stage: task.Running}
 	if view := Render(NewBoard([]Card{short}), Detail{}, 120, th); strings.Contains(view, "...") {
 		t.Errorf("a title that fits is marked as cut:\n%s", view)
+	}
+}
+
+// TestClipHelpLineFitsEveryWidth: the help line never exceeds its width. From
+// seven columns up, the close key's own width, "q close" stays whole and every
+// hint left on the line is whole. Narrower than seven no whole close key fits,
+// so only the width bound applies there.
+func TestClipHelpLineFitsEveryWidth(t *testing.T) {
+	const full = "r refresh, Enter details, / search, f focus, Tab next column, Shift+Tab previous column, q close"
+	closeWidth := displayWidth("q close")
+	for width := 1; width <= displayWidth(full); width++ {
+		got := clipHelpLine(full, width)
+		if n := displayWidth(got); n > width {
+			t.Errorf("width %d: %q is %d columns wide", width, got, n)
+		}
+		if width < closeWidth {
+			continue
+		}
+		if !strings.HasSuffix(got, "q close") {
+			t.Errorf("width %d: the close key is not on the line: %q", width, got)
+		}
+		for _, hint := range strings.Split(got, ", ") {
+			if !strings.Contains(", "+full+", ", ", "+hint+", ") {
+				t.Errorf("width %d: %q is not a whole key hint of %q", width, hint, got)
+			}
+		}
 	}
 }
