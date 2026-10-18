@@ -4874,8 +4874,9 @@ function Get-ExtensionConsentDialogTitles {
     <#
         The titles of the extension's consent dialogs: every ConfirmRequest in
         omp/herdr-orchestrator.ts (the helper tests compare this list with that
-        source). Each heads an OMP Yes/No panel, and the extension marks the
-        primary blocked in Herdr while one is open.
+        source). Each heads a panel the extension opens: a Yes/No panel for most, and an
+        overlay for the ticketless dispatch panel. The extension marks the primary blocked
+        in Herdr while one is open.
     #>
     return @(
         'Approve worker choice',
@@ -4906,6 +4907,8 @@ function Get-PrimaryConsentDialogTitle {
     #>
     param([string]$Screen)
     if ([string]::IsNullOrWhiteSpace($Screen)) { return $null }
+    # The ticketless dispatch panel is recognised by its window: once the window has scrolled, its heading is out of view.
+    if ($null -ne (ConvertFrom-DispatchPanelWindow -Screen $Screen)) { return $script:DispatchPanelHeading }
     $titles = @(Get-ExtensionConsentDialogTitles)
     $lines = @($Screen -split "`r?`n")
     for ($index = $lines.Count - 1; $index -ge 0; $index--) {
@@ -5151,45 +5154,175 @@ function ConvertTo-JsonArrayLiteral {
     return '[' + (@($quoted) -join ',') + ']'
 }
 
-function Test-PrimaryDispatchConfirmScreen {
+# The ticketless dispatch panel (omp/herdr-orchestrator.ts: dispatchConfirmRequest, drawn by
+# ReviewPanelView) is an overlay. It shows a window of its rows, a status line such as
+# "1-10/34 more", and a footer. The harness reads every window from the top to the end and
+# matches the rows against the request. Enter is sent only once the panel has been read to
+# its end; before that only the keys that scroll it are sent.
+$script:DispatchPanelHeading = 'Dispatch work without a ticket'
+$script:DispatchPanelIntro = 'Confirm starting or queueing one worker for this request. It names no ticket, so no accepted plan covers it.'
+$script:DispatchPanelFooter = 'The worker gets its own branch and checkout, and nothing merges without your review.'
+$script:PanelUnsafePattern = '[\u0000-\u0009\u000B-\u001F\u007F-\u009F\u061C\u200E\u200F\u2028\u2029\u202A-\u202E\u2066-\u2069]'
+
+function ConvertFrom-DispatchPanelWindow {
     <#
-        True only when the primary's ACTIVE confirmation is the dialog of
-        dispatchConfirmRequest (omp/herdr-orchestrator.ts) for exactly this
-        orch_dispatch request: its title, brief, checks, dependencies, reserved paths
-        and base revision, each as quoteForDialog shows it, in the last "Dispatch
-        work without a ticket" panel, followed directly by its Yes/No choices, which
-        end the panel. A request without dependencies or reserved paths shows [] for
-        them, as the tool's schema defaults do. Only whitespace is folded, so a
-        changed request, an older matching dialog, extra text before the choices or
-        a newer panel below it all refuse.
+        The newest window of the ticketless dispatch panel on a screen, or $null. A window is
+        its body rows, then one status line ("first-last/total more", or "first-last/total end"
+        at the bottom), then the footer that status calls for. The body is exactly last - first
+        + 1 lines above the status, so each row is placed by its index in the panel, never by
+        where it sits on the screen. After the footer only blank lines and one OMP status bar
+        (at least three middle-dot separators) may follow; any other text could be a newer Ask
+        or dialog, so the window fails closed.
     #>
-    param([string]$Screen, $Request)
-    if ([string]::IsNullOrWhiteSpace($Screen) -or $null -eq $Request) { return $false }
-    $title = [string](Get-Field $Request 'title')
-    $brief = [string](Get-Field $Request 'brief')
-    $baseRevision = [string](Get-Field $Request 'baseRevision')
-    if ([string]::IsNullOrWhiteSpace($title) -or [string]::IsNullOrWhiteSpace($brief) -or [string]::IsNullOrWhiteSpace($baseRevision)) { return $false }
-    $start = $Screen.LastIndexOf('Dispatch work without a ticket', [System.StringComparison]::Ordinal)
-    if ($start -lt 0) { return $false }
-    $panel = $Screen.Substring($start)
-    $expected = ((@(
-        'Dispatch work without a ticket',
-        'Confirm starting or queueing one worker for this request. It names no ticket, so no accepted plan covers it.',
-        ('Title: ' + (ConvertTo-JsonStringLiteral -Text $title)),
-        ('Brief: ' + (ConvertTo-JsonStringLiteral -Text $brief)),
-        ('Checks: ' + (ConvertTo-JsonArrayLiteral -Items @(Get-Field $Request 'checks' @()))),
-        ('Dependencies: ' + (ConvertTo-JsonArrayLiteral -Items @(Get-Field $Request 'dependencies' @()))),
-        ('Reserved paths: ' + (ConvertTo-JsonArrayLiteral -Items @(Get-Field $Request 'reservedPaths' @()))),
-        ('Base revision: ' + (ConvertTo-JsonStringLiteral -Text $baseRevision)),
-        'The worker gets its own branch and checkout, and nothing merges without your review.'
-    ) -join ' ') -replace '\s+', ' ').Trim()
-    $normalized = ConvertTo-ConfirmPanelText -Panel $panel
-    if (-not $normalized.StartsWith($expected, [System.StringComparison]::Ordinal)) { return $false }
-    # Only the choices may follow the request; the selector's marker before "Yes"
-    # is not a letter.
-    $rest = $normalized.Substring($expected.Length) -replace '^[^\p{L}]*', ''
-    if (-not $rest.StartsWith('Yes', [System.StringComparison]::Ordinal)) { return $false }
-    return (Test-ConfirmChoicesEndPanel -Panel $panel)
+    param([string]$Screen)
+    if ([string]::IsNullOrWhiteSpace($Screen)) { return $null }
+    $pattern = '^\s*(\d+)-(\d+)/(\d+) (more|end)\s*$'
+    $lines = @($Screen -split "`r?`n")
+    $statusIndex = -1
+    for ($index = $lines.Count - 1; $index -ge 0; $index--) {
+        if ($lines[$index] -cmatch $pattern) { $statusIndex = $index; break }
+    }
+    if ($statusIndex -lt 0) { return $null }
+    $status = [regex]::Match($lines[$statusIndex], $pattern)
+    $first = [int]$status.Groups[1].Value
+    $last = [int]$status.Groups[2].Value
+    $total = [int]$status.Groups[3].Value
+    $atEnd = $status.Groups[4].Value -ceq 'end'
+    $footer = if ($atEnd) { 'Enter: Yes  Esc: No' } else { 'Esc: No  j/k/space' }
+    $footerIndex = $statusIndex + 1
+    if ($footerIndex -ge $lines.Count -or $lines[$footerIndex].Trim() -cne $footer) { return $null }
+    $after = New-Object System.Collections.ArrayList
+    for ($index = $footerIndex + 1; $index -lt $lines.Count; $index++) {
+        if ($lines[$index].Trim().Length -gt 0) { [void]$after.Add($lines[$index].Trim()) }
+    }
+    if ($after.Count -gt 1) { return $null }
+    if ($after.Count -eq 1 -and [regex]::Matches($after[0], '\s\u00B7\s').Count -lt 3) { return $null }
+    $bodyCount = $last - $first + 1
+    $bodyStart = $statusIndex - $bodyCount
+    if ($first -lt 1 -or $last -lt $first -or $last -gt $total -or $bodyStart -lt 0) { return $null }
+    $body = @($lines[$bodyStart..($statusIndex - 1)] | ForEach-Object { $_.TrimEnd() })
+    return [pscustomobject]@{ First = $first; Last = $last; Total = $total; AtEnd = $atEnd; Body = $body }
+}
+
+function ConvertTo-PanelEscapedText {
+    <#
+        A panel value as its rows show it: each control character, the DEL and C1 controls, the
+        line and paragraph separators and the bidirectional marks appear as \uXXXX, as the
+        extension escapes them. Everything else, quotes and backslashes included, is as it is.
+    #>
+    param([string]$Text)
+    $escape = [System.Text.RegularExpressions.MatchEvaluator]{
+        param($match)
+        '\u' + ([int][char]$match.Value).ToString('x4')
+    }
+    return [regex]::Replace($Text, $script:PanelUnsafePattern, $escape)
+}
+
+function ConvertTo-PanelValueText {
+    <#
+        A text value as its row shows it: escaped, or (empty) when there is no text.
+    #>
+    param([string]$Text)
+    if ([string]::IsNullOrEmpty($Text)) { return '(empty)' }
+    return ConvertTo-PanelEscapedText -Text $Text
+}
+
+function Add-PanelListText {
+    <#
+        A list as its rows show it: none when empty, otherwise one bullet row per item.
+    #>
+    param($Parts, $Items)
+    $list = @(@($Items) | Where-Object { $null -ne $_ })
+    if ($list.Count -eq 0) { [void]$Parts.Add('none'); return }
+    foreach ($item in $list) { [void]$Parts.Add('-' + (ConvertTo-PanelEscapedText -Text ([string]$item))) }
+}
+
+function Get-DispatchPanelText {
+    <#
+        The text of the dispatch panel for one request, with every whitespace character removed.
+        A soft wrap, a hard break inside a word and the indent of a value row all fall away, so
+        only the request's characters, in order, are compared.
+    #>
+    param($Request)
+    $parts = New-Object System.Collections.ArrayList
+    [void]$parts.Add($script:DispatchPanelHeading)
+    [void]$parts.Add($script:DispatchPanelIntro)
+    [void]$parts.Add('Title:')
+    [void]$parts.Add((ConvertTo-PanelValueText -Text ([string](Get-Field $Request 'title'))))
+    [void]$parts.Add('Brief:')
+    [void]$parts.Add((ConvertTo-PanelValueText -Text ([string](Get-Field $Request 'brief'))))
+    [void]$parts.Add('Checks:')
+    Add-PanelListText -Parts $parts -Items (Get-Field $Request 'checks' @())
+    [void]$parts.Add('Dependencies:')
+    Add-PanelListText -Parts $parts -Items (Get-Field $Request 'dependencies' @())
+    [void]$parts.Add('Reserved paths:')
+    Add-PanelListText -Parts $parts -Items (Get-Field $Request 'reservedPaths' @())
+    [void]$parts.Add('Base revision:')
+    [void]$parts.Add((ConvertTo-PanelValueText -Text ([string](Get-Field $Request 'baseRevision'))))
+    [void]$parts.Add($script:DispatchPanelFooter)
+    return ((@($parts) -join '') -replace '\s', '')
+}
+
+function Test-PrimaryDispatchPanelRows {
+    <#
+        True only when the rows of the primary's dispatch panel, read from its top to its end,
+        are the panel of exactly this orch_dispatch request. The request's text must match
+        Get-DispatchPanelText, so a changed title, brief, check, reserved path, base revision or
+        dependency refuses, and so does a control character drawn raw. The labels must be the
+        only rows that start with a label at column 0, in the panel's order; every value row is
+        indented, so a value cannot add one. The screen cannot tell a soft wrap from a line
+        break, so the characters are compared and the extension's load check pins the breaks.
+    #>
+    param([string[]]$Rows, $Request)
+    if ($null -eq $Request -or @($Rows).Count -eq 0) { return $false }
+    $labels = @($Rows | Where-Object { $_ -cmatch '^(Title|Brief|Checks|Dependencies|Reserved paths|Base revision):$' })
+    if (($labels -join '|') -cne 'Title:|Brief:|Checks:|Dependencies:|Reserved paths:|Base revision:') { return $false }
+    $shown = ((@($Rows) -join '') -replace '\s', '')
+    return ($shown -ceq (Get-DispatchPanelText -Request $Request))
+}
+
+function Read-PrimaryDispatchPanel {
+    <#
+        Reads the whole ticketless dispatch panel on the primary's screen, from its top to its
+        end, and returns its rows in order with their total, or $null when no complete panel
+        can be read. It moves only the overlay's own cursor: g goes to the top, then j moves one
+        row at a time in steps that leave each window overlapping the last by one row. Enter is
+        never sent here, so reading never accepts. Each window names the rows it shows, so every
+        row is placed by its index: an overlapping row that differs between two windows, a total
+        that changes, or a window that is not a dispatch panel fails the read closed.
+    #>
+    param([int]$MaxWindows = 200)
+    if ($null -eq (ConvertFrom-DispatchPanelWindow -Screen (Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100))) { return $null }
+    $toTop = Send-AgentKeys -PaneId $script:PrimaryPane -Keys @('g')
+    [void]($script:PrimarySendKeysUsed += 'g')
+    if ($toTop.ExitCode -ne 0) { return $null }
+    $rowsByIndex = @{}
+    $total = $null
+    $window = $null
+    for ($count = 0; $count -lt $MaxWindows; $count++) {
+        $window = ConvertFrom-DispatchPanelWindow -Screen (Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100)
+        if ($null -eq $window) { return $null }
+        if ($null -eq $total) { $total = $window.Total }
+        if ($window.Total -ne $total) { return $null }
+        for ($offset = 0; $offset -lt $window.Body.Count; $offset++) {
+            $index = $window.First - 1 + $offset
+            if ($index -lt 0 -or $index -ge $total) { return $null }
+            if ($rowsByIndex.ContainsKey($index)) {
+                if ($rowsByIndex[$index] -cne $window.Body[$offset]) { return $null }
+            }
+            else { $rowsByIndex[$index] = $window.Body[$offset] }
+        }
+        if ($window.AtEnd) { break }
+        $step = $window.Body.Count - 1
+        if ($step -lt 1) { return $null }
+        $keys = @(@('j') * $step)
+        $moved = Send-AgentKeys -PaneId $script:PrimaryPane -Keys $keys
+        foreach ($key in $keys) { [void]($script:PrimarySendKeysUsed += $key) }
+        if ($moved.ExitCode -ne 0) { return $null }
+    }
+    if ($null -eq $window -or -not $window.AtEnd -or $rowsByIndex.Count -ne $total) { return $null }
+    $rows = @(for ($index = 0; $index -lt $total; $index++) { [string]$rowsByIndex[$index] })
+    return [pscustomobject]@{ Total = $total; Rows = $rows }
 }
 
 function Test-TaskMatchesDispatchRequest {
@@ -5241,7 +5374,7 @@ function Find-PrimaryDispatchModal {
         its dialog is open), so an idle or finished primary is refused.
         The candidates are the latest pending call for each expected title that
         matches every expected argument and names no ticket; a finished or
-        superseded call never qualifies. The transcript is read before the screen.
+        superseded call never qualifies. The transcript is read before the panel.
     #>
     param([string]$LaunchPaneId, [object[]]$ExpectedRequests = @())
     $live = Get-LiveAgent -Target $script:PrimaryPane
@@ -5258,8 +5391,9 @@ function Find-PrimaryDispatchModal {
         }
     })
     if ($candidates.Count -eq 0) { return $null }
-    $screen = Get-PaneScreen -PaneId $script:PrimaryPane -Source 'visible' -Lines 100
-    $shown = @($candidates | Where-Object { Test-PrimaryDispatchConfirmScreen -Screen $screen -Request $_ })
+    $panel = Read-PrimaryDispatchPanel
+    if ($null -eq $panel) { return $null }
+    $shown = @($candidates | Where-Object { Test-PrimaryDispatchPanelRows -Rows $panel.Rows -Request $_ })
     if ($shown.Count -ne 1) { return $null }
     return $shown[0]
 }

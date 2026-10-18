@@ -143,13 +143,14 @@ function sessionIdentity(sessionManager: {
 interface ConfirmRequest {
   title: string;
   message: string;
+  panel?: ReviewPanel;
 }
 
 // UIGate is the part of OMP's extension context these gates need: whether an
 // interactive UI exists at all, and the confirmation dialog itself.
 interface UIGate {
   hasUI: boolean;
-  confirm(title: string, message: string): Promise<boolean>;
+  confirm(title: string, message: string, panel?: ReviewPanel): Promise<boolean>;
 }
 
 // BlockedSignal is the slice of OMP's shared extension event bus (`pi.events`) the
@@ -176,16 +177,17 @@ const HERDR_BLOCKED_EVENT = "herdr:blocked";
 export function uiGate(
   ctx: {
     hasUI: boolean;
-    ui: { confirm(title: string, message: string): Promise<boolean> };
+    ui: { confirm(title: string, message: string): Promise<boolean>; custom?: ReviewUi["custom"] };
   },
   events?: BlockedSignal,
 ): UIGate {
   return {
     hasUI: ctx.hasUI === true,
-    confirm: async (title: string, message: string) => {
+    confirm: async (title: string, message: string, panel?: ReviewPanel) => {
       signalBlocked(events, { active: true, label: title });
       try {
-        return await ctx.ui.confirm(title, message);
+        if (panel === undefined) return await ctx.ui.confirm(title, message);
+        return (await openReviewPanel(ctx.ui, panel)) === "accepted";
       } finally {
         signalBlocked(events, { active: false });
       }
@@ -792,7 +794,7 @@ export async function confirmThen<T>(
   }
   let approved: unknown;
   try {
-    approved = await gate.confirm(request.title, request.message);
+    approved = await gate.confirm(request.title, request.message, request.panel);
   } catch (error) {
     return { ok: false, reason: `the confirmation failed (${String(error)}), so nothing was done` };
   }
@@ -802,16 +804,259 @@ export async function confirmThen<T>(
   return { ok: true, value: await act() };
 }
 
-// Every model-supplied or stored text in a consent dialog is shown as one JSON
+// Every model-supplied or stored text in a `confirm` dialog is shown as one JSON
 // string literal. JSON.stringify escapes the quote, the backslash and the C0
 // controls, so a newline cannot start a line that imitates the dialog's own and
 // an ESC cannot reach the terminal. This also escapes what JSON.stringify leaves
 // raw but a terminal acts on or reorders: DEL, the C1 controls, the line and
 // paragraph separators, and the bidirectional marks, embeddings, overrides and
 // isolates. The literal still parses (JSON.parse) to exactly the value sent.
+// The review panel below shows its values unquoted, with the same unsafe
+// characters escaped and every value row indented.
 const DIALOG_UNSAFE = /[\u007f-\u009f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g;
 export function quoteForDialog(value: string | readonly string[]): string {
   return JSON.stringify(value).replace(DIALOG_UNSAFE, (ch) => `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`);
+}
+
+// ---------------------------------------------------------------------------
+// the review panel
+// ---------------------------------------------------------------------------
+//
+// A ticketless dispatch is shown as a review panel rather than a confirm box. OMP's
+// confirm draws one plain-text block whose top rows are lost when it is tall, and it
+// cannot scroll. The panel is OMP's own overlay: it wraps each value at the width the
+// TUI gives, opens on the top of the request and scrolls. Every value row is indented,
+// so a value line can never start where a label or a choice is drawn. Enter accepts
+// only once the last row is in view, Esc declines, and a pane too small to show the
+// request refuses and sends nothing.
+
+// ReviewField is one labelled value of a panel. A list shows one item per row.
+export interface ReviewField {
+  label: string;
+  value: string | readonly string[];
+}
+
+// ReviewPanel is what a consent panel shows: a heading, plain text before the values,
+// the values exactly as the request holds them, and plain text after them.
+export interface ReviewPanel {
+  heading: string;
+  intro: string;
+  fields: readonly ReviewField[];
+  footer: string;
+}
+
+// The most rows the overlay draws, and the smallest pane it draws in. The two floors
+// are the smallest sizes measured live in OMP 18.12.1: a 20-column TUI and an 8-row
+// TUI, each showing the request to its end and accepting it with Enter. A pane narrower
+// or shorter than a floor refuses the request and accepts nothing.
+export const REVIEW_HEIGHT = 12;
+export const REVIEW_MIN_WIDTH = 20;
+export const REVIEW_MIN_ROWS = 8;
+
+// Every continuation row of a value is indented, so no value row starts at column 0,
+// where the labels, the choices and the dialog's own text start.
+const REVIEW_INDENT = "    ";
+const REVIEW_REFUSAL = "Enlarge the pane to review this request. Esc: No, nothing was sent.";
+const REVIEW_ACCEPT = "Enter: Yes  Esc: No";
+const REVIEW_SCROLL = "Esc: No  j/k/space";
+
+// PANEL_UNSAFE matches what a terminal would act on or reorder, other than the line
+// feed that separates rows: the C0 controls (an ESC cannot reach the terminal, and a
+// carriage return cannot overwrite a row), DEL and the C1 controls, the line and
+// paragraph separators, and the bidirectional marks, embeddings, overrides and
+// isolates. Each match shows as a \uXXXX escape.
+const PANEL_UNSAFE = /[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g;
+
+// cellWidth is how many terminal columns a code point takes, counted conservatively:
+// a code point below U+0300 takes one column and any other takes two. A wide character
+// or emoji therefore never counts narrower than it draws. A mark or joiner takes no
+// column but counts two, which only wraps a row early. OMP truncates a row that is
+// wider than the pane instead of wrapping it, so the count must never be too small.
+function cellWidth(ch: string): number {
+  const code = ch.codePointAt(0) ?? 0;
+  return code < 0x0300 ? 1 : 2;
+}
+
+// wrapText lays one text out as rows of at most width columns. Its first row starts
+// with first and its later rows with rest, which have the same width. Each line of
+// the text keeps its own row or rows; words wrap at spaces, and a word wider than a
+// row is split where it stops fitting.
+function wrapText(text: string, first: string, rest: string, width: number): string[] {
+  const avail = Math.max(1, width - rest.length);
+  const rows: string[] = [];
+  text.split("\n").forEach((line, index) => {
+    let prefix = index === 0 ? first : rest;
+    let chars = Array.from(line.replace(PANEL_UNSAFE, (ch) => `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`));
+    for (;;) {
+      let fit = 0;
+      let used = 0;
+      while (fit < chars.length && used + cellWidth(chars[fit]) <= avail) {
+        used += cellWidth(chars[fit]);
+        fit++;
+      }
+      if (fit >= chars.length) {
+        rows.push((prefix + chars.join("")).trimEnd());
+        return;
+      }
+      let cut = fit;
+      while (cut > 0 && chars[cut] !== " ") cut--;
+      const take = cut > 0 ? cut : Math.max(1, fit);
+      rows.push((prefix + chars.slice(0, take).join("")).trimEnd());
+      let next = chars.slice(cut > 0 ? cut + 1 : take);
+      while (next[0] === " ") next = next.slice(1);
+      chars = next;
+      prefix = rest;
+    }
+  });
+  return rows;
+}
+
+// reviewRows lays the whole panel out at a width, top to bottom.
+export function reviewRows(panel: ReviewPanel, width: number): string[] {
+  const rows: string[] = wrapText(panel.heading, "", "", width);
+  rows.push(...wrapText(panel.intro, "", "", width));
+  for (const field of panel.fields) {
+    rows.push(`${field.label}:`);
+    if (typeof field.value === "string") {
+      if (field.value === "") rows.push(`${REVIEW_INDENT}(empty)`);
+      else rows.push(...wrapText(field.value, REVIEW_INDENT, REVIEW_INDENT, width));
+    } else if (field.value.length === 0) {
+      rows.push(`${REVIEW_INDENT}none`);
+    } else {
+      for (const item of field.value) rows.push(...wrapText(item, "  - ", REVIEW_INDENT, width));
+    }
+  }
+  rows.push(...wrapText(panel.footer, "", "", width));
+  return rows;
+}
+
+// ReviewFrame is the window a panel draws in a pane: the rows in view, the status and
+// choices beneath them, the number of value rows in view, and whether the last row is.
+export interface ReviewFrame {
+  lines: string[];
+  offset: number;
+  body: number;
+  atEnd: boolean;
+  usable: boolean;
+}
+
+// reviewFrame draws the panel in a pane of maxRows rows, scrolled to offset. A pane
+// below a floor draws only the refusal, so nothing in it is usable and nothing can be
+// accepted.
+export function reviewFrame(panel: ReviewPanel, width: number, maxRows: number, offset: number): ReviewFrame {
+  if (width < REVIEW_MIN_WIDTH || maxRows < REVIEW_MIN_ROWS) {
+    const refusal = wrapText(REVIEW_REFUSAL, "", "", Math.max(1, width)).slice(0, Math.max(0, maxRows));
+    return { lines: refusal, offset: 0, body: 0, atEnd: false, usable: false };
+  }
+  const rows = reviewRows(panel, width);
+  // The status and the choices take the same rows at every scroll position, so the
+  // window is sized once, for the widest status this request can produce.
+  const widest = `${rows.length}-${rows.length}/${rows.length} more`;
+  const choiceRows = Math.max(wrapText(REVIEW_ACCEPT, "", "", width).length, wrapText(REVIEW_SCROLL, "", "", width).length);
+  const reserved = wrapText(widest, "", "", width).length + choiceRows;
+  const body = Math.max(1, maxRows - reserved);
+  const scrollable = Math.max(0, rows.length - body);
+  const at = Math.min(Math.max(0, offset), scrollable);
+  const atEnd = at >= scrollable;
+  const status = `${at + 1}-${Math.min(rows.length, at + body)}/${rows.length}${atEnd ? " end" : " more"}`;
+  const footer = [...wrapText(status, "", "", width), ...wrapText(atEnd ? REVIEW_ACCEPT : REVIEW_SCROLL, "", "", width)];
+  return { lines: [...rows.slice(at, at + body), ...footer], offset: at, body, atEnd, usable: true };
+}
+
+// ReviewAnswer is how the overlay ends: Enter on the last row accepts, Esc declines.
+export type ReviewAnswer = "accepted" | "declined";
+
+// ReviewKeys and ReviewTui are the parts of OMP's keybindings and TUI the view uses.
+export interface ReviewKeys {
+  matches(data: string, action: string): boolean;
+}
+export interface ReviewTui {
+  terminal?: { columns?: number; rows?: number };
+}
+
+// ReviewComponent is OMP's component shape for an overlay.
+export interface ReviewComponent {
+  render(width: number): readonly string[];
+  handleInput(data: string): void;
+  invalidate(): void;
+}
+
+// ReviewPanelView is the overlay. It draws the panel's window and turns each key into
+// scrolling, an accept or a decline. Each key is read against the window as it is
+// drawn, so Enter cannot accept a request whose last row is not in view.
+export class ReviewPanelView implements ReviewComponent {
+  private offset = 0;
+  private width = 0;
+  private height = REVIEW_HEIGHT;
+  private settled = false;
+  private frame: ReviewFrame = { lines: [], offset: 0, body: 0, atEnd: false, usable: false };
+
+  constructor(
+    private readonly panel: ReviewPanel,
+    private readonly tui: ReviewTui,
+    private readonly keys: ReviewKeys,
+    private readonly done: (answer: ReviewAnswer) => void,
+  ) {}
+
+  render(width: number): readonly string[] {
+    this.width = width;
+    this.height = Math.min(REVIEW_HEIGHT, this.tui.terminal?.rows ?? REVIEW_HEIGHT);
+    this.frame = reviewFrame(this.panel, width, this.height, this.offset);
+    this.offset = this.frame.offset;
+    return this.frame.lines;
+  }
+
+  handleInput(data: string): void {
+    if (this.settled) return;
+    if (this.keys.matches(data, "app.interrupt")) {
+      this.settle("declined");
+      return;
+    }
+    if (!this.frame.usable) return;
+    if (data === "\r" || data === "\n") {
+      if (this.frame.atEnd) this.settle("accepted");
+      return;
+    }
+    const page = Math.max(1, this.frame.body - 1);
+    if (data === "j") this.offset += 1;
+    else if (data === "k") this.offset -= 1;
+    else if (data === " ") this.offset += page;
+    else if (data === "b") this.offset -= page;
+    else if (data === "g") this.offset = 0;
+    else if (data === "G") this.offset = Number.MAX_SAFE_INTEGER;
+    else return;
+    this.frame = reviewFrame(this.panel, this.width, this.height, this.offset);
+    this.offset = this.frame.offset;
+  }
+
+  invalidate(): void {}
+
+  private settle(answer: ReviewAnswer): void {
+    this.settled = true;
+    this.done(answer);
+  }
+}
+
+// ReviewUi is the part of OMP's UI that opens an overlay.
+interface ReviewUi {
+  custom(
+    factory: (tui: ReviewTui, theme: unknown, keys: ReviewKeys, done: (answer: ReviewAnswer) => void) => ReviewComponent,
+    options: { overlay: boolean; overlayOptions: { anchor: string; width: string; maxHeight: number; margin: number } },
+  ): Promise<unknown>;
+}
+
+// openReviewPanel shows a panel as the overlay and resolves with the user's answer.
+// Without an overlay it throws: a panel is never shown as a plain confirm, which would
+// leave out its brief.
+async function openReviewPanel(ui: { custom?: ReviewUi["custom"] }, panel: ReviewPanel): Promise<ReviewAnswer | undefined> {
+  if (typeof ui.custom !== "function") {
+    throw new Error("this OMP session cannot show the review panel");
+  }
+  const answer = await ui.custom((tui, _theme, keys, done) => new ReviewPanelView(panel, tui, keys, done), {
+    overlay: true,
+    overlayOptions: { anchor: "bottom-center", width: "100%", maxHeight: REVIEW_HEIGHT, margin: 0 },
+  });
+  return answer === "accepted" || answer === "declined" ? answer : undefined;
 }
 
 // The review sends exactly the persisted report revision the user approved,
@@ -911,18 +1156,23 @@ export interface DispatchRequest {
 }
 
 export function dispatchConfirmRequest(request: DispatchRequest): ConfirmRequest {
+  const panel: ReviewPanel = {
+    heading: "Dispatch work without a ticket",
+    intro: "Confirm starting or queueing one worker for this request. It names no ticket, so no accepted plan covers it.",
+    fields: [
+      { label: "Title", value: request.title },
+      { label: "Brief", value: request.brief },
+      { label: "Checks", value: request.checks },
+      { label: "Dependencies", value: request.dependencies },
+      { label: "Reserved paths", value: request.reservedPaths },
+      { label: "Base revision", value: request.baseRevision },
+    ],
+    footer: "The worker gets its own branch and checkout, and nothing merges without your review.",
+  };
   return {
     title: "Dispatch work without a ticket",
-    message: [
-      "Confirm starting or queueing one worker for this request. It names no ticket, so no accepted plan covers it.",
-      `Title: ${quoteForDialog(request.title)}`,
-      `Brief: ${quoteForDialog(request.brief)}`,
-      `Checks: ${quoteForDialog(request.checks)}`,
-      `Dependencies: ${quoteForDialog(request.dependencies)}`,
-      `Reserved paths: ${quoteForDialog(request.reservedPaths)}`,
-      `Base revision: ${quoteForDialog(request.baseRevision)}`,
-      "The worker gets its own branch and checkout, and nothing merges without your review.",
-    ].join("\n"),
+    message: reviewRows(panel, 10_000).join("\n"),
+    panel,
   };
 }
 

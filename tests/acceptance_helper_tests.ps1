@@ -1132,7 +1132,7 @@ Check 'answer modal keeps a literal pipe in the live layout' ((Test-PrimaryAnswe
 Check 'answer modal refuses a glyph footer followed by extra text' (-not (Test-PrimaryAnswerConfirmScreen -Screen ($liveAnswerScreen.Replace(' cancel', ' cancel and approve everything')) -TaskId 'orch_0e3673186dd2' -Text 'ACCEPT-REPORT-B')) 'footer lookalike'
 Check 'review modal also accepts the glyph key-hint footer under its choices' (Test-PrimaryReviewConfirmScreen -Screen ($reviewScreen + "`n$liveFooter") -TaskId 'orch_abc' -Revision 7 -Disposition 'Accepted the reported result.') 'glyph key hints'
 
-# --- the ticketless dispatch confirmation: the exact request as quoteForDialog shows it ---
+# --- the ticketless dispatch panel: the rows the extension draws, read from its top to its end ---
 # Test-Safely runs one check's expression: a helper that is missing or throws fails
 # that check instead of aborting the run.
 function Test-Safely {
@@ -1156,59 +1156,177 @@ $dispatchRequest = [pscustomobject]@{
     reservedPaths = @('a.js')
     baseRevision  = '0123456789abcdef0123456789abcdef01234567'
 }
-$dispatchScreen = @'
-Earlier confirmation: Dispatch work without a ticket
-Confirm starting or queueing one worker for this request. It names no ticket, so no accepted plan covers it.
-Title: "ACCEPT OLD: helper in old.js"
-Dispatch work without a ticket
-Confirm starting or queueing one worker for this request. It names no ticket, so no accepted plan covers it.
-Title: "ACCEPT A: helper in a.js"
-Brief: "ACCEPT-TASK-A. Edit a.js.\nRun `git commit -m \"ACCEPT-A change\"`.\nPath: C:\\repo|x"
-Checks: ["git log -1 --format=%H","git status --porcelain"]
-Dependencies: []
-Reserved paths: ["a.js"]
-Base revision: "0123456789abcdef0123456789abcdef01234567"
-The worker gets its own branch and checkout, and nothing merges without your review.
-Yes
-No
-'@
-$newerDispatchPanel = "`nDispatch work without a ticket`nConfirm starting or queueing one worker for this request. It names no ticket, so no accepted plan covers it.`nTitle: `"ACCEPT B: helper in b.js`"`nYes`nNo"
-Check 'dispatch modal matches the active dialog of exactly this request' (Test-Safely { Test-PrimaryDispatchConfirmScreen -Screen $dispatchScreen -Request $dispatchRequest }) 'exact request'
-Check 'dispatch modal refuses another title' (Test-Safely { -not (Test-PrimaryDispatchConfirmScreen -Screen $dispatchScreen -Request (Copy-DispatchRequest $dispatchRequest @{ title = 'ACCEPT B: helper in b.js' })) }) 'title'
-Check 'dispatch modal refuses another brief' (Test-Safely { -not (Test-PrimaryDispatchConfirmScreen -Screen $dispatchScreen -Request (Copy-DispatchRequest $dispatchRequest @{ brief = $dispatchRequest.brief.Replace('|x', '|y') })) }) 'brief'
-Check 'dispatch modal refuses the checks in another order' (Test-Safely { -not (Test-PrimaryDispatchConfirmScreen -Screen $dispatchScreen -Request (Copy-DispatchRequest $dispatchRequest @{ checks = @('git status --porcelain', 'git log -1 --format=%H') })) }) 'check order'
-Check 'dispatch modal refuses another reserved path' (Test-Safely { -not (Test-PrimaryDispatchConfirmScreen -Screen $dispatchScreen -Request (Copy-DispatchRequest $dispatchRequest @{ reservedPaths = @('b.js') })) }) 'reserved path'
-Check 'dispatch modal refuses another base revision' (Test-Safely { -not (Test-PrimaryDispatchConfirmScreen -Screen $dispatchScreen -Request (Copy-DispatchRequest $dispatchRequest @{ baseRevision = '1123456789abcdef0123456789abcdef01234567' })) }) 'base revision'
-Check 'dispatch modal refuses dependencies the dialog does not show' (Test-Safely { -not (Test-PrimaryDispatchConfirmScreen -Screen $dispatchScreen -Request (Copy-DispatchRequest $dispatchRequest @{ dependencies = @('orch_aaaa11112222') })) }) 'dependencies'
-Check 'dispatch modal reads a request without dependencies as []' (Test-Safely { Test-PrimaryDispatchConfirmScreen -Screen $dispatchScreen -Request (Copy-DispatchRequest $dispatchRequest -Remove @('dependencies')) }) 'default dependencies'
-Check 'dispatch modal reads a request without reserved paths as []' (Test-Safely { Test-PrimaryDispatchConfirmScreen -Screen ($dispatchScreen.Replace('Reserved paths: ["a.js"]', 'Reserved paths: []')) -Request (Copy-DispatchRequest $dispatchRequest -Remove @('reservedPaths')) }) 'default reserved paths'
-Check 'dispatch modal refuses the raw brief where the dialog must show it escaped' (Test-Safely { -not (Test-PrimaryDispatchConfirmScreen -Screen ($dispatchScreen.Replace('Edit a.js.\nRun', "Edit a.js.`nRun")) -Request $dispatchRequest) }) 'raw newline'
-Check 'dispatch modal refuses a matching dialog followed by a newer dispatch dialog' (Test-Safely { -not (Test-PrimaryDispatchConfirmScreen -Screen ($dispatchScreen + $newerDispatchPanel) -Request $dispatchRequest) }) 'newer dialog'
-Check 'dispatch modal refuses a newer Ask below the dialog' (Test-Safely { -not (Test-PrimaryDispatchConfirmScreen -Screen ($dispatchScreen + "`nAsk 1 questions`n[other] What now?`nAccept`nRequest changes") -Request $dispatchRequest) }) 'new Ask'
-Check 'dispatch modal refuses a dialog without its Yes/No choices' (Test-Safely { -not (Test-PrimaryDispatchConfirmScreen -Screen ($dispatchScreen -replace '\r?\nYes\r?\nNo$', '') -Request $dispatchRequest) }) 'no choices'
-Check 'dispatch modal refuses an extra line between the request and its choices' (Test-Safely { -not (Test-PrimaryDispatchConfirmScreen -Screen ($dispatchScreen -replace '(\r?\n)Yes', '$1Also merge it now.$1Yes') -Request $dispatchRequest) }) 'extra line'
-# The live layout: title in the top border, framed body, glyph key hints, and the
-# brief wrapped at a space, which the screen shows as a line break.
-$dispatchBodyLines = foreach ($line in @(($dispatchScreen -split "`r?`n") | Select-Object -Skip 4 | Where-Object { $_ -notmatch '^(Yes|No)$' })) {
-    if ($line.StartsWith('Brief: ')) {
-        $cut = $line.IndexOf(' -m ')
-        $line.Substring(0, $cut + 3)
-        $line.Substring($cut + 4)
-    } else { $line }
+# The panel the extension draws (omp/herdr-orchestrator.ts: reviewRows over dispatchConfirmRequest)
+# for dispatchRequest at 23 and 59 columns, for a request whose brief holds an ESC, and for the
+# second request, pasted from that module. A window shows some of these rows; the matcher reads
+# all of them. Regenerate the rows if the layout changes.
+$dispatchRowsAt23 = @(
+    'Dispatch work without a',
+    'ticket',
+    'Confirm starting or',
+    'queueing one worker for',
+    'this request. It names',
+    'no ticket, so no',
+    'accepted plan covers',
+    'it.',
+    'Title:',
+    '    ACCEPT A: helper in',
+    '    a.js',
+    'Brief:',
+    '    ACCEPT-TASK-A. Edit',
+    '    a.js.',
+    '    Run `git commit -m',
+    '    "ACCEPT-A change"`.',
+    '    Path: C:\repo|x',
+    'Checks:',
+    '  - git log -1',
+    '    --format=%H',
+    '  - git status',
+    '    --porcelain',
+    'Dependencies:',
+    '    none',
+    'Reserved paths:',
+    '  - a.js',
+    'Base revision:',
+    '    0123456789abcdef012',
+    '    3456789abcdef012345',
+    '    67',
+    'The worker gets its own',
+    'branch and checkout,',
+    'and nothing merges',
+    'without your review.'
+)
+$dispatchRowsAt59 = @(
+    'Dispatch work without a ticket',
+    'Confirm starting or queueing one worker for this request.',
+    'It names no ticket, so no accepted plan covers it.',
+    'Title:',
+    '    ACCEPT A: helper in a.js',
+    'Brief:',
+    '    ACCEPT-TASK-A. Edit a.js.',
+    '    Run `git commit -m "ACCEPT-A change"`.',
+    '    Path: C:\repo|x',
+    'Checks:',
+    '  - git log -1 --format=%H',
+    '  - git status --porcelain',
+    'Dependencies:',
+    '    none',
+    'Reserved paths:',
+    '  - a.js',
+    'Base revision:',
+    '    0123456789abcdef0123456789abcdef01234567',
+    'The worker gets its own branch and checkout, and nothing',
+    'merges without your review.'
+)
+$dispatchRowsEsc = @(
+    'Dispatch work without a',
+    'ticket',
+    'Confirm starting or',
+    'queueing one worker for',
+    'this request. It names',
+    'no ticket, so no',
+    'accepted plan covers',
+    'it.',
+    'Title:',
+    '    ACCEPT ESC',
+    'Brief:',
+    '    ACCEPT-ESC.\u001b[2',
+    '    K ok',
+    'Checks:',
+    '    none',
+    'Dependencies:',
+    '    none',
+    'Reserved paths:',
+    '  - a.js',
+    'Base revision:',
+    '    0123456789abcdef',
+    'The worker gets its own',
+    'branch and checkout,',
+    'and nothing merges',
+    'without your review.'
+)
+$dispatchRowsB = @(
+    'Dispatch work without a',
+    'ticket',
+    'Confirm starting or',
+    'queueing one worker for',
+    'this request. It names',
+    'no ticket, so no',
+    'accepted plan covers',
+    'it.',
+    'Title:',
+    '    ACCEPT B: helper in',
+    '    b.js',
+    'Brief:',
+    '    ACCEPT-TASK-B.',
+    'Checks:',
+    '  - git status',
+    '    --porcelain',
+    'Dependencies:',
+    '    none',
+    'Reserved paths:',
+    '  - b.js',
+    'Base revision:',
+    '    0123456789abcdef012',
+    '    3456789abcdef012345',
+    '    67',
+    'The worker gets its own',
+    'branch and checkout,',
+    'and nothing merges',
+    'without your review.'
+)
+$dispatchRequestB = [pscustomobject]@{
+    title         = 'ACCEPT B: helper in b.js'
+    brief         = 'ACCEPT-TASK-B.'
+    checks        = @('git status --porcelain')
+    dependencies  = @()
+    reservedPaths = @('b.js')
+    baseRevision  = '0123456789abcdef0123456789abcdef01234567'
 }
-$framedDispatch = @('') + @($dispatchBodyLines) + @('', " $liveChoice Yes", '   No', '', $liveFooter, '') | ForEach-Object { "$bar $($_.PadRight(110)) $bar" }
-$liveDispatchScreen = (@(
-    ' Delegate task',
-    '  title="ACCEPT A: helper in a.js"',
-    '',
-    "$topLeft$dash Dispatch work without a ticket $($dash * 80)$topRight"
-) + $framedDispatch + @(
-    "$bottomLeft$($dash * 114)$bottomRight",
-    '',
-    " 3m $dot GPT-6-Luna $dot orch-accept-x\repo $dot master $dot 1.3%/872K"
-)) -join "`n"
-Check 'dispatch modal matches the live OMP layout with the brief wrapped at a space' (Test-Safely { Test-PrimaryDispatchConfirmScreen -Screen $liveDispatchScreen -Request $dispatchRequest }) 'live layout'
-Check 'dispatch modal refuses another brief in the live layout' (Test-Safely { -not (Test-PrimaryDispatchConfirmScreen -Screen $liveDispatchScreen -Request (Copy-DispatchRequest $dispatchRequest @{ brief = 'ACCEPT-TASK-A.' })) }) 'live wrong brief'
+$escRequest = [pscustomobject]@{ title = 'ACCEPT ESC'; brief = ('ACCEPT-ESC.' + [char]0x1B + '[2K ok'); checks = @(); dependencies = @(); reservedPaths = @('a.js'); baseRevision = '0123456789abcdef' }
+function ConvertTo-FakeDispatchScreen {
+    <#
+        The screen a pane shows for a dispatch panel of these rows: the window Body rows tall
+        at Offset, then the status and the footer the extension draws at that position.
+    #>
+    param([string[]]$Rows, [int]$Body, [int]$Offset)
+    $maxOffset = [Math]::Max(0, $Rows.Count - $Body)
+    $at = [Math]::Min([Math]::Max(0, $Offset), $maxOffset)
+    $last = [Math]::Min($Rows.Count, $at + $Body)
+    $atEnd = $at -ge $maxOffset
+    $status = '{0}-{1}/{2} {3}' -f ($at + 1), $last, $Rows.Count, $(if ($atEnd) { 'end' } else { 'more' })
+    $footer = if ($atEnd) { 'Enter: Yes  Esc: No' } else { 'Esc: No  j/k/space' }
+    $lines = New-Object System.Collections.ArrayList
+    for ($index = $at; $index -lt $last; $index++) { [void]$lines.Add($Rows[$index]) }
+    [void]$lines.Add($status)
+    [void]$lines.Add($footer)
+    return ($lines -join "`n")
+}
+Check 'dispatch panel rows at 23 columns match the exact request' (Test-Safely { Test-PrimaryDispatchPanelRows -Rows $dispatchRowsAt23 -Request $dispatchRequest }) 'rows at 23'
+Check 'dispatch panel rows at 59 columns match the same request' (Test-Safely { Test-PrimaryDispatchPanelRows -Rows $dispatchRowsAt59 -Request $dispatchRequest }) 'rows at 59'
+Check 'dispatch panel rows show a control character as its escape and match' (Test-Safely { Test-PrimaryDispatchPanelRows -Rows $dispatchRowsEsc -Request $escRequest }) 'escaped control'
+Check 'dispatch panel rows refuse a control character drawn raw' (Test-Safely { -not (Test-PrimaryDispatchPanelRows -Rows @($dispatchRowsEsc -replace '\\u001b', [string][char]0x1B) -Request $escRequest) }) 'raw control'
+Check 'dispatch panel rows refuse another title' (Test-Safely { -not (Test-PrimaryDispatchPanelRows -Rows $dispatchRowsAt23 -Request (Copy-DispatchRequest $dispatchRequest @{ title = 'ACCEPT B: helper in a.js' })) }) 'title'
+Check 'dispatch panel rows refuse another brief' (Test-Safely { -not (Test-PrimaryDispatchPanelRows -Rows $dispatchRowsAt23 -Request (Copy-DispatchRequest $dispatchRequest @{ brief = $dispatchRequest.brief.Replace('|x', '|y') })) }) 'brief'
+Check 'dispatch panel rows refuse the checks in another order' (Test-Safely { -not (Test-PrimaryDispatchPanelRows -Rows $dispatchRowsAt23 -Request (Copy-DispatchRequest $dispatchRequest @{ checks = @('git status --porcelain', 'git log -1 --format=%H') })) }) 'check order'
+Check 'dispatch panel rows refuse another reserved path' (Test-Safely { -not (Test-PrimaryDispatchPanelRows -Rows $dispatchRowsAt23 -Request (Copy-DispatchRequest $dispatchRequest @{ reservedPaths = @('b.js') })) }) 'reserved path'
+Check 'dispatch panel rows refuse another base revision' (Test-Safely { -not (Test-PrimaryDispatchPanelRows -Rows $dispatchRowsAt23 -Request (Copy-DispatchRequest $dispatchRequest @{ baseRevision = '1123456789abcdef0123456789abcdef01234567' })) }) 'base revision'
+Check 'dispatch panel rows refuse a dependency the panel does not show' (Test-Safely { -not (Test-PrimaryDispatchPanelRows -Rows $dispatchRowsAt23 -Request (Copy-DispatchRequest $dispatchRequest @{ dependencies = @('orch_aaaa11112222') })) }) 'dependencies'
+Check 'dispatch panel rows refuse a label row added after the panel' (Test-Safely { -not (Test-PrimaryDispatchPanelRows -Rows (@($dispatchRowsAt23) + @('Brief:')) -Request $dispatchRequest) }) 'label row'
+$windowMore = ConvertTo-FakeDispatchScreen -Rows $dispatchRowsAt23 -Body 10 -Offset 0
+$windowEnd = ConvertTo-FakeDispatchScreen -Rows $dispatchRowsAt23 -Body 10 -Offset 99
+Check 'a dispatch panel window reads its rows, its status and the total' (Test-Safely {
+        $window = ConvertFrom-DispatchPanelWindow -Screen $windowMore
+        $null -ne $window -and $window.First -eq 1 -and $window.Last -eq 10 -and $window.Total -eq $dispatchRowsAt23.Count -and
+        -not $window.AtEnd -and $window.Body.Count -eq 10 -and $window.Body[0] -ceq 'Dispatch work without a' }) 'window'
+Check 'the end window of a dispatch panel is read as the end' (Test-Safely {
+        $window = ConvertFrom-DispatchPanelWindow -Screen $windowEnd
+        $null -ne $window -and $window.AtEnd -and $window.Last -eq $dispatchRowsAt23.Count }) 'end window'
+Check 'a dispatch panel window followed by an Ask is refused' (Test-Safely { $null -eq (ConvertFrom-DispatchPanelWindow -Screen ($windowEnd + "`nAsk 1 questions`n[other] What now?")) }) 'Ask below'
+Check 'a dispatch panel window without its footer is refused' (Test-Safely { $null -eq (ConvertFrom-DispatchPanelWindow -Screen ($windowMore -replace '(?m)^Esc: No  j/k/space\s*$', '')) }) 'no footer'
+Check 'one OMP status bar below a dispatch panel window is allowed' (Test-Safely { $null -ne (ConvertFrom-DispatchPanelWindow -Screen ($windowEnd + "`n`n model " + [char]0x00B7 + " branch " + [char]0x00B7 + " 3 " + [char]0x00B7 + " 4")) }) 'status bar'
+Check 'the newest dispatch window on a screen is the one read' (Test-Safely { $window = ConvertFrom-DispatchPanelWindow -Screen ($windowMore + "`n" + $windowEnd); $null -ne $window -and $window.AtEnd }) 'newest window'
+Check 'the consent detection names the dispatch panel from its window, with its heading scrolled out of view' (Test-Safely { (Get-PrimaryConsentDialogTitle -Screen (ConvertTo-FakeDispatchScreen -Rows $dispatchRowsAt23 -Body 10 -Offset 10)) -ceq 'Dispatch work without a ticket' }) 'consent title'
 Check 'JSON array text of an empty list is []' (Test-Safely { (ConvertTo-JsonArrayLiteral -Items @()) -ceq '[]' }) 'empty list'
 Check 'JSON array text of one item is still a list' (Test-Safely { (ConvertTo-JsonArrayLiteral -Items @('a.js')) -ceq '["a.js"]' }) 'one item'
 Check 'JSON array text quotes each item as JSON.stringify does, with no spaces' (Test-Safely { (ConvertTo-JsonArrayLiteral -Items @('a"b', 'C:\x', "tab`there")) -ceq '["a\"b","C:\\x","tab\there"]' }) 'quoted items'
@@ -2010,7 +2128,10 @@ $script:SentKeysCallsForTest = @()
 $wrongWorkerQuestionAskResult = $null
 try { $wrongWorkerQuestionAskResult = Resolve-PrimaryWorkerQuestionAsk -QuestionMarker 'ACCEPT-Q-A' -QuestionText 'Should a.js keep its existing export style?' -TaskId 'task-a' -AnswerToken 'ACCEPT-ANSWER-A' -AssertionId 'TEST.question-answer-wrong' } catch { }
 Check 'worker-question resolver refuses an Ask with a different authorization token without typing' ($null -ne $wrongWorkerQuestionAskResult -and -not $wrongWorkerQuestionAskResult.Resolved -and $script:SentKeysCallsForTest.Count -eq 0) 'wrong worker Ask'
-# --- ticketless dispatch confirmations: Enter only on the exact dialog of a pending call ---
+# --- ticketless dispatch confirmations: a fake overlay pages like the extension's; Enter accepts only at its end ---
+# The fake shows Body rows of the current panel from Offset, then the status and footer the extension
+# draws there. g goes to the top, j moves one row (clamped), Enter accepts only at the end and shows the
+# next panel, esc declines and shows the next. No other key changes it.
 $stubbedForDispatch = @('Wait-Until', 'Get-ReadySession', 'Get-LiveAgent', 'Get-PaneScreen', 'Send-AgentKeys')
 $savedForDispatch = @{}
 foreach ($name in $stubbedForDispatch) { $savedForDispatch[$name] = (Get-Command -Name $name -CommandType Function).ScriptBlock }
@@ -2018,33 +2139,17 @@ $savedDispatchProject = $script:Project
 $savedDispatchPane = $script:PrimaryPane
 $script:Project = [pscustomobject]@{ LaunchPaneID = 'w1:p1'; Key = 'C:\r' }
 $script:PrimaryPane = 'w1:p1'
-$dispatchRequestB = [pscustomobject]@{
-    title         = 'ACCEPT B: helper in b.js'
-    brief         = 'ACCEPT-TASK-B.'
-    checks        = @('git status --porcelain')
-    dependencies  = @()
-    reservedPaths = @('b.js')
-    baseRevision  = '0123456789abcdef0123456789abcdef01234567'
-}
-$dispatchScreenB = @'
-Dispatch work without a ticket
-Confirm starting or queueing one worker for this request. It names no ticket, so no accepted plan covers it.
-Title: "ACCEPT B: helper in b.js"
-Brief: "ACCEPT-TASK-B."
-Checks: ["git status --porcelain"]
-Dependencies: []
-Reserved paths: ["b.js"]
-Base revision: "0123456789abcdef0123456789abcdef01234567"
-The worker gets its own branch and checkout, and nothing merges without your review.
-Yes
-No
-'@
 $script:DispatchDriverTranscript = Join-Path $script:HarnessRoot 'dispatch-driver.jsonl'
-# Reset-DispatchDriver writes a primary transcript in which the assistant made both
-# calls in one message (plus any recorded results), and the screens the pane shows
-# in turn: Enter on one dialog shows the next.
+function Next-FakeDispatchPanel {
+    $script:FakeDispatchPanel = $null
+    if (@($script:FakeDispatchQueue).Count -gt 0) {
+        $script:FakeDispatchPanel = $script:FakeDispatchQueue[0]
+        $script:FakeDispatchQueue = @($script:FakeDispatchQueue | Select-Object -Skip 1)
+    }
+    $script:FakeDispatchOffset = 0
+}
 function Reset-DispatchDriver {
-    param([string[]]$Screens, [string]$Status = 'working', [string[]]$AnsweredIds = @(), [int]$ReplaceAfterRead = 0)
+    param([object[]]$Panels = @(), [string]$Status = 'working', [string[]]$AnsweredIds = @(), [int]$ReplaceAfterRead = 0, [string[]]$ReplacementRows = @())
     $lines = @('{"type":"message","message":{"role":"assistant","content":[' +
         '{"type":"toolCall","id":"call_a","name":"orch_dispatch","arguments":' + ($dispatchRequest | ConvertTo-Json -Compress -Depth 5) + '},' +
         '{"type":"toolCall","id":"call_b","name":"orch_dispatch","arguments":' + ($dispatchRequestB | ConvertTo-Json -Compress -Depth 5) + '}]}}')
@@ -2052,10 +2157,12 @@ function Reset-DispatchDriver {
         $lines += ('{"type":"message","message":{"role":"toolResult","toolCallId":"' + $id + '","toolName":"orch_dispatch","content":[],"isError":false}}')
     }
     Set-Content -LiteralPath $script:DispatchDriverTranscript -Encoding UTF8 -Value $lines
-    $script:DispatchDriverScreens = @($Screens)
-    $script:DispatchDriverShown = 0
-    $script:DispatchDriverReads = 0
-    $script:DispatchDriverReplaceAfterRead = $ReplaceAfterRead
+    $script:FakeDispatchQueue = @($Panels)
+    Next-FakeDispatchPanel
+    $script:FakeDispatchReads = 0
+    $script:FakeDispatchReplaceAfterRead = $ReplaceAfterRead
+    $script:FakeDispatchReplacementRows = @($ReplacementRows)
+    $script:FakeDispatchAccepted = 0
     $script:DispatchDriverStatus = $Status
     $script:SentKeysCallsForTest = @()
 }
@@ -2068,86 +2175,77 @@ function Get-ReadySession { param([string]$LaunchPaneId) return [pscustomobject]
 function Get-LiveAgent { param([string]$Target) return [pscustomobject]@{ Found = $true; Agent = [pscustomobject]@{ agent_status = $script:DispatchDriverStatus } } }
 function Get-PaneScreen {
     param([string]$PaneId, [string]$Source, [int]$Lines)
-    $script:DispatchDriverReads++
-    if ($script:DispatchDriverReplaceAfterRead -gt 0 -and $script:DispatchDriverReads -gt $script:DispatchDriverReplaceAfterRead) { return 'Dispatch work without a ticket (replaced)' }
-    if ($script:DispatchDriverShown -ge $script:DispatchDriverScreens.Count) { return '' }
-    return $script:DispatchDriverScreens[$script:DispatchDriverShown]
+    $script:FakeDispatchReads++
+    if ($script:FakeDispatchReplaceAfterRead -gt 0 -and $script:FakeDispatchReads -gt $script:FakeDispatchReplaceAfterRead -and $null -ne $script:FakeDispatchPanel) {
+        $script:FakeDispatchPanel = @{ Rows = $script:FakeDispatchReplacementRows; Body = $script:FakeDispatchPanel.Body }
+        $script:FakeDispatchReplaceAfterRead = 0
+    }
+    if ($null -eq $script:FakeDispatchPanel) { return '' }
+    return ConvertTo-FakeDispatchScreen -Rows $script:FakeDispatchPanel.Rows -Body $script:FakeDispatchPanel.Body -Offset $script:FakeDispatchOffset
 }
 function Send-AgentKeys {
     param([string]$PaneId, [string[]]$Keys)
     $script:SentKeysCallsForTest += ($Keys -join ' ')
-    $script:DispatchDriverShown++
+    foreach ($key in $Keys) {
+        if ($null -eq $script:FakeDispatchPanel) { break }
+        $maxOffset = [Math]::Max(0, @($script:FakeDispatchPanel.Rows).Count - $script:FakeDispatchPanel.Body)
+        if ($key -ceq 'g') { $script:FakeDispatchOffset = 0 }
+        elseif ($key -ceq 'j') { $script:FakeDispatchOffset = [Math]::Min($script:FakeDispatchOffset + 1, $maxOffset) }
+        elseif ($key -ceq 'enter' -and $script:FakeDispatchOffset -ge $maxOffset) { $script:FakeDispatchAccepted++; Next-FakeDispatchPanel }
+        elseif ($key -ceq 'esc') { Next-FakeDispatchPanel }
+    }
     return [pscustomobject]@{ ExitCode = 0; CommandLine = "send-keys $PaneId $($Keys -join ' ')" }
 }
-$dispatchExpectedRequests = @($dispatchRequest, $dispatchRequestB)
-$dispatchTitles = @('ACCEPT A: helper in a.js', 'ACCEPT B: helper in b.js')
-
-Reset-DispatchDriver -Screens @($dispatchScreen, $dispatchScreenB)
-$bothConfirmed = $null
-try { $bothConfirmed = Confirm-PrimaryDispatchModals -ExpectedRequests $dispatchExpectedRequests -TimeoutSeconds 1 } catch { }
-Check 'dispatch confirmations: the first of two calls made in one message, then the second' (Test-Safely {
-        $requests = @($bothConfirmed.Requests)
-        $null -ne $bothConfirmed -and $bothConfirmed.Confirmed -and $requests.Count -eq 2 -and
-        (@($requests | ForEach-Object { [string](Get-Field $_ 'title') }) -join '|') -ceq ($dispatchTitles -join '|') -and
-        @($requests | Where-Object { ([string](Get-Field $_ 'title')).Trim() -ceq 'ACCEPT B: helper in b.js' }).Count -eq 1 -and
-        ($script:SentKeysCallsForTest -join ',') -ceq 'enter,enter' }) `
-    ("result=$(Get-Json $bothConfirmed) keys=$($script:SentKeysCallsForTest -join ',')")
-Check 'dispatch confirmations: a result wrapped in @() and piped still holds both requests' (Test-Safely {
-        $wrapped = @($bothConfirmed | Where-Object { $null -ne $_ })
-        $wrapped.Count -eq 1 -and @($wrapped[0].Requests).Count -eq 2 }) 'wrapped result'
-Reset-DispatchDriver -Screens @($dispatchScreenB, $dispatchScreen)
-$reversedConfirmed = $null
-try { $reversedConfirmed = Confirm-PrimaryDispatchModals -ExpectedRequests $dispatchExpectedRequests -TimeoutSeconds 1 } catch { }
-Check 'dispatch confirmations: dialogs shown in the other order are confirmed in that order' (Test-Safely {
-        $null -ne $reversedConfirmed -and $reversedConfirmed.Confirmed -and
-        (@(@($reversedConfirmed.Requests) | ForEach-Object { [string](Get-Field $_ 'title') }) -join '|') -ceq 'ACCEPT B: helper in b.js|ACCEPT A: helper in a.js' -and
-        $script:SentKeysCallsForTest.Count -eq 2 }) ("result=$(Get-Json $reversedConfirmed) keys=$($script:SentKeysCallsForTest -join ',')")
-Reset-DispatchDriver -Screens @($dispatchScreen)
-$oneConfirmed = $null
-try { $oneConfirmed = Confirm-PrimaryDispatchModals -ExpectedRequests @($dispatchRequest) -TimeoutSeconds 1 } catch { }
-Check 'dispatch confirmations: one confirmed call reads as one request the stored task is compared with' (Test-Safely {
-        $requests = @($oneConfirmed.Requests)
-        $null -ne $oneConfirmed -and $oneConfirmed.Confirmed -and $requests.Count -eq 1 -and
-        [string](Get-Field $requests[0] 'title') -ceq 'ACCEPT A: helper in a.js' -and
-        (Test-TaskMatchesDispatchRequest -Fact $storedDispatchFact -Request $requests[0]) }) ("result=$(Get-Json $oneConfirmed)")
-Reset-DispatchDriver -Screens @($dispatchScreen)
-$alteredExpected = Copy-DispatchRequest $dispatchRequest @{ brief = 'ACCEPT-TASK-A, but changed' }
-$alteredExpectation = $null
-try { $alteredExpectation = Confirm-PrimaryDispatchModals -ExpectedRequests @($alteredExpected) -TimeoutSeconds 1 } catch { }
-Check 'dispatch confirmations refuse a same-title pending request that differs from the prompt expectations' (Test-Safely {
-        $null -ne $alteredExpectation -and -not $alteredExpectation.Confirmed -and
-        @($alteredExpectation.Requests).Count -eq 0 -and $script:SentKeysCallsForTest.Count -eq 0
-    }) ("result=$(Get-Json $alteredExpectation) keys=$($script:SentKeysCallsForTest -join ',')")
-Reset-DispatchDriver -Screens @($dispatchScreen)
-$partlyConfirmed = $null
-try { $partlyConfirmed = Confirm-PrimaryDispatchModals -ExpectedRequests $dispatchExpectedRequests -TimeoutSeconds 1 } catch { }
-Check 'dispatch confirmations: a second dialog that never opens leaves the result unconfirmed with only the first request' (Test-Safely {
-        $null -ne $partlyConfirmed -and -not $partlyConfirmed.Confirmed -and @($partlyConfirmed.Requests).Count -eq 1 -and
-        ($script:SentKeysCallsForTest -join ',') -ceq 'enter' }) ("result=$(Get-Json $partlyConfirmed) keys=$($script:SentKeysCallsForTest -join ',')")
-Reset-DispatchDriver -Screens @($dispatchScreen.Replace('C:\\repo|x', 'C:\\repo|y'))
-$changedRequest = 'unset'
-try { $changedRequest = Confirm-PrimaryDispatchModals -ExpectedRequests $dispatchExpectedRequests -TimeoutSeconds 1 } catch { }
-Check 'dispatch confirmations: a dialog whose request differs from the pending call gets nothing' (Test-Safely {
-        $null -ne $changedRequest -and -not $changedRequest.Confirmed -and @($changedRequest.Requests).Count -eq 0 -and
-        $script:SentKeysCallsForTest.Count -eq 0 }) "keys=$($script:SentKeysCallsForTest.Count)"
-Reset-DispatchDriver -Screens @($dispatchScreen) -Status 'idle'
-$idleDialog = 'unset'
-try { $idleDialog = Confirm-PrimaryDispatchModals -ExpectedRequests @($dispatchRequest) -TimeoutSeconds 1 } catch { }
-Check 'dispatch confirmations: an idle primary gets nothing, even with a matching dialog on screen' (Test-Safely {
-        $null -ne $idleDialog -and -not $idleDialog.Confirmed -and @($idleDialog.Requests).Count -eq 0 -and
-        $script:SentKeysCallsForTest.Count -eq 0 }) "keys=$($script:SentKeysCallsForTest.Count)"
-Reset-DispatchDriver -Screens @($dispatchScreen) -AnsweredIds @('call_a')
-$answeredDialog = 'unset'
-try { $answeredDialog = Confirm-PrimaryDispatchModals -ExpectedRequests @($dispatchRequest) -TimeoutSeconds 1 } catch { }
+$pagedConfirm = $null
+Reset-DispatchDriver -Panels @(@{ Rows = $dispatchRowsAt23; Body = 10 })
+try { $pagedConfirm = Confirm-PrimaryDispatchModals -ExpectedRequests @($dispatchRequest) -TimeoutSeconds 1 } catch { }
+Check 'dispatch confirmations page the panel to its end, then send one Enter' (Test-Safely {
+        $null -ne $pagedConfirm -and $pagedConfirm.Confirmed -and @($pagedConfirm.Requests).Count -eq 1 -and $script:FakeDispatchAccepted -eq 1 -and
+        ($script:SentKeysCallsForTest -contains 'g') -and @($script:SentKeysCallsForTest | Where-Object { $_ -ceq 'enter' }).Count -eq 1 -and
+        $script:SentKeysCallsForTest[-1] -ceq 'enter' }) ("result=$(Get-Json $pagedConfirm) keys=$($script:SentKeysCallsForTest -join ' | ')")
+$changedTail = @($dispatchRowsAt23 | ForEach-Object { $_ })
+$changedTail[28] = '    3456789abcdef012346'
+$tailConfirm = $null
+Reset-DispatchDriver -Panels @(@{ Rows = $changedTail; Body = 10 })
+try { $tailConfirm = Confirm-PrimaryDispatchModals -ExpectedRequests @($dispatchRequest) -TimeoutSeconds 1 } catch { }
+Check 'dispatch confirmations refuse a row changed below the first window: nothing is accepted' (Test-Safely {
+        $null -ne $tailConfirm -and -not $tailConfirm.Confirmed -and $script:FakeDispatchAccepted -eq 0 -and
+        @($script:SentKeysCallsForTest | Where-Object { $_ -ceq 'enter' }).Count -eq 0 }) ("result=$(Get-Json $tailConfirm) keys=$($script:SentKeysCallsForTest.Count)")
+$idleConfirm = $null
+Reset-DispatchDriver -Panels @(@{ Rows = $dispatchRowsAt23; Body = 10 }) -Status 'idle'
+try { $idleConfirm = Confirm-PrimaryDispatchModals -ExpectedRequests @($dispatchRequest) -TimeoutSeconds 1 } catch { }
+Check 'dispatch confirmations: an idle primary gets nothing, even with the exact panel open' (Test-Safely {
+        $null -ne $idleConfirm -and -not $idleConfirm.Confirmed -and @($idleConfirm.Requests).Count -eq 0 -and $script:SentKeysCallsForTest.Count -eq 0 }) "keys=$($script:SentKeysCallsForTest.Count)"
+$answeredConfirm = $null
+Reset-DispatchDriver -Panels @(@{ Rows = $dispatchRowsAt23; Body = 10 }) -AnsweredIds @('call_a')
+try { $answeredConfirm = Confirm-PrimaryDispatchModals -ExpectedRequests @($dispatchRequest) -TimeoutSeconds 1 } catch { }
 Check 'dispatch confirmations: a call whose result is recorded is never confirmed' (Test-Safely {
-        $null -ne $answeredDialog -and -not $answeredDialog.Confirmed -and @($answeredDialog.Requests).Count -eq 0 -and
-        $script:SentKeysCallsForTest.Count -eq 0 }) "keys=$($script:SentKeysCallsForTest.Count)"
-Reset-DispatchDriver -Screens @($dispatchScreen) -ReplaceAfterRead 1
-$replacedDialog = 'unset'
-try { $replacedDialog = Confirm-PrimaryDispatchModals -ExpectedRequests @($dispatchRequest) -TimeoutSeconds 1 } catch { }
-Check 'dispatch confirmations: the screen is read again before Enter and a replaced dialog gets nothing' (Test-Safely {
-        $null -ne $replacedDialog -and -not $replacedDialog.Confirmed -and @($replacedDialog.Requests).Count -eq 0 -and
-        $script:SentKeysCallsForTest.Count -eq 0 -and $script:DispatchDriverReads -ge 2 }) "reads=$($script:DispatchDriverReads) keys=$($script:SentKeysCallsForTest.Count)"
+        $null -ne $answeredConfirm -and -not $answeredConfirm.Confirmed -and @($answeredConfirm.Requests).Count -eq 0 -and $script:SentKeysCallsForTest.Count -eq 0 }) "keys=$($script:SentKeysCallsForTest.Count)"
+$bothExpected = @($dispatchRequest, $dispatchRequestB)
+$bothConfirmed = $null
+Reset-DispatchDriver -Panels @(@{ Rows = $dispatchRowsAt23; Body = 10 }, @{ Rows = $dispatchRowsB; Body = 10 })
+try { $bothConfirmed = Confirm-PrimaryDispatchModals -ExpectedRequests $bothExpected -TimeoutSeconds 1 } catch { }
+Check 'dispatch confirmations: two panels are confirmed in the order they appear' (Test-Safely {
+        $null -ne $bothConfirmed -and $bothConfirmed.Confirmed -and $script:FakeDispatchAccepted -eq 2 -and
+        (@(@($bothConfirmed.Requests) | ForEach-Object { [string](Get-Field $_ 'title') }) -join '|') -ceq 'ACCEPT A: helper in a.js|ACCEPT B: helper in b.js' }) "result=$(Get-Json $bothConfirmed)"
+$reversedConfirmed = $null
+Reset-DispatchDriver -Panels @(@{ Rows = $dispatchRowsB; Body = 10 }, @{ Rows = $dispatchRowsAt23; Body = 10 })
+try { $reversedConfirmed = Confirm-PrimaryDispatchModals -ExpectedRequests $bothExpected -TimeoutSeconds 1 } catch { }
+Check 'dispatch confirmations: panels shown in the other order are confirmed in that order' (Test-Safely {
+        $null -ne $reversedConfirmed -and $reversedConfirmed.Confirmed -and $script:FakeDispatchAccepted -eq 2 -and
+        (@(@($reversedConfirmed.Requests) | ForEach-Object { [string](Get-Field $_ 'title') }) -join '|') -ceq 'ACCEPT B: helper in b.js|ACCEPT A: helper in a.js' }) "result=$(Get-Json $reversedConfirmed)"
+$alteredExpected = Copy-DispatchRequest $dispatchRequest @{ brief = 'ACCEPT-TASK-A, but changed' }
+$alteredConfirm = $null
+Reset-DispatchDriver -Panels @(@{ Rows = $dispatchRowsAt23; Body = 10 })
+try { $alteredConfirm = Confirm-PrimaryDispatchModals -ExpectedRequests @($alteredExpected) -TimeoutSeconds 1 } catch { }
+Check 'dispatch confirmations refuse a panel whose request differs from the pending call' (Test-Safely {
+        $null -ne $alteredConfirm -and -not $alteredConfirm.Confirmed -and @($alteredConfirm.Requests).Count -eq 0 -and $script:FakeDispatchAccepted -eq 0 }) "result=$(Get-Json $alteredConfirm)"
+$changedConfirm = $null
+Reset-DispatchDriver -Panels @(@{ Rows = $dispatchRowsAt23; Body = 10 }) -ReplaceAfterRead 1 -ReplacementRows $dispatchRowsB
+try { $changedConfirm = Confirm-PrimaryDispatchModals -ExpectedRequests @($dispatchRequest) -TimeoutSeconds 1 } catch { }
+Check 'dispatch confirmations: a panel that changes while it is read gets nothing' (Test-Safely {
+        $null -ne $changedConfirm -and -not $changedConfirm.Confirmed -and $script:FakeDispatchAccepted -eq 0 -and
+        @($script:SentKeysCallsForTest | Where-Object { $_ -ceq 'enter' }).Count -eq 0 }) ("result=$(Get-Json $changedConfirm)")
 foreach ($name in $stubbedForDispatch) { Set-Item -Path "Function:\$name" -Value $savedForDispatch[$name] }
 $script:Project = $savedDispatchProject
 $script:PrimaryPane = $savedDispatchPane
