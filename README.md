@@ -1,5 +1,7 @@
 # Herdr OMP Orchestrator
 
+> **Archived.** This project is superseded by the 1.0.0 release of [herdr-projects](https://github.com/eliasstravik/herdr-projects). Start with its [get-started guide](https://github.com/eliasstravik/herdr-projects/blob/main/docs/get-started.md).
+
 Herdr OMP Orchestrator is a Herdr plugin that runs Oh My Pi (OMP) agents as a durable, human-supervised task orchestrator. It runs on Windows and on Linux (x86_64). macOS is refused, and arm64 is untested.
 
 - A **primary** OMP session takes your requests and delegates them. It can read, search and use the plugin's tools, but it cannot edit files or run commands.
